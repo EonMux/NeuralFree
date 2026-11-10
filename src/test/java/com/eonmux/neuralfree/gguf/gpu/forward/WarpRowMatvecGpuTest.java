@@ -287,7 +287,7 @@ public class WarpRowMatvecGpuTest {
             int base = b * blockBytes;
             if (type == GGMLType.Q6_K) {
                 putHalf(data, base + 208, 0.01f);
-            } else if (type == GGMLType.Q4_K) {
+            } else if (type == GGMLType.Q4_K || type == GGMLType.Q5_K) {
                 putHalf(data, base, 0.02f);
                 putHalf(data, base + 2, 0.01f);
             } else {

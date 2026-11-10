@@ -28,6 +28,29 @@ public class MatVecMmaTuningTest {
     }
 
     @Test
+    public void q5kServesFromTwoTokensExceptNarrowShortProjectionsAndWidensTheNarrowSixteenTokenTile() {
+        for (int[] s : new int[][]{{9728, 2560}, {2560, 9728}, {3072, 1024}, {1024, 2560}, {151936, 1024}}) {
+            for (int n = 2; n <= 8; n++) {
+                assertEquals(4, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q5_K, s[0], s[1], n));
+            }
+        }
+        for (int[] s : new int[][]{{2048, 1024}, {1024, 1024}}) {
+            assertEquals(0, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q5_K, s[0], s[1], 2));
+            assertEquals(0, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q5_K, s[0], s[1], 3));
+            assertEquals(4, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q5_K, s[0], s[1], 4));
+            assertEquals(4, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q5_K, s[0], s[1], 8));
+        }
+        for (int n = 9; n <= 16; n++) {
+            assertEquals(8, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q5_K, 1024, 3072, n));
+            assertEquals(8, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q5_K, 1024, 1024, n));
+            assertEquals(4, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q5_K, 2048, 1024, n));
+            assertEquals(4, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q5_K, 9728, 2560, n));
+        }
+        assertEquals(0, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q5_K, 9728, 2304, 8));
+        assertEquals(0, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q5_K, 9728, 2560, 17));
+    }
+
+    @Test
     public void q6kServesTheEightTokenTileByRowClassAndTheSixteenTokenTileFromNine() {
         assertEquals(0, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q6_K, 2560, 9728, 3));
         for (int n = 4; n <= 8; n++) {
@@ -108,9 +131,14 @@ public class MatVecMmaTuningTest {
         assertEquals(32, MatVecMmaPlan.tileRows(GGMLType.Q6_K, 16));
         assertTrue(MatVecMmaPlan.serves(GGMLType.Q6_K, 1024));
         assertFalse(MatVecMmaPlan.serves(GGMLType.Q6_K, 768));
-        assertFalse(MatVecMmaPlan.serves(GGMLType.Q5_K, 1024));
+        assertTrue(MatVecMmaPlan.serves(GGMLType.Q5_K, 1024));
+        assertFalse(MatVecMmaPlan.serves(GGMLType.Q5_K, 768));
+        assertFalse(MatVecMmaPlan.serves(GGMLType.Q5_0, 1024));
+        MatVecMmaPlan q5 = MatVecMmaPlan.of(GGMLType.Q5_K, 77, 1024, 12, 4);
+        assertEquals("Q5_K_MatVecMma16_Q8", q5.kernel());
+        assertEquals(32, q5.tileRows());
         assertThrows(IllegalArgumentException.class, () -> MatVecMmaPlan.of(GGMLType.Q4_K, 77, 1024, 17, 4));
         assertThrows(IllegalArgumentException.class, () -> MatVecMmaPlan.of(GGMLType.Q4_K, 77, 1024, 4, 9));
-        assertThrows(IllegalArgumentException.class, () -> MatVecMmaPlan.of(GGMLType.Q5_K, 77, 1024, 4, 4));
+        assertThrows(IllegalArgumentException.class, () -> MatVecMmaPlan.of(GGMLType.Q5_0, 77, 1024, 4, 4));
     }
 }

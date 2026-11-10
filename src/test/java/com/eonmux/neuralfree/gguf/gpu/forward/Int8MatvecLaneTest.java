@@ -10,6 +10,7 @@ import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.arch.GluOp;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants;
+import com.eonmux.neuralfree.gguf.ops.gemm.GemmKernels;
 import com.eonmux.neuralfree.gguf.ops.gemm.MmqMode;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuPlaceholders;
@@ -22,6 +23,7 @@ import org.junit.Test;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Locale;
 
@@ -180,8 +182,12 @@ public class Int8MatvecLaneTest {
     }
 
     private GpuWeight weight(GGMLType type, int rows) {
-        long rowBytes = (long) (COLS / type.getBlockSize()) * type.getTypeSize();
-        return GpuWeight.of("blk.0.ffn_up.weight", type, new long[]{COLS, rows},
+        return weight(type, rows, COLS);
+    }
+
+    private GpuWeight weight(GGMLType type, int rows, int cols) {
+        long rowBytes = (long) (cols / type.getBlockSize()) * type.getTypeSize();
+        return GpuWeight.of("blk.0.ffn_up.weight", type, new long[]{cols, rows},
                 backend.allocateBuffer(rows * rowBytes, true));
     }
 
@@ -512,11 +518,11 @@ public class Int8MatvecLaneTest {
 
     /**
      * An OpenCL device whose program builds the subgroup-row forms (subgroups with a required-size range that
-     * holds 16 lanes, the Intel GPUs: {@link com.eonmux.neuralfree.acceleration.kernels.OpenClKernelLibrary#subgroupRowSize})
-     * runs the single-token Q8_0, Q4_K and Q6_K products, their accumulating form and the fused gate/up through
-     * them under AUTO, overriding the Arrow-Lake kind's family evidence against the Q8_0 lane; other types keep
-     * the family, OFF keeps the float matvec, and the same device without the size range keeps today's
-     * dispatch.
+     * holds 16 lanes, the Intel GPUs:
+     * {@link com.eonmux.neuralfree.acceleration.kernels.OpenClKernelLibrary#subgroupRowSize}) runs the single-token
+     * Q8_0, Q4_0, Q4_K, Q5_K and Q6_K products, their accumulating form and the fused gate/up through them under
+     * AUTO, overriding the Arrow-Lake kind's family evidence against the Q8_0 lane; other types keep the family, OFF
+     * keeps the float matvec, and the same device without the size range keeps today's dispatch.
      */
     @Test
     public void subgroupRowFormsServeTheSingleTokenLaneWhereTheProgramBuildsThem() {
@@ -524,7 +530,7 @@ public class Int8MatvecLaneTest {
                 subgroupRowCapabilities(8, 32));
         GpuBuffer in = backend.allocateBuffer((long) COLS * 4);
         GpuBuffer out = backend.allocateBuffer((long) ROWS * 4);
-        for (GGMLType type : new GGMLType[]{GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K}) {
+        for (GGMLType type : SubgroupRowMatvec.TYPES) {
             GpuWeight w = weight(type);
             assertEquals(Arrays.asList(GpuOps.QUANTIZE_Q8_1, type.name() + "_MatVecSg_Q8"),
                     run(() -> ops.matvec(w, in, 0, out, 0, 1)));
@@ -536,9 +542,11 @@ public class Int8MatvecLaneTest {
             assertEquals(Arrays.asList(GpuOps.QUANTIZE_Q8_1, type.name() + "_MatVecFusedGateUpSg_Q8"),
                     run(() -> ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, gateOut, 1)));
         }
-        GpuWeight q5k = weight(GGMLType.Q5_K);
-        List<String> family = run(() -> ops.matvec(q5k, in, 0, out, 0, 1));
-        assertFalse(family.toString(), family.contains("Q5_K_MatVecSg_Q8"));
+        assertEquals(EnumSet.of(GGMLType.Q8_0, GGMLType.Q4_0, GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.Q6_K),
+                SubgroupRowMatvec.TYPES);
+        GpuWeight q5_0 = weight(GGMLType.Q5_0);
+        List<String> family = run(() -> ops.matvec(q5_0, in, 0, out, 0, 1));
+        assertFalse(family.toString(), family.contains("Q5_0_MatVecSg_Q8"));
 
         open(Int8MatvecMode.OFF, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.OPENCL,
                 subgroupRowCapabilities(8, 32));
@@ -555,36 +563,69 @@ public class Int8MatvecLaneTest {
     }
 
     /**
-     * A multi-token Q8_0, Q4_K or Q6_K projection on a program built with the subgroup forms runs that type's
-     * subgroup-row MMQ GEMM over the same staged records ({@link SubgroupMmqGemm}); a type without a subgroup GEMM
-     * (Q5_K), and a device whose program does not build the forms, keep the portable MMQ kernel.
+     * A multi-token projection of a {@link SubgroupMmqGemm#TYPES} type on a program built with the subgroup forms
+     * runs that type's subgroup-row MMQ GEMM over the same staged records; a type without a subgroup GEMM (Q5_0),
+     * and a device whose program does not build the forms, keep the portable MMQ kernel.
      */
     @Test
-    public void subgroupMmqGemmServesTheMultiTokenQ8_0Q4_KAndQ6_KLanesWhereTheProgramBuildsIt() {
+    public void subgroupMmqGemmServesTheMultiTokenLanesOfItsTypesWhereTheProgramBuildsIt() {
         int tokens = 512;
         open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.OPENCL,
                 subgroupRowCapabilities(8, 32));
         GpuBuffer in = backend.allocateBuffer((long) COLS * tokens * 4);
         GpuBuffer out = backend.allocateBuffer((long) ROWS * tokens * 4);
-        for (GGMLType type : new GGMLType[]{GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K}) {
+        assertEquals(EnumSet.of(GGMLType.Q8_0, GGMLType.Q4_0, GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.Q6_K),
+                SubgroupMmqGemm.TYPES);
+        for (GGMLType type : SubgroupMmqGemm.TYPES) {
             GpuWeight w = weight(type);
             List<String> sg = run(() -> ops.matmul(w, in, 0, out, 0, tokens));
             assertTrue(type + " " + sg, sg.contains(type.name() + "_MatMulSg_MMQ"));
             assertFalse(type + " " + sg, sg.contains(type.name() + "_MatMul_MMQ"));
         }
-        GpuWeight q5k = weight(GGMLType.Q5_K);
-        List<String> family = run(() -> ops.matmul(q5k, in, 0, out, 0, tokens));
-        assertTrue(family.toString(), family.contains("Q5_K_MatMul_MMQ"));
-        assertFalse(family.toString(), family.contains("Q5_K_MatMulSg_MMQ"));
+        GpuWeight q50 = weight(GGMLType.Q5_0);
+        List<String> family = run(() -> ops.matmul(q50, in, 0, out, 0, tokens));
+        assertTrue(family.toString(), family.contains("Q5_0_MatMul_MMQ"));
+        assertFalse(family.toString(), family.contains("Q5_0_MatMulSg_MMQ"));
 
         open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.OPENCL,
                 subgroupRowCapabilities(32, 64));
-        for (GGMLType type : new GGMLType[]{GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K}) {
+        for (GGMLType type : SubgroupMmqGemm.TYPES) {
             GpuWeight noRange = weight(type);
             List<String> portable = run(() -> ops.matmul(noRange, backend.allocateBuffer((long) COLS * tokens * 4), 0,
                     backend.allocateBuffer((long) ROWS * tokens * 4), 0, tokens));
             assertTrue(type + " " + portable, portable.contains(type.name() + "_MatMul_MMQ"));
             assertFalse(type + " " + portable, portable.contains(type.name() + "_MatMulSg_MMQ"));
+        }
+    }
+
+    /**
+     * A subgroup-row GEMM launch splits by its own twin: on a program built with the subgroup forms (32 compute
+     * units), a 512 x 2048 projection of 16 tokens, a grid of four 128 x 32 tiles, runs {@code {T}_MatMulSg_MMQ_KSplit}
+     * and the reduce, and a 1024 x 2048 one, eight tiles, the plain subgroup grid; neither runs the portable kernel's
+     * split, which the second shape's 16 packed-dot tiles would take.
+     */
+    @Test
+    public void subgroupGemmLaunchesSplitByTheirOwnTwinAndNeverByThePortableOne() {
+        int tokens = 16;
+        int cols = 2048;
+        open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.OPENCL,
+                subgroupRowCapabilities(8, 32));
+        GpuBuffer in = backend.allocateBuffer((long) cols * tokens * 4);
+        for (GGMLType type : SubgroupMmqGemm.TYPES) {
+            String sg = type.name() + "_MatMulSg_MMQ";
+            GpuWeight narrow = weight(type, 512, cols);
+            List<String> split = run(() -> ops.matmul(narrow, in, 0, backend.allocateBuffer(512L * tokens * 4), 0,
+                    tokens));
+            assertTrue(type + " " + split, split.contains(sg + "_KSplit"));
+            assertTrue(type + " " + split, split.contains(GemmKernels.SPLIT_K_REDUCE));
+            assertFalse(type + " " + split, split.contains(sg));
+            assertFalse(type + " " + split, split.contains(type.name() + GemmKernels.MATMUL_MMQ_KSPLIT_SUFFIX));
+            GpuWeight coarse = weight(type, 1024, cols);
+            List<String> whole = run(() -> ops.matmul(coarse, in, 0, backend.allocateBuffer(1024L * tokens * 4), 0,
+                    tokens));
+            assertTrue(type + " " + whole, whole.contains(sg));
+            assertFalse(type + " " + whole, whole.contains(sg + "_KSplit"));
+            assertFalse(type + " " + whole, whole.contains(type.name() + GemmKernels.MATMUL_MMQ_KSPLIT_SUFFIX));
         }
     }
 
@@ -603,8 +644,8 @@ public class Int8MatvecLaneTest {
             assertFalse(type.name(), SubgroupMmqGemm.shapeServes(type, 192));
             assertFalse(type.name(), SubgroupMmqGemm.shapeServes(type, 0));
         }
-        assertNull(SubgroupMmqGemm.kernel(GGMLType.Q5_K));
-        assertFalse(SubgroupMmqGemm.shapeServes(GGMLType.Q5_K, 256));
+        assertNull(SubgroupMmqGemm.kernel(GGMLType.Q5_0));
+        assertFalse(SubgroupMmqGemm.shapeServes(GGMLType.Q5_0, 256));
     }
 
     /** The Arrow-Lake OpenCL kind with subgroups whose required sizes span {@code min..max}. */

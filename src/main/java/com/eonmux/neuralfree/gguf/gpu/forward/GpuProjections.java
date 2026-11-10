@@ -372,8 +372,8 @@ final class GpuProjections {
         Int8ActStaging int8Staging = fastUsable && fast.endsWith(GemmKernels.MATMUL_MMQ_SUFFIX)
                 ? ops.lanes.int8Staging(w, cols) : null;
         /* A plain MMQ launch on a backend with the subgroup forms (SubgroupRowForms.served: OpenCL or Intel Vulkan)
-         * runs the subgroup-row GEMM instead (SubgroupMmqGemm, same arguments and staging); its split-K launches keep
-         * the portable KSplit. */
+         * runs the subgroup-row GEMM instead (SubgroupMmqGemm, same arguments and staging), split by its own twin
+         * (FastGemmLanes.subgroupSplitK) rather than the portable KSplit. */
         String sgFast = fastUsable && smallFast == null && !invariant
                 ? ops.lanes.subgroupMmqKernel(fast, w, cols, nTokens, int8Staging) : null;
         Fp8ActStaging fp8Staging = fastUsable && FastGemmLanes.fp8Fast(w, fast)
@@ -407,6 +407,8 @@ final class GpuProjections {
                 StreamKGemmPlan streamK = invariant || smallFast != null ? null
                         : ops.lanes.streamK(fast, w, m, cols, nTokens, yOff, activations.off, rows);
                 SplitKGemmPlan split = invariant || streamK != null ? null
+                        : sgFast != null
+                        ? ops.lanes.subgroupSplitK(w, m, cols, nTokens, yOff, activations.off, rows)
                         : ops.lanes.splitK(fast, w, m, cols, nTokens, yOff, activations.off, rows,
                                 smallFast != null);
                 if (streamK != null) {

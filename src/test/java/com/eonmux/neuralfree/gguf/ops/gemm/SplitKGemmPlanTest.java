@@ -332,6 +332,100 @@ public class SplitKGemmPlanTest {
         assertTrue(reason, reason.contains("splits"));
     }
 
+    /**
+     * The subgroup-row MMQ split: only a grid of at most one 128 x 32 tile per eight compute units splits, into eight
+     * slices of whole 64-deep stages, the subgroup twin's name,
+     * its tile and work-group in the partial launch, and the staged records' stride and offset of the base.
+     */
+    @Test
+    public void theSubgroupMmqPlanSplitsOnlyCoarseGridsOverItsOwnTile() {
+        MmqGemmPlan base = MmqGemmPlan.of(MmqConfig.PACKED_DOT, GGMLType.Q4_K, 1024, 3072, 16,
+                MmqConfig.PACKED_DOT.rowRecords(3072), 7, 1024, 0);
+        SplitKGemmPlan p = SplitKGemmPlan.ofSubgroupMmq(base, 128, 32, 128, 64, 256);
+        assertNotNull("an eight-tile grid over 64 units splits", p);
+        assertEquals(SplitKGemmPlan.Family.MMQ_SG, p.family());
+        assertEquals("Q4_K_MatMulSg_MMQ_KSplit", p.kernelName());
+        assertEquals(SplitKGemmPlan.MAX_SPLITS, p.splits());
+        assertEquals(384, p.kSlice());
+        assertEquals(0, p.kSlice() % SplitKGemmPlan.SUBGROUP_MMQ_SLICE_DEPTH);
+        assertEquals(8, p.rowTiles());
+        assertEquals(1, p.tokenTiles());
+        assertEquals(128, p.workGroupSize());
+        assertArrayEquals(new long[]{8L * 128 * SplitKGemmPlan.MAX_SPLITS, 1}, p.partialGlobalWorkSize());
+        assertEquals(MmqConfig.PACKED_DOT.rowRecords(3072), p.xStride());
+        assertEquals(7, p.xOff());
+
+        assertNull("16 tiles over 64 units stay whole", SplitKGemmPlan.ofSubgroupMmq(
+                MmqGemmPlan.of(MmqConfig.PACKED_DOT, GGMLType.Q4_K, 2048, 3072, 16,
+                        MmqConfig.PACKED_DOT.rowRecords(3072), 0, 2048, 0), 128, 32, 128, 64, 256));
+        assertNull("a K below 2048 stays whole", SplitKGemmPlan.ofSubgroupMmq(MmqGemmPlan.of(MmqConfig.PACKED_DOT,
+                GGMLType.Q8_0, 1024, 1024, 16, MmqConfig.PACKED_DOT.rowRecords(1024), 0, 1024, 0), 128, 32, 128, 64,
+                256));
+        assertNull("unknown compute units never split", SplitKGemmPlan.ofSubgroupMmq(base, 128, 32, 128,
+                DeviceCapabilities.UNKNOWN_COMPUTE_UNITS, 256));
+        assertEquals(SplitKGemmPlan.MAX_SPLITS, SplitKGemmPlan.subgroupSplitsFor(64, 4, 2, 2048));
+        assertEquals(1, SplitKGemmPlan.subgroupSplitsFor(64, 9, 1, 2048));
+        assertEquals(1, SplitKGemmPlan.subgroupSplitsFor(64, 4, 4, 2048));
+        assertEquals(1, SplitKGemmPlan.subgroupSplitsFor(64, 1, 1, 2047));
+        assertEquals(SplitKGemmPlan.MAX_SPLITS, SplitKGemmPlan.subgroupSplitsFor(128, 1, 1, 4096));
+        expectInvalid("multiple of 64", () -> SplitKGemmPlan.ofSubgroupMmq(MmqGemmPlan.of(MmqConfig.PACKED_DOT,
+                GGMLType.Q8_0, 128, 2080, 1, MmqConfig.PACKED_DOT.rowRecords(2080), 0, 128, 0), 128, 32, 128, 64,
+                256));
+    }
+
+    /**
+     * The subgroup split counts at most the 64 compute units of the device it was measured on: a device of 512 units
+     * splits the eight-tile grid that split there, but neither the 16-tile nor the 20-32-tile grids that measured
+     * 0.82-1.2x split; a device of fewer units keeps its own bound.
+     */
+    @Test
+    public void theSubgroupSplitCountsNoMoreUnitsThanTheMeasuredDevice() {
+        assertEquals(SplitKGemmPlan.MAX_SPLITS, SplitKGemmPlan.subgroupSplitsFor(512, 8, 1, 2048));
+        assertEquals("16 tiles", 1, SplitKGemmPlan.subgroupSplitsFor(512, 16, 1, 2560));
+        assertEquals("4096 x 2560 at 64 tokens", 1, SplitKGemmPlan.subgroupSplitsFor(512, 32, 2, 2560));
+        assertEquals("2560 x 9728 at 32 tokens", 1, SplitKGemmPlan.subgroupSplitsFor(512, 20, 1, 9728));
+        assertEquals(1, SplitKGemmPlan.subgroupSplitsFor(65, 9, 1, 2048));
+        assertEquals(SplitKGemmPlan.MAX_SPLITS, SplitKGemmPlan.subgroupSplitsFor(32, 4, 1, 2048));
+        assertEquals(1, SplitKGemmPlan.subgroupSplitsFor(32, 5, 1, 2048));
+        assertNull("the 20-tile 2560 x 9728 grid over 512 units stays whole", SplitKGemmPlan.ofSubgroupMmq(
+                MmqGemmPlan.of(MmqConfig.PACKED_DOT, GGMLType.Q4_K, 2560, 9728, 32,
+                        MmqConfig.PACKED_DOT.rowRecords(9728), 0, 2560, 0), 128, 32, 128, 512, 256));
+    }
+
+    /**
+     * The subgroup split's device check judges its own tile, not the packed-dot config whose records it reads: the
+     * 128-item OpenCL tile with its 8192-byte double-buffered stage runs on a device of 128-item work-groups and
+     * 12 KiB of local memory, below the config's 256 items and 15040 bytes, while the 256-item work-group of a
+     * token-split tile and a device below 8192 bytes are refused.
+     */
+    @Test
+    public void theSubgroupSplitChecksItsOwnTileOnTheDevice() {
+        MmqGemmPlan base = MmqGemmPlan.of(MmqConfig.PACKED_DOT, GGMLType.Q8_0, 1024, 2048, 16,
+                MmqConfig.PACKED_DOT.rowRecords(2048), 0, 1024, 0);
+        SplitKGemmPlan p = SplitKGemmPlan.ofSubgroupMmq(base, 128, 32, 128, 64, 256);
+        assertNotNull(p);
+        assertEquals(8192, p.subgroupSharedBytes());
+        assertTrue(MmqConfig.PACKED_DOT.workGroupSize() > 128);
+        assertTrue(MmqConfig.PACKED_DOT.sharedBytes() > 12288);
+        assertNull(p.checkDevice(subgroupDevice(128, 12288)));
+        String wide = SplitKGemmPlan.ofSubgroupMmq(base, 128, 32, 256, 64, 256).checkDevice(subgroupDevice(128,
+                12288));
+        assertNotNull(wide);
+        assertTrue(wide, wide.contains("Q8_0_MatMulSg_MMQ_KSplit needs work-groups of 256"));
+        String small = p.checkDevice(subgroupDevice(1024, 8188));
+        assertNotNull(small);
+        assertTrue(small, small.contains("needs 8192 bytes of local memory"));
+    }
+
+    private static DeviceCapabilities subgroupDevice(int maxWorkGroup, long sharedBytes) {
+        return new DeviceCapabilities.Builder()
+                .deviceName("subgroup-device")
+                .maxWorkGroupSize(maxWorkGroup)
+                .maxSharedMemoryBytes(sharedBytes)
+                .maxWorkGroupCount(new long[]{65535, 65535, 65535})
+                .build();
+    }
+
     private static void expectInvalid(String messagePart, Runnable action) {
         try {
             action.run();

@@ -25,9 +25,9 @@ import java.util.Objects;
  *       (some mobile GPUs) have different register files and were never measured.</li>
  * </ul>
  *
- * <p>On the Arrow-Lake iGPU under Vulkan (Mesa ANV), the forms took a Qwen3 0.6B Q8_0 512-token prefill from 34-42
- * to 1338 tokens/s (llama.cpp Vulkan: 1034) and a Qwen3 4B Q4_K_M one from 25.6 to 195 (llama.cpp: 193); 4B Q4_K_M
- * decode runs 19.5 tokens/s against 4.4 (llama.cpp: 16.1).</p>
+ * <p>On the Arrow-Lake iGPU under Vulkan (Mesa ANV), the forms took a Qwen3-Embedding 0.6B Q8_0 512-token prefill
+ * from 34-42 to 1338 tokens/s (llama.cpp Vulkan: 1034) and a Qwen3-Embedding 4B Q4_K_M one from 25.6 to 195
+ * (llama.cpp: 193); 4B Q4_K_M decode runs 19.5 tokens/s against 4.4 (llama.cpp: 16.1).</p>
  */
 public final class SubgroupRowForms {
 

@@ -526,6 +526,30 @@ final class FastGemmLanes {
     }
 
     /**
+     * The split-K dispatch of one shard of a subgroup-row MMQ launch ({@code sgKernel}, {@link SubgroupMmqGemm}), or
+     * null when it keeps the plain grid ({@link SplitKGemmPlan#ofSubgroupMmq}: a coarse grid of a K of 2048 or more
+     * on a device that reports its compute units), or when the twin {@code {T}_MatMulSg_MMQ_KSplit} or the reduce is
+     * missing (the Vulkan form has no twin). A launch the subgroup form serves never falls back to the portable
+     * kernel's split, which the plain subgroup grid outran at every measured shape.
+     *
+     * @param qOff    staged record offset of the shard's activation view
+     * @param yStride element stride between output rows
+     */
+    SplitKGemmPlan subgroupSplitK(GpuWeight w, int m, int cols, int nTokens, int yOff, int qOff, int yStride) {
+        MmqGemmPlan base = MmqGemmPlan.of(mmqConfig, w.type(), m, cols, nTokens, mmqConfig.rowRecords(cols), qOff,
+                yStride, yOff);
+        SplitKGemmPlan plan = SplitKGemmPlan.ofSubgroupMmq(base, SubgroupMmqGemm.TILE_ROWS,
+                SubgroupMmqGemm.TILE_TOKENS, SubgroupMmqGemm.workGroup(kernels, w.type()),
+                kernels.caps().getComputeUnits(), local);
+        if (plan == null || plan.checkDevice(kernels.caps()) != null
+                || !ops.optionalReady(plan.kernelName(), plan.workGroupSize(), 1)
+                || !ops.optionalReady(GemmKernels.SPLIT_K_REDUCE, local)) {
+            return null;
+        }
+        return plan;
+    }
+
+    /**
      * One split-K launch: the shard's k-slice planes into their own staging slot (offset 0, never a view of the
      * projection's input or output), then the reduce into the output. The activation buffer is the projection input
      * (MMA, CM and CM2), or the staged records of {@link GemmKernels#QUANT_MMQ_Q8_1} (MMQ), at the offset

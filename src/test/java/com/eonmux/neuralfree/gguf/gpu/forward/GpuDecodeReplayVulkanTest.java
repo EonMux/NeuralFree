@@ -31,7 +31,10 @@ import static org.junit.Assert.assertTrue;
  * capture after the warmup, the verify steps as body replays, and every later step as a prepared patched replay, so
  * a replay that fell back to running the step directly fails here although its logits would match. Two models cover
  * both decode attention kernels: dim-16 heads over an fp32 cache (the split flash decode) and dim-64 heads over an
- * fp16 cache (the one-row decode kernel, which the capture must hold on an NVIDIA device and nowhere else).
+ * fp16 cache (the one-row decode kernel, which the capture must hold on an NVIDIA device and nowhere else). The
+ * engine picks its Vulkan device as usual; {@code -Dneuralfree.test.replay.device=<substring>} narrows that choice
+ * for the run as {@code -Dneuralfree.device} does an application's (for instance {@code Intel} on a machine whose
+ * first-ranked Vulkan device is another GPU).
  */
 public class GpuDecodeReplayVulkanTest {
 
@@ -39,6 +42,8 @@ public class GpuDecodeReplayVulkanTest {
     private static final int N_CTX = 64;
     private static final float TOL = 1e-5f;
     private static final int PCI_VENDOR_NVIDIA = 0x10DE;
+    private static final String DEVICE_PROPERTY = "neuralfree.test.replay.device";
+    private static final String ENGINE_DEVICE_PROPERTY = "neuralfree.device";
 
     @Test
     public void replayMatchesDirectDecodeOverAnFp32Cache() throws IOException {
@@ -90,6 +95,11 @@ public class GpuDecodeReplayVulkanTest {
 
     private static Decode decodeAll(Path model, KvDType kv, String replay) throws IOException {
         System.setProperty(GpuDecodeReplay.PROPERTY, replay);
+        String device = System.getProperty(DEVICE_PROPERTY);
+        String previousDevice = System.getProperty(ENGINE_DEVICE_PROPERTY);
+        if (device != null) {
+            System.setProperty(ENGINE_DEVICE_PROPERTY, device);
+        }
         try {
             MemoryConfig memory = MemoryConfig.builder().nCtx(N_CTX).typeK(kv).typeV(kv).build();
             EngineConfig cfg = EngineConfig.builder()
@@ -105,11 +115,19 @@ public class GpuDecodeReplayVulkanTest {
                 GpuForwardBackend f = (GpuForwardBackend) gpu.forwardBackend();
                 LlmKernels kernels = f.kernels();
                 DeviceIdentity id = kernels.caps().getIdentity();
+                System.out.println("REPLAY device " + kernels.caps().getDeviceName() + " replay=" + replay);
                 return new Decode(out, f.decodeReplayCounters(), f.decodeReplayKernels(),
                         id != null ? id.vendorId() : DeviceIdentity.UNKNOWN_VENDOR);
             }
         } finally {
             System.clearProperty(GpuDecodeReplay.PROPERTY);
+            if (device != null) {
+                if (previousDevice == null) {
+                    System.clearProperty(ENGINE_DEVICE_PROPERTY);
+                } else {
+                    System.setProperty(ENGINE_DEVICE_PROPERTY, previousDevice);
+                }
+            }
         }
     }
 

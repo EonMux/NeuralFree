@@ -20,11 +20,13 @@ import java.util.Set;
  * device keeps the family's forms. On the Arrow-Lake iGPU the OpenCL forms stream the weights at
  * 41-61 GB/s (Q8_0, Q4_K and Q6_K alike) against the 5-12 GB/s of the one-work-group-per-row family (its
  * streaming-read ceiling is 55-68 GB/s), because that device's loads are limited by load messages (2-byte
- * loads of 34-byte Q8_0 blocks) rather than by DRAM.</p>
+ * loads of 34-byte Q8_0 blocks) rather than by DRAM. The Q4_0 and Q5_K forms, measured with the package at its
+ * power limit, stream 34-51 GB/s against the family's 4-9 on the 4B projection and LM-head shapes (Q8_0 41-52 in
+ * the same run).</p>
  *
- * <p>Under Vulkan (Mesa ANV) on the same device, a Qwen3 4B Q4_K_M decode step's fused Q4_K gate/up product
- * (2 x 9728 x 2560) takes 417 us against the portable form's 1442 (67 against 19 GB/s) and its Q6_K down product
- * (2560 x 9728) 414 us against 959.</p>
+ * <p>Under Vulkan (Mesa ANV) on the same device, a Qwen3-Embedding 4B Q4_K_M decode step's fused Q4_K gate/up
+ * product (2 x 9728 x 2560) takes 417 us against the portable form's 1442 (67 against 19 GB/s) and its Q6_K down
+ * product (2560 x 9728) 414 us against 959.</p>
  *
  * <p>The constants mirror {@code NF_SGR_ROWS}, {@code NF_SGR_SUBGROUPS} and {@code NF_SGR_UNIT} of the kernel
  * source.</p>
@@ -39,12 +41,13 @@ final class SubgroupRowMatvec {
     static final int WORK_GROUP = SUBGROUPS * SubgroupRowForms.SIZE;
     /** Output rows per work-group. */
     static final int ROWS_PER_GROUP = SUBGROUPS * ROWS_PER_SUBGROUP;
-    /** Input elements per lane unit ({@code NF_SGR_UNIT}): a Q8_0 block pair, a K-quant quarter block. */
+    /** Input elements per lane unit ({@code NF_SGR_UNIT}): a Q8_0 or Q4_0 block pair, a K-quant quarter block. */
     static final int UNIT = 64;
 
     /** The weight types with subgroup-row forms. */
     static final Set<GGMLType> TYPES =
-            Collections.unmodifiableSet(EnumSet.of(GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K));
+            Collections.unmodifiableSet(EnumSet.of(GGMLType.Q8_0, GGMLType.Q4_0, GGMLType.Q4_K, GGMLType.Q5_K,
+                    GGMLType.Q6_K));
 
     private static final String Q8_SUFFIX = "_Q8";
 
@@ -72,8 +75,8 @@ final class SubgroupRowMatvec {
 
     /**
      * Whether rows of {@code cols} elements of {@code type} meet the forms' layout preconditions: whole lane
-     * units, and for Q8_0 an even block count so every row starts 4-byte aligned and holds whole block pairs
-     * (the K-quant super-blocks are whole units).
+     * units, and for Q8_0 and Q4_0 an even block count so every row starts 4-byte aligned and holds whole block
+     * pairs (the K-quant super-blocks are whole units).
      */
     static boolean shapeServes(GGMLType type, int cols) {
         return TYPES.contains(type) && cols > 0 && cols % UNIT == 0 && cols % type.getBlockSize() == 0;

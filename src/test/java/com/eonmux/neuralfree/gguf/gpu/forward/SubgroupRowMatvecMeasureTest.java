@@ -1,11 +1,7 @@
 package com.eonmux.neuralfree.gguf.gpu.forward;
 
-import com.eonmux.neuralfree.acceleration.GpuTestUtil;
-import com.eonmux.neuralfree.acceleration.HWAcceleration;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
-import com.eonmux.neuralfree.acceleration.backend.ocl.OclComputeBackend;
-import com.eonmux.neuralfree.acceleration.ocl.CLDevice;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.quant.FpBlockDecoders;
@@ -22,9 +18,11 @@ import java.util.Random;
 /**
  * Single-token matvec times of the subgroup-row forms ({@link SubgroupRowMatvec}) against the family's float
  * ({@code {T}_MatVec}) and integer-dot ({@code {T}_MatVec_Q8}, with and without its Q8_1 quantization) forms
- * and the fused gate/up pair, on one OpenCL device, over the projection shapes of 0.6B and 4B decoders. Rounds
- * alternate the lanes so clock states and throttling bias no lane. Opt-in through
- * {@code -Dneuralfree.test.sgrow.measure=true}; the device index by {@code -Dneuralfree.test.sgrow.measure.device}.
+ * and the fused gate/up pair, on one device of the forms ({@link SubgroupFormBackends}), over the projection shapes
+ * of 0.6B and 4B decoders. Rounds alternate the lanes so clock states and throttling bias no lane. Times are host
+ * wall times of a launch and its completion. Opt-in through {@code -Dneuralfree.test.sgrow.measure=true}; the API by
+ * {@code -Dneuralfree.test.sgrow.measure.api} ({@code opencl}, the default, or {@code vulkan}) and the index among
+ * that API's devices of the forms by {@code -Dneuralfree.test.sgrow.measure.device}.
  */
 public class SubgroupRowMatvecMeasureTest {
 
@@ -33,24 +31,26 @@ public class SubgroupRowMatvecMeasureTest {
         {1024, 1024}, {3072, 1024}, {1024, 3072}, {151936, 1024},
         {4096, 2560}, {9728, 2560}, {2560, 9728}, {151936, 2560},
     };
-    private static final GGMLType[] TYPES = {GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K};
+    private static final GGMLType[] TYPES = {GGMLType.Q8_0, GGMLType.Q4_0, GGMLType.Q4_K, GGMLType.Q5_K,
+        GGMLType.Q6_K};
     private static final int ROUNDS = 5;
     private static final int REPS = 5;
 
-    private HWAcceleration hw;
-    private OclComputeBackend backend;
+    private SubgroupFormBackends devices;
+    private ComputeBackend backend;
     private LlmKernels kernels;
     private int local;
 
     @Before
     public void open() {
         Assume.assumeTrue("opt-in (-D" + PROP + "=true)", Boolean.getBoolean(PROP));
-        GpuTestUtil.assumeOpenCLAvailable();
-        hw = new HWAcceleration(java.util.EnumSet.of(ComputeBackend.BackendType.OPENCL));
-        List<CLDevice> devices = hw.getCLDevices();
+        ComputeBackend.BackendType api = ComputeBackend.BackendType.valueOf(
+                System.getProperty(PROP + ".api", "opencl").toUpperCase(Locale.ROOT));
+        devices = SubgroupFormBackends.open(api);
+        List<ComputeBackend> opened = devices.backends();
         int index = Integer.getInteger(PROP + ".device", 0);
-        Assume.assumeTrue("no OpenCL device " + index, index < devices.size());
-        backend = new OclComputeBackend(devices.get(index));
+        Assume.assumeTrue("no " + api + " device " + index + " of the forms", index < opened.size());
+        backend = opened.get(index);
         kernels = LlmKernels.open(backend);
         local = kernels.matvecLocal();
         Assume.assumeTrue("the device builds no subgroup-row forms", kernels.has("Q8_0_MatVecSg_Q8"));
@@ -58,17 +58,15 @@ public class SubgroupRowMatvecMeasureTest {
 
     @After
     public void close() {
-        if (backend != null) {
-            backend.close();
-        }
-        if (hw != null) {
-            hw.shutdown();
+        if (devices != null) {
+            devices.close();
         }
     }
 
     @Test
     public void measure() throws Exception {
-        System.out.println("SGROW device=\"" + backend.capabilities().getDeviceName() + "\" matvecLocal=" + local);
+        System.out.println("SGROW " + backend.backendType() + " device=\"" + backend.capabilities().getDeviceName()
+                + "\" matvecLocal=" + local);
         for (GGMLType type : TYPES) {
             for (int[] shape : SHAPES) {
                 measureShape(type, shape[0], shape[1]);
@@ -159,7 +157,7 @@ public class SubgroupRowMatvecMeasureTest {
             int base = Math.toIntExact(b * blockBytes) + dOff;
             data[base] = (byte) bits;
             data[base + 1] = (byte) (bits >>> 8);
-            if (type == GGMLType.Q4_K) {
+            if (type == GGMLType.Q4_K || type == GGMLType.Q5_K) {
                 data[base + 2] = (byte) bits;
                 data[base + 3] = (byte) (bits >>> 8);
             }

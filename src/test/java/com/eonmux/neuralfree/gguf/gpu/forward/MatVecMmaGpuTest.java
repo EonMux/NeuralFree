@@ -30,10 +30,10 @@ import static org.junit.Assert.assertTrue;
  */
 public class MatVecMmaGpuTest {
 
-    /** Rows: a partial last 32-row tile. Cols: two Q4_K/Q6_K block pairs, sixteen Q8_0 block pairs. */
+    /** Rows: a partial last 32-row tile. Cols: two K-quant block pairs, sixteen Q8_0 block pairs. */
     private static final int ROWS = 77;
     private static final int COLS = 1024;
-    private static final GGMLType[] TYPES = {GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K};
+    private static final GGMLType[] TYPES = {GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.Q6_K};
     private static final int MAX_TOKENS = 16;
 
     private HWAcceleration hwAccel;
@@ -174,6 +174,7 @@ public class MatVecMmaGpuTest {
                     putHalf(data, off + 208, 0.01f);
                     break;
                 case Q4_K:
+                case Q5_K:
                     putHalf(data, off, 0.02f);
                     putHalf(data, off + 2, 0.01f);
                     break;

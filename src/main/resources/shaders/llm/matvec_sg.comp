@@ -1,12 +1,12 @@
-/* matvec_sg.comp - subgroup-row integer-dot matvecs of Q8_0, Q4_K and Q6_K weights for 16-lane subgroups: the Vulkan
- * form of kernels/llm/matvec_sg.cl, which documents the work mapping in full.
+/* matvec_sg.comp - subgroup-row integer-dot matvecs of Q8_0, Q4_0, Q4_K, Q5_K and Q6_K weights for 16-lane
+ * subgroups: the Vulkan form of kernels/llm/matvec_sg.cl, which documents the work mapping in full.
  * Requires: common/nf_common.glsl, common/act.glsl, GL_EXT_integer_dot_product.
  *
  * {T}_MatVecSg_Q8, {T}_MatVecAddSg_Q8 and {T}_MatVecFusedGateUpSg_Q8 compute what {T}_MatVec_Q8, {T}_MatVecAdd_Q8 and
  * {T}_MatVecFusedGateUp_Q8 (matvec_q8.comp) compute, with their argument lists, over one Q8_1 activation row (36-byte
- * blocks: f16 d, f16 s, 32 int8 codes). Variants rows select the weight type (NF_SGR_Q8_0, NF_SGR_Q4_K or
- * NF_SGR_Q6_K) and the form (OP=OP_MATVEC, OP_MATVEC_ADD or OP_GATEUP_SILU); flag sg16 (the pipeline pins 16-lane
- * full subgroups).
+ * blocks: f16 d, f16 s, 32 int8 codes). Variants rows select the weight type (NF_SGR_Q8_0, NF_SGR_Q4_0,
+ * NF_SGR_Q4_K, NF_SGR_Q5_K or NF_SGR_Q6_K) and the form (OP=OP_MATVEC, OP_MATVEC_ADD or OP_GATEUP_SILU); flag sg16
+ * (the pipeline pins 16-lane full subgroups).
  *
  * - One subgroup owns NF_SGR_ROWS consecutive output rows; a workgroup holds NF_SGR_SUBGROUPS subgroups.
  * - The input row is cut into 64-element units; lane l takes units l, l + 16, ... . A unit's Q8_1 codes, scales and
@@ -35,8 +35,9 @@
 #if !defined(USE_SUBGROUPS) || !defined(NF_SG_ROW_SIZE) || NF_SG_ROW_SIZE != 16
 #error "matvec_sg.comp is built only by an sg16 variants row"
 #endif
-#if defined(NF_SGR_Q8_0) + defined(NF_SGR_Q4_K) + defined(NF_SGR_Q6_K) != 1
-#error "matvec_sg.comp requires exactly one of NF_SGR_Q8_0, NF_SGR_Q4_K, NF_SGR_Q6_K"
+#if defined(NF_SGR_Q8_0) + defined(NF_SGR_Q4_0) + defined(NF_SGR_Q4_K) + defined(NF_SGR_Q5_K) \
+    + defined(NF_SGR_Q6_K) != 1
+#error "matvec_sg.comp requires exactly one of NF_SGR_Q8_0, NF_SGR_Q4_0, NF_SGR_Q4_K, NF_SGR_Q5_K, NF_SGR_Q6_K"
 #endif
 #if !defined(OP) || (OP != OP_MATVEC && OP != OP_MATVEC_ADD && OP != OP_GATEUP_SILU)
 #error "matvec_sg.comp requires OP=OP_MATVEC, OP_MATVEC_ADD or OP_GATEUP_SILU"
@@ -69,9 +70,15 @@ layout(push_constant) uniform NfSgrParams { int out_dim; int in_dim; } pc;
 #if defined(NF_SGR_Q8_0)
 #define NF_SGR_BS 32
 #define NF_SGR_BB 34
+#elif defined(NF_SGR_Q4_0)
+#define NF_SGR_BS 32
+#define NF_SGR_BB 18
 #elif defined(NF_SGR_Q4_K)
 #define NF_SGR_BS 256
 #define NF_SGR_BB 144
+#elif defined(NF_SGR_Q5_K)
+#define NF_SGR_BS 256
+#define NF_SGR_BB 176
 #else
 #define NF_SGR_BS 256
 #define NF_SGR_BB 210
@@ -96,8 +103,9 @@ uint nf_sgr_xc(uint b, uint i) {
     return xq_u32[b * (NF_SGR_Q81_BYTES / 4) + 1u + i];
 }
 
-#if defined(NF_SGR_Q8_0) || defined(NF_SGR_Q4_K)
-/* Q8_1 blocks 2u and 2u + 1: scales d[0..1], codes c[0..7] and c[8..15] (and, for Q4_K, their code sums). */
+#if !defined(NF_SGR_Q6_K)
+/* Q8_1 blocks 2u and 2u + 1: scales d[0..1], codes c[0..7] and c[8..15] (and, for the types with a bias or minimum
+ * term, Q4_0, Q4_K and Q5_K, their code sums). */
 void nf_sgr_act(uint u) {
     nf_sgr_d[0] = nf_sgr_xd(2u * u);
     nf_sgr_d[1] = nf_sgr_xd(2u * u + 1u);
@@ -105,7 +113,7 @@ void nf_sgr_act(uint u) {
         nf_sgr_c[i] = nf_sgr_xc(2u * u, i);
         nf_sgr_c[8u + i] = nf_sgr_xc(2u * u + 1u, i);
     }
-#if defined(NF_SGR_Q4_K)
+#if !defined(NF_SGR_Q8_0)
     int s0 = 0, s1 = 0;
     [[unroll]] for (int i = 0; i < 8; i++) {
         s0 += nf_sgr_sum4(nf_sgr_c[i]);
@@ -138,7 +146,30 @@ float nf_sgr_dot_##V(uint rb, uint u) { \
     } \
     return nf_sgr_d[0] * nf_half(w[0]) * float(s0) + nf_sgr_d[1] * nf_half(w[8] >> 16) * float(s1); \
 }
-#elif defined(NF_SGR_Q4_K)
+#elif defined(NF_SGR_Q4_0)
+/* The 36-byte block pair of unit u (4-byte aligned), y = d * (nibble - 8) with the low nibbles of code byte j holding
+ * element j and the high nibbles element j + 16: block 2u's d is the low half of w0 and its code word i is
+ * (w_i >> 16) | (w_{i+1} << 16); block 2u + 1's d is the high half of w4 and its code words are w5..w8. */
+#define NF_SGR_DECODER(V) \
+float nf_sgr_dot_##V(uint rb, uint u) { \
+    const uint p = (rb + u * (2u * NF_SGR_BB)) >> 2; \
+    uint w[9]; \
+    [[unroll]] for (uint i = 0u; i < 9u; i++) { \
+        w[i] = V##_u32[p + i]; \
+    } \
+    int i0 = 0, i1 = 0; \
+    [[unroll]] for (int i = 0; i < 4; i++) { \
+        const uint q0 = (w[i] >> 16) | (w[i + 1] << 16); \
+        const uint q1 = w[5 + i]; \
+        i0 = dotPacked4x8EXT(int(q0 & 0x0F0F0F0Fu), int(nf_sgr_c[i])) + i0; \
+        i0 = dotPacked4x8EXT(int((q0 >> 4) & 0x0F0F0F0Fu), int(nf_sgr_c[4 + i])) + i0; \
+        i1 = dotPacked4x8EXT(int(q1 & 0x0F0F0F0Fu), int(nf_sgr_c[8 + i])) + i1; \
+        i1 = dotPacked4x8EXT(int((q1 >> 4) & 0x0F0F0F0Fu), int(nf_sgr_c[12 + i])) + i1; \
+    } \
+    return nf_sgr_d[0] * nf_half(w[0]) * float(i0 - 8 * nf_sgr_s[0]) \
+         + nf_sgr_d[1] * nf_half(w[4] >> 16) * float(i1 - 8 * nf_sgr_s[1]); \
+}
+#elif defined(NF_SGR_Q4_K) || defined(NF_SGR_Q5_K)
 /* Byte k (0..11) of the 6-bit scale table held in words h.y..h.w of the block header. */
 uint nf_sgr_q4k_byte(uvec4 h, int k) {
     const uint w = k < 4 ? h.y : (k < 8 ? h.z : h.w);
@@ -155,6 +186,7 @@ vec2 nf_sgr_q4k_sm(uvec4 h, int j) {
                 float((hi >> 4) | ((nf_sgr_q4k_byte(h, j) >> 6) << 4)));
 }
 
+#if defined(NF_SGR_Q4_K)
 /* Unit u: quarter c = u % 4 of block u / 4, sub-blocks 2c (low nibbles of the 32 code bytes at 16 + 32c) and 2c + 1
  * (high nibbles), with the block's 16-byte header d, dmin, scales[12]. */
 #define NF_SGR_DECODER(V) \
@@ -174,6 +206,32 @@ float nf_sgr_dot_##V(uint rb, uint u) { \
     return nf_sgr_d[0] * (d * sm0.x * float(i0) - dmin * sm0.y * float(nf_sgr_s[0])) \
          + nf_sgr_d[1] * (d * sm1.x * float(i1) - dmin * sm1.y * float(nf_sgr_s[1])); \
 }
+#else
+/* Unit u: quarter c = u % 4 of block u / 4, laid out as Q4_K's quarter with the 32 code bytes at 48 + 32c and the
+ * fifth bits in the 32-byte qh at 16: bit 2c of qh byte l for the low nibble of code byte l, bit 2c + 1 for its high
+ * nibble. */
+#define NF_SGR_DECODER(V) \
+float nf_sgr_dot_##V(uint rb, uint u) { \
+    const int c = int(u & 3u); \
+    const uint bp = (rb + (u >> 2) * NF_SGR_BB) >> 2; \
+    const uvec4 h = uvec4(V##_u32[bp], V##_u32[bp + 1u], V##_u32[bp + 2u], V##_u32[bp + 3u]); \
+    const uint qa = bp + 12u + 8u * uint(c); \
+    const uint s0 = uint(2 * c), s1 = s0 + 1u; \
+    int i0 = 0, i1 = 0; \
+    [[unroll]] for (uint i = 0u; i < 8u; i++) { \
+        const uint q = V##_u32[qa + i]; \
+        const uint qh = V##_u32[bp + 4u + i]; \
+        const uint lo = (q & 0x0F0F0F0Fu) | (((qh >> s0) & 0x01010101u) << 4); \
+        const uint hi = ((q >> 4) & 0x0F0F0F0Fu) | (((qh >> s1) & 0x01010101u) << 4); \
+        i0 = dotPacked4x8EXT(int(lo), int(nf_sgr_c[i])) + i0; \
+        i1 = dotPacked4x8EXT(int(hi), int(nf_sgr_c[8u + i])) + i1; \
+    } \
+    const float d = nf_half(h.x), dmin = nf_half(h.x >> 16); \
+    const vec2 sm0 = nf_sgr_q4k_sm(h, 2 * c), sm1 = nf_sgr_q4k_sm(h, 2 * c + 1); \
+    return nf_sgr_d[0] * (d * sm0.x * float(i0) - dmin * sm0.y * float(nf_sgr_s[0])) \
+         + nf_sgr_d[1] * (d * sm1.x * float(i1) - dmin * sm1.y * float(nf_sgr_s[1])); \
+}
+#endif
 #else
 /* The Q8_1 blocks 8b + 4hf + t (t = 0..3) of Q6_K unit u (quarter r = u % 4 of block b = u / 4, half hf = r / 2,
  * positions [16 lh, 16 lh + 16) with lh = r % 2): the 16 codes at byte 16 lh of each, their scales and sums. */

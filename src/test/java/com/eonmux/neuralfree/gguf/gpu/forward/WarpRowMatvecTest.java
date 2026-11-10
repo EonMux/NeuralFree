@@ -32,7 +32,9 @@ public class WarpRowMatvecTest {
         assertNull("the paired form has no twin", WarpRowMatvec.twinName("Q4_K_MatVec2_Q8", GGMLType.Q4_K));
         assertNull("the float form has no twin", WarpRowMatvec.twinName("Q4_K_MatVec", GGMLType.Q4_K));
         assertNull("another type's kernel", WarpRowMatvec.twinName("Q8_0_MatVec_Q8", GGMLType.Q4_K));
-        assertNull("a type without forms", WarpRowMatvec.twinName("Q5_K_MatVec_Q8", GGMLType.Q5_K));
+        assertEquals("Q5_K_MatVecFusedGateUpRow_Q8",
+                WarpRowMatvec.twinName("Q5_K_MatVecFusedGateUp_Q8", GGMLType.Q5_K));
+        assertNull("a type without forms", WarpRowMatvec.twinName("Q5_0_MatVec_Q8", GGMLType.Q5_0));
         assertNull(WarpRowMatvec.twinName(null, GGMLType.Q8_0));
     }
 
@@ -43,12 +45,15 @@ public class WarpRowMatvecTest {
         }
     }
 
-    /** The measured choices: Q4_K two warps, Q6_K one (the family on a wide head), Q8_0 narrow rows only. */
+    /** The measured choices: Q4_K and Q5_K two warps, Q6_K one (the family on a wide head), Q8_0 narrow rows only. */
     @Test
     public void warpsFollowTheMeasuredTypeAndShape() {
         int head = WarpRowMatvec.HEAD_ROWS;
         assertEquals(2, WarpRowMatvec.warps(GGMLType.Q4_K, 9728, 2560));
         assertEquals(2, WarpRowMatvec.warps(GGMLType.Q4_K, 151669, 2560));
+        assertEquals(2, WarpRowMatvec.warps(GGMLType.Q5_K, 9728, 2560));
+        assertEquals(2, WarpRowMatvec.warps(GGMLType.Q5_K, 1024, 1024));
+        assertEquals(2, WarpRowMatvec.warps(GGMLType.Q5_K, 151936, 1024));
         assertEquals(1, WarpRowMatvec.warps(GGMLType.Q6_K, 2560, 9728));
         assertEquals(1, WarpRowMatvec.warps(GGMLType.Q6_K, 151669, 1024));
         assertEquals(0, WarpRowMatvec.warps(GGMLType.Q6_K, 151669, 2560));
@@ -64,10 +69,11 @@ public class WarpRowMatvecTest {
     public void shapesWithoutWholeBlocksOrFormsKeepTheFamily() {
         assertEquals(0, WarpRowMatvec.warps(GGMLType.Q4_K, 1024, 1000));
         assertEquals(0, WarpRowMatvec.warps(GGMLType.Q8_0, 1024, 48));
-        assertEquals(0, WarpRowMatvec.warps(GGMLType.Q5_K, 1024, 1024));
+        assertEquals(0, WarpRowMatvec.warps(GGMLType.Q5_K, 1024, 1000));
+        assertEquals(0, WarpRowMatvec.warps(GGMLType.Q5_0, 1024, 1024));
         assertEquals(0, WarpRowMatvec.warps(GGMLType.F16, 1024, 1024));
         assertEquals(0, WarpRowMatvec.warps(GGMLType.Q4_K, 0, 1024));
-        assertFalse(WarpRowMatvec.TYPES.contains(GGMLType.Q5_K));
+        assertFalse(WarpRowMatvec.TYPES.contains(GGMLType.Q5_0));
     }
 
     @Test

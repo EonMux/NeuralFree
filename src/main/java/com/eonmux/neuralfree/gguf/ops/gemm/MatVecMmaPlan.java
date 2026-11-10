@@ -14,8 +14,8 @@ import com.eonmux.neuralfree.gguf.GGMLType;
  * token tile is 8 up to 8 tokens and 16 above.</p>
  *
  * <p>Served shapes: {@link GGMLType#Q8_0} with {@code cols % 64 == 0} (a whole number of word-aligned block
- * pairs per row) and {@link GGMLType#Q4_K} / {@link GGMLType#Q6_K} with {@code cols % 512 == 0} (an even block
- * count keeps every row word aligned); any row count.</p>
+ * pairs per row) and {@link GGMLType#Q4_K} / {@link GGMLType#Q5_K} / {@link GGMLType#Q6_K} with
+ * {@code cols % 512 == 0} (an even block count keeps every row word aligned); any row count.</p>
  */
 public final class MatVecMmaPlan {
 
@@ -55,6 +55,7 @@ public final class MatVecMmaPlan {
             case Q8_0:
                 return cols % 64 == 0;
             case Q4_K:
+            case Q5_K:
             case Q6_K:
                 return cols % 512 == 0;
             default:

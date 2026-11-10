@@ -2,15 +2,23 @@
 # Pinned 16-lane subgroup forms (flag sg16): the Vulkan twins of the [opencl] Intel subgroup kernels, named like them
 # and taking their arguments. The int8 MMQ GEMM of kernels/llm/matmul_mmq_sg.cl:
 Q8_0_MatMulSg_MMQ	matmul_mmq_sg.comp	NF_SGM_Q8_0	sg16
+Q4_0_MatMulSg_MMQ	matmul_mmq_sg.comp	NF_SGM_Q4_0	sg16
 Q4_K_MatMulSg_MMQ	matmul_mmq_sg.comp	NF_SGM_Q4_K	sg16
+Q5_K_MatMulSg_MMQ	matmul_mmq_sg.comp	NF_SGM_Q5_K	sg16
 Q6_K_MatMulSg_MMQ	matmul_mmq_sg.comp	NF_SGM_Q6_K	sg16
 # The subgroup-row integer-dot matvecs of kernels/llm/matvec_sg.cl:
 Q8_0_MatVecSg_Q8	matvec_sg.comp	NF_SGR_Q8_0 OP=OP_MATVEC	sg16
 Q8_0_MatVecAddSg_Q8	matvec_sg.comp	NF_SGR_Q8_0 OP=OP_MATVEC_ADD	sg16
 Q8_0_MatVecFusedGateUpSg_Q8	matvec_sg.comp	NF_SGR_Q8_0 OP=OP_GATEUP_SILU	sg16
+Q4_0_MatVecSg_Q8	matvec_sg.comp	NF_SGR_Q4_0 OP=OP_MATVEC	sg16
+Q4_0_MatVecAddSg_Q8	matvec_sg.comp	NF_SGR_Q4_0 OP=OP_MATVEC_ADD	sg16
+Q4_0_MatVecFusedGateUpSg_Q8	matvec_sg.comp	NF_SGR_Q4_0 OP=OP_GATEUP_SILU	sg16
 Q4_K_MatVecSg_Q8	matvec_sg.comp	NF_SGR_Q4_K OP=OP_MATVEC	sg16
 Q4_K_MatVecAddSg_Q8	matvec_sg.comp	NF_SGR_Q4_K OP=OP_MATVEC_ADD	sg16
 Q4_K_MatVecFusedGateUpSg_Q8	matvec_sg.comp	NF_SGR_Q4_K OP=OP_GATEUP_SILU	sg16
+Q5_K_MatVecSg_Q8	matvec_sg.comp	NF_SGR_Q5_K OP=OP_MATVEC	sg16
+Q5_K_MatVecAddSg_Q8	matvec_sg.comp	NF_SGR_Q5_K OP=OP_MATVEC_ADD	sg16
+Q5_K_MatVecFusedGateUpSg_Q8	matvec_sg.comp	NF_SGR_Q5_K OP=OP_GATEUP_SILU	sg16
 Q6_K_MatVecSg_Q8	matvec_sg.comp	NF_SGR_Q6_K OP=OP_MATVEC	sg16
 Q6_K_MatVecAddSg_Q8	matvec_sg.comp	NF_SGR_Q6_K OP=OP_MATVEC_ADD	sg16
 Q6_K_MatVecFusedGateUpSg_Q8	matvec_sg.comp	NF_SGR_Q6_K OP=OP_GATEUP_SILU	sg16

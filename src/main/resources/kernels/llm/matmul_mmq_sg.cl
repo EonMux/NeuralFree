@@ -1,4 +1,4 @@
-/* matmul_mmq_sg.cl - subgroup-row int8 MMQ GEMM of Q8_0, Q4_K and Q6_K weights (OpenCL only). Requires: common/dialect.h, common/matmul_mmq_config.h */
+/* matmul_mmq_sg.cl - subgroup-row int8 MMQ GEMM of Q8_0, Q4_0, Q4_K, Q5_K and Q6_K weights (OpenCL only). Requires: common/dialect.h, common/matmul_mmq_config.h */
 /*
  * Q8_0_MatMulSg_MMQ computes what Q8_0_MatMul_MMQ (common/matmul_mmq_family.h) computes, with its argument list
  * and the same staged Q8_1 activation records (LLM_Quant_MMQ_Q8_1, NF_Q8_REC(16) units per 16-deep record), under
@@ -17,16 +17,17 @@
  *   words are shared across the lanes by constant-index shuffles, so each lane's 8 dp4a per block against that
  *   token cost no per-lane local traffic. One barrier per stage.
  *
- * Q4_K_MatMulSg_MMQ and Q6_K_MatMulSg_MMQ (below) compute what Q4_K_MatMul_MMQ and Q6_K_MatMul_MMQ compute under
- * the same mapping, launch and records, a stage being a quarter of a 256-element super-block.
+ * Q4_0_MatMulSg_MMQ, Q4_K_MatMulSg_MMQ, Q5_K_MatMulSg_MMQ and Q6_K_MatMulSg_MMQ (below) compute what their
+ * {T}_MatMul_MMQ twins compute under the same mapping, launch and records, a Q4_0 stage being a block pair and a
+ * K-quant stage a quarter of a 256-element super-block.
  *
  * Each output is one lane's fixed-order float sum over K, independent of N and of the tile position, so results
  * are deterministic; only the float summation order differs from the portable {T}_MatMul_MMQ's.
  *
- * Preconditions the host checks: K is a multiple of 64 (of 256 for the K-quants), the weight buffer starts 4-byte
- * aligned, the records are symmetric (zero point unit 0) and 16 deep (NF_MMQ_TK == 16). The kernels exist only
- * when the host defines NF_SG_ROW_SIZE (16) for a subgroup program and the compiler offers subgroup block reads of
- * local memory (cl_intel_subgroup_local_block_io).
+ * Preconditions the host checks: K is a multiple of 64 (of 256 for the K-quants), so every Q8_0 and Q4_0 block pair
+ * starts 4-byte aligned, the weight buffer starts 4-byte aligned, the records are symmetric (zero point unit 0) and
+ * 16 deep (NF_MMQ_TK == 16). The kernels exist only when the host defines NF_SG_ROW_SIZE (16) for a subgroup program
+ * and the compiler offers subgroup block reads of local memory (cl_intel_subgroup_local_block_io).
  */
 #if defined(USE_SUBGROUPS) && defined(cl_intel_required_subgroup_size) && defined(cl_intel_subgroup_local_block_io) \
     && defined(NF_SG_ROW_SIZE) && NF_SG_ROW_SIZE == 16 && NF_MMQ_TK == 16
@@ -94,22 +95,16 @@ NF_INLINE float nf_sgm_half(uint v) {
  * 32 accumulators and the block's codes peak at about 111 GRF, and gathering at the top of the stage instead of
  * between the blocks, or loading the segment per lane instead of by block read, spills.
  */
-__attribute__((intel_reqd_sub_group_size(NF_SG_ROW_SIZE))) __attribute__((reqd_work_group_size(NF_SGM_WG, 1, 1)))
-NF_KERNEL void Q8_0_MatMulSg_MMQ(
-    const int M, const int K, const int N,
-    const int q_stride, const int q_off, const int y_stride, const int y_off,
-    NF_GLOBAL const uchar* NF_RESTRICT weight,
-    NF_GLOBAL const uint* NF_RESTRICT q8,
-    NF_GLOBAL float* NF_RESTRICT y) {
-    NF_LOCAL uint xs[2 * NF_SGM_XBUF];
+NF_INLINE void nf_sgm_q8_0(
+    const int M, const int K, const int N, const int q_stride, const int q_off, const int m0, const int n0,
+    const int s0, const int s1, NF_GLOBAL const uchar* NF_RESTRICT weight, NF_GLOBAL const uint* NF_RESTRICT q8,
+    NF_GLOBAL float* NF_RESTRICT y, const int y_stride, const nf_i64 y_off, NF_LOCAL uint* xs) {
     const int lid = (int)get_local_id(0);
-    const int m0 = (int)get_group_id(0) * NF_SGM_TM;
-    const int n0 = (int)get_group_id(1) * NF_SGM_TN;
     const uint row_words = (uint)(K / NF_SGM_TK) * NF_SGM_PAIR_WORDS;
     /* Uniform 64-bit bases and 32-bit lane offsets: a 64-bit address per lane costs registers the tile needs.
      * Rows past M repeat row M - 1 and drop their stores. */
     NF_GLOBAL const uint* wbase = (NF_GLOBAL const uint*)weight + (nf_i64)m0 * row_words;
-    uint woff = (uint)min(lid, M - 1 - m0) * row_words;
+    uint woff = (uint)min(lid, M - 1 - m0) * row_words + (uint)s0 * NF_SGM_PAIR_WORDS;
     NF_GLOBAL const uint* qbase = q8 + (nf_i64)q_off + (nf_i64)n0 * q_stride * NF_SGM_RC;
     const int gt = lid >> 2, gc = lid & 3;
     const bool glive = n0 + gt < N;
@@ -120,10 +115,9 @@ NF_KERNEL void Q8_0_MatMulSg_MMQ(
     for (int t = 0; t < NF_SGM_TN; t++) {
         acc[t] = 0.0f;
     }
-    const int stages = K / NF_SGM_TK;
-    NF_SGM_GATHER(xs, 0)
+    NF_SGM_GATHER(xs + (s0 & 1) * NF_SGM_XBUF, s0)
     barrier(CLK_LOCAL_MEM_FENCE);
-    for (int s = 0; s < stages; s++, woff += NF_SGM_PAIR_WORDS) {
+    for (int s = s0; s < s1; s++, woff += NF_SGM_PAIR_WORDS) {
         NF_LOCAL const uint* xb = xs + (s & 1) * NF_SGM_XBUF;
         NF_GLOBAL const uint* p = wbase + woff;
         const uint4 a0 = vload4(0, p), a1 = vload4(1, p);
@@ -137,7 +131,7 @@ NF_KERNEL void Q8_0_MatMulSg_MMQ(
             const float dw = nf_sgm_half(a0.x);
             NF_SGM_BLOCK(xb, c, dw)
         }
-        if (s + 1 < stages) {
+        if (s + 1 < s1) {
             NF_SGM_GATHER(xs + ((s + 1) & 1) * NF_SGM_XBUF, s + 1)
         }
         {
@@ -151,7 +145,7 @@ NF_KERNEL void Q8_0_MatMulSg_MMQ(
     }
     const int row = m0 + lid;
     if (row < M) {
-        NF_GLOBAL float* yr = y + (nf_i64)y_off + (nf_i64)n0 * y_stride + row;
+        NF_GLOBAL float* yr = y + y_off + (nf_i64)n0 * y_stride + row;
         _Pragma("unroll")
         for (int t = 0; t < NF_SGM_TN; t++) {
             if (n0 + t < N) {
@@ -162,18 +156,22 @@ NF_KERNEL void Q8_0_MatMulSg_MMQ(
 }
 
 
-/* ---- K-quant forms: Q4_K_MatMulSg_MMQ and Q6_K_MatMulSg_MMQ. ----
+/* ---- Offset forms: Q4_0_MatMulSg_MMQ, Q4_K_MatMulSg_MMQ, Q5_K_MatMulSg_MMQ and Q6_K_MatMulSg_MMQ. ----
  *
  * The same work mapping, launch geometry and record consumption as Q8_0_MatMulSg_MMQ, with a 64-deep stage that is
- * quarter q = s % 4 of super-block s / 4 (K is a multiple of 256). The record gather of these forms rewrites unit 6
- * (the zero point, 0 for the symmetric records the host admits) in local memory with the activation side of the
- * type's offset term, so the per-token work stays 8 dp4a per 32-deep half and no per-token offset arithmetic:
+ * a Q4_0 block pair, or quarter q = s % 4 of super-block s / 4 (K is a multiple of 256). The record gather of these
+ * forms rewrites unit 6 (the zero point, 0 for the symmetric records the host admits) in local memory with the
+ * activation side of the type's offset term, so the per-token work stays 8 dp4a per 32-deep half and no per-token
+ * offset arithmetic:
  * - Q4_K: W = d * sc * c - dmin * m with 4-bit codes c, so a 16-deep record r contributes
  *   dx_r * (d * sc * idot_r - dmin * m * sum_r). Unit 6 of both records of each 32-deep sub-block pair holds
  *   dx_r * sum_r + dx_(r+1) * sum_(r+1) (the pair is summed across adjacent lanes of the gather).
+ * - Q5_K: W = d * sc * c - dmin * m with 5-bit codes c (a Q4_K nibble and one qh bit), offset as Q4_K.
  * - Q6_K: W = d * sc_r * (c - 32) with 6-bit codes c and one int8 scale per 16 elements, so record r contributes
  *   d * sc_r * dx_r * (idot_r - 32 * sum_r). Unit 6 holds -32 * sum_r, the initial value of the record's exact
  *   integer dot.
+ * - Q4_0: W = d * (c - 8) with 4-bit codes c, so record r contributes d * dx_r * (idot_r - 8 * sum_r); unit 6
+ *   holds -8 * sum_r, as for Q6_K.
  */
 
 /* Words of a 144-byte Q4_K block and bytes of a 210-byte Q6_K block. */
@@ -184,8 +182,8 @@ NF_KERNEL void Q8_0_MatMulSg_MMQ(
 #define NF_SGM_TWO 0x03030303u
 
 /* Copies stage st's record of this work-item into dst + gdst like NF_SGM_GATHER, with unit 6 replaced by
- * FIX(g1), g1 = (d, code sum, zero point) of the record; a record past N stays all zero (FIX(0) is 0 for both
- * forms). FIX runs on every lane, so it may use subgroup shuffles. */
+ * FIX(g1), g1 = (d, code sum, zero point) of the record; a record past N stays all zero (FIX(0) is 0 for every
+ * form). FIX runs on every lane, so it may use subgroup shuffles. */
 #define NF_SGM_GATHER_KQ(dst, st, FIX) \
     { \
         NF_LOCAL uint* gd = (dst) + gdst; \
@@ -201,7 +199,7 @@ NF_KERNEL void Q8_0_MatMulSg_MMQ(
         vstore3(g1, 0, gd + 4); \
     }
 
-/* Q4_K unit 6: dx * sum of this record plus that of its sub-block partner, the adjacent lane (gc ^ 1). */
+/* Q4_K and Q5_K unit 6: dx * sum of this record plus that of its sub-block partner, the adjacent lane (gc ^ 1). */
 NF_INLINE uint nf_sgm_q4k_fix(uint3 g1) {
     const float ds = as_float(g1.x) * (float)(int)g1.y;
     return as_uint(ds + intel_sub_group_shuffle_xor(ds, 1u));
@@ -209,6 +207,8 @@ NF_INLINE uint nf_sgm_q4k_fix(uint3 g1) {
 #define NF_SGM_Q4K_FIX(g1) nf_sgm_q4k_fix(g1)
 /* Q6_K unit 6: -32 * sum, the code offset of the record's integer dot. */
 #define NF_SGM_Q6K_FIX(g1) ((uint)(-32 * (int)(g1).y))
+/* Q4_0 unit 6: -8 * sum. */
+#define NF_SGM_Q40_FIX(g1) ((uint)(-8 * (int)(g1).y))
 
 /* Zeroes the NF_SGM_TN accumulators. */
 #define NF_SGM_ACC_ZERO \
@@ -222,7 +222,7 @@ NF_INLINE uint nf_sgm_q4k_fix(uint3 g1) {
     { \
         const int row = m0 + lid; \
         if (row < M) { \
-            NF_GLOBAL float* yr = y + (nf_i64)y_off + (nf_i64)n0 * y_stride + row; \
+            NF_GLOBAL float* yr = y + y_off + (nf_i64)n0 * y_stride + row; \
             _Pragma("unroll") \
             for (int t = 0; t < NF_SGM_TN; t++) { \
                 if (n0 + t < N) { \
@@ -250,9 +250,9 @@ NF_INLINE uint nf_sgm_q4k_fix(uint3 g1) {
         acc[t] = fma(nmm, as_float(NF_SGM_X(6)), acc[t]); \
     }
 
-/* One Q6_K pass of the stage against the tile's tokens: 6-bit codes c[0..3] of record A (units 0..6 of the segment at xb)
- * and c[4..7] of record B (units 7..13), with the lane's d * sc of each (ea, eb); each integer dot starts at its
- * record's -32 * sum. */
+/* One pass of an offset form whose unit 6 holds the record's code offset (Q6_K, Q4_0) against the tile's tokens:
+ * codes c[0..3] of record A (units 0..6 of the segment at xb) and c[4..7] of record B (units 7..13), with the lane's
+ * scale of each (ea, eb); each integer dot starts at its record's offset. */
 #define NF_SGM_BLOCK_Q6K(xb, c, ea, eb) \
     _Pragma("unroll") \
     for (int t = 0; t < NF_SGM_TN; t++) { \
@@ -282,17 +282,11 @@ NF_INLINE float2 nf_sgm_q4k_scales(uint4 h, int q, int i) {
     return (float2)(nf_sgm_half(h.x) * (float)sc, -(nf_sgm_half(h.x >> 16) * (float)mn));
 }
 
-__attribute__((intel_reqd_sub_group_size(NF_SG_ROW_SIZE))) __attribute__((reqd_work_group_size(NF_SGM_WG, 1, 1)))
-NF_KERNEL void Q4_K_MatMulSg_MMQ(
-    const int M, const int K, const int N,
-    const int q_stride, const int q_off, const int y_stride, const int y_off,
-    NF_GLOBAL const uchar* NF_RESTRICT weight,
-    NF_GLOBAL const uint* NF_RESTRICT q8,
-    NF_GLOBAL float* NF_RESTRICT y) {
-    NF_LOCAL uint xs[2 * NF_SGM_XBUF];
+NF_INLINE void nf_sgm_q4_k(
+    const int M, const int K, const int N, const int q_stride, const int q_off, const int m0, const int n0,
+    const int s0, const int s1, NF_GLOBAL const uchar* NF_RESTRICT weight, NF_GLOBAL const uint* NF_RESTRICT q8,
+    NF_GLOBAL float* NF_RESTRICT y, const int y_stride, const nf_i64 y_off, NF_LOCAL uint* xs) {
     const int lid = (int)get_local_id(0);
-    const int m0 = (int)get_group_id(0) * NF_SGM_TM;
-    const int n0 = (int)get_group_id(1) * NF_SGM_TN;
     const uint row_words = (uint)(K / 256) * NF_SGM_Q4K_WORDS;
     NF_GLOBAL const uint* wbase = (NF_GLOBAL const uint*)weight + (nf_i64)m0 * row_words;
     const uint woff = (uint)min(lid, M - 1 - m0) * row_words;
@@ -303,10 +297,9 @@ NF_KERNEL void Q4_K_MatMulSg_MMQ(
     const int gdst = gt * NF_SGM_XT + (gc >> 1) * 16 + (gc & 1) * NF_SGM_RC;
     float acc[NF_SGM_TN];
     NF_SGM_ACC_ZERO
-    const int stages = K / NF_SGM_TK;
-    NF_SGM_GATHER_KQ(xs, 0, NF_SGM_Q4K_FIX)
+    NF_SGM_GATHER_KQ(xs + (s0 & 1) * NF_SGM_XBUF, s0, NF_SGM_Q4K_FIX)
     barrier(CLK_LOCAL_MEM_FENCE);
-    for (int s = 0; s < stages; s++) {
+    for (int s = s0; s < s1; s++) {
         NF_LOCAL const uint* xb = xs + (s & 1) * NF_SGM_XBUF;
         const int q = s & 3;
         /* The 32 code bytes of quarter q (low nibbles sub-block 2q, high nibbles 2q + 1) and the block header.
@@ -321,7 +314,7 @@ NF_KERNEL void Q4_K_MatMulSg_MMQ(
             const float2 sm = nf_sgm_q4k_scales(vload4(0, p), q, 0);
             NF_SGM_BLOCK_Q4K(xb, c, sm.x, sm.y)
         }
-        if (s + 1 < stages) {
+        if (s + 1 < s1) {
             NF_SGM_GATHER_KQ(xs + ((s + 1) & 1) * NF_SGM_XBUF, s + 1, NF_SGM_Q4K_FIX)
         }
         {
@@ -329,6 +322,118 @@ NF_KERNEL void Q4_K_MatMulSg_MMQ(
             const uint c[8] = {(b0.x >> 4) & NF_SGM_NIB, (b0.y >> 4) & NF_SGM_NIB, (b0.z >> 4) & NF_SGM_NIB,
                                (b0.w >> 4) & NF_SGM_NIB, (b1.x >> 4) & NF_SGM_NIB, (b1.y >> 4) & NF_SGM_NIB,
                                (b1.z >> 4) & NF_SGM_NIB, (b1.w >> 4) & NF_SGM_NIB};
+            const float2 sm = nf_sgm_q4k_scales(vload4(0, p), q, 1);
+            NF_SGM_BLOCK_Q4K(xb + 16, c, sm.x, sm.y)
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    NF_SGM_STORE
+}
+
+/* Q4_0: the 36-byte block pair of stage s (9 words, 4-byte aligned): block A's d is the low half of word 0 and its
+ * code word i is (w_i >> 16) | (w_{i+1} << 16), block B's d the high half of word 4 and its code words words 5..8.
+ * The low nibbles of a block's code words hold record r (elements 0..15), the high nibbles record r + 1. */
+#define NF_SGM_Q40_WORDS 9
+
+NF_INLINE void nf_sgm_q4_0(
+    const int M, const int K, const int N, const int q_stride, const int q_off, const int m0, const int n0,
+    const int s0, const int s1, NF_GLOBAL const uchar* NF_RESTRICT weight, NF_GLOBAL const uint* NF_RESTRICT q8,
+    NF_GLOBAL float* NF_RESTRICT y, const int y_stride, const nf_i64 y_off, NF_LOCAL uint* xs) {
+    const int lid = (int)get_local_id(0);
+    const uint row_words = (uint)(K / NF_SGM_TK) * NF_SGM_Q40_WORDS;
+    NF_GLOBAL const uint* wbase = (NF_GLOBAL const uint*)weight + (nf_i64)m0 * row_words;
+    uint woff = (uint)min(lid, M - 1 - m0) * row_words + (uint)s0 * NF_SGM_Q40_WORDS;
+    NF_GLOBAL const uint* qbase = q8 + (nf_i64)q_off + (nf_i64)n0 * q_stride * NF_SGM_RC;
+    const int gt = lid >> 2, gc = lid & 3;
+    const bool glive = n0 + gt < N;
+    const uint goff = ((uint)gt * (uint)q_stride + (uint)gc) * NF_SGM_RC;
+    const int gdst = gt * NF_SGM_XT + (gc >> 1) * 16 + (gc & 1) * NF_SGM_RC;
+    float acc[NF_SGM_TN];
+    NF_SGM_ACC_ZERO
+    NF_SGM_GATHER_KQ(xs + (s0 & 1) * NF_SGM_XBUF, s0, NF_SGM_Q40_FIX)
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = s0; s < s1; s++, woff += NF_SGM_Q40_WORDS) {
+        NF_LOCAL const uint* xb = xs + (s & 1) * NF_SGM_XBUF;
+        NF_GLOBAL const uint* p = wbase + woff;
+        const uint4 a0 = vload4(0, p), a1 = vload4(1, p);
+        {
+            const uint q0 = (a0.x >> 16) | (a0.y << 16), q1 = (a0.y >> 16) | (a0.z << 16);
+            const uint q2 = (a0.z >> 16) | (a0.w << 16), q3 = (a0.w >> 16) | (a1.x << 16);
+            const uint c[8] = {q0 & NF_SGM_NIB, q1 & NF_SGM_NIB, q2 & NF_SGM_NIB, q3 & NF_SGM_NIB,
+                               (q0 >> 4) & NF_SGM_NIB, (q1 >> 4) & NF_SGM_NIB, (q2 >> 4) & NF_SGM_NIB,
+                               (q3 >> 4) & NF_SGM_NIB};
+            const float dw = nf_sgm_half(a0.x);
+            NF_SGM_BLOCK_Q6K(xb, c, dw, dw)
+        }
+        if (s + 1 < s1) {
+            NF_SGM_GATHER_KQ(xs + ((s + 1) & 1) * NF_SGM_XBUF, s + 1, NF_SGM_Q40_FIX)
+        }
+        {
+            const uint4 b = vload4(0, p + 5);
+            const uint c[8] = {b.x & NF_SGM_NIB, b.y & NF_SGM_NIB, b.z & NF_SGM_NIB, b.w & NF_SGM_NIB,
+                               (b.x >> 4) & NF_SGM_NIB, (b.y >> 4) & NF_SGM_NIB, (b.z >> 4) & NF_SGM_NIB,
+                               (b.w >> 4) & NF_SGM_NIB};
+            const float dw = nf_sgm_half(a1.x >> 16);
+            NF_SGM_BLOCK_Q6K(xb + 16, c, dw, dw)
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    NF_SGM_STORE
+}
+
+/* Words of a 176-byte Q5_K block: header at 0 (d, dmin, scales[12]), qh at 4, the 128 code bytes at 12. */
+#define NF_SGM_Q5K_WORDS 44
+/* Bit 0 of every byte of a word. */
+#define NF_SGM_ONE 0x01010101u
+
+/* Codes of 4 bytes of a Q5_K quarter half: the nibbles of q selected by nsh, with the qh bits selected by hsh as
+ * their bit 4. */
+#define NF_SGM_Q5K_CODE(q, h) ((((q) >> nsh) & NF_SGM_NIB) | ((((h) >> hsh) & NF_SGM_ONE) << 4))
+
+NF_INLINE void nf_sgm_q5_k(
+    const int M, const int K, const int N, const int q_stride, const int q_off, const int m0, const int n0,
+    const int s0, const int s1, NF_GLOBAL const uchar* NF_RESTRICT weight, NF_GLOBAL const uint* NF_RESTRICT q8,
+    NF_GLOBAL float* NF_RESTRICT y, const int y_stride, const nf_i64 y_off, NF_LOCAL uint* xs) {
+    const int lid = (int)get_local_id(0);
+    const uint row_words = (uint)(K / 256) * NF_SGM_Q5K_WORDS;
+    NF_GLOBAL const uint* wbase = (NF_GLOBAL const uint*)weight + (nf_i64)m0 * row_words;
+    const uint woff = (uint)min(lid, M - 1 - m0) * row_words;
+    NF_GLOBAL const uint* qbase = q8 + (nf_i64)q_off + (nf_i64)n0 * q_stride * NF_SGM_RC;
+    const int gt = lid >> 2, gc = lid & 3;
+    const bool glive = n0 + gt < N;
+    const uint goff = ((uint)gt * (uint)q_stride + (uint)gc) * NF_SGM_RC;
+    const int gdst = gt * NF_SGM_XT + (gc >> 1) * 16 + (gc & 1) * NF_SGM_RC;
+    float acc[NF_SGM_TN];
+    NF_SGM_ACC_ZERO
+    NF_SGM_GATHER_KQ(xs + (s0 & 1) * NF_SGM_XBUF, s0, NF_SGM_Q4K_FIX)
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = s0; s < s1; s++) {
+        NF_LOCAL const uint* xb = xs + (s & 1) * NF_SGM_XBUF;
+        const int q = s & 3;
+        /* Quarter q: the 32 code bytes at 48 + 32q (low nibbles sub-block 2q, high nibbles 2q + 1) with bits 2q and
+         * 2q + 1 of the 32 qh bytes, and the block header; each half loads its own words, as in Q4_K. */
+        NF_GLOBAL const uint* p = wbase + woff + (uint)(s >> 2) * NF_SGM_Q5K_WORDS;
+        NF_GLOBAL const uint* pq = p + 12 + 8 * q;
+        {
+            const uint nsh = 0u, hsh = (uint)(2 * q);
+            const uint4 a0 = vload4(0, pq), a1 = vload4(1, pq);
+            const uint4 h0 = vload4(1, p), h1 = vload4(2, p);
+            const uint c[8] = {NF_SGM_Q5K_CODE(a0.x, h0.x), NF_SGM_Q5K_CODE(a0.y, h0.y), NF_SGM_Q5K_CODE(a0.z, h0.z),
+                               NF_SGM_Q5K_CODE(a0.w, h0.w), NF_SGM_Q5K_CODE(a1.x, h1.x), NF_SGM_Q5K_CODE(a1.y, h1.y),
+                               NF_SGM_Q5K_CODE(a1.z, h1.z), NF_SGM_Q5K_CODE(a1.w, h1.w)};
+            const float2 sm = nf_sgm_q4k_scales(vload4(0, p), q, 0);
+            NF_SGM_BLOCK_Q4K(xb, c, sm.x, sm.y)
+        }
+        if (s + 1 < s1) {
+            NF_SGM_GATHER_KQ(xs + ((s + 1) & 1) * NF_SGM_XBUF, s + 1, NF_SGM_Q4K_FIX)
+        }
+        {
+            const uint nsh = 4u, hsh = (uint)(2 * q + 1);
+            const uint4 b0 = vload4(0, pq), b1 = vload4(1, pq);
+            const uint4 h0 = vload4(1, p), h1 = vload4(2, p);
+            const uint c[8] = {NF_SGM_Q5K_CODE(b0.x, h0.x), NF_SGM_Q5K_CODE(b0.y, h0.y), NF_SGM_Q5K_CODE(b0.z, h0.z),
+                               NF_SGM_Q5K_CODE(b0.w, h0.w), NF_SGM_Q5K_CODE(b1.x, h1.x), NF_SGM_Q5K_CODE(b1.y, h1.y),
+                               NF_SGM_Q5K_CODE(b1.z, h1.z), NF_SGM_Q5K_CODE(b1.w, h1.w)};
             const float2 sm = nf_sgm_q4k_scales(vload4(0, p), q, 1);
             NF_SGM_BLOCK_Q4K(xb + 16, c, sm.x, sm.y)
         }
@@ -373,24 +478,18 @@ NF_INLINE uint4 nf_sgm_run16(NF_GLOBAL const uint* pw, uint sh) {
         NF_SGM_BLOCK_Q6K(xseg, c, ea, eb) \
     }
 
-__attribute__((intel_reqd_sub_group_size(NF_SG_ROW_SIZE))) __attribute__((reqd_work_group_size(NF_SGM_WG, 1, 1)))
-NF_KERNEL void Q6_K_MatMulSg_MMQ(
-    const int M, const int K, const int N,
-    const int q_stride, const int q_off, const int y_stride, const int y_off,
-    NF_GLOBAL const uchar* NF_RESTRICT weight,
-    NF_GLOBAL const uint* NF_RESTRICT q8,
-    NF_GLOBAL float* NF_RESTRICT y) {
-    NF_LOCAL uint xs[2 * NF_SGM_XBUF];
+NF_INLINE void nf_sgm_q6_k(
+    const int M, const int K, const int N, const int q_stride, const int q_off, const int m0, const int n0,
+    const int s0, const int s1, NF_GLOBAL const uchar* NF_RESTRICT weight, NF_GLOBAL const uint* NF_RESTRICT q8,
+    NF_GLOBAL float* NF_RESTRICT y, const int y_stride, const nf_i64 y_off, NF_LOCAL uint* xs) {
     const int lid = (int)get_local_id(0);
-    const int m0 = (int)get_group_id(0) * NF_SGM_TM;
-    const int n0 = (int)get_group_id(1) * NF_SGM_TN;
     const uint row_bytes = (uint)(K / 256) * NF_SGM_Q6K_BYTES;
     /* m0 is a multiple of 128, so the tile base is 4-byte aligned; lane offsets are bytes. */
     NF_GLOBAL const uchar* bbase = weight + (nf_i64)m0 * row_bytes;
     NF_GLOBAL const uint* wbase = (NF_GLOBAL const uint*)bbase;
     NF_GLOBAL const ushort* hbase = (NF_GLOBAL const ushort*)bbase;
     /* The lane's block offset is carried through the loop: a row offset held beside it spills the tile. */
-    uint bo = (uint)min(lid, M - 1 - m0) * row_bytes;
+    uint bo = (uint)min(lid, M - 1 - m0) * row_bytes + (uint)(s0 >> 2) * NF_SGM_Q6K_BYTES;
     NF_GLOBAL const uint* qbase = q8 + (nf_i64)q_off + (nf_i64)n0 * q_stride * NF_SGM_RC;
     const int gt = lid >> 2, gc = lid & 3;
     const bool glive = n0 + gt < N;
@@ -399,10 +498,9 @@ NF_KERNEL void Q6_K_MatMulSg_MMQ(
     const int gdst = gt * NF_SGM_XT + (gc & 1) * 16 + (gc >> 1) * NF_SGM_RC;
     float acc[NF_SGM_TN];
     NF_SGM_ACC_ZERO
-    const int stages = K / NF_SGM_TK;
-    NF_SGM_GATHER_KQ(xs, 0, NF_SGM_Q6K_FIX)
+    NF_SGM_GATHER_KQ(xs + (s0 & 1) * NF_SGM_XBUF, s0, NF_SGM_Q6K_FIX)
     barrier(CLK_LOCAL_MEM_FENCE);
-    for (int s = 0; s < stages; s++) {
+    for (int s = s0; s < s1; s++) {
         NF_LOCAL const uint* xb = xs + (s & 1) * NF_SGM_XBUF;
         const int q = s & 3, hf = q >> 1;
         const uint nsh = (uint)(4 * (q & 1));
@@ -413,7 +511,7 @@ NF_KERNEL void Q6_K_MatMulSg_MMQ(
         const uint scw = NF_SGM_FUNNEL(pa[48 + q], pa[48 + q + (al >> 1)]);
         const float d = nf_sgm_half((uint)hbase[(bo + 208u) >> 1]);
         NF_SGM_Q6K_PASS(0, xb)
-        if (s + 1 < stages) {
+        if (s + 1 < s1) {
             NF_SGM_GATHER_KQ(xs + ((s + 1) & 1) * NF_SGM_XBUF, s + 1, NF_SGM_Q6K_FIX)
         }
         NF_SGM_Q6K_PASS(1, xb + 16)
@@ -422,5 +520,45 @@ NF_KERNEL void Q6_K_MatMulSg_MMQ(
     }
     NF_SGM_STORE
 }
+
+/*
+ * The kernels: {T}_MatMulSg_MMQ over the whole reduction into y, and its split-K twin
+ *
+ *   {T}_MatMulSg_MMQ_KSplit(i M, i K, i N, i q_stride, i q_off, i k_slice, R uchar weight, R uint q8, W float partial)
+ *   partial[(slice * N + t) * M + r] = sum_{k in [slice * k_slice, min((slice + 1) * k_slice, K))} W[r][k] * x[t][k]
+ *
+ * which runs the same tile over the stages of its slice (slice = gid0 / ceil(M / NF_SGM_TM), the row tile
+ * gid0 % ceil(M / NF_SGM_TM)) and writes every live element of its [M x N] plane, the contract of the portable
+ * {T}_MatMul_MMQ_KSplit, so LLM_SplitK_Reduce sums the planes. The host (gguf.ops.gemm.SplitKGemmPlan) keeps
+ * k_slice a multiple of NF_SGM_TK, so a slice starts at a stage: a Q8_0 or Q4_0 block pair, or a quarter of a
+ * K-quant super-block, whose quarter index the stage number carries.
+ */
+#define NF_SGM_KERNELS(T, BODY) \
+__attribute__((intel_reqd_sub_group_size(NF_SG_ROW_SIZE))) __attribute__((reqd_work_group_size(NF_SGM_WG, 1, 1))) \
+NF_KERNEL void T##_MatMulSg_MMQ(const int M, const int K, const int N, const int q_stride, const int q_off, \
+                                const int y_stride, const int y_off, NF_GLOBAL const uchar* NF_RESTRICT weight, \
+                                NF_GLOBAL const uint* NF_RESTRICT q8, NF_GLOBAL float* NF_RESTRICT y) { \
+    NF_LOCAL uint xs[2 * NF_SGM_XBUF]; \
+    BODY(M, K, N, q_stride, q_off, (int)get_group_id(0) * NF_SGM_TM, (int)get_group_id(1) * NF_SGM_TN, 0, \
+         K / NF_SGM_TK, weight, q8, y, y_stride, (nf_i64)y_off, xs); \
+} \
+__attribute__((intel_reqd_sub_group_size(NF_SG_ROW_SIZE))) __attribute__((reqd_work_group_size(NF_SGM_WG, 1, 1))) \
+NF_KERNEL void T##_MatMulSg_MMQ_KSplit(const int M, const int K, const int N, const int q_stride, const int q_off, \
+                                       const int k_slice, NF_GLOBAL const uchar* NF_RESTRICT weight, \
+                                       NF_GLOBAL const uint* NF_RESTRICT q8, NF_GLOBAL float* NF_RESTRICT partial) { \
+    NF_LOCAL uint xs[2 * NF_SGM_XBUF]; \
+    const int rtiles = (M + NF_SGM_TM - 1) / NF_SGM_TM; \
+    const int slice = (int)get_group_id(0) / rtiles; \
+    const int k0 = slice * k_slice; \
+    BODY(M, K, N, q_stride, q_off, ((int)get_group_id(0) - slice * rtiles) * NF_SGM_TM, \
+         (int)get_group_id(1) * NF_SGM_TN, k0 / NF_SGM_TK, min(k0 + k_slice, K) / NF_SGM_TK, weight, q8, \
+         partial + (nf_i64)slice * M * N, M, 0, xs); \
+}
+
+NF_SGM_KERNELS(Q8_0, nf_sgm_q8_0)
+NF_SGM_KERNELS(Q4_0, nf_sgm_q4_0)
+NF_SGM_KERNELS(Q4_K, nf_sgm_q4_k)
+NF_SGM_KERNELS(Q5_K, nf_sgm_q5_k)
+NF_SGM_KERNELS(Q6_K, nf_sgm_q6_k)
 
 #endif

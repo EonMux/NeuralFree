@@ -302,7 +302,9 @@ public final class Int8MatvecTuning {
                 GGMLType.IQ4_NL, GGMLType.IQ4_XS));
         slower.put(nvidiaDiscreteCudaTensor(), EnumSet.of(GGMLType.Q4_0, GGMLType.Q4_1, GGMLType.Q5_0,
                 GGMLType.Q5_1, GGMLType.IQ4_NL));
-        // Vulkan Arrow-Lake iGPU (no packed dot product, the lane forced).
+        // Vulkan Arrow-Lake iGPU (no packed dot product, the lane forced). The single-token projections the
+        // subgroup-row forms serve (SubgroupRowMatvec: Q4_0 among them) take the lane through those forms whatever
+        // this entry says, so it decides the counted multi-column lane and the shapes the forms do not serve.
         slower.put(intelIntegrated(BackendType.VULKAN), EnumSet.of(GGMLType.Q4_0));
         // Vulkan RTX 5080: no type lost at every shape; its Vulkan {T}_MatVec_Q8 kernels win from
         // 16.8M elements up for all fifteen types, so this kind records only largeOnly losses.
@@ -311,7 +313,9 @@ public final class Int8MatvecTuning {
         // (0.70-0.99x, Q5_1's 14336x4096 the one 0.99x), Q5_0 and IQ4_NL lost the small shapes and
         // tied the large ones across two runs (0.99-1.06x), and Q8_0's isolated 16.8M+ wins
         // (1.02-1.11x) did not survive the decoder step, which measured 0.75-0.85x with the lane
-        // on the Q8_0 4B model.
+        // on the Q8_0 4B model. These measured the family's forms: a single-token projection the subgroup-row
+        // forms serve (Q8_0 among them) takes the lane through them instead, so for Q8_0 the entry decides the
+        // counted multi-column lane and the shapes the forms do not serve.
         slower.put(intelIntegrated(BackendType.OPENCL), EnumSet.of(GGMLType.Q4_1, GGMLType.Q5_0,
                 GGMLType.Q5_1, GGMLType.Q8_0, GGMLType.Q3_K, GGMLType.MXFP4, GGMLType.IQ4_NL,
                 GGMLType.IQ4_XS));
@@ -346,7 +350,9 @@ public final class Int8MatvecTuning {
         // OpenCL Arrow-Lake iGPU: at or below parity on the small projections (Q6_K and Q8_K only
         // lost at 1024x1024, the others measured 0.77-1.09x across two runs) and 1.01-1.51x from
         // 16.8M up; the boundary shapes inside the noise band are Q2_K's 32768x1024 (0.99x) and
-        // Q4_K and Q5_K at 16.8M (1.01x each).
+        // Q4_K and Q5_K at 16.8M (1.01x each). The subgroup-row forms' types (Q4_0, Q4_K, Q5_K, Q6_K here) take
+        // the lane at every single-token shape those forms serve, so for them the entry decides the counted
+        // multi-column lane and the shapes the forms do not serve.
         large.put(intelIntegrated(BackendType.OPENCL), EnumSet.of(GGMLType.Q4_0, GGMLType.Q2_K,
                 GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.Q6_K, GGMLType.Q8_K));
         return Collections.unmodifiableMap(large);

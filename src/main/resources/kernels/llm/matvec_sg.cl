@@ -1,4 +1,4 @@
-/* matvec_sg.cl - subgroup-row integer-dot matvecs of Q8_0, Q4_K and Q6_K weights (OpenCL only). Requires: common/dialect.h, common/config.h, common/math.h, common/quant_blocks.h, common/q8_dot.h */
+/* matvec_sg.cl - subgroup-row integer-dot matvecs of Q8_0, Q4_0, Q4_K, Q5_K and Q6_K weights (OpenCL only). Requires: common/dialect.h, common/config.h, common/math.h, common/quant_blocks.h, common/q8_dot.h */
 /*
  * {T}_MatVecSg_Q8, {T}_MatVecAddSg_Q8 and {T}_MatVecFusedGateUpSg_Q8 compute what {T}_MatVec_Q8,
  * {T}_MatVecAdd_Q8 and {T}_MatVecFusedGateUp_Q8 (common/matvec_family.h) compute, with the argument
@@ -10,9 +10,10 @@
  *   NF_SGR_SUBGROUPS * NF_SG_ROW_SIZE, global = ceil(rows / (NF_SGR_SUBGROUPS * NF_SGR_ROWS)) * local.
  * - The input row is cut into 64-element units; lane l takes units l, l + 16, ... . Each unit's weight
  *   bytes are read with 16-byte vector loads (a Q8_0 block pair is 68 bytes, so the 4-byte-aligned pair
- *   is four uint4 loads and one uint; a Q4_K quarter is its 16-byte header and two uint4 of codes; a
- *   Q6_K quarter is three 16-byte code runs), against one or two 2-byte loads per 4 codes in the
- *   one-work-group-per-row family.
+ *   is four uint4 loads and one uint; a Q4_0 pair is 36 bytes, two uint4 and one uint; a Q4_K quarter is
+ *   its 16-byte header and two uint4 of codes, a Q5_K quarter the same plus the block's two uint4 of
+ *   fifth bits; a Q6_K quarter is three 16-byte code runs), against one or two 2-byte loads per 4 codes
+ *   in the one-work-group-per-row family.
  * - The unit's Q8_1 activation codes, scales and code sums are loaded once per lane and dotted with
  *   every row of the subgroup, and each row is reduced by one sub_group_reduce_add: no local memory and
  *   no barrier. Rows past the end repeat the last row's weights and drop their stores.
@@ -21,8 +22,8 @@
  * float as the family decoders do; only the float summation order differs from the family's. Results
  * are deterministic: the lane assignment and the subgroup reduction are fixed.
  *
- * Preconditions the host checks: in_dim is a multiple of 64 for Q8_0 (so every row starts 4-byte
- * aligned and holds whole block pairs) and of 256 for the K-quants; weight buffers start 16-byte
+ * Preconditions the host checks: in_dim is a multiple of 64 for Q8_0 and Q4_0 (so every row starts
+ * 4-byte aligned and holds whole block pairs) and of 256 for the K-quants; weight buffers start 16-byte
  * aligned. The kernels exist only when the host defines NF_SG_ROW_SIZE (a subgroup size the device
  * accepts through cl_intel_required_subgroup_size) for a subgroup program.
  */
@@ -84,6 +85,18 @@ NF_INLINE void Q8_0_sgr_act(NF_GLOBAL const uchar* xq, int u, nf_sgr_act* a) {
     a->c[12] = x3.x; a->c[13] = x3.y; a->c[14] = x3.z; a->c[15] = x3.w;
 }
 
+/* Q8_0_sgr_act and the exact code sums s[0..1] of the two blocks, for the types with a bias or minimum term. */
+NF_INLINE void nf_sgr_pair_act_sums(NF_GLOBAL const uchar* xq, int u, nf_sgr_act* a) {
+    Q8_0_sgr_act(xq, u, a);
+    int s0 = 0, s1 = 0;
+    for (int i = 0; i < 8; i++) {
+        s0 += nf_sgr_sum4(a->c[i]);
+        s1 += nf_sgr_sum4(a->c[8 + i]);
+    }
+    a->s[0] = s0;
+    a->s[1] = s1;
+}
+
 /* Pair words w0..w16: block 2u's d is the low half of w0 and its code word i is (w_i >> 16) | (w_{i+1} << 16);
  * block 2u + 1's d is the high half of w8 and its code words are w9..w16. */
 NF_INLINE float Q8_0_sgr_dot(NF_GLOBAL const uchar* wrow, int u, const nf_sgr_act* a) {
@@ -100,19 +113,39 @@ NF_INLINE float Q8_0_sgr_dot(NF_GLOBAL const uchar* wrow, int u, const nf_sgr_ac
     return a->d[0] * nf_sgr_half(w[0]) * (float)s0 + a->d[1] * nf_sgr_half(w[8] >> 16) * (float)s1;
 }
 
+/* ---- Q4_0: unit u is the block pair 2u, 2u + 1 (36 bytes at u * 36 of the row); y = d * (nibble - 8), the
+ * low nibbles of code byte j holding element j and the high nibbles element j + 16. ---- */
+
+/* Q8_1 blocks 2u and 2u + 1 with their code sums for the -8 bias term. */
+NF_INLINE void Q4_0_sgr_act(NF_GLOBAL const uchar* xq, int u, nf_sgr_act* a) {
+    nf_sgr_pair_act_sums(xq, u, a);
+}
+
+/* Pair words w0..w8: block 2u's d is the low half of w0 and its code word i is (w_i >> 16) | (w_{i+1} << 16);
+ * block 2u + 1's d is the high half of w4 and its code words are w5..w8. */
+NF_INLINE float Q4_0_sgr_dot(NF_GLOBAL const uchar* wrow, int u, const nf_sgr_act* a) {
+    NF_GLOBAL const uint* p = (NF_GLOBAL const uint*)(wrow + (nf_i64)u * (2 * Q4_0_BLOCK_BYTES));
+    const uint4 v0 = vload4(0, p), v1 = vload4(1, p);
+    const uint w[9] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w, p[8]};
+    int i0 = 0, i1 = 0;
+    for (int i = 0; i < 4; i++) {
+        const uint q0 = (w[i] >> 16) | (w[i + 1] << 16);
+        const uint q1 = w[5 + i];
+        i0 = NF_DP4A((int)(q0 & 0x0F0F0F0Fu), (int)a->c[i], i0);
+        i0 = NF_DP4A((int)((q0 >> 4) & 0x0F0F0F0Fu), (int)a->c[4 + i], i0);
+        i1 = NF_DP4A((int)(q1 & 0x0F0F0F0Fu), (int)a->c[8 + i], i1);
+        i1 = NF_DP4A((int)((q1 >> 4) & 0x0F0F0F0Fu), (int)a->c[12 + i], i1);
+    }
+    return a->d[0] * nf_sgr_half(w[0]) * (float)(i0 - 8 * a->s[0])
+         + a->d[1] * nf_sgr_half(w[4] >> 16) * (float)(i1 - 8 * a->s[1]);
+}
+
 /* ---- Q4_K: unit u is quarter c = u % 4 of block u / 4: sub-blocks 2c (low nibbles of the 32 code bytes
  * at 16 + 32c) and 2c + 1 (high nibbles), with the block's 16-byte header d, dmin, scales[12]. ---- */
 
 /* Q8_1 blocks 8b + 2c and 8b + 2c + 1 = 2u and 2u + 1, with their code sums for the minimum term. */
 NF_INLINE void Q4_K_sgr_act(NF_GLOBAL const uchar* xq, int u, nf_sgr_act* a) {
-    Q8_0_sgr_act(xq, u, a);
-    int s0 = 0, s1 = 0;
-    for (int i = 0; i < 8; i++) {
-        s0 += nf_sgr_sum4(a->c[i]);
-        s1 += nf_sgr_sum4(a->c[8 + i]);
-    }
-    a->s[0] = s0;
-    a->s[1] = s1;
+    nf_sgr_pair_act_sums(xq, u, a);
 }
 
 /* Byte k (0..11) of the 6-bit scale table held in words s1..s3 of the header. */
@@ -141,6 +174,37 @@ NF_INLINE float Q4_K_sgr_dot(NF_GLOBAL const uchar* wrow, int u, const nf_sgr_ac
     for (int i = 0; i < 8; i++) {
         i0 = NF_DP4A((int)(q[i] & 0x0F0F0F0Fu), (int)a->c[i], i0);
         i1 = NF_DP4A((int)((q[i] >> 4) & 0x0F0F0F0Fu), (int)a->c[8 + i], i1);
+    }
+    const float d = nf_sgr_half(h.x), dmin = nf_sgr_half(h.x >> 16);
+    const float2 sm0 = nf_sgr_q4k_sm(h, 2 * c), sm1 = nf_sgr_q4k_sm(h, 2 * c + 1);
+    return a->d[0] * (d * sm0.x * (float)i0 - dmin * sm0.y * (float)a->s[0])
+         + a->d[1] * (d * sm1.x * (float)i1 - dmin * sm1.y * (float)a->s[1]);
+}
+
+/* ---- Q5_K: unit u is quarter c = u % 4 of block u / 4, laid out as Q4_K's quarter with the 32 code bytes at
+ * 48 + 32c and the fifth bits in the 32-byte qh at 16: bit 2c of qh byte l for the low nibble of code byte l,
+ * bit 2c + 1 for its high nibble. ---- */
+
+/* Q8_1 blocks 2u and 2u + 1 with their code sums for the minimum term, as for Q4_K. */
+NF_INLINE void Q5_K_sgr_act(NF_GLOBAL const uchar* xq, int u, nf_sgr_act* a) {
+    nf_sgr_pair_act_sums(xq, u, a);
+}
+
+NF_INLINE float Q5_K_sgr_dot(NF_GLOBAL const uchar* wrow, int u, const nf_sgr_act* a) {
+    const int c = u & 3;
+    NF_GLOBAL const uint* bp = (NF_GLOBAL const uint*)(wrow + (nf_i64)(u >> 2) * Q5_K_BLOCK_BYTES);
+    const uint4 h = vload4(0, bp);
+    const uint4 ha = vload4(1, bp), hb = vload4(2, bp);
+    const uint4 qa = vload4(3 + 2 * c, bp), qb = vload4(4 + 2 * c, bp);
+    const uint q[8] = {qa.x, qa.y, qa.z, qa.w, qb.x, qb.y, qb.z, qb.w};
+    const uint qh[8] = {ha.x, ha.y, ha.z, ha.w, hb.x, hb.y, hb.z, hb.w};
+    const uint s0 = (uint)(2 * c), s1 = s0 + 1u;
+    int i0 = 0, i1 = 0;
+    for (int i = 0; i < 8; i++) {
+        const uint lo = (q[i] & 0x0F0F0F0Fu) | (((qh[i] >> s0) & 0x01010101u) << 4);
+        const uint hi = ((q[i] >> 4) & 0x0F0F0F0Fu) | (((qh[i] >> s1) & 0x01010101u) << 4);
+        i0 = NF_DP4A((int)lo, (int)a->c[i], i0);
+        i1 = NF_DP4A((int)hi, (int)a->c[8 + i], i1);
     }
     const float d = nf_sgr_half(h.x), dmin = nf_sgr_half(h.x >> 16);
     const float2 sm0 = nf_sgr_q4k_sm(h, 2 * c), sm1 = nf_sgr_q4k_sm(h, 2 * c + 1);
@@ -291,7 +355,9 @@ NF_SGR_ATTR NF_KERNEL void N##_MatVecFusedGateUpSg_Q8( \
     NF_SGR_FUSEDGATEUP(N, BS, BB)
 
 NF_SGR_ALL(Q8_0, Q8_0_BLOCK_SIZE, Q8_0_BLOCK_BYTES)
+NF_SGR_ALL(Q4_0, Q4_0_BLOCK_SIZE, Q4_0_BLOCK_BYTES)
 NF_SGR_ALL(Q4_K, Q4_K_BLOCK_SIZE, Q4_K_BLOCK_BYTES)
+NF_SGR_ALL(Q5_K, Q5_K_BLOCK_SIZE, Q5_K_BLOCK_BYTES)
 NF_SGR_ALL(Q6_K, Q6_K_BLOCK_SIZE, Q6_K_BLOCK_BYTES)
 
 #endif /* USE_SUBGROUPS && cl_intel_required_subgroup_size && NF_SG_ROW_SIZE */

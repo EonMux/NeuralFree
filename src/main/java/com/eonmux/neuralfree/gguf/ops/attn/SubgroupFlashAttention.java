@@ -11,7 +11,8 @@ import com.eonmux.neuralfree.gguf.memory.KvDType;
  * {@code LLM_FlashDecodePagedSg_<KV>} and the prefill kernels {@code LLM_FlashAttnSg_<KV>} /
  * {@code LLM_FlashAttnPagedSg_<KV>}. Each takes the arguments of its portable counterpart ({@code LLM_FlashDecode*},
  * {@code LLM_FlashAttn*}) and writes the same outputs and partials, with work-groups of {@link #SUBGROUPS} 16-lane
- * subgroups whose state stays in registers ({@link #DIMS_PER_LANE} dims of the output per lane):
+ * subgroups that keep their running state per lane ({@link #DIMS_PER_LANE} dims of the output per lane; in the
+ * Intel runtime build the decode kernels hold it in registers, the prefill kernels spill part of it):
  * <ul>
  *   <li>decode: one query head per work-group; each subgroup scans every {@link #SUBGROUPS}-th key of the split and
  *       the subgroups merge through about 2 KB of local memory;</li>
@@ -31,9 +32,10 @@ import com.eonmux.neuralfree.gguf.memory.KvDType;
  * against its 10.7 ms. {@link FlashPlan} picks the forms for a layer ({@link #serves}) and its dense and paged plans
  * then all use them, so a single-row step and a paged batch row over the same keys keep one summation order.</p>
  *
- * <p>Under Vulkan (Mesa ANV) on the same device, the 512-token prefill attention of a Qwen3 0.6B layer takes
- * 2.4-2.8 ms against the portable GLSL kernel's 210 ms, and of a Qwen3 4B layer (32 heads) 4.3-4.5 ms against
- * llama.cpp Vulkan's 8.3 ms; a Qwen3 4B decode step's attention takes 16 us per layer against 990.</p>
+ * <p>Under Vulkan (Mesa ANV) on the same device, the 512-token prefill attention of a Qwen3-Embedding 0.6B layer
+ * takes 2.4-2.8 ms against the portable GLSL kernel's 210 ms, and of a Qwen3-Embedding 4B layer (32 heads) 4.3-4.5 ms
+ * against llama.cpp Vulkan's 8.3 ms; a Qwen3-Embedding 4B decode step's attention takes 16 us per layer against
+ * 990.</p>
  *
  * <p>The constants mirror {@code NF_FDS_SUBGROUPS}, {@code NF_FDS_DPL} and {@code NF_FAS_ROWS} of the kernel
  * sources.</p>

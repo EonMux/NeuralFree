@@ -42,20 +42,21 @@ import static org.junit.Assert.assertTrue;
  * weights and the CPU Q8_1 quantizer's dequantized activations, on every OpenCL device whose program builds
  * them ({@link OpenClKernelLibrary#subgroupRowSize} positive) and every Vulkan device that loads their pinned
  * 16-lane modules (the GLSL port shaders/llm/matvec_sg.comp, refused by {@link VulkanKernelLibrary#pinnedRefusal}
- * and {@link VkPinnedSubgroups#refusal}). Shapes cover a single row, row counts that end
- * inside a subgroup and inside a work-group, rows of an odd Q6_K block count (whose odd rows and odd blocks start
- * 2 bytes off a word) and the 2560-column rows of a 4B decoder; on a Vulkan device a launch of more work-groups than
- * {@code maxComputeWorkGroupCount[0]} checks the folded one-dimensional dispatch. Every other device and backend must
- * lack the forms, and Vulkan serves them only on Intel devices ({@link SubgroupRowForms#served}), so the projections
- * keep the family there. The tolerance derives from the L1 magnitude of each row's terms, which bounds the float
- * summation-order error.
+ * and {@link VkPinnedSubgroups#refusal}). Shapes cover a single row, row counts that end inside a subgroup and
+ * inside a work-group, rows of an odd Q6_K block count (whose odd rows and odd blocks start 2 bytes off a word), the
+ * 2560-column rows of a 4B decoder and the full projections of a 0.6B decoder; on a Vulkan device a launch of more
+ * work-groups than {@code maxComputeWorkGroupCount[0]} checks the folded one-dimensional dispatch. Every other
+ * device and backend must lack the forms, and Vulkan serves them only on Intel devices
+ * ({@link SubgroupRowForms#served}), so the projections keep the family there. The tolerance derives from the L1
+ * magnitude of each row's terms, which bounds the float summation-order error.
  */
 @RunWith(Parameterized.class)
 public class SubgroupRowMatvecGpuTest {
 
     private static final int[] ROW_COUNTS = {1, 3, 13};
     private static final int[] COL_COUNTS = {256, 1280, 2560};
-    private static final GGMLType[] TYPES = {GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K};
+    private static final GGMLType[] TYPES = {GGMLType.Q8_0, GGMLType.Q4_0, GGMLType.Q4_K, GGMLType.Q5_K,
+        GGMLType.Q6_K};
     private static final String OPENCL_PREFIX = "opencl:";
     private static final int PCI_VENDOR_INTEL = 0x8086;
     /** Largest work-group limit the folding test still exceeds with a launch it can afford. */
@@ -275,6 +276,32 @@ public class SubgroupRowMatvecGpuTest {
         }
     }
 
+    /**
+     * The projection shapes of a 0.6B Qwen3 decoder (rows x cols: 1024 x 1024 for Q and the output, 3072 x 1024 for
+     * gate and up, 1024 x 2048 for the 16-head output projection, 1024 x 3072 for down), whose row counts span many
+     * work-groups of the launch and whose rows hold 16 to 48 Q8_0 block pairs.
+     */
+    @Test
+    public void decoderShapesMatchTheReference() throws Exception {
+        assumeForms();
+        int[][] shapes = {{1024, 1024}, {3072, 1024}, {1024, 2048}, {1024, 3072}};
+        for (GGMLType type : TYPES) {
+            for (int[] shape : shapes) {
+                int rows = shape[0];
+                int cols = shape[1];
+                if (!SubgroupRowMatvec.shapeServes(type, cols)) {
+                    continue;
+                }
+                byte[] w = randomWeights(type, rows, cols, 37L * rows + cols + type.ordinal());
+                float[] x = randomActivations(cols, 41L + cols);
+                float[] termAbs = new float[rows];
+                float[] want = reference(type, w, rows, cols, x, termAbs);
+                float[] got = run(type.name() + "_MatVecSg_Q8", rows, cols, x, new float[rows], w);
+                assertClose(type + " " + rows + "x" + cols + " MatVecSg", want, got, termAbs);
+            }
+        }
+    }
+
     @Test
     public void fusedGateUpMatchesTheReference() throws Exception {
         assumeForms();
@@ -384,7 +411,7 @@ public class SubgroupRowMatvecGpuTest {
             int base = b * blockBytes;
             if (type == GGMLType.Q6_K) {
                 putHalf(data, base + 208, 0.01f);
-            } else if (type == GGMLType.Q4_K) {
+            } else if (type == GGMLType.Q4_K || type == GGMLType.Q5_K) {
                 putHalf(data, base, 0.02f);
                 putHalf(data, base + 2, 0.01f);
             } else {

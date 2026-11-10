@@ -153,7 +153,7 @@ public final class OpenClKernelLibrary implements KernelLibrary {
      * subgroup size, which the pair's bit-identical reduction contract requires: the hardware
      * reduction width otherwise follows the compiler's per-kernel SIMD choice. The pin is the
      * largest size in the range: the matvec reductions are bandwidth-bound, and on the Intel
-     * Arrow-Lake iGPU a Qwen3 0.6B Q8_0 forward step measured 669 ms at 9 rows pinned to 32 against
+     * Arrow-Lake iGPU a Qwen3-Embedding 0.6B Q8_0 forward step measured 669 ms at 9 rows pinned to 32 against
      * 748 unpinned, 760 pinned to 16 and 1097 pinned to 8 (147, 140, 184 and 256 ms at one row).
      * Programs without subgroup reductions get 0 whatever size the capabilities carry (NVIDIA and
      * AMD report their warp/wave size without exposing a required-size extension), and so does a

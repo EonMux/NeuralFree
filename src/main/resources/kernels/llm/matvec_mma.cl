@@ -11,8 +11,8 @@
  *   out[t * rows + r] = sum_k W[r][k] * x[t][k],  r < rows, t < n_tokens <= NT
  *
  * xq holds n_tokens consecutive Q8_1 rows (ggml block_q8_1: d f16 @0, s = d * sum(qs) f16 @2, qs[32] @4;
- * cols / 32 blocks per row), the LLM_QuantizeQ8_1 output the counted matvec lane reads. T is Q8_0, Q4_K or
- * Q6_K; NT is 8 or 16 (one or two n8 token tiles).
+ * cols / 32 blocks per row), the LLM_QuantizeQ8_1 output the counted matvec lane reads. T is Q8_0, Q4_K, Q5_K
+ * or Q6_K; NT is 8 or 16 (one or two n8 token tiles).
  *
  * Geometry: global {ceil(rows / (16 * MT)) * L}, local {L}, L = 32 * nw with nw in 1..NF_MVM_MAX_WARPS. A
  * work-group owns the 16 * MT rows [r0, r0 + 16 * MT) (MT m16 tiles); its nw warps split the reduction
@@ -25,17 +25,18 @@
  * m16 tile, B registers token g of the n8 tile, C/D rows g (+8) at tokens 2q, 2q + 1. The dot over a
  * 32-element group is order-free, so each type picks the lane-to-element map that makes its weight bytes
  * contiguous per lane, and the B fragment follows the same map:
- *   - Q8_0, Q4_K: lane q takes elements [8q, 8q + 8) of the group (one 8-byte run of Q8_0 codes, the low or
- *     high nibbles of one 8-byte Q4_K run), so B is the 8 bytes [8q, 8q + 8) of the Q8_1 block.
+ *   - Q8_0, Q4_K, Q5_K: lane q takes elements [8q, 8q + 8) of the group (one 8-byte run of Q8_0 codes, the low
+ *     or high nibbles of one 8-byte Q4_K or Q5_K run, a Q5_K code's fifth bit from the qh bytes [8q, 8q + 8)),
+ *     so B is the 8 bytes [8q, 8q + 8) of the Q8_1 block.
  *   - Q6_K: one k16 product per 16-element scale group, lane q takes elements [4q, 4q + 4) and
  *     [16 + 4q, 16 + 4q + 4) (the standard layout), so B is the words at 4q and 16 + 4q.
- * Scales apply per group after the int32 product: Q8_0 c * dw * dx, Q4_K c * (d sc) * dx - (dmin m) * s,
+ * Scales apply per group after the int32 product: Q8_0 c * dw * dx, Q4_K and Q5_K c * (d sc) * dx - (dmin m) * s,
  * Q6_K (c0 sc0 + c1 sc1) * d * dx with the integer scale sums exact in int32.
  *
  * Steps: Q8_0 two blocks (64 elements; a block pair is word aligned, its first block's codes start two
- * bytes past a word boundary, so they are rebuilt with a funnel shift), Q4_K and Q6_K half a super-block
+ * bytes past a word boundary, so they are rebuilt with a funnel shift), the K-quants half a super-block
  * (128 elements). Host plan constraints (gguf.ops.gemm.MatVecMmaPlan): cols a multiple of 64 (Q8_0) or 512
- * (Q4_K, Q6_K: an even block count keeps every row word aligned), 2 <= n_tokens <= NT, the weight rows
+ * (Q4_K, Q5_K, Q6_K: an even block count keeps every row word aligned), 2 <= n_tokens <= NT, the weight rows
  * contiguous at cols / BS * BB bytes. A violation writes NaN over the work-group's outputs.
  */
 
@@ -48,6 +49,7 @@
 #define NF_MVM_Q8_0 0
 #define NF_MVM_Q4_K 1
 #define NF_MVM_Q6_K 2
+#define NF_MVM_Q5_K 3
 
 /* d = A * B over one 16 x 8 x 32 int8 tile, zero accumulator. */
 NF_INLINE void nf_mvm_k32(int d[4], uint a0, uint a1, uint a2, uint a3, uint b0, uint b1) {
@@ -89,10 +91,11 @@ NF_INLINE float nf_mvm_h(uint bits) {
  *   Q8_0: w[0..1] block 2p codes [8q, 8q+8), w[2..3] block 2p+1 codes, w[4] the two block scales (f16 pair)
  *   Q4_K: w[0..3] the two 8-byte runs [16 + 32j + 8q] of the half's sub-block pairs j = 2h, 2h + 1,
  *         w[4..6] the 12 scale bytes and w[7] (d, dmin)
+ *   Q5_K: w[0..7] as Q4_K from the code runs [48 + 32j + 8q], w[8..9] the qh bytes [16 + 8q, 16 + 8q + 8)
  *   Q6_K: w[0..3] ql words at 64h + {0, 16, 32, 48} + 4q, w[4..5] qh words at 128 + 32h + {0, 16} + 4q,
  *         w[6..7] the half's eight int8 scales at 192 + 8h, w[8] d (f16 bits)
  */
-#define NF_MVM_WREGS 9
+#define NF_MVM_WREGS 10
 
 template <int T>
 NF_INLINE void nf_mvm_load(NF_GLOBAL const uchar* row, int step, int tq, uint w[NF_MVM_WREGS]) {
@@ -108,14 +111,20 @@ NF_INLINE void nf_mvm_load(NF_GLOBAL const uchar* row, int step, int tq, uint w[
         const uint s0 = nf_mvm_w(p);                          /* d0 | codes 0, 1 */
         const uint s1 = nf_mvm_w(p + 32);                     /* codes 30, 31 | d1 */
         w[4] = (s0 & 0xFFFFu) | (s1 & 0xFFFF0000u);
-    } else if (T == NF_MVM_Q4_K) {
-        NF_GLOBAL const uchar* b = row + (step >> 1) * 144;
+    } else if (T == NF_MVM_Q4_K || T == NF_MVM_Q5_K) {
+        const int q5 = T == NF_MVM_Q5_K;
+        NF_GLOBAL const uchar* b = row + (step >> 1) * (q5 ? 176 : 144);
+        const int qs = q5 ? 48 : 16;
         const int h = step & 1;
-        const uint2 r0 = *(NF_GLOBAL const uint2*)(b + 16 + 64 * h + 8 * tq);
-        const uint2 r1 = *(NF_GLOBAL const uint2*)(b + 48 + 64 * h + 8 * tq);
+        const uint2 r0 = *(NF_GLOBAL const uint2*)(b + qs + 64 * h + 8 * tq);
+        const uint2 r1 = *(NF_GLOBAL const uint2*)(b + qs + 32 + 64 * h + 8 * tq);
         const uint4 hd = *(NF_GLOBAL const uint4*)b;
         w[0] = r0.x; w[1] = r0.y; w[2] = r1.x; w[3] = r1.y;
         w[4] = hd.y; w[5] = hd.z; w[6] = hd.w; w[7] = hd.x;
+        if (q5) {
+            const uint2 qh = *(NF_GLOBAL const uint2*)(b + 16 + 8 * tq);
+            w[8] = qh.x; w[9] = qh.y;
+        }
     } else {
         NF_GLOBAL const uchar* b = row + (step >> 1) * 210;
         const int h = step & 1;
@@ -157,7 +166,7 @@ NF_INLINE uint nf_mvm_q6(uint ql, uint qh, int hi, int sh) {
 
 /*
  * The activation words of Q8_1 block sb for this lane, per n tile j: x[j][0..1] the B fragment (token 8j + g;
- * Q8_0 / Q4_K elements [8q, 8q + 8), Q6_K the words at 4q and 16 + 4q), x[j][2..3] the d|s words of the C
+ * Q8_0 / Q4_K / Q5_K elements [8q, 8q + 8), Q6_K the words at 4q and 16 + 4q), x[j][2..3] the d|s words of the C
  * tokens 8j + 2q and 8j + 2q + 1. Dead tokens read nothing and give zero.
  */
 template <int T, int NJ>
@@ -197,7 +206,7 @@ NF_INLINE void nf_mvm_run(const int rows, const int cols, const int n_tokens,
     const int tq = lane & 3;
     const int r0 = (int)get_group_id(0) * TR;
     const int bs = T == NF_MVM_Q8_0 ? 32 : 256;
-    const int bb = T == NF_MVM_Q8_0 ? 34 : (T == NF_MVM_Q4_K ? 144 : 210);
+    const int bb = T == NF_MVM_Q8_0 ? 34 : T == NF_MVM_Q4_K ? 144 : T == NF_MVM_Q5_K ? 176 : 210;
     const int align = T == NF_MVM_Q8_0 ? 64 : 512;
     const int ok = rows > 0 && cols > 0 && cols % align == 0 && n_tokens >= 1 && n_tokens <= NT
                    && nw >= 1 && nw <= NF_MVM_MAX_WARPS && ((int)get_local_size(0) & 31) == 0;
@@ -327,15 +336,22 @@ NF_INLINE void nf_mvm_run(const int rows, const int cols, const int n_tokens,
                         acc[i][j][2] += (float)d[2] * (db * dx[j][0]);
                         acc[i][j][3] += (float)d[3] * (db * dx[j][1]);
                     }
-                } else if (T == NF_MVM_Q4_K) {
-                    /* sub-block 4h + u of the super-block: pair j = u >> 1 of the step, nibble u & 1 */
+                } else if (T == NF_MVM_Q4_K || T == NF_MVM_Q5_K) {
+                    /* sub-block 4h + u of the super-block: pair j = u >> 1 of the step, nibble u & 1; a Q5_K
+                     * code's fifth bit is bit `sub` of its qh byte */
                     const int sub = 4 * (s & 1) + u;
                     const int hi = u & 1;
                     const int pr = u >> 1;
-                    const uint a0 = (wa[2 * pr] >> (4 * hi)) & 0x0F0F0F0Fu;
-                    const uint a2 = (wa[2 * pr + 1] >> (4 * hi)) & 0x0F0F0F0Fu;
-                    const uint a1 = (wb[2 * pr] >> (4 * hi)) & 0x0F0F0F0Fu;
-                    const uint a3 = (wb[2 * pr + 1] >> (4 * hi)) & 0x0F0F0F0Fu;
+                    uint a0 = (wa[2 * pr] >> (4 * hi)) & 0x0F0F0F0Fu;
+                    uint a2 = (wa[2 * pr + 1] >> (4 * hi)) & 0x0F0F0F0Fu;
+                    uint a1 = (wb[2 * pr] >> (4 * hi)) & 0x0F0F0F0Fu;
+                    uint a3 = (wb[2 * pr + 1] >> (4 * hi)) & 0x0F0F0F0Fu;
+                    if (T == NF_MVM_Q5_K) {
+                        a0 |= ((wa[8] >> sub) & 0x01010101u) << 4;
+                        a2 |= ((wa[9] >> sub) & 0x01010101u) << 4;
+                        a1 |= ((wb[8] >> sub) & 0x01010101u) << 4;
+                        a3 |= ((wb[9] >> sub) & 0x01010101u) << 4;
+                    }
                     int sca, ma, scb, mb;
                     nf_mvm_k4_scale(wa + 4, sub, &sca, &ma);
                     nf_mvm_k4_scale(wb + 4, sub, &scb, &mb);
@@ -450,6 +466,8 @@ NF_MVM_KERNEL(Q8_0_MatVecMma8_Q8, NF_MVM_Q8_0, 8, 2, 0, 2)
 NF_MVM_KERNEL(Q8_0_MatVecMma16_Q8, NF_MVM_Q8_0, 16, 1, 1, 2)
 NF_MVM_KERNEL(Q4_K_MatVecMma8_Q8, NF_MVM_Q4_K, 8, 2, 1, 1)
 NF_MVM_KERNEL(Q4_K_MatVecMma16_Q8, NF_MVM_Q4_K, 16, 2, 1, 1)
+NF_MVM_KERNEL(Q5_K_MatVecMma8_Q8, NF_MVM_Q5_K, 8, 2, 1, 1)
+NF_MVM_KERNEL(Q5_K_MatVecMma16_Q8, NF_MVM_Q5_K, 16, 2, 1, 1)
 NF_MVM_KERNEL(Q6_K_MatVecMma8_Q8, NF_MVM_Q6_K, 8, 2, 0, 1)
 NF_MVM_KERNEL(Q6_K_MatVecMma16_Q8, NF_MVM_Q6_K, 16, 2, 0, 1)
 

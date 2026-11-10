@@ -1925,14 +1925,18 @@ Q5_K_MatVec2N8_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q5_K_MatVec2N9_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q5_K_MatVec2_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q5_K_MatVecAdd	matvec_kquant.cl	3	2	i,i	iiBBB
+Q5_K_MatVecAddRow_Q8	matvec_row.cl	3	2	i,i	iiBBB
 Q5_K_MatVecAdd_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q5_K_MatVecFusedGateUp	matvec_kquant.cl	4	2	i,i	iiBBBB
+Q5_K_MatVecFusedGateUpRow_Q8	matvec_row.cl	4	2	i,i	iiBBBB
 Q5_K_MatVecFusedGateUp_Q8	matvec_kquant.cl	4	2	i,i	iiBBBB
 Q5_K_MatVecId	moe_matvec.cl	5	9	i,i,i,i,i,i,i,i,i	iiiiiiiiiBBBBB
 Q5_K_MatVecIdGateUp	moe_matvec.cl	6	13	i,i,i,i,i,i,f,f,f,i,i,i,i	iiiiiifffiiiiBBBBBB
 Q5_K_MatVecIdGateUpInd	moe_matvec.cl	7	11	i,i,i,i,i,i,f,f,f,i,i	iiiiiifffiiBBBBBBB
 Q5_K_MatVecIdInd	moe_matvec.cl	6	7	i,i,i,i,i,i,i	iiiiiiiBBBBBB
 Q5_K_MatVecIdT	moe_matvec.cl	5	9	i,i,i,i,i,i,i,i,i	iiiiiiiiiBBBBB
+Q5_K_MatVecMma16_Q8	matvec_mma.cl	3	3	i,i,i	iiiBBB
+Q5_K_MatVecMma8_Q8	matvec_mma.cl	3	3	i,i,i	iiiBBB
 Q5_K_MatVecN10_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q5_K_MatVecN11_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q5_K_MatVecN12_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
@@ -1949,6 +1953,7 @@ Q5_K_MatVecN7_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q5_K_MatVecN8_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q5_K_MatVecN9_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q5_K_MatVecN_Q8	matvec_kquant.cl	3	3	i,i,i	iiiBBB
+Q5_K_MatVecRow_Q8	matvec_row.cl	3	2	i,i	iiBBB
 Q5_K_MatVec_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q6_K_BatchEmbeddingLookup	matvec_kquant.cl	3	2	i,i	iiBBB
 Q6_K_BatchMatMul	matvec_kquant.cl	3	3	i,i,i	iiiBBB

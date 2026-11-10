@@ -86,6 +86,9 @@ public final class GemmKernels {
     public static final String MATMUL_MMQ_SUFFIX = "_MatMul_MMQ";
     /** Name suffix of the split-K twins of the int8 MMQ GEMM kernels, {@code <T>_MatMul_MMQ_KSplit}. */
     public static final String MATMUL_MMQ_KSPLIT_SUFFIX = "_MatMul_MMQ_KSplit";
+    /** Name suffix of the split-K twins of the subgroup-row MMQ GEMM kernels, {@code <T>_MatMulSg_MMQ_KSplit}
+     *  (kernels/llm/matmul_mmq_sg.cl). */
+    public static final String MATMUL_MMQ_SG_KSPLIT_SUFFIX = "_MatMulSg_MMQ_KSplit";
     /** Name suffix of the stream-k form of the int8 MMQ GEMM kernels, {@code <T>_MatMul_MMQ_StreamK}. */
     public static final String MATMUL_MMQ_STREAMK_SUFFIX = "_MatMul_MMQ_StreamK";
     /** Name suffix of the fused gate/up SwiGLU stream-k kernels, {@code <T>_MatMul_MMQ_StreamK_GateUp}. */

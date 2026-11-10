@@ -8,7 +8,8 @@ import java.util.Objects;
 
 /**
  * Immutable dispatch plan of one split-K GEMM over the fast GEMM lanes: the
- * {@code <T>_MatMul_MMA_KSplit}, {@code <T>_MatMul_MMQ_KSplit}, {@code <T>_MatMul_W4A8_KSplit} or
+ * {@code <T>_MatMul_MMA_KSplit}, {@code <T>_MatMul_MMQ_KSplit}, {@code <T>_MatMulSg_MMQ_KSplit},
+ * {@code <T>_MatMul_W4A8_KSplit} or
  * {@code <T>_MatMul_CM_KSplit} partial launch and its {@code LLM_SplitK_Reduce} reduce, with the
  * validated shape and view arguments, the work sizes and the argument arrays.
  *
@@ -17,13 +18,13 @@ import java.util.Objects;
  * {@code partial[(s * N + t) * M + r] = sum_k W[r][k] * x[t][k]} with the tiles and paths of its
  * family: the MMA GEMM over a dense 16-bit weight ({@link Family#MMA},
  * kernels/llm/common/matmul_mma_family.h), the int8 MMQ GEMM over the staged activation records of
- * {@link GemmKernels#QUANT_MMQ_Q8_1} ({@link Family#MMQ}, kernels/llm/common/matmul_mmq_family.h), the
- * E4M3 GEMM over codes of a 4-bit or FP8 weight ({@link Family#W4A8}, kernels/llm/matmul_fp8.cl) or
- * the dequantizing CM GEMM ({@link Family#CM}, kernels/llm/matmul_cm.cl and
- * shaders/llm/matmul_mmq_cm.comp); the reduce sums the planes into {@code y[yOff + t*yStride + r]}
- * (kernels/llm/split_k_reduce.cl). Every slice covers whole stage depths ({@code kSlice} is a
- * multiple of the family's slice depth, and of the type's block size for the quantized families, so
- * a slice always starts at a block and chunk boundary) and the last slice is not empty
+ * {@link GemmKernels#QUANT_MMQ_Q8_1} ({@link Family#MMQ}, kernels/llm/common/matmul_mmq_family.h) or its subgroup-row
+ * form over the same records ({@link Family#MMQ_SG}, kernels/llm/matmul_mmq_sg.cl), the E4M3 GEMM over codes of a 4-bit
+ * or FP8 weight ({@link Family#W4A8}, kernels/llm/matmul_fp8.cl) or the dequantizing CM GEMM ({@link Family#CM},
+ * kernels/llm/matmul_cm.cl and shaders/llm/matmul_mmq_cm.comp); the reduce sums the planes into
+ * {@code y[yOff + t*yStride + r]} (kernels/llm/split_k_reduce.cl). Every slice covers whole stage depths
+ * ({@code kSlice} is a multiple of the family's slice depth, and of the type's block size for the quantized
+ * families, so a slice always starts at a block and chunk boundary) and the last slice is not empty
  * ({@code kSlice * (splits - 1) < K}), so the full product is covered exactly once. The fp32 plane
  * sums differ from the plain kernel's sequential accumulation by fp32 addition rounding.</p>
  *
@@ -62,6 +63,17 @@ public final class SplitKGemmPlan {
     static final int TWIN64_SPLIT_WAVES = 6;
     /** Output elements per reduce work-item. */
     public static final int REDUCE_ELEMENTS_PER_ITEM = 4;
+    /** Compute units per tile of the largest subgroup-row MMQ grid that splits ({@link #subgroupSplitsFor}). */
+    static final int SUBGROUP_UNITS_PER_TILE = 8;
+    /** Compute units of the device the subgroup-row MMQ split was measured on (the Arrow-Lake iGPU under OpenCL):
+     *  {@link #subgroupSplitsFor} counts no more units than these. */
+    static final int SUBGROUP_MEASURED_UNITS = 64;
+    /** Local-memory words per token of one stage buffer of the subgroup-row MMQ GEMM ({@code NF_SGM_XT}); the
+     *  kernels double-buffer a stage of every token of the tile. */
+    static final int SUBGROUP_MMQ_TOKEN_WORDS = 32;
+    /** Reduction depth of one stage of the subgroup-row MMQ GEMM ({@code NF_SGM_TK}): a Q8_0 or Q4_0 block
+     *  pair, a quarter of a K-quant super-block. Its slices start at a stage. */
+    public static final int SUBGROUP_MMQ_SLICE_DEPTH = 64;
 
     /**
      * The fast GEMM lane a split-K plan runs: the kernel family, its weight-byte accounting and its
@@ -78,6 +90,10 @@ public final class SplitKGemmPlan {
         CM2(GemmKernels.MATMUL_CM2_KSPLIT_SUFFIX),
         /** The int8 MMQ GEMM over staged activations, stages of the device's {@link MmqConfig}. */
         MMQ(GemmKernels.MATMUL_MMQ_KSPLIT_SUFFIX),
+        /** The subgroup-row int8 MMQ GEMM over the same staged activation records, slices of whole
+         *  {@link #SUBGROUP_MMQ_SLICE_DEPTH}-deep stages and the subgroup tile its factory names
+         *  ({@link #ofSubgroupMmq}). */
+        MMQ_SG(GemmKernels.MATMUL_MMQ_SG_KSPLIT_SUFFIX),
         /** The E4M3 GEMM over a 4-bit weight, stages of the device's {@link MmqConfig}. */
         W4A8(GemmKernels.MATMUL_W4A8_KSPLIT_SUFFIX);
 
@@ -99,7 +115,7 @@ public final class SplitKGemmPlan {
 
         /** Whether the family reads the staged activation records of the device's {@link MmqConfig}. */
         boolean staged() {
-            return this == MMQ || this == W4A8;
+            return this == MMQ || this == MMQ_SG || this == W4A8;
         }
 
         /** Bytes of one activation element unit the partial kernel reads: a staged record word (MMQ, W4A8), an
@@ -111,7 +127,8 @@ public final class SplitKGemmPlan {
         /** The family's fixed slice depth, or 0 when it follows the device's {@link MmqConfig} (MMQ, W4A8). */
         int fixedSliceDepth() {
             return this == CM2 ? Cm2GemmPlan.TILE_DEPTH
-                    : this == MMA || this == CM ? MmaGemmPlan.TILE_DEPTH : 0;
+                    : this == MMA || this == CM ? MmaGemmPlan.TILE_DEPTH
+                    : this == MMQ_SG ? SUBGROUP_MMQ_SLICE_DEPTH : 0;
         }
 
         /** Bytes of one weight row of {@code k} elements over {@code type}. */
@@ -219,7 +236,7 @@ public final class SplitKGemmPlan {
                                     int splits, int kSlice, int tileTokens, int reduceLocal) {
         Objects.requireNonNull(family, "family");
         Objects.requireNonNull(type, "type");
-        if (family == Family.MMQ || family == Family.W4A8) {
+        if (family.staged()) {
             throw new IllegalArgumentException(family + " split-K plans come from their staged factory"
                     + " (the staged records follow the device's MmqConfig)");
         }
@@ -348,16 +365,23 @@ public final class SplitKGemmPlan {
     private static SplitKGemmPlan of(Family family, GGMLType type, int m, int k, int n, int xStride, int xOff,
                                      int splits, int kSlice, int tileTokens, MmqConfig staged, boolean smallSplit,
                                      int reduceLocal) {
+        int tileRows = staged != null ? staged.tileRows()
+                : family == Family.CM2 ? Cm2GemmPlan.TILE_ROWS : MmaGemmPlan.TILE_ROWS;
+        int workGroupSize = staged != null ? staged.workGroupSize()
+                : family == Family.CM2 ? Cm2GemmPlan.WORKGROUP_SIZE : MmaGemmPlan.WORKGROUP_SIZE;
+        return of(family, type, m, k, n, xStride, xOff, splits, kSlice, tileRows, tileTokens, workGroupSize, staged,
+                smallSplit, reduceLocal);
+    }
+
+    private static SplitKGemmPlan of(Family family, GGMLType type, int m, int k, int n, int xStride, int xOff,
+                                     int splits, int kSlice, int tileRows, int tileTokens, int workGroupSize,
+                                     MmqConfig staged, boolean smallSplit, int reduceLocal) {
         if (family.staged() != (staged != null)) {
             throw new IllegalArgumentException((family.staged() ? "the staged " + family + " family"
                     : "the " + family + " family") + (staged != null ? " does not" : " must")
                     + " follow a device MmqConfig");
         }
         int stageDepth = staged != null ? staged.stageDepth() : MmaGemmPlan.TILE_DEPTH;
-        int tileRows = staged != null ? staged.tileRows()
-                : family == Family.CM2 ? Cm2GemmPlan.TILE_ROWS : MmaGemmPlan.TILE_ROWS;
-        int workGroupSize = staged != null ? staged.workGroupSize()
-                : family == Family.CM2 ? Cm2GemmPlan.WORKGROUP_SIZE : MmaGemmPlan.WORKGROUP_SIZE;
         int depth = family.fixedSliceDepth() > 0 ? family.fixedSliceDepth() : stageDepth;
         if (m < 1 || k < 1 || n < 1) {
             throw new IllegalArgumentException("split-K GEMM needs M, K, N >= 1, got M=" + m + ", K=" + k
@@ -466,20 +490,90 @@ public final class SplitKGemmPlan {
                 twin.tileTokens(), twin, true, reduceLocal);
     }
 
+    /**
+     * The split of a launch of the subgroup-row MMQ GEMM ({@link Family#MMQ_SG}, {@code <T>_MatMulSg_MMQ}) over the
+     * staged records of {@code base} ({@link #subgroupSplitsFor}): its own tile of {@code tileRows} x
+     * {@code tileTokens} in work-groups of {@code workGroupSize} work-items sizes the grid, and its slices are whole
+     * {@link #SUBGROUP_MMQ_SLICE_DEPTH}-deep stages.
+     *
+     * @param computeUnits compute units of the device, or {@link DeviceCapabilities#UNKNOWN_COMPUTE_UNITS}
+     * @return the plan, or null when the heuristic does not split
+     * @throws IllegalArgumentException when K is not whole stages, or naming another violated condition
+     */
+    public static SplitKGemmPlan ofSubgroupMmq(MmqGemmPlan base, int tileRows, int tileTokens, int workGroupSize,
+                                               int computeUnits, int reduceLocal) {
+        Objects.requireNonNull(base, "base");
+        if (tileRows < 1 || tileTokens < 1 || workGroupSize < 1) {
+            throw new IllegalArgumentException("subgroup MMQ split-K needs a positive tile and work-group, got "
+                    + tileRows + " x " + tileTokens + " in " + workGroupSize);
+        }
+        if (base.k() % SUBGROUP_MMQ_SLICE_DEPTH != 0) {
+            throw new IllegalArgumentException("subgroup MMQ split-K needs K a multiple of "
+                    + SUBGROUP_MMQ_SLICE_DEPTH + ", got " + base.k());
+        }
+        int rowTiles = (base.m() + tileRows - 1) / tileRows;
+        int tokenTiles = (base.n() + tileTokens - 1) / tileTokens;
+        int splits = stepped(subgroupSplitsFor(computeUnits, rowTiles, tokenTiles, base.k()), base.k(),
+                SUBGROUP_MMQ_SLICE_DEPTH);
+        if (splits <= 1) {
+            return null;
+        }
+        return of(Family.MMQ_SG, base.type(), base.m(), base.k(), base.n(), base.qStride(), base.qOff(), splits,
+                sliceLength(base.k(), splits, SUBGROUP_MMQ_SLICE_DEPTH), tileRows, tileTokens, workGroupSize,
+                base.config(), false, reduceLocal);
+    }
+
     /** Steps the count down while its round-up would leave the last slice empty, as llama.cpp does. */
     private static SplitKGemmPlan finished(Family family, GGMLType type, int m, int k, int n, int xStride, int xOff,
                                            int splits, int tileTokens, MmqConfig staged, boolean smallSplit,
                                            int reduceLocal) {
         int depth = family.fixedSliceDepth() > 0 ? family.fixedSliceDepth()
                 : staged != null ? staged.stageDepth() : MmaGemmPlan.TILE_DEPTH;
-        while (splits > 1 && (long) sliceLength(k, splits, depth) * (splits - 1) >= k) {
-            splits--;
-        }
+        splits = stepped(splits, k, depth);
         if (splits <= 1) {
             return null;
         }
         return of(family, type, m, k, n, xStride, xOff, splits, sliceLength(k, splits, depth), tileTokens, staged,
                 smallSplit, reduceLocal);
+    }
+
+    /**
+     * The slice count of a subgroup-row MMQ grid: K of {@link #MIN_SPLIT_K} and more, and only a grid of at most one
+     * tile per {@link #SUBGROUP_UNITS_PER_TILE} compute units, which splits into {@link #MAX_SPLITS} slices (at
+     * most one partial work-group per unit). The subgroup tile is 128 rows by 32 tokens, eight times the packed-dot
+     * tile, so its grids are coarse: on the Arrow-Lake iGPU (64 compute units under OpenCL) the eight-slice split of
+     * an eight-tile grid (1024 x 2048 and 1024 x 3072 at up to 32 tokens) ran 1.2-1.8x faster than the whole grid for
+     * Q8_0, Q4_0, Q4_K and Q5_K, while the two- and three-slice splits llama.cpp's rule gives 4096 x 2560 and
+     * 2560 x 9728 (20-32 tiles) ran 0.82-0.88x and 0.85-1.2x, and the four-slice split of a 16-tile grid 0.85-1.2x.
+     * The rule counts at most {@link #SUBGROUP_MEASURED_UNITS} units, those of the measured device, so a device
+     * with more compute units splits no grid of more than eight tiles, and never the 16-32-tile grids that measured
+     * 0.82-1.2x there.
+     *
+     * @param computeUnits compute units of the device, or {@link DeviceCapabilities#UNKNOWN_COMPUTE_UNITS} (never
+     *                     split)
+     * @throws IllegalArgumentException for a negative compute-unit count
+     */
+    public static int subgroupSplitsFor(int computeUnits, int rowTiles, int tokenTiles, int k) {
+        if (computeUnits < DeviceCapabilities.UNKNOWN_COMPUTE_UNITS) {
+            throw new IllegalArgumentException("split-K heuristic needs a non-negative compute-unit count"
+                    + " (" + DeviceCapabilities.UNKNOWN_COMPUTE_UNITS + " when the device does not report one), got "
+                    + computeUnits);
+        }
+        long tiles = (long) rowTiles * tokenTiles;
+        int units = Math.min(computeUnits, SUBGROUP_MEASURED_UNITS);
+        if (computeUnits == DeviceCapabilities.UNKNOWN_COMPUTE_UNITS || k < MIN_SPLIT_K || tiles < 1
+                || tiles * SUBGROUP_UNITS_PER_TILE > units) {
+            return 1;
+        }
+        return MAX_SPLITS;
+    }
+
+    /** The largest count up to {@code splits} whose round-up slices of {@code depth} leave no slice empty. */
+    private static int stepped(int splits, int k, int depth) {
+        while (splits > 1 && (long) sliceLength(k, splits, depth) * (splits - 1) >= k) {
+            splits--;
+        }
+        return splits;
     }
 
     /**
@@ -657,7 +751,9 @@ public final class SplitKGemmPlan {
         return workGroupSize;
     }
 
-    /** The staged tile of the {@link Family#MMQ} and {@link Family#W4A8} families, or null for MMA and CM. */
+    /** The staged tile of the {@link Family#MMQ} and {@link Family#W4A8} families, or null for MMA and CM; for
+     *  {@link Family#MMQ_SG} the config whose records the launch reads (its tile is {@link #tileRows()} x the
+     *  plan's token tile, not the config's). */
     public MmqConfig stagedConfig() {
         return stagedConfig;
     }
@@ -720,7 +816,8 @@ public final class SplitKGemmPlan {
 
     /**
      * Whether the device can run the partial launches: the family plain kernel's device support plus
-     * the group counts of both dispatch dimensions (dimension 0 carries the split).
+     * the group counts of both dispatch dimensions (dimension 0 carries the split). The subgroup-row MMQ family
+     * checks its own tile ({@link #subgroupTileSupport}), not the staged config's.
      *
      * @return null when it can, otherwise the reason
      */
@@ -729,6 +826,7 @@ public final class SplitKGemmPlan {
         String reason = family == Family.MMA ? MmaGemmPlan.deviceSupport(caps)
                 : family == Family.CM ? CmGemmPlan.deviceSupport(type, caps)
                 : family == Family.CM2 ? Cm2GemmPlan.deviceSupport(type, caps)
+                : family == Family.MMQ_SG ? subgroupTileSupport(caps)
                 : MmqGemmPlan.stagedTileSupport(stagedConfig, type, caps);
         if (reason != null) {
             return reason;
@@ -744,6 +842,32 @@ public final class SplitKGemmPlan {
                     + caps.getDeviceName() + " allows " + maxGroups[1];
         }
         return null;
+    }
+
+    /**
+     * Whether the device can run the subgroup-row MMQ partial tile of this plan: work-groups of
+     * {@link #workGroupSize()} work-items and the double-buffered stage of {@link #subgroupSharedBytes()} bytes.
+     *
+     * @return null when it can, otherwise the reason
+     */
+    private String subgroupTileSupport(DeviceCapabilities caps) {
+        long maxWg = caps.getMaxWorkGroupSize();
+        if (maxWg > 0 && maxWg < workGroupSize) {
+            return kernelName + " needs work-groups of " + workGroupSize + " work-items; device "
+                    + caps.getDeviceName() + " allows " + maxWg;
+        }
+        long shared = caps.getMaxSharedMemoryBytes();
+        if (shared > 0 && shared < subgroupSharedBytes()) {
+            return kernelName + " needs " + subgroupSharedBytes() + " bytes of local memory; device "
+                    + caps.getDeviceName() + " offers " + shared;
+        }
+        return null;
+    }
+
+    /** Local memory of the subgroup-row MMQ tile: two stage buffers of {@link #SUBGROUP_MMQ_TOKEN_WORDS} words per
+     *  token of the plan's token tile. */
+    long subgroupSharedBytes() {
+        return 2L * tileTokens * SUBGROUP_MMQ_TOKEN_WORDS * Integer.BYTES;
     }
 
     /**

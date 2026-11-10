@@ -1,8 +1,8 @@
 /* matvec_row.cl - {T}_MatVecRow_Q8, {T}_MatVecAddRow_Q8 and {T}_MatVecFusedGateUpRow_Q8: the one-row
  * integer-dot matvec of the CUDA decode step. Requires: common/dialect.h, common/config.h, common/math.h */
 /*
- * CUDA-only twins of the family's single-token Q8_1-activation forms (common/matvec_family.h) for Q8_0, Q4_K and
- * Q6_K, with their argument lists:
+ * CUDA-only twins of the family's single-token Q8_1-activation forms (common/matvec_family.h) for Q8_0, Q4_K, Q5_K
+ * and Q6_K, with their argument lists:
  *
  *   {T}_MatVecRow_Q8(i rows, i cols, R uchar weight, R uchar xq, W float out)       out[r] = W[r] . x
  *   {T}_MatVecAddRow_Q8(i rows, i cols, R uchar weight, R uchar xq, RW float acc)   acc[r] += W[r] . x
@@ -17,7 +17,7 @@
  *
  *   Warp w of work-group g computes row g * W + w, W = get_local_size(0) / 32 (1, 2 or 4 warps; the host picks
  *   per type and shape, gpu.forward.WarpRowMatvec). A row's units (a Q8_0 block, a K-quant super-block) are split
- *   over lane groups of LPU lanes (4 for Q8_0, 16 for Q4_K and Q6_K); group k of the warp takes units k,
+ *   over lane groups of LPU lanes (4 for Q8_0, 16 for the K-quants); group k of the warp takes units k,
  *   k + 32 / LPU, ... so consecutive lanes read consecutive bytes. Each lane accumulates its dot in a float
  *   register and the warp reduces it by the 32-lane butterfly: no shared memory, no barrier.
  *
@@ -28,6 +28,10 @@
  *     the 144-byte super-blocks keep 16-byte alignment): the low nibbles are sub-block 2j, the high ones 2j + 1.
  *     Both dot their activation block's 8 codes; d * sc and dmin * m apply per sub-block, the minimum through the
  *     exact code sum of the lane's activation codes.
+ *   - Q5_K: the Q4_K lane map over the 176-byte super-block (qs at 48, 16-byte aligned like Q4_K's): lane q also
+ *     loads the 8 qh bytes [16 + 8 (q & 3), + 8), whose bits 2j and 2j + 1 are the fifth bits of the same
+ *     positions in sub-blocks 2j and 2j + 1, and ORs them above each nibble before the dot; the scale and minimum
+ *     terms are Q4_K's.
  *   - Q6_K: lane q of 16 takes half h = q >> 3 and the 4 positions l = 4 (q & 7): the ql words at 64h + l and
  *     64h + 32 + l and the qh word at 128 + 32h + l hold all four 2-bit planes of those positions, i.e. elements
  *     128h + l + {0, 32, 64, 96} + [0, 4), so every weight byte is read once; the 6-bit code minus 32 dots its
@@ -47,11 +51,12 @@
 #define NF_MVR_Q8_0  0
 #define NF_MVR_Q4_K  1
 #define NF_MVR_Q6_K  2
+#define NF_MVR_Q5_K  3
 
 /* Lanes per unit, elements per unit and bytes per unit of type T. */
 #define NF_MVR_LPU(T) ((T) == NF_MVR_Q8_0 ? 4 : 16)
 #define NF_MVR_BS(T)  ((T) == NF_MVR_Q8_0 ? 32 : 256)
-#define NF_MVR_BB(T)  ((T) == NF_MVR_Q8_0 ? 34 : ((T) == NF_MVR_Q4_K ? 144 : 210))
+#define NF_MVR_BB(T)  ((T) == NF_MVR_Q8_0 ? 34 : (T) == NF_MVR_Q4_K ? 144 : (T) == NF_MVR_Q5_K ? 176 : 210)
 
 #define NF_MVR_FORM_PLAIN  0
 #define NF_MVR_FORM_ADD    1
@@ -87,7 +92,7 @@ NF_INLINE void nf_mvr_k4(NF_GLOBAL const uchar* sc, int s, int* d, int* m) {
     }
 }
 
-/* Lane q's share of the dot of unit u of the Q8_0 or Q4_K weight row at row with the activation row xq. */
+/* Lane q's share of the dot of unit u of the Q8_0, Q4_K or Q5_K weight row at row with the activation row xq. */
 template <int T>
 NF_INLINE float nf_mvr_dot(NF_GLOBAL const uchar* row, NF_GLOBAL const uchar* xq, int u, int q) {
     if (T == NF_MVR_Q8_0) {
@@ -96,15 +101,24 @@ NF_INLINE float nf_mvr_dot(NF_GLOBAL const uchar* row, NF_GLOBAL const uchar* xq
         const int w1 = nf_mvr_w2(bp + 6 + 8 * q);
         const int s = nf_dp4a(w1, nf_mvr_xw(xq, u, 8 * q + 4), nf_dp4a(w0, nf_mvr_xw(xq, u, 8 * q), 0));
         return nf_mvr_h(bp) * nf_mvr_xd(xq, u) * (float)s;
-    } else if (T == NF_MVR_Q4_K) {
-        NF_GLOBAL const uchar* bp = row + u * 144;
+    } else if (T == NF_MVR_Q4_K || T == NF_MVR_Q5_K) {
+        NF_GLOBAL const uchar* bp = row + u * NF_MVR_BB(T);
         const int j = q >> 2, l0 = (q & 3) * 8;
-        const uint2 w = *(const uint2*)(bp + 16 + 32 * j + l0);
+        const uint2 w = *(const uint2*)(bp + (T == NF_MVR_Q5_K ? 48 : 16) + 32 * j + l0);
+        uint lo0 = w.x & 0x0F0F0F0Fu, lo1 = w.y & 0x0F0F0F0Fu;
+        uint hi0 = (w.x >> 4) & 0x0F0F0F0Fu, hi1 = (w.y >> 4) & 0x0F0F0F0Fu;
+        if (T == NF_MVR_Q5_K) {
+            const uint2 h = *(const uint2*)(bp + 16 + l0);
+            lo0 |= ((h.x >> (2 * j)) & 0x01010101u) << 4;
+            lo1 |= ((h.y >> (2 * j)) & 0x01010101u) << 4;
+            hi0 |= ((h.x >> (2 * j + 1)) & 0x01010101u) << 4;
+            hi1 |= ((h.y >> (2 * j + 1)) & 0x01010101u) << 4;
+        }
         const int b0 = u * 8 + 2 * j;
         const int x0 = nf_mvr_xw(xq, b0, l0), x1 = nf_mvr_xw(xq, b0, l0 + 4);
         const int y0 = nf_mvr_xw(xq, b0 + 1, l0), y1 = nf_mvr_xw(xq, b0 + 1, l0 + 4);
-        const int dlo = nf_dp4a((int)(w.y & 0x0F0F0F0Fu), x1, nf_dp4a((int)(w.x & 0x0F0F0F0Fu), x0, 0));
-        const int dhi = nf_dp4a((int)((w.y >> 4) & 0x0F0F0F0Fu), y1, nf_dp4a((int)((w.x >> 4) & 0x0F0F0F0Fu), y0, 0));
+        const int dlo = nf_dp4a((int)lo1, x1, nf_dp4a((int)lo0, x0, 0));
+        const int dhi = nf_dp4a((int)hi1, y1, nf_dp4a((int)hi0, y0, 0));
         const int slo = nf_dp4a(0x01010101, x1, nf_dp4a(0x01010101, x0, 0));
         const int shi = nf_dp4a(0x01010101, y1, nf_dp4a(0x01010101, y0, 0));
         int s0, m0, s1, m1;
@@ -228,6 +242,7 @@ void N##_MatVecFusedGateUpRow_Q8(const int rows, const int cols, NF_GLOBAL const
 
 NF_MVR_KERNELS(Q8_0, NF_MVR_Q8_0)
 NF_MVR_KERNELS(Q4_K, NF_MVR_Q4_K)
+NF_MVR_KERNELS(Q5_K, NF_MVR_Q5_K)
 NF_MVR_KERNELS(Q6_K, NF_MVR_Q6_K)
 
 #endif /* CUDA */

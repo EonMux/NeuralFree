@@ -21,6 +21,12 @@ import com.eonmux.neuralfree.gguf.ops.gemm.MatVecMmaPlan;
  *   <li>Q4_K from 2 tokens on every shape, at 4 warps (9728x2560 at 2: 26.4 us against the pair's 30.9, at 4:
  *       26.4 against 46.1; at 16: 43.4 against 144.8; the 1024-column head at 2: 139 against 204; the
  *       2560-column head at 16: 510 against 2250). The 1024-row projections tie at 2 and 3 tokens.</li>
+ *   <li>Q5_K at 4 warps from 2 tokens (9728x2560 at 2: 28.9 us against the pair's 32.6, at 8: 32.8 against
+ *       80.3; 2560x9728 at 4: 30.8 against 47.1; the 1024-column head at 2: 170 against 238), except a projection of
+ *       at most {@value #Q5_K_NARROW_ROWS} rows over at most {@value #Q5_K_SHORT_COLS} columns, from 4 tokens
+ *       (2048x1024 at 2: 11.2 against 8.9, at 4: 10.6 against 10.8; 1024x1024 at 4: 5.8 against 7.6). Through the
+ *       16-token tile a projection of at most {@value #Q5_K_EIGHT_WARP_ROWS} rows takes 8 warps (1024x3072 at 9: 10.7
+ *       against 12.5 at 4 warps and 15.8 for the pair; 1024x2560 at 16: 12.0 against 13.4 and 21.5).</li>
  *   <li>Q6_K through the 8-token tile at 4 warps on projections of at least {@value #Q6_K_WIDE_ROWS} rows: an
  *       output head from 3 tokens (151936x1024 at 3: 211 against 318; 151936x2560 at 3: 551 against 609, at 8:
  *       561 against 779 at 8 warps), the others from 4 (9728x2560 at 4: 39.0 against 42.6; 2560x9728 at 4: 42.5
@@ -48,6 +54,12 @@ public final class MatVecMmaTuning {
     static final int Q8_0_WIDE_ROWS = 2048;
     /** Widest reduction the Q8_0 8-token form serves from fewer than 8 tokens off a head. */
     static final int Q8_0_SHORT_COLS = 1024;
+    /** Most rows of a Q5_K projection over a short reduction that the tensor-core form serves only from 4 tokens. */
+    static final int Q5_K_NARROW_ROWS = 2048;
+    /** Widest reduction of such a Q5_K projection. */
+    static final int Q5_K_SHORT_COLS = 1024;
+    /** Most rows of a Q5_K projection whose 16-token form runs at 8 warps. */
+    static final int Q5_K_EIGHT_WARP_ROWS = 1024;
     /** Rows from which the Q6_K 8-token form serves at 4 warps from 4 tokens. */
     static final int Q6_K_WIDE_ROWS = 2048;
     /** Largest token count of the 8-token tile. */
@@ -69,6 +81,8 @@ public final class MatVecMmaTuning {
         switch (type) {
             case Q4_K:
                 return 4;
+            case Q5_K:
+                return q5kWarps(rows, cols, nTokens);
             case Q6_K:
                 return q6kWarps(rows, nTokens);
             case Q8_0:
@@ -76,6 +90,15 @@ public final class MatVecMmaTuning {
             default:
                 return 0;
         }
+    }
+
+    /** The Q5_K tensor-core form's warps for {@code nTokens} rows through a {@code rows x cols} projection, or 0. */
+    private static int q5kWarps(int rows, int cols, int nTokens) {
+        if (nTokens > EIGHT_TILE) {
+            return rows <= Q5_K_EIGHT_WARP_ROWS ? 8 : 4;
+        }
+        boolean narrow = rows <= Q5_K_NARROW_ROWS && cols <= Q5_K_SHORT_COLS;
+        return !narrow || nTokens >= 4 ? 4 : 0;
     }
 
     /** The Q6_K tensor-core form's warps for {@code nTokens} rows through a projection of {@code rows} rows, or 0. */

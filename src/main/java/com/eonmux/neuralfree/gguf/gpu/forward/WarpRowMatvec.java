@@ -25,6 +25,13 @@ import java.util.Set;
  *   <li>Q4_K, two warps: 23.6 against 26.2 at 9728x2560, 21.1 against 23.4 at 2560x9728, the fused gate/up
  *       43.3 against 50.7 at 9728x2560, a 151669x1024 head 124 against 187. One warp per work-group caps the
  *       resident warps at the per-SM work-group limit, which two avoid.</li>
+ *   <li>Q5_K, two warps, as Q4_K (two sweeps): the fused gate/up 32.8-34.0 against 49.4-51.2 at 9728x2560,
+ *       16.7-19.1 against 24.6-25.3 at 4096x2560 and 11.1-11.6 against 12.9-13.7 at 1024x2560; plain products at or
+ *       below the family (38.6-41.1 against 41.1-43.3 at 2560x9728, a 151936x1024 head 162-198 against 198-200).
+ *       Below the family lane's threshold, where the float matvec served Q5_K, the form takes 5.7-8.2 against
+ *       7.9-9.8 at 1024x1024 and 8.0-9.7 against 13.7-15.6 at 1024x2560. Qwen3-Embedding 0.6B decodes 611-615
+ *       tokens/s against 477-500 in Q5_K_M and 599-625 against 467-476 in pure Q5_K with them (tg128, three
+ *       alternating runs).</li>
  *   <li>Q6_K, one warp: 31.5 against 34.1 at 2560x9728, 15.0 against 16.1 at 4096x2560, the fused gate/up 65.8
  *       against 74.0 at 9728x2560, a 151669x1024 head 190 against 231. It also serves the small projections
  *       below the family lane's threshold ({@link Int8MatvecTuning#LANE_MIN_ELEMENTS}), where the float matvec beat
@@ -48,7 +55,7 @@ final class WarpRowMatvec {
 
     /** The weight types with one-row forms. */
     static final Set<GGMLType> TYPES =
-            Collections.unmodifiableSet(EnumSet.of(GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K));
+            Collections.unmodifiableSet(EnumSet.of(GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.Q6_K));
 
     private static final String Q8_SUFFIX = "_Q8";
 
@@ -89,6 +96,7 @@ final class WarpRowMatvec {
         boolean head = rows >= HEAD_ROWS;
         switch (type) {
             case Q4_K:
+            case Q5_K:
                 return 2;
             case Q6_K:
                 return head && cols > NARROW_COLS ? 0 : 1;
