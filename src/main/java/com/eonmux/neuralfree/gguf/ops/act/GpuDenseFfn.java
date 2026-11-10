@@ -89,8 +89,9 @@ public final class GpuDenseFfn implements GpuFfnBlock {
     private Projection up;
     private Projection down;
     /**
-     * True when the gate and up weights admit the single-token fused gate+up+GLU kernel. Deltas register after the
-     * block is bound, so whether a step may use the kernel is decided per step ({@link #fusedGateUpServes}).
+     * True when the gate and up weights admit a fused gate+up+GLU kernel: the single-token matvec form, or the
+     * prefill GEMM form at the ubatch. Deltas register after the block is bound and the GEMM form depends on the row
+     * count, so whether a step may use a kernel is decided per step ({@link #fusedGateUpServes}).
      */
     private boolean fusedGateUp;
     private PreparedDispatch topK;
@@ -177,7 +178,9 @@ public final class GpuDenseFfn implements GpuFfnBlock {
         down = projectionDown(weights, layer, downW);
         fusedGateUp = layout.form() == DenseLayout.Form.PARALLEL_GLU && layout.sparsity() <= 0f
                 && gate.plainWeight() && up.plainWeight()
-                && ops.gateUpGluUsable(gate.weight, up.weight, layout.glu(), layout.params());
+                && (ops.gateUpGluUsable(gate.weight, up.weight, layout.glu(), layout.params(), 1)
+                    || ubatch > 1
+                        && ops.gateUpGluUsable(gate.weight, up.weight, layout.glu(), layout.params(), ubatch));
 
         if (layout.sparsity() > 0f) {
             topKLocal = Gemma3nKernels.rowLocal(local);
@@ -372,7 +375,7 @@ public final class GpuDenseFfn implements GpuFfnBlock {
         switch (layout.form()) {
             case PARALLEL_GLU: {
                 if (fusedGateUpServes(nTokens, xOff)) {
-                    ops.gateUpGlu(gate.weight, up.weight, layout.glu(), layout.params(), x, g);
+                    ops.gateUpGlu(gate.weight, up.weight, layout.glu(), layout.params(), x, g, nTokens);
                     break;
                 }
                 GpuOps.SharedQ8 share = GpuOps.shareableQ8Activations(xOff, layout.nIn())
@@ -424,15 +427,17 @@ public final class GpuDenseFfn implements GpuFfnBlock {
     }
 
     /**
-     * Whether this step runs the fused gate+up+GLU kernel: a single token at element 0 of a layer whose weights admit
-     * it, and no LoRA delta registered on the gate or up product now, since the fused kernel computes the bare
-     * {@code W x} products and an adapter registered after binding must still apply from its first step.
+     * Whether this step runs a fused gate+up+GLU kernel: rows at element 0 of a layer whose weights admit one, a
+     * kernel serving this row count (the single-token matvec form, or the prefill GEMM form where both products
+     * would take the int8 MMQ GEMM), and no LoRA delta registered on the gate or up product now, since the fused
+     * kernels compute the bare {@code W x} products and an adapter registered after binding must still apply from
+     * its first step.
      */
     private boolean fusedGateUpServes(int nTokens, int xOff) {
         // a W12 Q-view scope refuses the fused kernel while open, so the ops-level form is re-checked per step
         // and the separate products read the Q rows instead
-        return fusedGateUp && nTokens == 1 && xOff == 0 && !gate.hasDeltas() && !up.hasDeltas()
-                && ops.gateUpGluUsable(gate.weight, up.weight, layout.glu(), layout.params());
+        return fusedGateUp && xOff == 0 && !gate.hasDeltas() && !up.hasDeltas()
+                && ops.gateUpGluUsable(gate.weight, up.weight, layout.glu(), layout.params(), nTokens);
     }
 
     private void sparsity(int nTokens) {

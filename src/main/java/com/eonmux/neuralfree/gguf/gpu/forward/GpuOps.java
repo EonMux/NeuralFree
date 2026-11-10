@@ -7,7 +7,6 @@ import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
-import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
 import com.eonmux.neuralfree.acceleration.backend.KernelHandle;
 import com.eonmux.neuralfree.gguf.BatchInvariance;
 import com.eonmux.neuralfree.gguf.GGMLType;
@@ -31,8 +30,6 @@ import com.eonmux.neuralfree.gguf.spec.ActParams;
 import com.eonmux.neuralfree.utils.LoggingUtil;
 import org.apache.logging.log4j.Logger;
 
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -85,8 +82,10 @@ import java.util.Set;
  * <ul>
  *   <li>the fast quantized-weight GEMM ({@code <T>_MatMul_MMQ}, the {@link MmqConfig} row and token tiles) over
  *       the llama.cpp MMQ types (the legacy 32-element blocks, the K-quants and the i-quants iq1_s..iq4_xs): the weight
- *       stays quantized and the activations are quantized once per projection by {@code LLM_Quant_MMQ_Q8_1} (llama.cpp
- *       quantize_mmq_q8_1) into 8-bit codes per chunk, as in llama.cpp ggml-cuda/mmq.cuh (int8 tensor cores on CUDA
+ *       stays quantized and the activations are quantized once per projection, or once for all projections of a
+ *       {@link SharedQ8} scope over them, by {@code LLM_Quant_MMQ_Q8_1} (llama.cpp quantize_mmq_q8_1; on CUDA its
+ *       warp-cooperative form {@code LLM_Quant_MMQ_Q8_1_Warp}, the same records) into 8-bit codes per chunk, as in
+ *       llama.cpp ggml-cuda/mmq.cuh (int8 tensor cores on CUDA
  *       sm_80+, else dp4a / scalar integer dots), so results differ from the tiled GEMM by the 8-bit activation
  *       quantization error; a weight with an int8 activation scheme ({@link InputTransform.ActQuant}) stages the
  *       codes with that scheme's own scale instead ({@value GemmKernels#QUANT_MMQ_INT8_STATIC},
@@ -94,7 +93,9 @@ import java.util.Set;
  *       multiplies the checkpoint's int8 activations and the ACT_QUANT fake-quantization pass is skipped. On Vulkan
  *       devices with cooperative matrices the same weight types run {@code <T>_MatMul_CM}
  *       (tile 64 rows x 32 tokens), which dequantizes the weight into fp16 tiles for the tensor cores (llama.cpp
- *       ggml-vulkan mul_mm_cm2.comp) and differs by fp16 rounding instead. {@link MmqMode} (property
+ *       ggml-vulkan mul_mm.comp's COOPMAT form) and differs by fp16 rounding instead; devices with
+ *       VK_NV_cooperative_matrix2 run {@code <T>_MatMul_CM2} ({@code Cm2GemmPlan}, llama.cpp mul_mm_cm2.comp)
+ *       there. {@link MmqMode} (property
  *       {@code neuralfree.gemm.mmq}) turns the lane off for callers that need the exact tiled GEMM.</li>
  *   <li>{@code <T>_MatMul_MMA} (tile 64 rows x 32 tokens) on devices with tensor cores
  *       ({@link DeviceFeature#COOPERATIVE_MATRIX}): F16 weights on CUDA sm_80+ and Vulkan, BF16 weights on CUDA sm_80+
@@ -216,6 +217,8 @@ public final class GpuOps implements AutoCloseable {
     final FastGemmLanes lanes;
     /** The dense projections this class's matvec, matmul, gate+up and prewarm calls run. */
     private final GpuProjections projections;
+    /** The embedding-table lookups of this class's embed calls. */
+    private final GpuEmbeddings embeddings;
     private final Set<PreparedDispatch> prepared = Collections.newSetFromMap(new IdentityHashMap<>());
     private final HadamardSignBuffers signs;
     private final Map<String, Boolean> optionalStatus = new HashMap<>();
@@ -279,6 +282,7 @@ public final class GpuOps implements AutoCloseable {
         this.q8 = new Q8Activations(scratch, kernels.caps(), int8Mode);
         this.lanes = new FastGemmLanes(this, queue, kernels, scratch);
         this.projections = new GpuProjections(this, queue, kernels, scratch);
+        this.embeddings = new GpuEmbeddings(this, queue, scratch);
         prewarmHelperKernels();
     }
 
@@ -469,28 +473,28 @@ public final class GpuOps implements AutoCloseable {
     }
 
     /**
-     * Whether the single-token fused gate and up projection with the activation ({@code {T}_MatVecFusedGateUp})
-     * can serve {@code gate} and {@code up}: the weights of one type and shape whose rows the kernels decode
-     * together, a SWIGLU without parity-changing parameters, and no weight scale or input transform. The fused
-     * kernel writes {@code silu(gate . x) * (up . x)} directly, replacing two matvecs and one GLU launch, as
-     * llama.cpp's mul_mat + mul_mat + GLU fusion does. The fused selection mode applies: {@code off} refuses the
-     * form and {@code on} requires it.
+     * Whether a fused gate and up projection with the activation serves {@code nTokens} rows of {@code gate} and
+     * {@code up}: weights of one type and shape decoded together, a SWIGLU without parity-changing parameters, no
+     * scale or input transform, and a kernel: {@code {T}_MatVecFusedGateUp} for one row, and for more the
+     * {@code <T>_MatMul_MMQ_StreamK_GateUp} GEMM where both products would run the int8 MMQ GEMM. It writes
+     * {@code silu(gate . x) * (up . x)}, replacing two products and one GLU launch (llama.cpp's mul_mat + mul_mat +
+     * GLU fusion). The fused selection mode applies: {@code off} refuses it and {@code on} requires the 1-row form.
      */
-    public boolean gateUpGluUsable(GpuWeight gate, GpuWeight up, GluOp op, ActParams params) {
-        return projections.gateUpGluUsable(gate, up, op, params);
+    public boolean gateUpGluUsable(GpuWeight gate, GpuWeight up, GluOp op, ActParams params, int nTokens) {
+        return projections.gateUpGluUsable(gate, up, op, params, nTokens);
     }
 
     /**
-     * Runs {@link #gateUpGluUsable}'s fused projection: {@code out[r] = silu(gate[r] . x) * (up[r] . x)} over the
-     * single input row {@code x} (at element 0 of {@code in}), written from element 0 of {@code out}. Above the
-     * two-row thread floor ({@link GpuProjections#TWO_ROW_MIN_THREADS} live matvec threads) the launch pairs the rows of both
-     * weights in the {@code {T}_MatVec2FusedGateUp} form at {@code global = ceil(rows / 2) * L}; below it the
-     * kernel runs one row per workgroup.
+     * Runs {@link #gateUpGluUsable}'s fused projection {@code out[t*rows + r] = silu(gate[r] . x_t) * (up[r] . x_t)}
+     * over the {@code nTokens} rows {@code x_t} from element 0 of {@code in}, written from element 0 of {@code out}.
+     * One row above the two-row thread floor ({@link GpuProjections#TWO_ROW_MIN_THREADS}) pairs the rows of both
+     * weights in {@code {T}_MatVec2FusedGateUp} at {@code global = ceil(rows / 2) * L}, below it one row per group.
      *
-     * @throws UnsupportedOperationException when the form cannot serve the weights, op or buffers
+     * @throws UnsupportedOperationException when the form cannot serve the weights, op, row count or buffers
      */
-    public void gateUpGlu(GpuWeight gate, GpuWeight up, GluOp op, ActParams params, GpuBuffer in, GpuBuffer out) {
-        projections.gateUpGlu(gate, up, op, params, in, out);
+    public void gateUpGlu(GpuWeight gate, GpuWeight up, GluOp op, ActParams params, GpuBuffer in, GpuBuffer out,
+                          int nTokens) {
+        projections.gateUpGlu(gate, up, op, params, in, out, nTokens);
     }
 
     /** {@code accum[accOff + t*rows + r] += scale * W[r] . in[inOff + t*cols ...]}. */
@@ -520,17 +524,20 @@ public final class GpuOps implements AutoCloseable {
     }
 
     /**
-     * Consecutive activation rows quantized to Q8_1 blocks once for the projections that read them
-     * ({@link #shareQ8Activations}). A projection of the scope whose view is exactly the shared rows (element 0 of
-     * their buffer, the same token count) and whose weight takes an integer-dot lane, single-token or multi-column,
-     * reuses the blocks, which are the per-projection quantizer's output bit for bit; any other quantizes its own
-     * rows. The caller keeps the rows unchanged until the scope closes. Closing enqueues nothing and is idempotent.
+     * Consecutive activation rows quantized once for the projections that read them ({@link #shareQ8Activations}). A
+     * projection of the scope whose view is exactly the shared rows (element 0 of their buffer, the same token count)
+     * reuses its lane's form, each bit for bit the per-projection staging and each in its own staging slot: the Q8_1
+     * blocks of an integer-dot lane ({@link #blocks}: the blocks the rows' norm wrote when the scope opens right after
+     * it, {@link Q8Activations#take}, else quantized on first use) or the int8 MMQ GEMM's records ({@link #records},
+     * staged on first use). Any other projection quantizes its own rows. The caller keeps the rows unchanged until the
+     * scope closes. Closing enqueues nothing and is idempotent.
      */
     public final class SharedQ8 implements AutoCloseable {
         private final GpuBuffer source;
         private final int cols;
         private final int rows;
         private GpuBuffer blocks;
+        private ScratchSlot records;
         private boolean closed;
 
         private SharedQ8(GpuBuffer source, int cols, int rows) {
@@ -542,9 +549,7 @@ public final class GpuOps implements AutoCloseable {
 
         /** The Q8_1 blocks of the shared rows, quantizing them on first use. */
         GpuBuffer blocks() {
-            if (closed) {
-                throw new IllegalStateException("the Q8_1 activation share is closed");
-            }
+            ensureShareOpen();
             if (blocks == null) {
                 long n = (long) rows * (cols / Q8_1_BLOCK_SIZE);
                 ScratchSlot slot = scratch.staging(GpuScratch.Staging.SHARED_Q8_1, n * Q8_1_FLOATS);
@@ -552,6 +557,25 @@ public final class GpuOps implements AutoCloseable {
                 blocks = slot.buffer();
             }
             return blocks;
+        }
+
+        /**
+         * The int8 MMQ GEMM's staged records of the shared rows in the {@code SHARED_MMQ} slot, staged on first use
+         * ({@link FastGemmLanes#stageQ8(GpuScratch.Staging, GpuBuffer, int, int, int)}), as llama.cpp quantizes the
+         * input of Q/K/V, and of gate/up, once.
+         */
+        ScratchSlot records() {
+            ensureShareOpen();
+            if (records == null) {
+                records = lanes.stageQ8(GpuScratch.Staging.SHARED_MMQ, source, 0, rows, cols);
+            }
+            return records;
+        }
+
+        private void ensureShareOpen() {
+            if (closed) {
+                throw new IllegalStateException("the Q8_1 activation share is closed");
+            }
         }
 
         /** Whether {@code nTokens} rows of {@code width} elements at {@code x} are the shared rows. */
@@ -704,29 +728,7 @@ public final class GpuOps implements AutoCloseable {
      *                                       {@link #embed(GpuWeight, int[], GpuBuffer, int)}
      */
     public void embed(GpuWeight table, GpuBuffer tokenIds, int nTokens, GpuBuffer out, int outOff) {
-        ensureOpen();
-        int dim = cols(table);
-        rows(table);
-        checkTokens(nTokens);
-        Objects.requireNonNull(tokenIds, "tokenIds");
-        if ((long) nTokens * Integer.BYTES > tokenIds.sizeInBytes()) {
-            throw new IllegalArgumentException("token id buffer of " + tokenIds.sizeInBytes() + " bytes is too small"
-                    + " for " + nTokens + " ids");
-        }
-        if (!table.isSingleShard()) {
-            throw new UnsupportedOperationException("embedding table " + table.name() + " is split into "
-                    + table.shardCount() + " row shards; device token ids cannot select the shard, use the host-id"
-                    + " lookup");
-        }
-        long n = (long) nTokens * dim;
-        checkView("embedding output of " + table.name(), out, outOff, n);
-        checkInt(n, "embedding output size of " + table.name());
-        WeightKernels k = family(table);
-        HadamardSpec inv = table.inverseHadamard();
-        boolean direct = outOff == 0 && (inv == null || inv.inPlaceAllowed());
-        View dst = direct ? new View(out, 0) : stagingView(GpuScratch.Staging.OUTPUT, n);
-        launchMatvec(k.batchEmbed, n, dim, nTokens, tokenIds, table.shard(0), dst.buf);
-        finishLookup(inv, dst, out, outOff, nTokens, dim);
+        embeddings.embed(table, tokenIds, nTokens, out, outOff);
     }
 
     /**
@@ -746,73 +748,7 @@ public final class GpuOps implements AutoCloseable {
      *                                  outside the table
      */
     public void embed(GpuWeight table, int[] tokens, int count, GpuBuffer out, int outOff) {
-        ensureOpen();
-        Objects.requireNonNull(tokens, "tokens");
-        if (count < 0 || count > tokens.length) {
-            throw new IllegalArgumentException("embedding lookup count " + count + " is outside [0, "
-                    + tokens.length + "]");
-        }
-        int nTokens = count;
-        int dim = cols(table);
-        checkTokens(nTokens);
-        long rows = table.rows();
-        for (int t = 0; t < nTokens; t++) {
-            if (tokens[t] < 0 || tokens[t] >= rows) {
-                throw new IllegalArgumentException("token id " + tokens[t] + " at " + t + " is outside the "
-                        + rows + " rows of " + table.name());
-            }
-        }
-        long n = (long) nTokens * dim;
-        checkView("embedding output of " + table.name(), out, outOff, n);
-        checkInt(outOff + n, "embedding output end of " + table.name());
-        if (table.isSingleShard()) {
-            ScratchSlot ids = scratch.staging(GpuScratch.Staging.INPUT, nTokens);
-            writeInts(ids, tokens);
-            embed(table, ids.buffer(), nTokens, out, outOff);
-            return;
-        }
-        WeightKernels k = family(table);
-        HadamardSpec inv = table.inverseHadamard();
-        View rowsDst = inv != null && !inv.inPlaceAllowed()
-                ? stagingView(GpuScratch.Staging.RESULT, n) : new View(out, outOff);
-        for (int t = 0; t < nTokens; t++) {
-            int s = table.shardOfRow(tokens[t]);
-            int localId = (int) (tokens[t] - table.shardRowStart(s));
-            int at = rowsDst.off + t * dim;
-            if (at == 0) {
-                launchMatvec(k.embed, dim, dim, localId, table.shard(s), rowsDst.buf);
-            } else {
-                ScratchSlot stage = scratch.staging(GpuScratch.Staging.OUTPUT, dim);
-                launchMatvec(k.embed, dim, dim, localId, table.shard(s), stage.buffer());
-                copy2dUnchecked(1, dim, stage.buffer(), stage.offset(), dim, rowsDst.buf, at, dim);
-            }
-        }
-        if (inv != null) {
-            hadamard(inv, rowsDst.buf, rowsDst.off, out, outOff, nTokens, dim);
-        }
-    }
-
-    /** Moves looked-up rows from {@code dst} to the output, through the inverse transform when there is one. */
-    private void finishLookup(HadamardSpec inv, View dst, GpuBuffer out, int outOff, int nTokens, int dim) {
-        boolean inPlace = dst.buf == out && dst.off == outOff;
-        if (inv != null) {
-            hadamard(inv, dst.buf, dst.off, out, outOff, nTokens, dim);
-        } else if (!inPlace) {
-            copy2dUnchecked(nTokens, dim, dst.buf, dst.off, dim, out, outOff, dim);
-        }
-    }
-
-    private void writeInts(ScratchSlot slot, int[] values) {
-        ByteBuffer bb = ByteBuffer.allocate(values.length * Integer.BYTES).order(ByteOrder.LITTLE_ENDIAN);
-        for (int v : values) {
-            bb.putInt(v);
-        }
-        q8.invalidate();
-        GpuEvent e = queue.enqueueWriteBuffer(slot.buffer(), (long) slot.offset() * Float.BYTES,
-                (long) values.length * Integer.BYTES, bb.array());
-        if (e != null) {
-            e.close();
-        }
+        embeddings.embed(table, tokens, count, out, outOff);
     }
 
     // ================================================================== Hadamard
@@ -1302,11 +1238,6 @@ public final class GpuOps implements AutoCloseable {
     /** The read-only float dummy; every placeholder use in this class is a read-only binding. */
     private GpuBuffer placeholder() {
         return placeholders.readOnlyFloats();
-    }
-
-    private View stagingView(GpuScratch.Staging which, long floats) {
-        ScratchSlot s = scratch.staging(which, floats);
-        return new View(s.buffer(), s.offset());
     }
 
     // ================================================================== validation

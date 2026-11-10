@@ -538,8 +538,8 @@ planes. On a reduction shorter than the split-K threshold (K below 2048, no spli
 Wider steps run the plain tile. The weight stream is a software pipeline, so the next tile's loads overlap the
 current tile's dot products, and each 4-bit word decodes in two ALU ops. On an RTX 5080 Laptop (CUDA), `nftool batched-bench -c 4096 -npp 1 -ntg 128` decodes Qwen3-Embedding-4B
 at an 8-row step of 11.0 ms in Q8_0 and 7.3 ms in Q4_K_M, and a 16-row step of 13.7 and 10.4 ms
-(`llama-batched-bench -ngl 99 -fa on`: 9.6 and 6.7 ms at 8 rows, 10.3 and 8.1 at 16); a 512-token prefill (`nftool bench -p 512`) runs 7290 t/s in Q8_0 (`llama-bench -fa 1` 10230) and
-5880 t/s in Q4_K_M (llama.cpp 9240), and 31700 t/s for Qwen3 0.6B in Q8_0 (llama.cpp 39080).
+(`llama-batched-bench -ngl 99 -fa on`: 9.6 and 6.7 ms at 8 rows, 10.3 and 8.1 at 16); a 512-token prefill (`nftool bench -p 512`) runs 7740 t/s in Q8_0 (`llama-bench -fa 1` 9690) and
+6430 t/s in Q4_K_M (llama.cpp 9150), and 38800 t/s for Qwen3 0.6B in Q8_0 (llama.cpp 38900).
 
 | Weights | Fast lane | Where | Rounding vs. the exact tiled GEMM |
 |---|---|---|---|
@@ -555,9 +555,13 @@ The i-quant types run the same MMQ GEMM llama.cpp's `mmq.cu` serves them with, d
 i-quant grids from the tables the tiled GEMM uses. TQ1_0/TQ2_0 and the NeuralFree extension types
 keep their tiled kernels (llama.cpp's MMQ does not serve them), except the E4M3 types and the E4M3 lanes below.
 
-Before the MMQ GEMM, one `LLM_Quant_MMQ_Q8_1` launch quantizes every token row of the projection
-once (llama.cpp `quantize_mmq_q8_1`), unless the checkpoint's activation scheme stages its own int8 codes
-([activation quantization](#activation-quantization)), and every row tile reads those 8-bit codes. On CUDA sm_80+
+Before the MMQ GEMM, one staging launch quantizes every token row of the projection once (llama.cpp
+`quantize_mmq_q8_1`), unless the checkpoint's activation scheme stages its own int8 codes
+([activation quantization](#activation-quantization)), and every row tile reads those 8-bit codes. Projections
+that read the same input (Q, K and V; gate and up) share one staging. On CUDA, rows that start on a
+16-byte boundary stage through `LLM_Quant_MMQ_Q8_1_Warp`, whose lanes share each record so that a warp reads its
+rows and writes its records contiguously; its records equal `LLM_Quant_MMQ_Q8_1`'s bit for bit. Other rows, and
+the other backends, run `LLM_Quant_MMQ_Q8_1`. On CUDA sm_80+
 the tensor tile is 128 rows × 128 tokens on 256 work-items: eight warps of 32 rows × 64 tokens, so every
 activation fragment feeds two `mma` and each weight word decodes once per 128-token tile (four times at a
 512-token projection). The staged records arrive by `cp.async` two 32-deep chunks ahead of the `mma`, with one
@@ -566,7 +570,12 @@ multiprocessor (llama.cpp's stream-k rule), `<T>_MatMul_MMQ_StreamK` instead run
 over an even share of the (tile, 32-deep chunk) sequence; a block that stops inside a tile writes its partial
 sums to a scratch plane, and `LLM_MMQ_StreamK_Fixup` adds those planes into the output. Tiles that no block
 splits match the plain kernel bit for bit; a split tile differs only by the fp32 rounding of the added partial
-sums, so batch-invariant runs keep the plain grid. Other devices use 16 × 16 tiles, following llama.cpp's
+sums, so batch-invariant runs keep the plain grid. A prefill's SwiGLU gate and up projections of one weight type
+and shape run as one `<T>_MatMul_MMQ_StreamK_GateUp` launch, llama.cpp's fused gate/up MMQ: each 64-row output
+tile computes the gate rows and the up rows of the same indices in one 128-row tensor tile and writes
+`silu(gate) * up`, and `LLM_MMQ_StreamK_Fixup_GateUp` completes its split tiles, in place of two GEMMs and
+`LLM_GLU` (1-2.5% faster at 512 tokens on Qwen3-Embedding 4B and 0.6B). Its tiles that no block splits equal
+`LLM_GLU` over the plain kernel's products bit for bit; batch-invariant runs keep the separate products. Other devices use 16 × 16 tiles, following llama.cpp's
 per-architecture MMQ configuration.
 
 When a checkpoint carries an activation quantization scheme (`<base>.input_scale`, `<base>.input_zero_point`, as

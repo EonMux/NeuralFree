@@ -10,6 +10,7 @@ import com.eonmux.neuralfree.acceleration.backend.DeviceIdentity;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.kernels.KernelLibraries;
 import com.eonmux.neuralfree.acceleration.kernels.KernelManifest;
+import com.eonmux.neuralfree.gguf.BatchInvariance;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.arch.GluOp;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
@@ -20,6 +21,7 @@ import com.eonmux.neuralfree.gguf.ops.gemm.GemmKernels;
 import com.eonmux.neuralfree.gguf.ops.gemm.MmqConfig;
 import com.eonmux.neuralfree.gguf.ops.gemm.MmqMode;
 import com.eonmux.neuralfree.gguf.ops.gemm.SplitKGemmPlan;
+import com.eonmux.neuralfree.gguf.ops.gemm.StreamKGemmPlan;
 import com.eonmux.neuralfree.gguf.ops.norm.NormKernels;
 import com.eonmux.neuralfree.gguf.quant.HadamardSpec;
 import com.eonmux.neuralfree.gguf.spec.ActParams;
@@ -38,6 +40,7 @@ import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotSame;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
@@ -125,6 +128,29 @@ public class GpuOpsTest {
         backend.clearLog();
         r.run();
         return backend.dispatches();
+    }
+
+    /** The dispatches of {@code ds} whose kernel name starts with {@code prefix}. */
+    private static List<FakeDispatch> dispatchesOf(List<FakeDispatch> ds, String prefix) {
+        List<FakeDispatch> out = new ArrayList<>();
+        for (FakeDispatch d : ds) {
+            if (d.kernelName().startsWith(prefix)) {
+                out.add(d);
+            }
+        }
+        return out;
+    }
+
+    /** Opens the ops on a CUDA sm_120 device of 60 multiprocessors, whose int8 MMQ lane runs the tensor tile. */
+    private void openCudaTensorTile() {
+        open(FakeComputeBackend.builder().backendType(ComputeBackend.BackendType.CUDA).strictLlmArgs(true)
+                .capabilities(tensorCores(ComputeBackend.BackendType.CUDA, 60)).build());
+    }
+
+    /** A single-shard Q8_0 weight of {@code rows} rows of {@link #COLS}. */
+    private GpuWeight q80OfRows(int rows, String name) {
+        return GpuWeight.of(name, GGMLType.Q8_0, new long[]{COLS, rows},
+                backend.allocateBuffer((long) rows * COLS / 32 * 34, true));
     }
 
     private static List<String> names(List<FakeDispatch> ds) {
@@ -295,7 +321,7 @@ public class GpuOpsTest {
         GpuWeight up = q4kSingleOfRows(1024, "blk.0.ffn_up.weight");
         GpuBuffer in = floats(COLS);
         GpuBuffer out = floats(1024);
-        List<FakeDispatch> ds = run(() -> ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, out));
+        List<FakeDispatch> ds = run(() -> ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, out, 1));
 
         assertEquals(Collections.singletonList("Q4_K_MatVec2FusedGateUp"), names(ds));
         FakeDispatch fu = ds.get(0);
@@ -315,7 +341,7 @@ public class GpuOpsTest {
         GpuWeight up = q4kSingleOfRows(128, "blk.0.ffn_up.weight");
         GpuBuffer in = floats(COLS);
         GpuBuffer out = floats(128);
-        List<FakeDispatch> ds = run(() -> ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, out));
+        List<FakeDispatch> ds = run(() -> ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, out, 1));
 
         assertEquals(Collections.singletonList("Q4_K_MatVecFusedGateUp"), names(ds));
         assertArrayEquals(new long[]{128L * local}, ds.get(0).global());
@@ -453,6 +479,227 @@ public class GpuOpsTest {
         }
     }
 
+    /**
+     * On CUDA the int8 MMQ staging runs the warp-cooperative form ({@code LLM_Quant_MMQ_Q8_1_Warp}, a {@code [cuda]}
+     * entry the OpenCL programs leave out): the per-record kernel's arguments over one work-item per float4 of the
+     * rows, read by the GEMM.
+     */
+    @Test
+    public void cudaStagesTheMmqRecordsWithTheWarpForm() {
+        openCudaTensorTile();
+        int n = 256;
+        GpuWeight w = q80OfRows(320, "blk.0.attn_q.weight");
+        GpuBuffer in = floats((long) (n + 1) * COLS);
+        GpuBuffer out = floats(320L * n);
+        List<FakeDispatch> ds = run(() -> ops.matmul(w, in, COLS, out, 0, n));
+
+        FakeDispatch quant = ds.get(0);
+        assertEquals(GemmKernels.QUANT_MMQ_Q8_1_WARP, quant.kernelName());
+        assertArrayEquals(new int[]{n, COLS, MmqConfig.INT8_TENSOR.stageDepth(), COLS, COLS}, ints(quant, 0, 5));
+        assertSame(in, quant.bufferArg(5));
+        assertArrayEquals("one work-item per float4 of the rows", new long[]{(long) n * COLS / 4}, quant.global());
+        assertTrue(ds.get(1).kernelName(), ds.get(1).kernelName().startsWith("Q8_0_MatMul_MMQ"));
+        assertSame("the GEMM reads the staged records", quant.bufferArg(6), ds.get(1).bufferArg(GemmKernels.ARG_X));
+    }
+
+    /**
+     * A view whose float4 loads would not be 16-byte aligned (an offset that is not a multiple of 4) keeps the
+     * per-record staging kernel on CUDA, which writes the same records.
+     */
+    @Test
+    public void cudaUnalignedViewsStageRecordByRecord() {
+        openCudaTensorTile();
+        int n = 256;
+        GpuWeight w = q80OfRows(320, "blk.0.attn_q.weight");
+        GpuBuffer in = floats((long) n * COLS + 2);
+        GpuBuffer out = floats(320L * n);
+        FakeDispatch quant = run(() -> ops.matmul(w, in, 2, out, 0, n)).get(0);
+        assertEquals(GemmKernels.QUANT_MMQ_Q8_1, quant.kernelName());
+        assertArrayEquals(new int[]{n, COLS, MmqConfig.INT8_TENSOR.stageDepth(), COLS, 2}, ints(quant, 0, 5));
+    }
+
+    /** A CUDA program without the warp staging keeps the per-record staging kernel. */
+    @Test
+    public void cudaProgramsWithoutTheWarpFormStageRecordByRecord() {
+        open(FakeComputeBackend.builder().backendType(ComputeBackend.BackendType.CUDA).strictLlmArgs(true)
+                .capabilities(tensorCores(ComputeBackend.BackendType.CUDA, 60))
+                .unavailableKernels(GemmKernels.QUANT_MMQ_Q8_1_WARP).build());
+        int n = 256;
+        GpuWeight w = q80OfRows(320, "blk.0.attn_q.weight");
+        GpuBuffer in = floats((long) n * COLS);
+        GpuBuffer out = floats(320L * n);
+        assertEquals(GemmKernels.QUANT_MMQ_Q8_1, run(() -> ops.matmul(w, in, 0, out, 0, n)).get(0).kernelName());
+    }
+
+    /**
+     * The projections of a {@link GpuOps.SharedQ8} scope over their input rows read one staging of the int8 MMQ
+     * records (Q, K and V, or gate and up, quantize the rows once) in a slot apart from the per-projection staging;
+     * after the scope closes a projection stages its own records again.
+     */
+    @Test
+    public void aSharedScopeStagesTheMmqRecordsOnceForItsProjections() {
+        openCudaTensorTile();
+        int n = 256;
+        GpuWeight q = q80OfRows(320, "blk.0.attn_q.weight");
+        GpuWeight k = q80OfRows(128, "blk.0.attn_k.weight");
+        GpuBuffer in = floats((long) n * COLS);
+        GpuBuffer qOut = floats(320L * n);
+        GpuBuffer kOut = floats(128L * n);
+        List<FakeDispatch> ds = run(() -> {
+            try (GpuOps.SharedQ8 ignored = ops.shareQ8Activations(in, 0, COLS, n)) {
+                ops.matmul(q, in, 0, qOut, 0, n);
+                ops.matmul(k, in, 0, kOut, 0, n);
+            }
+        });
+        List<FakeDispatch> staging = dispatchesOf(ds, GemmKernels.QUANT_MMQ_Q8_1_WARP);
+        assertEquals("one staging serves both projections", 1, staging.size());
+        GpuBuffer records = staging.get(0).bufferArg(6);
+        List<FakeDispatch> gemms = dispatchesOf(ds, "Q8_0_MatMul_MMQ");
+        assertEquals(names(ds).toString(), 2, gemms.size());
+        for (FakeDispatch g : gemms) {
+            assertSame("every projection of the scope reads the shared records", records,
+                    g.bufferArg(GemmKernels.ARG_X));
+        }
+
+        List<FakeDispatch> outside = dispatchesOf(run(() -> ops.matmul(q, in, 0, qOut, 0, n)),
+                GemmKernels.QUANT_MMQ_Q8_1_WARP);
+        assertEquals(1, outside.size());
+        assertNotSame("outside the scope the projection stages into its own slot", records,
+                outside.get(0).bufferArg(6));
+    }
+
+    /**
+     * A share's records live only as long as its scope: the next scope over the same buffer (the next layer, whose
+     * input the trunk has rewritten in place) stages again, and a projection inside a scope whose view is not the
+     * shared one stages its own records rather than reading the shared ones.
+     */
+    @Test
+    public void everyScopeStagesItsOwnRecordsAndOnlyTheSharedViewReadsThem() {
+        openCudaTensorTile();
+        int n = 256;
+        GpuWeight q = q80OfRows(320, "blk.0.attn_q.weight");
+        GpuWeight k = q80OfRows(128, "blk.0.attn_k.weight");
+        GpuBuffer in = floats((long) n * COLS);
+        GpuBuffer qOut = floats(320L * n);
+        GpuBuffer kOut = floats(128L * n);
+        List<FakeDispatch> ds = run(() -> {
+            for (int layer = 0; layer < 2; layer++) {
+                try (GpuOps.SharedQ8 ignored = ops.shareQ8Activations(in, 0, COLS, n)) {
+                    ops.matmul(q, in, 0, qOut, 0, n);
+                    ops.matmul(k, in, 0, kOut, 0, n);
+                }
+            }
+        });
+        List<String> order = new ArrayList<>();
+        for (FakeDispatch d : ds) {
+            if (d.kernelName().equals(GemmKernels.QUANT_MMQ_Q8_1_WARP)) {
+                order.add("stage");
+            } else if (d.kernelName().startsWith("Q8_0_MatMul_MMQ")) {
+                order.add("gemm");
+            }
+        }
+        assertEquals("each scope stages once, ahead of its projections",
+                Arrays.asList("stage", "gemm", "gemm", "stage", "gemm", "gemm"), order);
+
+        List<FakeDispatch> inner = run(() -> {
+            try (GpuOps.SharedQ8 ignored = ops.shareQ8Activations(in, 0, COLS, n)) {
+                ops.matmul(q, in, 0, qOut, 0, n);
+                ops.matmul(k, in, COLS, kOut, 0, n - 1);
+            }
+        });
+        List<FakeDispatch> staged = dispatchesOf(inner, GemmKernels.QUANT_MMQ_Q8_1_WARP);
+        assertEquals("the offset view stages its own records", 2, staged.size());
+        List<FakeDispatch> gemms = dispatchesOf(inner, "Q8_0_MatMul_MMQ");
+        assertEquals(names(inner).toString(), 2, gemms.size());
+        assertSame(staged.get(0).bufferArg(6), gemms.get(0).bufferArg(GemmKernels.ARG_X));
+        assertNotSame("the offset view never reads the shared records", staged.get(0).bufferArg(6),
+                gemms.get(1).bufferArg(GemmKernels.ARG_X));
+    }
+
+    /**
+     * Every launch of the fast GEMM lanes, the activation staging included, drops the Q8_1 blocks a norm recorded
+     * ({@link Q8Activations#invalidate}), so no later request reads them after a launch could have written the
+     * rows; with no launch in between, the request takes them.
+     */
+    @Test
+    public void everyFastLaneLaunchDropsTheNormWrittenQ8Record() {
+        openCudaTensorTile();
+        int n = 256;
+        int rows = 320;
+        GpuWeight gate = q80OfRows(rows, "blk.0.ffn_gate.weight");
+        GpuWeight up = q80OfRows(rows, "blk.0.ffn_up.weight");
+        GpuBuffer normed = floats(COLS);
+        GpuBuffer blocks = floats(COLS);
+        GpuBuffer in = floats((long) n * COLS);
+        GpuBuffer out = floats((long) rows * n);
+        ops.q8.emitted(normed, 1, COLS, blocks);
+        assertSame("with no launch in between the request takes the record", blocks, ops.q8.take(normed, 1, COLS));
+
+        String fast = ops.lanes.fastGemm(gate, COLS);
+        StreamKGemmPlan plain = ops.lanes.streamK(fast, gate, rows, COLS, n, 0, 0, rows);
+        StreamKGemmPlan fused = ops.lanes.streamKGateUp(fast, gate, rows, COLS, n, 0);
+        assertTrue("the plans split tiles, so each launch runs its fixup too",
+                plain.splitsTiles() && fused.splitsTiles());
+        List<Runnable> launches = Arrays.asList(
+                () -> ops.lanes.stageQ8(in, 0, n, COLS),
+                () -> ops.lanes.streamKLaunch(plain, gate.shard(0), in, out),
+                () -> ops.lanes.streamKGateUpLaunch(fused, gate.shard(0), up.shard(0), in, out));
+        for (Runnable launch : launches) {
+            ops.q8.emitted(normed, 1, COLS, blocks);
+            assertFalse(run(launch).isEmpty());
+            assertNull("a launch drops the record", ops.q8.take(normed, 1, COLS));
+        }
+    }
+
+    /**
+     * Several rows of a SWIGLU gate/up pair whose products would each run the plain-tile int8 MMQ GEMM take one
+     * {@code <T>_MatMul_MMQ_StreamK_GateUp} launch over the rows' staged records in place of the two GEMMs and
+     * {@code LLM_GLU}: the gate weight, the staged records, the output and the planes, then the up weight; its
+     * blocks split tiles, so {@code LLM_MMQ_StreamK_Fixup_GateUp} follows over the same planes and output. Batch
+     * invariance keeps the separate products.
+     */
+    @Test
+    public void prefillGateUpTakesTheFusedStreamKGemmOnTheTensorTile() {
+        openCudaTensorTile();
+        int rows = 320;
+        int n = 256;
+        GpuWeight gate = q80OfRows(rows, "blk.0.ffn_gate.weight");
+        GpuWeight up = q80OfRows(rows, "blk.0.ffn_up.weight");
+        GpuBuffer in = floats((long) n * COLS);
+        GpuBuffer out = floats((long) n * rows);
+        assertTrue(ops.gateUpGluUsable(gate, up, GluOp.SWIGLU, ActParams.NONE, n));
+        List<FakeDispatch> ds = run(() -> ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, out, n));
+
+        assertEquals(Arrays.asList(GemmKernels.QUANT_MMQ_Q8_1_WARP, "Q8_0_MatMul_MMQ_StreamK_GateUp",
+                GemmKernels.STREAM_K_FIXUP_GATE_UP), names(ds));
+        FakeDispatch quant = ds.get(0);
+        assertSame(in, quant.bufferArg(5));
+        FakeDispatch gu = ds.get(1);
+        assertArrayEquals(new int[]{rows, COLS, n, MmqConfig.INT8_TENSOR.rowRecords(COLS), 0, rows, 0},
+                ints(gu, 0, 7));
+        assertArrayEquals("five 64-row tiles by two token tiles of eight chunks over the 60 resident blocks",
+                new long[]{60L * MmqConfig.INT8_TENSOR.workGroupSize(), 1}, gu.global());
+        assertSame(gate.shard(0), gu.bufferArg(GemmKernels.ARG_WEIGHT));
+        assertSame("the GEMM reads the staged records", quant.bufferArg(6), gu.bufferArg(GemmKernels.ARG_X));
+        assertSame(out, gu.bufferArg(GemmKernels.ARG_Y));
+        assertSame(up.shard(0), gu.bufferArg(StreamKGemmPlan.ARG_WEIGHT_UP));
+        assertNotSame(out, gu.bufferArg(StreamKGemmPlan.ARG_FIXUP));
+        FakeDispatch fix = ds.get(2);
+        assertArrayEquals(new int[]{rows, COLS, n, rows, 0}, ints(fix, 0, 5));
+        assertArrayEquals("the 64 x 128 outputs of a tile in eight slices, for every block",
+                new long[]{60L * MmqConfig.INT8_TENSOR.workGroupSize(), 8}, fix.global());
+        assertSame(gu.bufferArg(StreamKGemmPlan.ARG_FIXUP), fix.bufferArg(StreamKGemmPlan.FIXUP_ARG_FIXUP));
+        assertSame(out, fix.bufferArg(StreamKGemmPlan.FIXUP_ARG_Y));
+
+        BatchInvariance.setEnabled(Boolean.TRUE);
+        try {
+            assertFalse("batch invariance keeps the separate products",
+                    ops.gateUpGluUsable(gate, up, GluOp.SWIGLU, ActParams.NONE, n));
+        } finally {
+            BatchInvariance.clearOverride();
+        }
+    }
+
     @Test
     public void matmulOfAnMmqTypeFallsBackToTiledWithoutTheMmqKernel() {
         open(FakeComputeBackend.builder().strictLlmArgs(true).unavailableKernels("Q4_K_MatMul_MMQ").build());
@@ -481,6 +728,8 @@ public class GpuOpsTest {
             assertFalse(backend.preparedKernels().toString(), backend.preparedKernels().contains("Q4_K_MatMul_MMQ"));
             assertFalse(backend.preparedKernels().toString(),
                     backend.preparedKernels().contains(GemmKernels.QUANT_MMQ_Q8_1));
+            assertFalse(backend.preparedKernels().toString(),
+                    backend.preparedKernels().contains(GemmKernels.QUANT_MMQ_Q8_1_WARP));
             assertTrue(backend.preparedKernels().toString(), backend.preparedKernels().contains("Q4_K_MatMul_Tiled"));
             assertEquals(Arrays.asList("Q4_K_MatMul_Tiled"), names(run(() -> ops.matmul(w, in, 0, out, 0, 8))));
         } finally {

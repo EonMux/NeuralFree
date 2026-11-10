@@ -46,6 +46,8 @@ final class FastGemmLanes {
 
     /** Smallest CUDA compute capability with the E4M3 tensor-core multiply ({@code sm_89}: {@code mma e4m3}). */
     static final int FP8_MIN_COMPUTE_CAPABILITY = 89;
+    /** Lanes of the warp {@link GemmKernels#QUANT_MMQ_Q8_1_WARP} reduces a record across. */
+    private static final int WARP_LANES = 32;
 
     private final GpuOps ops;
     private final ComputeQueue queue;
@@ -531,11 +533,10 @@ final class FastGemmLanes {
      */
     void splitKLaunch(SplitKGemmPlan plan, GpuBuffer shard, GpuBuffer x, GpuBuffer out, int yOff, int yStride) {
         ScratchSlot partial = scratch.staging(GpuScratch.Staging.SPLIT_K, plan.partialElements());
-        ops.q8.invalidate();
-        queue.enqueueKernelNoEvent(kernels.get(plan.kernelName()), plan.partialGlobalWorkSize(),
-                plan.partialLocalWorkSize(), plan.partialArgs(shard, x, partial.buffer()));
-        queue.enqueueKernelNoEvent(kernels.get(GemmKernels.SPLIT_K_REDUCE), plan.reduceGlobalWorkSize(),
-                plan.reduceLocalWorkSize(), plan.reduceArgs(partial.buffer(), out, yStride, yOff));
+        enqueue(plan.kernelName(), plan.partialGlobalWorkSize(), plan.partialLocalWorkSize(),
+                plan.partialArgs(shard, x, partial.buffer()));
+        enqueue(GemmKernels.SPLIT_K_REDUCE, plan.reduceGlobalWorkSize(), plan.reduceLocalWorkSize(),
+                plan.reduceArgs(partial.buffer(), out, yStride, yOff));
     }
 
     /**
@@ -556,9 +557,14 @@ final class FastGemmLanes {
                 yStride, yOff);
         StreamKGemmPlan plan = StreamKGemmPlan.of(base, kernels.caps().getComputeUnits());
         int workGroup = mmqConfig.workGroupSize();
+        return ready(plan, workGroup);
+    }
+
+    /** {@code plan}, or null when the device cannot run its stream-k kernel or its fixup. */
+    private StreamKGemmPlan ready(StreamKGemmPlan plan, int workGroup) {
         if (plan == null || plan.checkDevice(kernels.caps()) != null
                 || !ops.optionalReady(plan.kernelName(), workGroup, 1)
-                || !ops.optionalReady(GemmKernels.STREAM_K_FIXUP, workGroup, 1)) {
+                || !ops.optionalReady(plan.fixupKernelName(), workGroup, 1)) {
             return null;
         }
         return plan;
@@ -570,12 +576,49 @@ final class FastGemmLanes {
      */
     void streamKLaunch(StreamKGemmPlan plan, GpuBuffer shard, GpuBuffer q8, GpuBuffer out) {
         ScratchSlot fixup = scratch.staging(GpuScratch.Staging.SPLIT_K, plan.fixupElements());
-        queue.enqueueKernelNoEvent(kernels.get(plan.kernelName()), plan.globalWorkSize(), plan.localWorkSize(),
+        enqueue(plan.kernelName(), plan.globalWorkSize(), plan.localWorkSize(),
                 plan.args(shard, q8, out, fixup.buffer()));
-        if (plan.fixupNeeded()) {
-            queue.enqueueKernelNoEvent(kernels.get(GemmKernels.STREAM_K_FIXUP), plan.fixupGlobalWorkSize(),
-                    plan.localWorkSize(), plan.fixupArgs(fixup.buffer(), out));
+        streamKFixup(plan, fixup.buffer(), out);
+    }
+
+    /**
+     * The fused gate/up SwiGLU stream-k launch of {@code nTokens} rows staged from record unit {@code qOff} through
+     * two single-shard weights of one type and shape, writing {@code rows} activated values per token from element
+     * 0 of the output, or null when this device has no such kernel ({@link StreamKGemmPlan#ofGateUp}: the CUDA
+     * sm_80+ tensor tile).
+     */
+    StreamKGemmPlan streamKGateUp(String fastKernel, GpuWeight gate, int rows, int cols, int nTokens, int qOff) {
+        if (!fastKernel.endsWith(GemmKernels.MATMUL_MMQ_SUFFIX) || !GemmKernels.isInt8Mmq(gate.type())) {
+            return null;
         }
+        MmqGemmPlan base = MmqGemmPlan.of(mmqConfig, gate.type(), rows, cols, nTokens, mmqConfig.rowRecords(cols),
+                qOff, rows, 0);
+        return ready(StreamKGemmPlan.ofGateUp(base, kernels.caps().getComputeUnits()), mmqConfig.workGroupSize());
+    }
+
+    /** One gate/up launch of {@link #streamKGateUp}'s plan, with its planes and fixup as {@link #streamKLaunch}. */
+    void streamKGateUpLaunch(StreamKGemmPlan plan, GpuBuffer gate, GpuBuffer up, GpuBuffer q8, GpuBuffer out) {
+        ScratchSlot fixup = scratch.staging(GpuScratch.Staging.SPLIT_K, plan.fixupElements());
+        enqueue(plan.kernelName(), plan.globalWorkSize(), plan.localWorkSize(),
+                plan.argsGateUp(gate, up, q8, out, fixup.buffer()));
+        streamKFixup(plan, fixup.buffer(), out);
+    }
+
+    /** The fixup of a stream-k launch whose blocks split some tile ({@link StreamKGemmPlan#splitsTiles}). */
+    private void streamKFixup(StreamKGemmPlan plan, GpuBuffer fixup, GpuBuffer out) {
+        if (plan.splitsTiles()) {
+            enqueue(plan.fixupKernelName(), plan.fixupGlobalWorkSize(), plan.localWorkSize(),
+                    plan.fixupArgs(fixup, out));
+        }
+    }
+
+    /**
+     * Enqueues one lane launch after dropping the norm-written Q8_1 record of the owning GpuOps
+     * ({@link Q8Activations#invalidate}), as every launch path of a GpuOps does.
+     */
+    private void enqueue(String kernel, long[] global, long[] localSize, Object[] args) {
+        ops.q8.invalidate();
+        queue.enqueueKernelNoEvent(kernels.get(kernel), global, localSize, args);
     }
 
     /**
@@ -587,23 +630,50 @@ final class FastGemmLanes {
     ScratchSlot stageF16(GGMLType type, GpuBuffer x, int xOff, int nTokens, int cols) {
         Cm2GemmPlan plan = Cm2GemmPlan.of(type, 1, cols, nTokens, cols, xOff, 1, 0);
         ScratchSlot slot = scratch.staging(GpuScratch.Staging.F16, (plan.stagedHalves() + 1) / 2);
-        ops.q8.invalidate();
-        queue.enqueueKernelNoEvent(kernels.get(Cm2GemmPlan.STAGE_KERNEL), plan.stageGlobalWorkSize(),
-                Cm2GemmPlan.stageLocalWorkSize(), plan.stageArgs(x, slot.buffer()));
+        enqueue(Cm2GemmPlan.STAGE_KERNEL, plan.stageGlobalWorkSize(), Cm2GemmPlan.stageLocalWorkSize(),
+                plan.stageArgs(x, slot.buffer()));
         return slot;
     }
 
     /**
      * The staged activations of the int8 MMQ lane: one {@link GemmKernels#QUANT_MMQ_Q8_1} launch over the whole
-     * projection input, into its own staging slot (never a view of the input), shared by all row tiles of the
-     * projection (llama.cpp quantize_mmq_q8_1).
+     * projection input, into the {@code Q8_1} staging slot (never a view of the input), shared by all row tiles of
+     * the projection (llama.cpp quantize_mmq_q8_1).
      */
     ScratchSlot stageQ8(GpuBuffer x, int xOff, int nTokens, int cols) {
+        return stageQ8(GpuScratch.Staging.Q8_1, x, xOff, nTokens, cols);
+    }
+
+    /**
+     * {@link #stageQ8(GpuBuffer, int, int, int)} into staging slot {@code which} (the per-projection {@code Q8_1}
+     * slot, or the {@code SHARED_MMQ} slot of the rows of a {@link GpuOps.SharedQ8} scope, {@code SharedQ8.records}):
+     * the per-record kernel, or its warp-cooperative form ({@link GemmKernels#QUANT_MMQ_Q8_1_WARP}, the same records)
+     * where this device runs it and every float4 of the view is 16-byte aligned ({@code xOff} and the row length
+     * multiples of 4).
+     */
+    ScratchSlot stageQ8(GpuScratch.Staging which, GpuBuffer x, int xOff, int nTokens, int cols) {
         int tk = mmqConfig.stageDepth();
         long records = (long) nTokens * mmqConfig.rowRecords(cols);
-        ScratchSlot slot = scratch.staging(GpuScratch.Staging.Q8_1, Math.multiplyExact(records, mmqConfig.recordUnits()));
-        ops.launch(GemmKernels.QUANT_MMQ_Q8_1, records, nTokens, cols, tk, cols, xOff, x, slot.buffer());
+        ScratchSlot slot = scratch.staging(which, Math.multiplyExact(records, mmqConfig.recordUnits()));
+        if (warpStaging(xOff, cols)) {
+            ops.launch(GemmKernels.QUANT_MMQ_Q8_1_WARP, Math.multiplyExact((long) nTokens, cols / 4), nTokens, cols,
+                    tk, cols, xOff, x, slot.buffer());
+        } else {
+            ops.launch(GemmKernels.QUANT_MMQ_Q8_1, records, nTokens, cols, tk, cols, xOff, x, slot.buffer());
+        }
         return slot;
+    }
+
+    /**
+     * Whether a staging launch of a view at {@code xOff} with rows of {@code cols} values runs
+     * {@link GemmKernels#QUANT_MMQ_Q8_1_WARP}: both multiples of 4 (aligned float4 loads), a launch work-group of
+     * whole 32-lane warps (the kernel reduces each record with lane shuffles), and the kernel ready at that size
+     * (only the CUDA program has it).
+     */
+    private boolean warpStaging(int xOff, int cols) {
+        int launchLocal = kernels.rowReduceLocal();
+        return xOff % 4 == 0 && cols % 4 == 0 && launchLocal % WARP_LANES == 0
+                && ops.optionalReady(GemmKernels.QUANT_MMQ_Q8_1_WARP, launchLocal);
     }
 
     /**
@@ -684,6 +754,7 @@ final class FastGemmLanes {
         ops.optionalReady(fast, workGroup, 1);
         if (fast.endsWith(GemmKernels.MATMUL_MMQ_SUFFIX)) {
             ops.optionalReady(GemmKernels.QUANT_MMQ_Q8_1, local);
+            ops.optionalReady(GemmKernels.QUANT_MMQ_Q8_1_WARP, kernels.rowReduceLocal());
             ops.optionalReady(GemmKernels.matmulMmqKSplit(type), workGroup, 1);
             if (SubgroupMmqGemm.programBuilds(kernels) && SubgroupMmqGemm.kernel(type) != null) {
                 ops.optionalReady(SubgroupMmqGemm.kernel(type), SubgroupMmqGemm.workGroup(kernels, type), 1);

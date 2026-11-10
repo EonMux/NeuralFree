@@ -37,8 +37,12 @@ import java.util.Set;
  *       int y_off, GpuBuffer weight, GpuBuffer q8, GpuBuffer y, GpuBuffer fixup)} and
  *       {@code LLM_MMQ_StreamK_Fixup(int M, int K, int N, int y_stride, int y_off, GpuBuffer fixup,
  *       GpuBuffer y)}: the stream-k form of the int8 MMQ GEMM on the CUDA tensor tile
- *       ({@code kernels/llm/matmul_mmq_stream.cl}) and the pass that adds its split tiles' partial
- *       sums; dispatch geometry in {@link StreamKGemmPlan}.</li>
+ *       ({@code kernels/llm/matmul_mmq_stream.cl}) and the pass that adds its split tiles' partial sums;
+ *       dispatch geometry in {@link StreamKGemmPlan}.</li>
+ *   <li>{@code <T>_MatMul_MMQ_StreamK_GateUp(...)}: the stream-k kernel's arguments followed by
+ *       {@code GpuBuffer weight_up}, the fused gate/up SwiGLU form: {@code y = silu(weight . x) * (weight_up . x)}
+ *       over two weights of one type and shape ({@link StreamKGemmPlan#ofGateUp}), and
+ *       {@code LLM_MMQ_StreamK_Fixup_GateUp}, the fixup's arguments, which activates its split tiles.</li>
  *   <li>{@code <T>_MatMul_W4A8(int M, int K, int N, int q_stride, int q_off, int y_stride, int y_off,
  *       GpuBuffer weight, GpuBuffer q8, GpuBuffer y)}: the E4M3 GEMM of a 4-bit weight type, same argument
  *       list and staged records as the MMQ form ({@link #MATMUL_W4A8_SUFFIX}).</li>
@@ -51,7 +55,8 @@ import java.util.Set;
  *       GpuBuffer q8)}: quantizes every token row of a projection once, per {@code tk}-deep chunk
  *       (the device's {@link MmqConfig#stageDepth()}), into the records the MMQ GEMM kernels read,
  *       shared by all row tiles (llama.cpp quantize_mmq_q8_1); one work-item per chunk, a 1-D
- *       dispatch of {@code N * (K / tk)} work-items.</li>
+ *       dispatch of {@code N * (K / tk)} work-items. {@code LLM_Quant_MMQ_Q8_1_Warp} (same arguments, CUDA)
+ *       writes the same records from {@code N * K / 4} work-items, one float4 each.</li>
  *   <li>{@code LLM_Quant_MMQ_Int8Static(int N, int K, int tk, int x_stride, int x_off, float scale,
  *       GpuBuffer x, GpuBuffer q8)}, {@code LLM_Quant_MMQ_Int8Row(int N, int K, int tk, int x_stride,
  *       int x_off, GpuBuffer x, GpuBuffer q8)} and {@code LLM_Quant_MMQ_Int8Group128(...)}: the same
@@ -83,6 +88,8 @@ public final class GemmKernels {
     public static final String MATMUL_MMQ_KSPLIT_SUFFIX = "_MatMul_MMQ_KSplit";
     /** Name suffix of the stream-k form of the int8 MMQ GEMM kernels, {@code <T>_MatMul_MMQ_StreamK}. */
     public static final String MATMUL_MMQ_STREAMK_SUFFIX = "_MatMul_MMQ_StreamK";
+    /** Name suffix of the fused gate/up SwiGLU stream-k kernels, {@code <T>_MatMul_MMQ_StreamK_GateUp}. */
+    public static final String MATMUL_MMQ_STREAMK_GATE_UP_SUFFIX = "_MatMul_MMQ_StreamK_GateUp";
     /** Name suffix of the small-token-tile twins of the int8 MMQ GEMM kernels, {@code <T>_MatMul_MMQ_S}. */
     public static final String MATMUL_MMQ_S_SUFFIX = "_MatMul_MMQ_S";
     /** Name suffix of the 64-token small-token-tile twins, {@code <T>_MatMul_MMQ_S64}. */
@@ -130,6 +137,13 @@ public final class GemmKernels {
      */
     public static final String QUANT_MMQ_Q8_1 = "LLM_Quant_MMQ_Q8_1";
     /**
+     * The warp-cooperative form of {@link #QUANT_MMQ_Q8_1} ({@code kernels/llm/quant_mmq_warp.cl}, CUDA): the same
+     * records, written by {@code tk / 4} lanes per record from one float4 load each, so the row is read and the
+     * records are stored in contiguous warp spans (llama.cpp {@code quantize_mmq_q8_1}'s lane mapping), where
+     * the per-record kernel's lanes store 48 bytes apart.
+     */
+    public static final String QUANT_MMQ_Q8_1_WARP = "LLM_Quant_MMQ_Q8_1_Warp";
+    /**
      * The static int8 activation staging of an {@link ActQuantScheme#INT8_STATIC}
      * weight ({@code kernels/llm/quant_mmq_q8_1.cl}): the codes are {@code sat8(rne(x / input_scale))} and the
      * chunk scale is {@code input_scale}, so the int8 MMQ GEMM multiplies the checkpoint's own int8 codes.
@@ -165,6 +179,9 @@ public final class GemmKernels {
     public static final String SPLIT_K_REDUCE = "LLM_SplitK_Reduce";
     /** The stream-k fixup: adds the partial sums of the tiles a stream-k MMQ launch split into their outputs. */
     public static final String STREAM_K_FIXUP = "LLM_MMQ_StreamK_Fixup";
+    /** The gate/up stream-k fixup: writes {@code silu(gate) * up} of the summed partials of the split tiles of a
+     *  {@code <T>_MatMul_MMQ_StreamK_GateUp} launch. */
+    public static final String STREAM_K_FIXUP_GATE_UP = "LLM_MMQ_StreamK_Fixup_GateUp";
     /** Partial top-k over vocabulary slices. */
     public static final String TOPK_PARTIAL = "LLM_TopK_Partial";
     /** Row-wise top-k in rank order with the row's softmax denominators. */
@@ -416,6 +433,16 @@ public final class GemmKernels {
                     + "; supported: " + MMQ_TYPES);
         }
         return type.name() + MATMUL_MMQ_STREAMK_SUFFIX;
+    }
+
+    /**
+     * Name of the fused gate/up SwiGLU stream-k kernel of a weight type ({@code <T>_MatMul_MMQ_StreamK_GateUp}):
+     * CUDA sm_80+ only, like {@link #matmulMmqStreamK}.
+     *
+     * @throws IllegalArgumentException when the type has no int8 MMQ GEMM kernel
+     */
+    public static String matmulMmqStreamKGateUp(GGMLType type) {
+        return matmulMmqStreamK(type).replace(MATMUL_MMQ_STREAMK_SUFFIX, MATMUL_MMQ_STREAMK_GATE_UP_SUFFIX);
     }
 
     /**

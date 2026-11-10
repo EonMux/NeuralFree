@@ -244,9 +244,9 @@ public class W12GpuOpsDispatchTest {
         GpuBuffer in = floats(COLS);
         GpuBuffer out = floats(ROWS);
         try (GpuOps.W12QView scope = ops.openW12QView()) {
-            assertFalse(ops.gateUpGluUsable(gate, up, GluOp.SWIGLU, ActParams.NONE));
+            assertFalse(ops.gateUpGluUsable(gate, up, GluOp.SWIGLU, ActParams.NONE, 1));
             UnsupportedOperationException e = assertThrows(UnsupportedOperationException.class,
-                    () -> ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, out));
+                    () -> ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, out, 1));
             assertTrue(e.getMessage(), e.getMessage().contains("fused gate+up"));
         }
     }
@@ -260,9 +260,9 @@ public class W12GpuOpsDispatchTest {
                 backend.allocateBuffer(ROWS * W12_ROW_BYTES, true));
         GpuBuffer in = floats(COLS);
         GpuBuffer out = floats(ROWS);
-        assertTrue(ops.gateUpGluUsable(gate, up, GluOp.SWIGLU, ActParams.NONE));
+        assertTrue(ops.gateUpGluUsable(gate, up, GluOp.SWIGLU, ActParams.NONE, 1));
         assertEquals(Collections.singletonList("W12_MatVecFusedGateUp"),
-                names(run(() -> ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, out))));
+                names(run(() -> ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, out, 1))));
     }
 
     // ------------------------------------------------------------------ preparation

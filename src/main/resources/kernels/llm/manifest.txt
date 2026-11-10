@@ -46,6 +46,7 @@ moe_matvec.cl
 matmul_tiled.cl
 moe_gemm.cl
 quant_mmq_q8_1.cl
+[cuda] quant_mmq_warp.cl
 quantize_q8_1.cl
 [opencl] matvec_sg.cl
 matmul_mmq.cl

@@ -26,8 +26,9 @@ import static org.junit.Assert.assertTrue;
  * The stream-k form of the int8 MMQ GEMM ({@code <T>_MatMul_MMQ_StreamK} with {@code LLM_MMQ_StreamK_Fixup})
  * against the plain kernel of the same CUDA fatbin on the tensor tile: a partition of whole tiles runs every
  * tile through the plain kernel's chunk pipe, so its outputs equal the plain kernel's bit for bit; partitions
- * that split tiles across blocks add the fixup planes, which moves only the fp32 rounding of the partial
- * sums. The shapes cover partial row and token tiles and a chunk count that no block count divides.
+ * that split tiles across blocks add the fixup planes after the launch, which moves only the fp32 rounding of
+ * the partial sums and gives the same bits on every run. The shapes cover partial row and token tiles and a
+ * chunk count that no block count divides.
  */
 @RunWith(Parameterized.class)
 public class CudaMmqStreamKParityTest {
@@ -103,8 +104,8 @@ public class CudaMmqStreamKParityTest {
         long tiles = (long) plain.rowTiles() * plain.tokenTiles();
         for (int blocks : new int[]{(int) tiles, (int) tiles / 2}) {
             StreamKGemmPlan sk = StreamKGemmPlan.ofBlocks(plain, blocks);
-            assertTrue(sk + " splits no tile", !sk.fixupNeeded());
-            float[] out = launchStreamK(sk, weight, x);
+            assertTrue(sk + " splits no tile", !sk.splitsTiles());
+            float[] out = launchStreamK(sk, weight, x)[0];
             for (int i = 0; i < plainOut.length; i++) {
                 assertTrue(sk + " element " + i + ": " + Float.toHexString(out[i]) + " plain "
                                 + Float.toHexString(plainOut[i]),
@@ -118,7 +119,8 @@ public class CudaMmqStreamKParityTest {
      * per block) match the plain kernel within the fp32 rounding of the partial sums: the split-K planes'
      * bound ({@link CudaMmqSmallTileParityTest#theSplitKPlanesSumToThePlainKernel}), since the synthetic
      * k-quant and i-quant blocks reduce to outputs far smaller than their per-chunk partial sums, whose
-     * reassociation moves the result by a few ulps of the partials.
+     * reassociation moves the result by a few ulps of the partials. The launch and its fixup run twice over the
+     * same buffers and must give the same bits.
      */
     @Test
     public void splitTilePartitionsMatchThePlainKernel() throws InterruptedException {
@@ -130,21 +132,26 @@ public class CudaMmqStreamKParityTest {
         long steps = (long) plain.rowTiles() * plain.tokenTiles() * (k / config.stageDepth());
         for (int blocks : new int[]{5, 7, 13, (int) steps}) {
             StreamKGemmPlan sk = StreamKGemmPlan.ofBlocks(plain, blocks);
-            assertTrue(sk + " splits tiles", sk.fixupNeeded());
-            float[] out = launchStreamK(sk, weight, x);
+            assertTrue(sk + " splits tiles", sk.splitsTiles());
+            float[][] runs = launchStreamK(sk, weight, x);
+            float[] out = runs[0];
             for (int i = 0; i < plainOut.length; i++) {
                 assertTrue(sk + " element " + i + ": " + out[i] + " plain " + plainOut[i],
                         Math.abs(out[i] - plainOut[i]) <= 5e-3 * (1.0 + Math.abs(plainOut[i])));
+                assertTrue(sk + " element " + i + " differs between runs: " + Float.toHexString(out[i]) + " and "
+                                + Float.toHexString(runs[1][i]),
+                        Float.floatToRawIntBits(out[i]) == Float.floatToRawIntBits(runs[1][i]));
             }
         }
     }
 
     /**
      * The stream-k launch over freshly staged records ({@code LLM_Quant_MMQ_Q8_1}, the launch contract of
-     * {@link FastGemmParity#launchMmq}): the stream-k kernel, then the fixup when a tile is split. The fixup
-     * planes start as NaN so a plane the fixup reads but no block wrote shows in the outputs.
+     * {@link FastGemmParity#launchMmq}), then the fixup when a tile is split, twice on the same buffers; returns
+     * both outputs. The fixup planes start as NaN so a plane the fixup reads but no block wrote shows in the
+     * outputs.
      */
-    private float[] launchStreamK(StreamKGemmPlan sk, byte[] weight, float[] x) throws InterruptedException {
+    private float[][] launchStreamK(StreamKGemmPlan sk, byte[] weight, float[] x) throws InterruptedException {
         MmqGemmPlan plan = sk.base();
         int k = plan.k();
         int n = plan.n();
@@ -163,17 +170,19 @@ public class CudaMmqStreamKParityTest {
                 Object[] quantArgs = {n, k, config.stageDepth(), k, 0, xbuf, qbuf};
                 queue.enqueueKernelNoEvent(kernels.get(GemmKernels.QUANT_MMQ_Q8_1),
                         new long[]{(records + 63) / 64 * 64}, new long[]{64}, quantArgs, fv);
-                queue.enqueueKernelNoEvent(kernels.get(sk.kernelName()), sk.globalWorkSize(), sk.localWorkSize(),
-                        sk.args(wbuf, qbuf, ybuf, fbuf));
-                if (sk.fixupNeeded()) {
-                    queue.enqueueKernelNoEvent(kernels.get(GemmKernels.STREAM_K_FIXUP), sk.fixupGlobalWorkSize(),
-                            sk.localWorkSize(), sk.fixupArgs(fbuf, ybuf));
+                float[][] outs = new float[2][(int) plan.yElementsRequired()];
+                for (float[] out : outs) {
+                    queue.enqueueKernelNoEvent(kernels.get(sk.kernelName()), sk.globalWorkSize(),
+                            sk.localWorkSize(), sk.args(wbuf, qbuf, ybuf, fbuf));
+                    if (sk.splitsTiles()) {
+                        queue.enqueueKernelNoEvent(kernels.get(sk.fixupKernelName()), sk.fixupGlobalWorkSize(),
+                                sk.localWorkSize(), sk.fixupArgs(fbuf, ybuf));
+                    }
+                    try (GpuEvent read = queue.enqueueReadBuffer(ybuf, 0, (long) out.length * Float.BYTES, out)) {
+                        read.awaitCompletion();
+                    }
                 }
-                float[] out = new float[(int) plan.yElementsRequired()];
-                try (GpuEvent read = queue.enqueueReadBuffer(ybuf, 0, (long) out.length * Float.BYTES, out)) {
-                    read.awaitCompletion();
-                }
-                return out;
+                return outs;
             }
         } finally {
             wbuf.close();

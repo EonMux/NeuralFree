@@ -191,7 +191,7 @@ public class GpuGateUpGluGpuTest {
         GpuWeight gate = weight("ffn_gate.weight", GGMLType.F32, buffer(random(COLS * ROWS, 11)));
         GpuWeight up = weight("ffn_up.weight", GGMLType.F32, buffer(random(COLS * ROWS, 12)));
         Assume.assumeTrue("fused gate+up not available on " + api,
-                ops.gateUpGluUsable(gate, up, GluOp.SWIGLU, ActParams.NONE));
+                ops.gateUpGluUsable(gate, up, GluOp.SWIGLU, ActParams.NONE, 1));
         assertMatchesUnfused(gate, up, random(COLS, 13));
     }
 
@@ -210,7 +210,7 @@ public class GpuGateUpGluGpuTest {
         GpuWeight gate = weight("ffn_gate.weight", type, bytes(quantized(type, gateSeed)));
         GpuWeight up = weight("ffn_up.weight", type, bytes(quantized(type, upSeed)));
         Assume.assumeTrue("fused gate+up not available on " + api,
-                ops.gateUpGluUsable(gate, up, GluOp.SWIGLU, ActParams.NONE));
+                ops.gateUpGluUsable(gate, up, GluOp.SWIGLU, ActParams.NONE, 1));
         assertMatchesUnfused(gate, up, random(COLS, xSeed));
     }
 
@@ -224,7 +224,7 @@ public class GpuGateUpGluGpuTest {
         ops.matvec(gate, in, 0, gateOut, 0, 1);
         ops.matvec(up, in, 0, upOut, 0, 1);
         ops.glu(GluOp.SWIGLU, ActParams.NONE, gateOut, 0, ROWS, upOut, 0, ROWS, expected, 0, ROWS, 1, ROWS);
-        ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, actual);
+        ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, actual, 1);
 
         float[] want = read(expected, ROWS);
         float[] got = read(actual, ROWS);

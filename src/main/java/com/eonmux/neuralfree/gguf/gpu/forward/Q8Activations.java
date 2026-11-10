@@ -19,11 +19,13 @@ import java.util.Objects;
  * quantization, a multi-row group of the counted lane) reads the recorded blocks instead of launching the
  * quantizer, which the norm kernel's segment reductions make bit for bit the quantizer's output. The record is
  * valid only until the next queue operation of its {@link GpuOps}: every kernel launch path
- * ({@link GpuOps#enqueue}, its internal launch helpers, {@link PreparedDispatch} and the fast GEMM lanes'
- * split-K) and its fills and writes drop it first ({@link #invalidate}), so a write to the normed rows or to the
- * shared slot between the norm and the request can never be read as stale blocks, and the first request takes or
- * drops it. A norm does not emit while a {@link GpuOps.SharedQ8} scope is open, as the scope's blocks occupy the
- * slot.</p>
+ * ({@link GpuOps#enqueue}, its internal launch helpers, {@link PreparedDispatch}, the subgroup-row matvecs and every
+ * launch of the fast GEMM lanes, their activation staging included) and its fills and writes drop it first
+ * ({@link #invalidate}), so a write to the normed rows or to the shared slot between the norm and the request can
+ * never be read as stale blocks, and the first request takes or drops it. A norm does not emit while a
+ * {@link GpuOps.SharedQ8} scope is open, as the scope's blocks occupy the slot. The int8 MMQ GEMM reads its own
+ * record layout, never these blocks: a scope over the rows keeps the blocks it took and stages the GEMM's records
+ * separately ({@link GpuOps.SharedQ8#records}).</p>
  *
  * <p><b>The quantizer launch.</b> {@value GpuOps#QUANTIZE_Q8_1} quantizes one block per 32-lane subgroup on the
  * shuffle backends and one block per work-item elsewhere; {@link #quantizeWorkItems} sizes its grid.</p>

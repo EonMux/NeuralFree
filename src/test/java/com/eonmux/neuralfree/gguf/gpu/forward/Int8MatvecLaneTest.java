@@ -420,7 +420,7 @@ public class Int8MatvecLaneTest {
             GpuWeight up = weight(type, 1024);
             GpuBuffer gateOut = backend.allocateBuffer(1024L * 4);
             assertEquals(Arrays.asList(GpuOps.QUANTIZE_Q8_1, type.name() + "_MatVecFusedGateUpSg_Q8"),
-                    run(() -> ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, gateOut)));
+                    run(() -> ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, gateOut, 1)));
         }
         GpuWeight q5k = weight(GGMLType.Q5_K);
         List<String> family = run(() -> ops.matvec(q5k, in, 0, out, 0, 1));
@@ -952,7 +952,7 @@ public class Int8MatvecLaneTest {
         GpuWeight gate = weight(GGMLType.Q4_K, rows);
         GpuWeight up = weight(GGMLType.Q4_K, rows);
         List<String> names = run(() -> ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE,
-                backend.allocateBuffer((long) COLS * 4), backend.allocateBuffer((long) rows * 4)));
+                backend.allocateBuffer((long) COLS * 4), backend.allocateBuffer((long) rows * 4), 1));
         assertTrue(names.toString(), names.contains("Q4_K_MatVec2FusedGateUp_Q8"));
         assertFalse(names.toString(), names.contains("Q4_K_MatVecFusedGateUp_Q8"));
     }
@@ -988,7 +988,7 @@ public class Int8MatvecLaneTest {
         backend.clearLog();
         try (GpuOps.SharedQ8 share = ops.shareQ8Activations(in, 0, COLS)) {
             ops.matvecAdd(w, in, 0, out, 0, 1);
-            ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, out);
+            ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, out, 1);
         }
         List<String> names = kernelNames(backend.dispatches());
         assertEquals(names.toString(), 1, Collections.frequency(names, GpuOps.QUANTIZE_Q8_1));

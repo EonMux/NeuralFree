@@ -91,13 +91,21 @@ final class GpuProjections {
         project(w, in, inOff, out, outOff, nTokens, true, true);
     }
 
-    boolean gateUpGluUsable(GpuWeight gate, GpuWeight up, GluOp op, ActParams params) {
+    boolean gateUpGluUsable(GpuWeight gate, GpuWeight up, GluOp op, ActParams params, int nTokens) {
         ops.ensureOpen();
-        return fusedGateUpKernel(gate, up, op, params) != null;
+        GpuOps.checkTokens(nTokens);
+        return nTokens == 1 ? fusedGateUpKernel(gate, up, op, params) != null
+                : gateUpRowsPlan(gate, up, op, params, nTokens, 0) != null;
     }
 
-    void gateUpGlu(GpuWeight gate, GpuWeight up, GluOp op, ActParams params, GpuBuffer in, GpuBuffer out) {
+    void gateUpGlu(GpuWeight gate, GpuWeight up, GluOp op, ActParams params, GpuBuffer in, GpuBuffer out,
+                   int nTokens) {
         ops.ensureOpen();
+        GpuOps.checkTokens(nTokens);
+        if (nTokens > 1) {
+            gateUpGluRows(gate, up, op, params, in, out, nTokens);
+            return;
+        }
         String kernel = fusedGateUpKernel(gate, up, op, params);
         if (kernel == null) {
             throw new UnsupportedOperationException("no fused gate+up kernel serves " + gate + " and " + up
@@ -125,38 +133,120 @@ final class GpuProjections {
     }
 
     /**
+     * The fused gate/up SwiGLU GEMM over {@code nTokens > 1} rows at element 0 of {@code in} into the rows at element
+     * 0 of {@code out}: the staged records of the rows (shared with an open {@link GpuOps.SharedQ8} scope over them)
+     * through {@link StreamKGemmPlan#ofGateUp}'s single launch, in place of the gate and up GEMMs and the GLU pass.
+     */
+    private void gateUpGluRows(GpuWeight gate, GpuWeight up, GluOp op, ActParams params, GpuBuffer in,
+                               GpuBuffer out, int nTokens) {
+        if (gateUpRowsPlan(gate, up, op, params, nTokens, 0) == null) {
+            throw new UnsupportedOperationException("no fused gate+up GEMM serves " + nTokens + " rows of " + gate
+                    + " and " + up + " with " + op + " on the " + backend.backendType() + " backend");
+        }
+        int cols = GpuOps.cols(gate);
+        int rows = GpuOps.rows(gate);
+        long nIn = (long) nTokens * cols;
+        long nOut = (long) nTokens * rows;
+        GpuOps.checkView("fused gate+up input", in, 0, nIn);
+        GpuOps.checkView("fused gate+up output", out, 0, nOut);
+        GpuOps.checkInt(nOut, "fused gate+up output size");
+        if (GpuOps.overlaps(in, 0, nIn, out, 0, nOut)) {
+            throw new IllegalArgumentException("fused gate+up: input and output views overlap");
+        }
+        GpuMatmulTap.dense(queue, gate, in, 0, nTokens, cols);
+        GpuMatmulTap.dense(queue, up, in, 0, nTokens, cols);
+        ScratchSlot q8 = stagedRecords(new GpuOps.View(in, 0), nTokens, cols);
+        StreamKGemmPlan plan = gateUpRowsPlan(gate, up, op, params, nTokens, q8.offset());
+        ops.lanes.streamKGateUpLaunch(plan, gate.shard(0), up.shard(0), q8.buffer(), out);
+    }
+
+    /**
+     * The fused gate/up SwiGLU GEMM of {@code nTokens > 1} rows whose staged records start at unit {@code qOff}, or
+     * null: the weights pass the single-token form's structural checks, fusion is permitted, and the projection of
+     * each would run the same plain-tile int8 MMQ GEMM over plain staged records at this token count, so the fused
+     * launch changes only how the two products and the activation are grouped.
+     */
+    private StreamKGemmPlan gateUpRowsPlan(GpuWeight gate, GpuWeight up, GluOp op, ActParams params, int nTokens,
+                                           int qOff) {
+        if (!gateUpFusable(gate, up, op, params) || !fusedMode.permitsFusion()) {
+            return null;
+        }
+        int cols = GpuOps.cols(gate);
+        String fast = plainMmqLane(gate, cols, nTokens);
+        if (fast == null || !fast.equals(plainMmqLane(up, cols, nTokens))) {
+            return null;
+        }
+        return ops.lanes.streamKGateUp(fast, gate, GpuOps.rows(gate), cols, nTokens, qOff);
+    }
+
+    /**
+     * The plain-tile int8 MMQ kernel {@link #project} runs for {@code nTokens} rows of {@code w} outside batch
+     * invariance when that is its route over plain staged records (no small-token twin, no checkpoint activation or
+     * FP8 staging, no input transform), or null for any other route.
+     */
+    private String plainMmqLane(GpuWeight w, int cols, int nTokens) {
+        String lane = ops.lanes.fastGemm(w, cols);
+        if (lane == null || !lane.endsWith(GemmKernels.MATMUL_MMQ_SUFFIX) || w.hasInputTransform()
+                || w.hadamard() != null) {
+            return null;
+        }
+        WeightKernels k = ops.family(w);
+        long elements = (long) GpuOps.rows(w) * cols;
+        int floatNMax = k.matvecN != null ? SmallBatchCrossover.floatMatvecNMax(deviceKind, w.type(), elements) : 0;
+        int int8Max = SmallBatchCrossover.int8MatvecNMax(deviceKind, w.type(), elements, true);
+        if (nTokens < SmallBatchCrossover.fastGemmMinTokens(deviceKind, w.type(), elements)
+                || int8MultiColumnServes(k, w, cols, nTokens, int8Max)
+                || (nTokens >= 2 && nTokens <= floatNMax && ops.optionalReady(k.matvecN, matvecLocal))) {
+            return null;
+        }
+        boolean usable = ops.lanes.fastUsable(lane, ops.lanes.fastTileRows(lane), ops.lanes.fastTileTokens(lane),
+                ops.lanes.fastWorkGroup(lane), w, nTokens);
+        return usable && ops.lanes.smallTileKernel(lane, w, nTokens) == null && ops.lanes.int8Staging(w, cols) == null
+                && !FastGemmLanes.fp8Fast(w, lane) ? lane : null;
+    }
+
+    /**
+     * Whether gate and up admit a fused gate/up form at all: two single-shard weights of one type and shape
+     * without scale, input transform or Hadamard rotation, a SWIGLU without parity-changing parameters, outside
+     * batch invariance (which takes the separate products at every row count) and outside a W12 Q-view scope.
+     */
+    private boolean gateUpFusable(GpuWeight gate, GpuWeight up, GluOp op, ActParams params) {
+        if (BatchInvariance.enabled()) {
+            /* Batch-invariant steps take the separate products at every row count, so no fused form serves
+             * them. Requiring the fusion and requiring batch invariance cannot both hold. */
+            if (fusedMode.requiresFusion()) {
+                throw new IllegalArgumentException("-D" + FusedMode.PROPERTY + "=on requires the fused"
+                        + " gate+up kernels, which -D" + BatchInvariance.PROPERTY + " turns off");
+            }
+            return false;
+        }
+        if (gate == null || up == null || op != GluOp.SWIGLU
+                || (params != null && params != ActParams.NONE)) {
+            return false;
+        }
+        if (gate.type() != up.type() || !gate.isSingleShard() || !up.isSingleShard()
+                || gate.rows() != up.rows() || gate.cols() != up.cols()) {
+            return false;
+        }
+        if (gate.hasScale() || up.hasScale() || gate.hasInputTransform() || up.hasInputTransform()
+                || gate.hadamard() != null || up.hadamard() != null) {
+            return false;
+        }
+        if (gate.type() == GGMLType.W12 && ops.activeW12Q != null) {
+            /* A W12QView scope routes every W12 projection through the 8-bit Q view, whose row set has no
+             * fused form; the separate gate and up matvecs take it. */
+            return false;
+        }
+        return true;
+    }
+
+    /**
      * The fused gate+up kernel for these weights, or null. Structural objections (shapes, types, scale, transform,
      * op) are not a fusion the caller asked for, so they return null even in {@link FusedMode#ON}; a structurally
      * eligible layer on a backend without the kernel is refused there.
      */
     private String fusedGateUpKernel(GpuWeight gate, GpuWeight up, GluOp op, ActParams params) {
-        if (BatchInvariance.enabled()) {
-            /* A fused form runs only the single-token path; batch-invariant steps take the separate products at
-             * every row count. Requiring the fusion and requiring batch invariance cannot both hold. */
-            if (fusedMode.requiresFusion()) {
-                throw new IllegalArgumentException("-D" + FusedMode.PROPERTY + "=on requires the fused"
-                        + " gate+up kernels, which -D" + BatchInvariance.PROPERTY + " turns off");
-            }
-            return null;
-        }
-        if (gate == null || up == null || op != GluOp.SWIGLU
-                || (params != null && params != ActParams.NONE)) {
-            return null;
-        }
-        if (gate.type() != up.type() || !gate.isSingleShard() || !up.isSingleShard()
-                || gate.rows() != up.rows() || gate.cols() != up.cols()) {
-            return null;
-        }
-        if (gate.hasScale() || up.hasScale() || gate.hasInputTransform() || up.hasInputTransform()
-                || gate.hadamard() != null || up.hadamard() != null) {
-            return null;
-        }
-        if (gate.type() == GGMLType.W12 && ops.activeW12Q != null) {
-            /* A W12QView scope routes every W12 projection through the 8-bit Q view, whose row set has no
-             * fused form; the separate gate and up matvecs take it. */
-            return null;
-        }
-        if (!fusedMode.permitsFusion()) {
+        if (!gateUpFusable(gate, up, op, params) || !fusedMode.permitsFusion()) {
             return null;
         }
         WeightKernels k = ops.family(gate);
@@ -303,7 +393,7 @@ final class GpuProjections {
                 } else if (int8Staging != null) {
                     q8 = ops.lanes.stageInt8(int8Staging, x.buf, x.off, nTokens, cols);
                 } else {
-                    q8 = ops.lanes.stageQ8(x.buf, x.off, nTokens, cols);
+                    q8 = stagedRecords(x, nTokens, cols);
                 }
                 activations = new GpuOps.View(q8.buffer(), q8.offset());
             }
@@ -784,6 +874,7 @@ final class GpuProjections {
         args[0] = rows;
         args[1] = cols;
         System.arraycopy(buffers, 0, args, 2, buffers.length);
+        ops.q8.invalidate();
         queue.enqueueKernelNoEvent(kernels.get(kernel), new long[]{SubgroupRowMatvec.globalSize(rows)},
                 new long[]{SubgroupRowMatvec.WORK_GROUP}, args);
     }
@@ -862,6 +953,15 @@ final class GpuProjections {
         }
         GpuBuffer normed = ops.q8.take(x.buf, 1, cols);
         return normed != null ? normed : quantizeQ8(x.buf, cols);
+    }
+
+    /** {@link FastGemmLanes#stageQ8} through the open {@link GpuOps.SharedQ8} when it covers these rows. */
+    private ScratchSlot stagedRecords(GpuOps.View x, int nTokens, int cols) {
+        GpuOps.SharedQ8 share = ops.activeShare;
+        if (share != null && share.matches(x, cols, nTokens)) {
+            return share.records();
+        }
+        return ops.lanes.stageQ8(x.buf, x.off, nTokens, cols);
     }
 
     /** {@link #quantizeQ8N} through the open {@link GpuOps.SharedQ8} when it covers these rows. */
