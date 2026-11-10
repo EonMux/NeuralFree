@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * Runs one forward call over any number of tokens as a sequence of ubatch steps (llama.cpp {@code llama_decode}
@@ -270,6 +271,16 @@ public final class GpuPrefillDriver {
      */
     String decodeReplayStats() {
         return decodeReplay + " " + stepReplay;
+    }
+
+    /** The one-token decode replay's counters. */
+    GpuDecodeReplay.Counters decodeReplayCounters() {
+        return decodeReplay.counters();
+    }
+
+    /** The kernel names of the one-token decode replay's captured graph; empty while none is held. */
+    Set<String> decodeReplayKernels() {
+        return decodeReplay.capturedKernels();
     }
 
     /**

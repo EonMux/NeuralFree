@@ -116,7 +116,7 @@ final class FlashPlan {
         }
         String rowName = subgroup ? null : rowKernelName(keys.typeK(), keys.typeV(), keys.vAliasesK(), a.headDimK(),
                 a.headDimV(), a.biasMode(), a.sinks(), keys.kRowStride(), keys.vRowStride(), pg != null);
-        String row = rowName != null && kernels.has(rowName) ? rowName : null;
+        String row = rowName != null && kernels.flashDecodeRowPath() && kernels.has(rowName) ? rowName : null;
         return new FlashPlan(decode, decodeKernel, pagedDecodeKernel, prefill, tiledKernel, mma, paged, pagedPrefill,
                 pagedGqa, cap, row == null && depthRouted(mma, fast, pg != null, a.nHead(), a.nHeadKv()), row);
     }
@@ -125,9 +125,10 @@ final class FlashPlan {
      * The one-row decode kernel {@value AttnKernels#FLASH_DECODE_ROW_F16} when it serves the layer's plain step:
      * F16 K and V caches (V not read through K), equal head dims that are multiples of 64 of at most
      * {@value AttnKernels#FLASH_DECODE_ROW_MAX_D}, no position bias and no sink logits, even row strides and a dense
-     * cache. Null otherwise; the caller still requires {@code kernels.has(name)} (the CUDA fatbins hold it). It
-     * takes {@code LLM_FlashDecode_F16}'s arguments and replaces it for every one-row launch without a tree mask
-     * (see {@code flash_decode_row.cl}).
+     * cache. Null otherwise; the caller still requires {@link LlmKernels#flashDecodeRowPath()} and
+     * {@code kernels.has(name)} (the CUDA fatbins and the Vulkan shader set hold it). It takes
+     * {@code LLM_FlashDecode_F16}'s arguments and replaces it for every one-row launch without a tree mask (see
+     * {@code flash_decode_row.cl}).
      */
     static String rowKernelName(KvDType typeK, KvDType typeV, boolean vAliasesK, int dK, int dV, BiasMode bias,
                                 boolean sinks, int kRowStride, int vRowStride, boolean paged) {

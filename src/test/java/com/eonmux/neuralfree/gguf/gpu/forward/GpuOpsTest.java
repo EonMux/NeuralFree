@@ -13,6 +13,7 @@ import com.eonmux.neuralfree.acceleration.kernels.KernelManifest;
 import com.eonmux.neuralfree.gguf.BatchInvariance;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.arch.GluOp;
+import com.eonmux.neuralfree.gguf.arch.NormKind;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants;
@@ -632,7 +633,7 @@ public class GpuOpsTest {
         GpuBuffer blocks = floats(COLS);
         GpuBuffer in = floats((long) n * COLS);
         GpuBuffer out = floats((long) rows * n);
-        ops.q8.emitted(normed, 1, COLS, blocks);
+        ops.q8.emitted(normed, null, 1, COLS, blocks);
         assertSame("with no launch in between the request takes the record", blocks, ops.q8.take(normed, 1, COLS));
 
         String fast = ops.lanes.fastGemm(gate, COLS);
@@ -645,10 +646,109 @@ public class GpuOpsTest {
                 () -> ops.lanes.streamKLaunch(plain, gate.shard(0), in, out),
                 () -> ops.lanes.streamKGateUpLaunch(fused, gate.shard(0), up.shard(0), in, out));
         for (Runnable launch : launches) {
-            ops.q8.emitted(normed, 1, COLS, blocks);
+            ops.q8.emitted(normed, null, 1, COLS, blocks);
             assertFalse(run(launch).isEmpty());
             assertNull("a launch drops the record", ops.q8.take(normed, 1, COLS));
         }
+    }
+
+    /** Opens the ops on a CUDA device with the subgroup shuffle and the integer dot, where the row norms emit Q8_1. */
+    private void openShuffleInt8() {
+        open(FakeComputeBackend.builder().backendType(ComputeBackend.BackendType.CUDA).strictLlmArgs(true)
+                .capabilities(new DeviceCapabilities.Builder().deviceName("ShuffleDevice").totalVramBytes(8L << 30)
+                        .maxAllocSizeBytes(2L << 30).computeUnits(60).maxClockFrequencyMhz(1500)
+                        .maxWorkGroupSize(1024).driverVersion("fake-1.0").supportsSubgroups(true)
+                        .maxLocalMemoryBytes(48L * 1024).computeCapability(120)
+                        .feature(DeviceFeature.SUBGROUP_SHUFFLE).feature(DeviceFeature.INTEGER_DOT_PRODUCT).build())
+                .build());
+    }
+
+    /**
+     * A norm site whose recorded Q8_1 blocks were dropped unread stops emitting, as its consumer quantizes nothing;
+     * a site whose blocks were taken, and every other row count, output buffer or weight, keep emitting.
+     */
+    @Test
+    public void aNormSiteWhoseBlocksWentUnreadStopsEmitting() {
+        openShuffleInt8();
+        GpuBuffer normed = floats(4L * COLS);
+        GpuBuffer branch = floats(4L * COLS);
+        GpuBuffer weight = floats(COLS);
+        GpuBuffer blocks = floats(4L * COLS);
+        assertTrue("a one-row norm emits on the shuffle backend", ops.q8.emits(normed, weight, 1, COLS, 0, 1));
+        ops.q8.emitted(normed, weight, 1, COLS, blocks);
+        assertSame(blocks, ops.q8.take(normed, 1, COLS));
+        assertTrue("taken blocks keep the site emitting", ops.q8.emits(normed, weight, 1, COLS, 0, 1));
+
+        ops.q8.emitted(normed, weight, 1, COLS, blocks);
+        assertNull("a request for other rows drops the record", ops.q8.take(normed, 2, COLS));
+        assertFalse("the dropped site stops emitting", ops.q8.emits(normed, weight, 1, COLS, 0, 1));
+        assertTrue("another row count of the site still emits", ops.q8.emits(normed, weight, 4, COLS, 0, 1));
+        assertTrue("another output buffer of the shape still emits", ops.q8.emits(branch, weight, 1, COLS, 0, 1));
+        assertTrue("another weight of the shape still emits", ops.q8.emits(normed, null, 1, COLS, 0, 1));
+
+        ops.q8.emitted(normed, weight, 4, COLS, blocks);
+        ops.q8.invalidate();
+        assertFalse("a launch that drops the record stops its site too", ops.q8.emits(normed, weight, 4, COLS, 0, 1));
+    }
+
+    /**
+     * A sandwich layer through {@link GpuOps#norm}: the input norm's blocks are read by the projections, while the
+     * post-attention norm on the branch and the output norm (into the input norm's buffer, before a head off the
+     * int8 lane) go unread. From the next step on only the two unread norms run the plain kernel; the input norm,
+     * of the same shape, keeps writing the blocks its projections read.
+     */
+    @Test
+    public void anUnreadNormLeavesTheOtherNormsOfItsShapeEmitting() {
+        openShuffleInt8();
+        GpuBuffer x = floats(COLS);
+        GpuBuffer normed = floats(COLS);
+        GpuBuffer branch = floats(COLS);
+        GpuWeight attnNorm = GpuWeight.of("blk.0.attn_norm.weight", GGMLType.F32, new long[]{COLS}, floats(COLS));
+        GpuWeight postNorm = GpuWeight.of("blk.0.post_attention_norm.weight", GGMLType.F32, new long[]{COLS},
+                floats(COLS));
+        GpuWeight outputNorm = GpuWeight.of("output_norm.weight", GGMLType.F32, new long[]{COLS}, floats(COLS));
+        List<String> firstStep = new ArrayList<>();
+        List<String> secondStep = new ArrayList<>();
+        for (List<String> step : Arrays.asList(firstStep, secondStep)) {
+            step.addAll(names(run(() -> ops.norm(NormKind.RMS, attnNorm, null, 1e-6f, x, 0, normed, 0, 1, COLS))));
+            ops.q8.take(normed, 1, COLS);
+            step.addAll(names(run(() -> ops.norm(NormKind.RMS, postNorm, null, 1e-6f, branch, 0, branch, 0, 1,
+                    COLS))));
+            run(() -> ops.add(x, 0, branch, 0, x, 0, COLS));
+            step.addAll(names(run(() -> ops.norm(NormKind.RMS, outputNorm, null, 1e-6f, x, 0, normed, 0, 1,
+                    COLS))));
+            run(() -> ops.add(x, 0, normed, 0, x, 0, COLS));
+        }
+        assertEquals(Arrays.asList(NormKernels.ROW_NORM_Q8, NormKernels.ROW_NORM_Q8, NormKernels.ROW_NORM_Q8),
+                firstStep);
+        assertEquals(Arrays.asList(NormKernels.ROW_NORM_Q8, GpuOps.ROW_NORM, GpuOps.ROW_NORM), secondStep);
+    }
+
+    /**
+     * A {@link GpuOps.SharedQ8} scope takes a norm's blocks for its projections, but only a projection that reads them
+     * keeps the norm emitting: a scope whose projections all ran off the int8 lane reports the blocks unread as it
+     * closes, and that norm runs the plain kernel from the next step on.
+     */
+    @Test
+    public void aShareWhoseProjectionsReadNoBlocksStopsItsNormEmitting() {
+        openShuffleInt8();
+        GpuBuffer x = floats(COLS);
+        GpuBuffer normed = floats(COLS);
+        GpuWeight unreadNorm = GpuWeight.of("blk.0.attn_norm.weight", GGMLType.F32, new long[]{COLS}, floats(COLS));
+        GpuWeight readNorm = GpuWeight.of("blk.0.ffn_norm.weight", GGMLType.F32, new long[]{COLS}, floats(COLS));
+        List<String> firstStep = new ArrayList<>();
+        List<String> secondStep = new ArrayList<>();
+        for (List<String> step : Arrays.asList(firstStep, secondStep)) {
+            step.addAll(names(run(() -> ops.norm(NormKind.RMS, unreadNorm, null, 1e-6f, x, 0, normed, 0, 1,
+                    COLS))));
+            ops.shareQ8Activations(normed, 0, COLS).close();
+            step.addAll(names(run(() -> ops.norm(NormKind.RMS, readNorm, null, 1e-6f, x, 0, normed, 0, 1, COLS))));
+            try (GpuOps.SharedQ8 share = ops.shareQ8Activations(normed, 0, COLS)) {
+                assertTrue("the norm's blocks serve the scope", run(share::blocks).isEmpty());
+            }
+        }
+        assertEquals(Arrays.asList(NormKernels.ROW_NORM_Q8, NormKernels.ROW_NORM_Q8), firstStep);
+        assertEquals(Arrays.asList(GpuOps.ROW_NORM, NormKernels.ROW_NORM_Q8), secondStep);
     }
 
     /**

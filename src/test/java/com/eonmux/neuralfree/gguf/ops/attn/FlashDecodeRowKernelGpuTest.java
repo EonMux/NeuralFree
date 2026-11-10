@@ -7,7 +7,12 @@ import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
+import com.eonmux.neuralfree.acceleration.backend.KernelHandle;
 import com.eonmux.neuralfree.acceleration.kernels.Availability;
+import com.eonmux.neuralfree.acceleration.kernels.KernelLibraries;
+import com.eonmux.neuralfree.acceleration.kernels.KernelLibraryConfig;
+import com.eonmux.neuralfree.acceleration.kernels.VulkanKernelLibrary;
+import com.eonmux.neuralfree.acceleration.vulkan.VkDeviceRanking;
 import com.eonmux.neuralfree.gguf.arch.SwaType;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
@@ -30,12 +35,16 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The one-row decode kernel ({@code LLM_FlashDecodeRow_F16}, CUDA only) against the CPU reference and against the
- * generic decode kernel it replaces ({@code LLM_FlashDecode_F16}, same arguments): at every head dim it serves
- * (64, 128, 256), GQA, key counts from one key through direct steps to split-K steps with the combine, and the
- * step forms the plain one-row route meets — a key range starting past row 0, a sliding window, a softcap and
- * empty cache cells (kv_pos -1). The CPU reference covers the causal steps; the generic kernel, itself held to the
- * same reference by {@link FlashDecodeKernelGpuTest}, covers the window, softcap and empty-cell steps.
+ * The one-row decode kernel ({@code LLM_FlashDecodeRow_F16}: {@code flash_decode_row.cl} on CUDA, its twin
+ * {@code flash_decode_row.comp} on Vulkan) against the CPU reference and against the generic decode kernel it
+ * replaces ({@code LLM_FlashDecode_F16}, same arguments): at every head dim it serves (64, 128, 256), GQA, key
+ * counts from one key through direct steps to split-K steps with the combine, and the step forms the plain one-row
+ * route meets — a key range starting past row 0, a sliding window, a softcap and empty cache cells (kv_pos -1). The
+ * CPU reference covers the causal steps; the generic kernel, itself held to the same reference by
+ * {@link FlashDecodeKernelGpuTest}, covers the window, softcap and empty-cell steps. The Vulkan cases run the module
+ * the device binds (the subgroup module on subgroup-arithmetic devices) and the plain module, whose lane groups
+ * reduce through shared memory, and both read caches whose row stride is a multiple of 4 elements (8-byte lane
+ * loads) or only of 2 (two 4-byte loads).
  */
 @RunWith(Parameterized.class)
 public class FlashDecodeRowKernelGpuTest {
@@ -46,38 +55,68 @@ public class FlashDecodeRowKernelGpuTest {
     private static final float TOL = 1e-4f;
     private static final int[] KEY_COUNTS = {1, 5, 37, 128, 129, 200, 700};
 
-    @Parameterized.Parameters(name = "d={0}")
+    /** The row kernel's module: the one the backend binds, or (Vulkan) the plain module without subgroups. */
+    enum Module { BOUND, PLAIN }
+
+    @Parameterized.Parameters(name = "{0} {1} d={2}")
     public static List<Object[]> cases() {
-        return Arrays.asList(new Object[]{64}, new Object[]{128}, new Object[]{256});
+        List<Object[]> rows = new ArrayList<>();
+        for (int d : new int[]{64, 128, 256}) {
+            rows.add(new Object[]{ComputeBackend.BackendType.CUDA, Module.BOUND, d});
+            rows.add(new Object[]{ComputeBackend.BackendType.VULKAN, Module.BOUND, d});
+            rows.add(new Object[]{ComputeBackend.BackendType.VULKAN, Module.PLAIN, d});
+        }
+        return rows;
     }
 
+    private final ComputeBackend.BackendType api;
+    private final Module module;
     private final int d;
     private HWAcceleration hw;
     private ComputeBackend backend;
     private LlmKernels kernels;
+    private KernelHandle rowHandle;
     private FlashAttnTiling tiling;
     private final List<GpuBuffer> bufs = new ArrayList<>();
 
-    public FlashDecodeRowKernelGpuTest(int d) {
+    public FlashDecodeRowKernelGpuTest(ComputeBackend.BackendType api, Module module, int d) {
+        this.api = api;
+        this.module = module;
         this.d = d;
     }
 
     @Before
     public void open() {
-        GpuTestUtil.assumeCudaAvailable();
-        hw = new HWAcceleration(EnumSet.of(ComputeBackend.BackendType.CUDA));
-        Assume.assumeFalse("no CUDA device enumerated", hw.getCUDevices().isEmpty());
-        HardwareDevice device = hw.getCUDevices().get(0);
+        if (api == ComputeBackend.BackendType.CUDA) {
+            GpuTestUtil.assumeCudaAvailable();
+        } else {
+            GpuTestUtil.assumeVulkanAvailable();
+        }
+        hw = new HWAcceleration(EnumSet.of(api));
+        HardwareDevice device = api == ComputeBackend.BackendType.CUDA
+                ? (hw.getCUDevices().isEmpty() ? null : hw.getCUDevices().get(0))
+                : VkDeviceRanking.fastestDevice(hw.getVkDevices(), null);
+        Assume.assumeTrue("no " + api + " device enumerated", device != null);
         backend = hw.createBackend(device);
         Availability a = LlmKernels.availability(backend);
-        Assume.assumeTrue("LLM kernels unavailable on CUDA: " + a.reason(), a.available());
+        Assume.assumeTrue("LLM kernels unavailable on " + api + ": " + a.reason(), a.available());
         kernels = LlmKernels.open(backend);
         Assume.assumeTrue("no " + AttnKernels.FLASH_DECODE_ROW_F16 + " kernel",
                 kernels.has(AttnKernels.FLASH_DECODE_ROW_F16));
+        rowHandle = module == Module.PLAIN ? plainVulkanKernel(AttnKernels.FLASH_DECODE_ROW_F16)
+                : kernels.get(AttnKernels.FLASH_DECODE_ROW_F16);
         boolean fast = FlashAttnTiling.decodeFastPath(backend.capabilities().hasFeature(DeviceFeature.SUBGROUP_SHUFFLE),
                 KvDType.F16, KvDType.F16, d, d);
         tiling = FlashAttnTiling.decode(N_HEAD, N_HEAD_KV, d, d, N_KV, kernels.faSmemFloats(),
                 Math.max(1, backend.capabilities().getComputeUnits()), fast);
+    }
+
+    /** The Vulkan LLM library's module of {@code name} without subgroup variants: the plain SPIR-V. */
+    private KernelHandle plainVulkanKernel(String name) {
+        KernelLibraryConfig c = KernelLibraries.LLM_CONFIG;
+        KernelLibraryConfig plain = new KernelLibraryConfig(c.libraryId(), c.sourceRoot(), c.cudaRoot(), c.spvRoot(),
+                c.requireCompleteInventory(), c.openClOptions(), false, c.vulkanFeatures());
+        return backend.loadKernel(new VulkanKernelLibrary(plain).resolve(name, backend));
     }
 
     @After
@@ -86,6 +125,9 @@ public class FlashDecodeRowKernelGpuTest {
             b.close();
         }
         bufs.clear();
+        if (module == Module.PLAIN && rowHandle != null) {
+            rowHandle.close();
+        }
         if (backend != null) {
             backend.close();
         }
@@ -96,17 +138,27 @@ public class FlashDecodeRowKernelGpuTest {
 
     @Test
     public void causalStepsMatchTheCpuReference() {
-        Fixture f = new Fixture(new Random(11), identityPositions());
+        causalSteps(0);
+    }
+
+    /** A row stride of 2 mod 4 elements: the Vulkan twin loads each lane's four halves as two words. */
+    @Test
+    public void causalStepsOverAHalfAlignedRowStrideMatchTheCpuReference() {
+        causalSteps(2);
+    }
+
+    private void causalSteps(int pad) {
+        Fixture f = new Fixture(new Random(11), identityPositions(), pad);
         CpuAttentionCore.Params params = CpuAttentionCore.Params.builder(N_HEAD).scale(f.scale)
                 .window(KvWindow.FULL_CAUSAL).build();
         for (int n : KEY_COUNTS) {
             float[] want = new float[N_HEAD * d];
             CpuAttentionCore.attendRows(params, 1, f.qHost, 0, N_HEAD * d, new int[]{n - 1}, 0,
-                    CpuAttentionCore.DenseKv.of(f.kF, 0, N_HEAD_KV * d, d, f.vF, 0, N_HEAD_KV * d, d,
+                    CpuAttentionCore.DenseKv.of(f.kF, 0, f.rowStride, d, f.vF, 0, f.rowStride, d,
                             N_HEAD_KV, d, d, f.kvPos, 0),
                     0, n, want, 0, N_HEAD * d);
             float[] got = f.run(AttnKernels.FLASH_DECODE_ROW_F16, 0, n, n - 1, 0f, SwaType.NONE, 0);
-            assertClose("n=" + n, want, got);
+            assertClose("pad=" + pad + " n=" + n, want, got);
         }
     }
 
@@ -116,7 +168,7 @@ public class FlashDecodeRowKernelGpuTest {
         for (int i = 3; i < N_KV; i += 17) {
             positions[i] = -1;   // empty cells are never visible
         }
-        Fixture f = new Fixture(new Random(13), positions);
+        Fixture f = new Fixture(new Random(13), positions, 0);
         int[][] steps = {
             // kv_start, kv_end, q_pos, swa type, n_swa, softcap * 100
             {0, 300, 299, SwaType.STANDARD.code(), 64, 0},
@@ -145,14 +197,16 @@ public class FlashDecodeRowKernelGpuTest {
 
     private void assertClose(String where, float[] want, float[] got) {
         for (int i = 0; i < want.length; i++) {
-            assertTrue("d=" + d + " " + where + " output " + i + " is not finite: " + got[i], Float.isFinite(got[i]));
-            assertEquals("d=" + d + " " + where + " output " + i, want[i], got[i], TOL);
+            String at = api + " " + module + " d=" + d + " " + where + " output " + i;
+            assertTrue(at + " is not finite: " + got[i], Float.isFinite(got[i]));
+            assertEquals(at, want[i], got[i], TOL);
         }
     }
 
     /** One cache and query on the device, run through either kernel at a step's range and window. */
     private final class Fixture {
         final float scale = (float) (1.0 / Math.sqrt(d));
+        final int rowStride;
         final float[] qHost;
         final float[] kF;
         final float[] vF;
@@ -167,9 +221,10 @@ public class FlashDecodeRowKernelGpuTest {
         final GpuBuffer out;
         final GpuBuffer partial;
 
-        Fixture(Random rnd, int[] kvPos) {
+        Fixture(Random rnd, int[] kvPos, int pad) {
             this.kvPos = kvPos;
-            short[] k16 = new short[N_KV * N_HEAD_KV * d];
+            this.rowStride = N_HEAD_KV * d + pad;
+            short[] k16 = new short[N_KV * rowStride];
             short[] v16 = new short[k16.length];
             kF = new float[k16.length];
             vF = new float[k16.length];
@@ -210,9 +265,9 @@ public class FlashDecodeRowKernelGpuTest {
             args[AttnKernels.ARG_FD_KV_START] = kvStart;
             args[AttnKernels.ARG_FD_KV_END] = kvEnd;
             args[AttnKernels.ARG_FD_Q_POS] = qPos;
-            args[AttnKernels.ARG_FD_K_ROW_STRIDE] = N_HEAD_KV * d;
+            args[AttnKernels.ARG_FD_K_ROW_STRIDE] = rowStride;
             args[AttnKernels.ARG_FD_K_HEAD_STRIDE] = d;
-            args[AttnKernels.ARG_FD_V_ROW_STRIDE] = N_HEAD_KV * d;
+            args[AttnKernels.ARG_FD_V_ROW_STRIDE] = rowStride;
             args[AttnKernels.ARG_FD_V_HEAD_STRIDE] = d;
             args[AttnKernels.ARG_FD_SCALE] = scale;
             args[AttnKernels.ARG_FD_SOFTCAP] = softcap;
@@ -246,7 +301,8 @@ public class FlashDecodeRowKernelGpuTest {
     }
 
     private void dispatch(String kernel, long[] global, long[] local, Object[] args) {
-        close(backend.computeQueue().enqueueKernel(kernels.get(kernel), global, local, args));
+        KernelHandle h = kernel.equals(AttnKernels.FLASH_DECODE_ROW_F16) ? rowHandle : kernels.get(kernel);
+        close(backend.computeQueue().enqueueKernel(h, global, local, args));
     }
 
     private GpuBuffer alloc(long bytes) {

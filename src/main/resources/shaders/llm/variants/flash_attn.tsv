@@ -1,7 +1,8 @@
 # kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg, vk13, vulkan, noopt)
 # Flash attention (kernels/llm/flash_decode.cl, kernels/llm/flash_prefill.cl, kernels/llm/flash_combine.cl), and the
-# VK_NV_cooperative_matrix2 twins of the CUDA-only tensor-core prefill (kernels/llm/flash_mma.cl): Vulkan-only rows
-# (flags as the CM2 GEMM rows of gemm_fast.tsv) whose SPIR-V signatures the inventory check compares with the CUDA kernels.
+# Vulkan-only twins of CUDA-only kernels, whose SPIR-V signatures the inventory check compares with the CUDA kernels: the
+# VK_NV_cooperative_matrix2 tensor-core prefill (kernels/llm/flash_mma.cl; flags as the CM2 GEMM rows of gemm_fast.tsv)
+# and the one-row decode (kernels/llm/flash_decode_row.cl).
 LLM_FlashDecode_F32	flash_decode.comp	KV=NF_KV_F32	sg
 LLM_FlashDecode_F16	flash_decode.comp	KV=NF_KV_F16	sg
 LLM_FlashDecode_Q8_0	flash_decode.comp	KV=NF_KV_Q8_0	sg
@@ -105,3 +106,4 @@ LLM_FlashAttnPaged_NVFP4_DS_MLA	flash_prefill.comp	KV=NF_KV_NVFP4_DS_MLA PAGED=1
 LLM_FlashAttnPaged_Mixed	flash_prefill.comp	KV_MIXED=1 PAGED=1	sg
 LLM_FlashAttnMma_F16	flash_mma_cm2.comp		vk13,vulkan,noopt
 LLM_FlashAttnMmaPaged_F16	flash_mma_cm2.comp	PAGED=1	vk13,vulkan,noopt
+LLM_FlashDecodeRow_F16	flash_decode_row.comp		sg,vulkan

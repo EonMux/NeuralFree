@@ -84,12 +84,14 @@ import static org.lwjgl.vulkan.VK10.vkDestroySemaphore;
  * <p><b>Graph capture.</b> {@code beginCapture()} records dispatches into a dedicated simultaneous-use
  * command buffer instead of the current batch; {@code endCapture()} returns them as a replayable
  * {@link VkGraph}. The step that captured them submits them once with
- * {@link GpuGraph#launch(ComputeQueue, GpuEvent...)}, and a replay verifies the step's dispatches against
- * the capture and resubmits the recorded buffer once, ordered on the queue's timeline. Host transfers,
- * reads, copies, fills, markers and event dispatches are refused while capturing with
- * {@link IllegalStateException}; during a replay they report a mismatch. A graph launches only on the
- * queue that captured it. A replay refuses a dispatch whose bound arguments or group counts changed since
- * the capture: the recorded push constants and group counts are fixed.</p>
+ * {@link GpuGraph#launch(ComputeQueue, GpuEvent...)}, and a replay (a body replay that matches the step's
+ * dispatches against the capture, or a patched replay that takes a plan's values) submits the graph once,
+ * ordered on the queue's timeline: the recorded buffer while nothing changed, else the graph's
+ * step re-recorded into a buffer of its {@link VkGraphRecording} ring. Host transfers, reads, copies, fills,
+ * markers and event dispatches are refused while capturing with {@link IllegalStateException}; during a
+ * replay they report a mismatch. A graph launches only on the queue that captured it. A replay refuses a
+ * dispatch that binds another buffer or runs another local size than the capture: the recorded barriers hold
+ * only for the captured buffers.</p>
  */
 @NotThreadSafe("Commands are recorded by one thread at a time. Event completion, waits from other queues and "
         + "flushes are thread-safe: all queue state is guarded by the queue's monitor, and a queue never "
@@ -142,6 +144,8 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
     private final ArrayDeque<Long> replaySignals = new ArrayDeque<>();
     /** Largest submitted replay value not known complete; later submissions wait on it. */
     private long pendingReplaySignal;
+    /** The command buffers and frames of the captured graphs and their re-recorded forms. */
+    final VkGraphResources graphResources;
 
     /**
      * @param backend        the owning backend (device, allocator, descriptor strategy, limits)
@@ -178,6 +182,8 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
             throw e;
         }
         this.timeline = semaphore;
+        this.graphResources = new VkGraphResources(device, commandPool, strategy, dispatchCapable, semaphore,
+                () -> completedValue);
     }
 
     /**
@@ -485,15 +491,16 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
     }
 
     /** One dispatch of a capture: recorded into the captured command batch, executed by no replay. */
-    private void recordCaptureLocked(VkKernelHandle handle, VkKernelHandle.Variant variant, long[] groups,
-                                     Object[] args) {
+    private void recordCaptureLocked(VkKernelHandle handle, VkKernelHandle.Variant variant, long[] global,
+                                     int[] local3, long[] groups, Object[] args) {
         VkArgState state = handle.argState();
         if (args != null && args.length > 0) {
             state.setAll(args);
         }
         state.materialize();
         VkCommandBatch b = captureBatchLocked();
-        if (tracker.needsBarrier(state.readIds(), state.writeIds())) {
+        boolean barrier = tracker.needsBarrier(state.readIds(), state.writeIds());
+        if (barrier) {
             b.barrier();
             tracker.reset();
         }
@@ -502,60 +509,41 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         variant.program().pushConstants(b.commandBuffer(), state);
         b.dispatch((int) groups[0], (int) groups[1], (int) groups[2]);
         tracker.record(state.readIds(), state.writeIds());
-        captureDispatches.add(new VkGraph.Dispatch(handle, groups.clone(), VkGraph.copyArgs(state)));
+        captureDispatches.add(new VkGraph.Dispatch(handle, variant, local3.clone(), barrier, global.clone(),
+                groups.clone(), VkGraph.copyArgs(state)));
     }
 
     /** One dispatch of a replay body: matched against the next captured dispatch, never executed. */
-    private void verifyReplayLocked(VkKernelHandle handle, long[] groups, Object[] args) {
+    private void verifyReplayLocked(VkKernelHandle handle, long[] global, int[] local3, long[] groups,
+                                    Object[] args) {
         VkArgState state = handle.argState();
         if (args != null && args.length > 0) {
             state.setAll(args);
         }
-        replayGraph.dispatch(handle, groups, VkGraph.copyArgs(state));
+        replayGraph.dispatch(handle, global, local3, groups, VkGraph.copyArgs(state));
+    }
+
+    /** The group counts of a dispatch of {@code handle} over {@code global} at {@code local3}, folded as launched. */
+    long[] groupCounts(VkKernelHandle handle, long[] global, int[] local3) {
+        return VkDispatchLimits.groupCounts(handle.kernelName(), global, local3, maxGroups);
     }
 
     /** The command batch the capture records into, begun on first use. */
     private VkCommandBatch captureBatchLocked() {
         lastUseValue = pendingValue();
         if (captureBatch == null) {
-            captureBatch = newReplayableBatch();
+            captureBatch = graphResources.newCaptureBatch();
             captureDispatches.clear();
         }
         return captureBatch;
     }
 
-    private VkCommandBatch newReplayableBatch() {
-        VkCommandBuffer cb = VkQueueResources.allocateCommandBuffer(device, commandPool);
-        VkDescriptorStrategy.Frame frame;
-        try {
-            frame = strategy.newFrame();
-        } catch (RuntimeException e) {
-            VkQueueResources.freeCommandBuffer(device, commandPool, cb);
-            throw e;
-        }
-        VkCommandBatch b = new VkCommandBatch(cb, frame, dispatchCapable, true);
-        try {
-            b.begin();
-        } catch (RuntimeException e) {
-            step(() -> strategy.destroy(frame), e);
-            b.close();
-            VkQueueResources.freeCommandBuffer(device, commandPool, cb);
-            throw e;
-        }
-        return b;
-    }
-
     /** Returns an unused capture batch's command buffer and frame to the queue. */
     private void disposeCaptureBatch(VkCommandBatch b) {
-        if (b == null) {
-            return;
+        RuntimeException failure = graphResources.freeCaptureBatch(b, null);
+        if (failure != null) {
+            throw failure;
         }
-        if (b.isRecording()) {
-            b.reset();
-        }
-        strategy.destroy(b.descriptorFrame());
-        b.close();
-        VkQueueResources.freeCommandBuffer(device, commandPool, b.commandBuffer());
     }
 
     /**
@@ -596,30 +584,77 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
      */
     void beginGraphReplay(VkGraph graph) {
         synchronized (this) {
-            enter();
-            if (capturing || replayGraph != null) {
-                throw new IllegalStateException("Vulkan " + queueType + " queue is already "
-                        + (capturing ? "capturing" : "replaying") + " dispatches");
-            }
-            if (graph.isClosed()) {
-                throw new IllegalStateException(graph + " is closed");
-            }
-            if (!graphs.contains(graph)) {
-                throw new IllegalArgumentException(graph + " was not captured on this queue");
-            }
+            requireIdleFor(graph);
             replayGraph = graph;
         }
     }
 
-    /** The replay submission: one resubmission of the captured command buffer, ordered on the timeline. */
+    /** The replay submission: one submission of the graph's command buffers, ordered on the timeline. */
     void submitGraphReplay(VkGraph graph) {
         synchronized (this) {
             enter();
             if (replayGraph != graph) {
                 throw new IllegalStateException("Vulkan " + queueType + " queue: " + graph + " is not replaying");
             }
-            submitCapturedBatchLocked(graph.batch());
+            submitGraphLocked(graph, false);
         }
+    }
+
+    /**
+     * A patched replay's submission, without a step body: a graph with changed dispatches is recorded again (unless
+     * {@code prepared}, when {@link #prepareGraphRecording} recorded it ahead) and the graph is submitted once.
+     *
+     * @throws IllegalStateException when the queue is closed, another recording is active or the graph does not
+     *                               belong to this queue
+     */
+    void submitPatchedReplay(VkGraph graph, boolean prepared) {
+        synchronized (this) {
+            requireIdleFor(graph);
+            submitGraphLocked(graph, prepared);
+        }
+    }
+
+    /**
+     * Records the graph for its next submission ahead of it, while earlier submissions run.
+     *
+     * @return false when no dispatch changed since the capture (its captured command buffer serves as is)
+     */
+    boolean prepareGraphRecording(VkGraph graph) {
+        synchronized (this) {
+            requireIdleFor(graph);
+            return graph.recordChanges(graphResources) != null;
+        }
+    }
+
+    private void requireIdleFor(VkGraph graph) {
+        enter();
+        if (capturing || replayGraph != null) {
+            throw new IllegalStateException("Vulkan " + queueType + " queue is already "
+                    + (capturing ? "capturing" : "replaying") + " dispatches");
+        }
+        if (graph.isClosed()) {
+            throw new IllegalStateException(graph + " is closed");
+        }
+        if (!graphs.contains(graph)) {
+            throw new IllegalArgumentException(graph + " was not captured on this queue");
+        }
+    }
+
+    /**
+     * Submits {@code graph}: its captured command buffer while no dispatch changed since the capture, else the
+     * step recorded again with the current values for this submission.
+     */
+    private void submitGraphLocked(VkGraph graph, boolean prepared) {
+        VkGraphRecording rec = graph.recording();
+        if (!prepared || rec == null || !rec.recorded()) {
+            rec = graph.recordChanges(graphResources);
+        }
+        if (rec == null) {
+            submitCapturedBatchLocked(graph.batch());
+            return;
+        }
+        long signal = submitReplayLocked(null, new VkCommandBuffer[]{rec.commandBuffer()});
+        rec.submitted(signal);
     }
 
     /**
@@ -639,17 +674,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         VkEventWaits.validate(waitOnEvents, backend);
         VkEventWaits.flushProducers(waitOnEvents, this);
         synchronized (this) {
-            enter();
-            if (capturing || replayGraph != null) {
-                throw new IllegalStateException("Vulkan " + queueType + " queue is already "
-                        + (capturing ? "capturing" : "replaying") + " dispatches");
-            }
-            if (graph.isClosed()) {
-                throw new IllegalStateException(graph + " is closed");
-            }
-            if (!graphs.contains(graph)) {
-                throw new IllegalArgumentException(graph + " was not captured on this queue");
-            }
+            requireIdleFor(graph);
             applyWaitsTo(graph.batch(), waitOnEvents);
             long signal = submitCapturedBatchLocked(graph.batch());
             return new VkGpuEvent(this, signal);
@@ -686,9 +711,19 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
      * @return the timeline value the submission signals
      */
     private long submitCapturedBatchLocked(VkCommandBatch batch) {
+        return submitReplayLocked(batch, new VkCommandBuffer[]{batch.commandBuffer()});
+    }
+
+    /**
+     * Submits replayed command buffers in order after the queue's recorded batch, on the timeline, with the waits
+     * {@code waits} carries (null for none); a later batch waits on the replay signal, so the queue's order is kept.
+     *
+     * @return the timeline value the submission signals
+     */
+    private long submitReplayLocked(VkCommandBatch waits, VkCommandBuffer[] buffers) {
         submitLocked();
         long signal = submittedValue + 1;
-        submitBatchLocked(batch, signal, submittedValue);
+        submitBatchLocked(waits, buffers, signal, submittedValue);
         replaySignals.addLast(signal);
         pendingReplaySignal = signal;
         submittedValue = signal;
@@ -728,10 +763,10 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         synchronized (this) {
             retireUpTo(last);
             graphs.remove(graph);
-            graph.destroy();
-            strategy.destroy(graph.batch().descriptorFrame());
-            graph.batch().close();
-            VkQueueResources.freeCommandBuffer(device, commandPool, graph.batch().commandBuffer());
+            RuntimeException failure = graphResources.freeGraph(graph, null);
+            if (failure != null) {
+                throw failure;
+            }
         }
     }
 
@@ -739,20 +774,14 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
     private void closeGraphsLocked() {
         RuntimeException failure = null;
         for (VkGraph graph : graphs) {
-            failure = step(() -> strategy.destroy(graph.batch().descriptorFrame()), failure);
-            failure = step(graph.batch()::close, failure);
-            failure = step(() -> VkQueueResources.freeCommandBuffer(device, commandPool,
-                    graph.batch().commandBuffer()), failure);
-            graph.destroy();
+            failure = graphResources.freeGraph(graph, failure);
         }
         graphs.clear();
         if (captureBatch != null) {
             VkCommandBatch b = captureBatch;
             captureBatch = null;
             capturing = false;
-            failure = step(() -> strategy.destroy(b.descriptorFrame()), failure);
-            failure = step(b::close, failure);
-            failure = step(() -> VkQueueResources.freeCommandBuffer(device, commandPool, b.commandBuffer()), failure);
+            failure = graphResources.freeCaptureBatch(b, failure);
         }
         if (failure != null) {
             throw failure;
@@ -997,7 +1026,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
                             + (wantEvent ? "returns an event" : "waits on events") + " cannot be captured: enqueue"
                             + " it before beginCapture, or return no event and wait on this queue's order");
                 }
-                recordCaptureLocked(handle, variant, groups, args);
+                recordCaptureLocked(handle, variant, global, local3, groups, args);
                 return null;
             } else if (replayGraph != null) {
                 if (wantEvent || (waits != null && waits.length > 0)) {
@@ -1005,7 +1034,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
                             + handle.kernelName() + (wantEvent ? " returns an event" : " waits on another queue's"
                             + " events") + ", which the captured dispatches do not contain");
                 }
-                verifyReplayLocked(handle, groups, args);
+                verifyReplayLocked(handle, global, local3, groups, args);
                 return null;
             }
             applyWaits(waits);
@@ -1185,7 +1214,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         long selfWait = pendingReplaySignal;
         try {
             b.end();
-            submitBatchLocked(b, signal, selfWait);
+            submitBatchLocked(b, new VkCommandBuffer[]{b.commandBuffer()}, signal, selfWait);
         } catch (RuntimeException e) {
             recycleUnsubmitted(b, e);
             throw e;
@@ -1197,14 +1226,14 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
     }
 
     /**
-     * Submits an ended batch, signalling {@code signal}: the batch's recorded cross-queue waits, and
-     * {@code selfWaitValue} on this queue's own timeline when it is still pending (0 for none), so the
-     * batch executes after that timeline point's work.
+     * Submits ended command buffers in order, signalling {@code signal}: the cross-queue waits recorded in
+     * {@code b} (none when null), and {@code selfWaitValue} on this queue's own timeline when it is still pending
+     * (0 for none), so the buffers execute after that timeline point's work.
      */
-    private void submitBatchLocked(VkCommandBatch b, long signal, long selfWaitValue) {
+    private void submitBatchLocked(VkCommandBatch b, VkCommandBuffer[] buffers, long signal, long selfWaitValue) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkComputeQueue[] producers = b.waitProducers();
-            long[] values = b.waitValues();
+            VkComputeQueue[] producers = b != null ? b.waitProducers() : new VkComputeQueue[0];
+            long[] values = b != null ? b.waitValues() : new long[0];
             LongBuffer waitSemaphores = stack.mallocLong(producers.length + 1);
             LongBuffer waitValues = stack.mallocLong(producers.length + 1);
             int waitCount = 0;
@@ -1248,7 +1277,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
                     .waitSemaphoreCount(waitCount)
                     .pWaitSemaphores(waitSemaphores)
                     .pWaitDstStageMask(waitStages)
-                    .pCommandBuffers(stack.pointers(b.commandBuffer()))
+                    .pCommandBuffers(stack.pointers(buffers))
                     .pSignalSemaphores(stack.longs(timeline));
             context.submit(info, VK_NULL_HANDLE);
         }

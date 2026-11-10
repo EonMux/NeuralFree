@@ -1,6 +1,8 @@
 package com.eonmux.neuralfree.gguf.gpu.forward;
 
+import com.eonmux.neuralfree.acceleration.GpuTestUtil;
 import com.eonmux.neuralfree.acceleration.HWAcceleration;
+import com.eonmux.neuralfree.acceleration.HardwareDevice;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
@@ -8,6 +10,7 @@ import com.eonmux.neuralfree.acceleration.backend.cuda.CudaComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.ocl.OclComputeBackend;
 import com.eonmux.neuralfree.acceleration.cuda.CUDevice;
 import com.eonmux.neuralfree.acceleration.kernels.Availability;
+import com.eonmux.neuralfree.acceleration.vulkan.VkDeviceRanking;
 import com.eonmux.neuralfree.gguf.arch.NormKind;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.ops.norm.NormKernels;
@@ -22,6 +25,7 @@ import org.junit.runners.Parameterized;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Random;
 
@@ -34,9 +38,9 @@ import static org.junit.Assert.assertEquals;
  * {@code LLM_QuantizeQ8_1} over the normalized rows. The contract is bit-exact: the same y (and mixed x) floats and
  * the same Q8_1 bytes, for every row-norm mode, with and without weight and bias, one and several rows, and row
  * lengths that are and are not a multiple of the work-group size. The quantizer runs at both grid forms the host
- * may launch (one work-item per block, and the 32-lane-per-block grid of the shuffle backends). Runs on CUDA and
- * OpenCL (the subgroup-shuffle and the local-memory segment reductions); a backend is skipped when its GPU or its
- * kernel library is unavailable. The plain forms are also held to the CPU reference ({@link NormMath}) at row lengths
+ * may launch (one work-item per block, and the 32-lane-per-block grid of the shuffle backends). Runs on CUDA,
+ * OpenCL and Vulkan (the subgroup-shuffle, the local-memory and, on a 32-lane subgroup device, the subgroup
+ * segment reductions); a backend is skipped when its GPU or its kernel library is unavailable. The plain forms are also held to the CPU reference ({@link NormMath}) at row lengths
  * inside, at and past the kernels' register cache, so both of their row passes are covered.
  */
 @RunWith(Parameterized.class)
@@ -49,7 +53,7 @@ public class Q8NormFoldGpuTest {
 
     @Parameterized.Parameters(name = "{0}")
     public static List<Object[]> backends() {
-        return Arrays.asList(new Object[]{"cuda"}, new Object[]{"opencl"});
+        return Arrays.asList(new Object[]{"cuda"}, new Object[]{"opencl"}, new Object[]{"vulkan"});
     }
 
     private final String api;
@@ -88,6 +92,14 @@ public class Q8NormFoldGpuTest {
             Assume.assumeFalse("no CUDA device", accel.getCUDevices().isEmpty());
             CUDevice device = accel.getCUDevices().get(0);
             return new CudaComputeBackend(device);
+        }
+        if (api.equals("vulkan")) {
+            GpuTestUtil.assumeVulkanAvailable();
+            HWAcceleration accel = new HWAcceleration(EnumSet.of(ComputeBackend.BackendType.VULKAN));
+            hwAccel = accel;
+            HardwareDevice device = VkDeviceRanking.fastestDevice(accel.getVkDevices(), null);
+            Assume.assumeTrue("no Vulkan device enumerated", device != null);
+            return accel.createBackend(device);
         }
         HWAcceleration accel = new HWAcceleration();
         hwAccel = accel;

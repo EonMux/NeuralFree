@@ -1,7 +1,13 @@
 package com.eonmux.neuralfree.gguf.ops.attn;
 
+import com.eonmux.neuralfree.acceleration.backend.ComputeBackend.BackendType;
+import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
+import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
+import com.eonmux.neuralfree.acceleration.backend.DeviceIdentity;
+import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.spec.AttentionSpec.BiasMode;
+import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
@@ -17,7 +23,7 @@ import static org.junit.Assert.assertTrue;
  * cache, or at most one workgroup of live keys) and the mma kernel exists. The mixer dispatches the base
  * kernel over a dense cache (its identity paging); the paged kernel serves launches over a
  * paginated cache. The one-row decode kernel {@code LLM_FlashDecodeRow_F16} serves the plain step of a dense F16
- * cache, which then never routes through the mma prefill.
+ * cache, which then never routes through the mma prefill; on Vulkan it serves NVIDIA devices only.
  */
 public class GpuAttentionMixerMmaSelectionTest {
 
@@ -109,5 +115,32 @@ public class GpuAttentionMixerMmaSelectionTest {
                 1025, 1024, false));
         assertNull(FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, false, 128, 128, BiasMode.NONE, false,
                 1024, 1024, true));
+    }
+
+    @Test
+    public void theRowKernelServesVulkanOnNvidiaDevicesOnly() {
+        assertTrue(rowPath(BackendType.CUDA, 0x10DE));
+        assertTrue(rowPath(BackendType.VULKAN, 0x10DE));
+        assertFalse("AMD", rowPath(BackendType.VULKAN, 0x1002));
+        assertFalse("Intel", rowPath(BackendType.VULKAN, 0x8086));
+        assertFalse("Apple through MoltenVK", rowPath(BackendType.VULKAN, 0x106B));
+        assertFalse("ARM Mali", rowPath(BackendType.VULKAN, 0x13B5));
+        assertFalse("Qualcomm Adreno", rowPath(BackendType.VULKAN, 0x5143));
+        assertFalse("an unknown vendor", rowPath(BackendType.VULKAN, DeviceIdentity.UNKNOWN_VENDOR));
+    }
+
+    private static boolean rowPath(BackendType type, int vendorId) {
+        DeviceCapabilities caps = new DeviceCapabilities.Builder().deviceName("Device").totalVramBytes(8L << 30)
+                .maxAllocSizeBytes(2L << 30).computeUnits(32).maxClockFrequencyMhz(1500).maxWorkGroupSize(1024)
+                .driverVersion("fake-1.0").supportsSubgroups(true).subgroupSize(32).maxLocalMemoryBytes(48L * 1024)
+                .computeCapability(type == BackendType.CUDA ? 120 : 0).feature(DeviceFeature.STORAGE_8BIT)
+                .feature(DeviceFeature.STORAGE_16BIT).feature(DeviceFeature.TIMELINE_SEMAPHORE)
+                .identity(new DeviceIdentity("Device", vendorId, null, null)).build();
+        FakeComputeBackend fake = FakeComputeBackend.builder().backendType(type).capabilities(caps).build();
+        try {
+            return LlmKernels.open(fake).flashDecodeRowPath();
+        } finally {
+            fake.close();
+        }
     }
 }

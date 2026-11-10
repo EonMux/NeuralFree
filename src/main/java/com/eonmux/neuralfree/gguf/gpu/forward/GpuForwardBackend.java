@@ -14,6 +14,7 @@ import com.eonmux.neuralfree.gguf.engine.RowTopK;
 import com.eonmux.neuralfree.gguf.engine.RopeSectionSupport;
 import com.eonmux.neuralfree.gguf.engine.TreeAccept;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants;
+import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuBlockRegistry;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuMixer;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuRecurrentTreeMixer;
@@ -1120,6 +1121,21 @@ public final class GpuForwardBackend implements ForwardBackend {
     /** The decode-step replay's state, for diagnostics: a captured graph's dispatches or the warmup progress. */
     public String decodeReplayStats() {
         return driver.decodeReplayStats();
+    }
+
+    /** The one-token decode replay's counters, for tests. */
+    GpuDecodeReplay.Counters decodeReplayCounters() {
+        return driver.decodeReplayCounters();
+    }
+
+    /** The LLM kernels this backend runs, for tests. */
+    LlmKernels kernels() {
+        return ctx.kernels();
+    }
+
+    /** The kernel names of the one-token decode replay's captured graph, for tests; empty while none is held. */
+    Set<String> decodeReplayKernels() {
+        return driver.decodeReplayKernels();
     }
 
     @Override

@@ -7,9 +7,12 @@
  * through the ConstantNV clamped layouts one stage at a time. The activation rows are padded with zero
  * rows to a whole number of NF_CM2_BN tokens, so the activation load never needs a clamp; the store
  * clamps to N tokens and M rows. The fp16 accumulator saturates at +-NF_CM2_ACC_MAX before the fp32 store,
- * so an overflowing sum stores the largest finite fp16 value instead of an infinity.
+ * so an overflowing sum stores the largest finite fp16 value instead of an infinity. Every stage first calls
+ * nf_cm2_scales, which publishes the staged scales of a new K block (Q4_K / Q5_K; nothing for the other types);
+ * an interior tile's unrolled groups start on block boundaries, as the shader takes the interior path only for
+ * a k range that starts on one.
  * Requires: the declarations of matmul_mmq_cm2.comp (bindings, push block, NF_CM2_* sizes,
- * mmq_ref_decode).
+ * mmq_ref_decode, nf_cm2_scales_begin, nf_cm2_scales).
  */
 void NF_CM2_TILE_FN(const uint m0, const uint n0, const uint kb, const uint ke, const uint pos_d,
                     const uint stride_d, const bool interior) {
@@ -29,6 +32,7 @@ void NF_CM2_TILE_FN(const uint m0, const uint n0, const uint kb, const uint ke, 
     coopmat<float16_t, gl_ScopeWorkgroup, NF_CM2_BM, NF_CM2_TW, gl_MatrixUseAccumulator> sum =
         coopmat<float16_t, gl_ScopeWorkgroup, NF_CM2_BM, NF_CM2_TW, gl_MatrixUseAccumulator>(float16_t(0.0));
     uint k0 = kb;
+    nf_cm2_scales_begin(m0, kb);
     if (interior) {
         tensorLayoutNV<2> la = createTensorLayoutNV(2);
         la = setTensorLayoutBlockSizeNV(la, 1u, uint(MMQ_BS));
@@ -36,6 +40,7 @@ void NF_CM2_TILE_FN(const uint m0, const uint n0, const uint kb, const uint ke, 
         la = setTensorLayoutStrideNV(la, uint(pc.K) / uint(MMQ_BS), 1u);
         const uint unrolled_end = kb + ((ke - kb) / NF_CM2_UNROLL_K) * NF_CM2_UNROLL_K;
         while (k0 < unrolled_end) {
+            nf_cm2_scales(m0, k0, kb, ke);
             [[unroll]] for (uint j = 0u; j < NF_CM2_UNROLL_K / NF_CM2_BK; j++) {
                 coopmat<float16_t, gl_ScopeWorkgroup, NF_CM2_BM, NF_CM2_BK, gl_MatrixUseA> ma;
                 coopmat<float16_t, gl_ScopeWorkgroup, NF_CM2_BK, NF_CM2_TW, gl_MatrixUseB> mb;
@@ -46,6 +51,7 @@ void NF_CM2_TILE_FN(const uint m0, const uint n0, const uint kb, const uint ke, 
             }
         }
         while (k0 < ke) {
+            nf_cm2_scales(m0, k0, kb, ke);
             coopmat<float16_t, gl_ScopeWorkgroup, NF_CM2_BM, NF_CM2_BK, gl_MatrixUseA> ma;
             coopmat<float16_t, gl_ScopeWorkgroup, NF_CM2_BK, NF_CM2_TW, gl_MatrixUseB> mb;
             coopMatLoadTensorNV(ma, w_u8, 0u, sliceTensorLayoutNV(la, m0, NF_CM2_BM, k0, NF_CM2_BK), mmq_ref_decode);
@@ -64,6 +70,7 @@ void NF_CM2_TILE_FN(const uint m0, const uint n0, const uint kb, const uint ke, 
         lbc = setTensorLayoutDimensionNV(lbc, padded_n, ke);
         lbc = setTensorLayoutStrideNV(lbc, stride_b, 1u);
         while (k0 < ke) {
+            nf_cm2_scales(m0, k0, kb, ke);
             coopmat<float16_t, gl_ScopeWorkgroup, NF_CM2_BM, NF_CM2_BK, gl_MatrixUseA> ma;
             coopmat<float16_t, gl_ScopeWorkgroup, NF_CM2_BK, NF_CM2_TW, gl_MatrixUseB> mb;
             coopMatLoadTensorNV(ma, w_u8, 0u, sliceTensorLayoutNV(la, m0, NF_CM2_BM, k0, NF_CM2_BK), mmq_ref_decode);

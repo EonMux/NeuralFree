@@ -29,8 +29,11 @@
  *   OP_ROW_NORM_Q8     (OP_ROW_NORM's arguments, then W uchar q8)
  *   OP_RESIDUAL_MIX_NORM_Q8 (OP_RESIDUAL_MIX_NORM's arguments, then W uchar q8)
  *       the same y (and x) plus row r's Q8_1 blocks at byte r * (row_len / 32) * 36 of q8, with the bits
- *       LLM_QuantizeQ8_1 (quantize_q8_1.comp) writes for the y values; row_len a multiple of 32. The Q8 forms
- *       always take the scalar strided loop.
+ *       LLM_QuantizeQ8_1 (quantize_q8_1.comp) writes for the y values; row_len a multiple of 32. The mix form
+ *       takes the plain form's register-resident row where that does (so y and x round as the plain form's),
+ *       otherwise both Q8 forms take the scalar strided loop. A row of at most NF_Q8_STASH elements writes its
+ *       blocks from a workgroup-memory copy of y, one invocation per block; a longer one reduces every block
+ *       over its 32 invocations.
  *   OP_MUL_ROW_SCALE   (i n_rows, i row_len, i scale_len, R float scale, float x)
  *       x[r*row_len + c] *= scale[scale_len == 1 ? 0 : c].
  * Buffers take bindings 0.. in argument order; scalars fill the push block in argument order. Operands that
@@ -144,14 +147,12 @@ layout(std430, binding = 1) readonly buffer NfNxAdd { float add_in[]; };
 layout(std430, binding = 2) readonly buffer NfNxW { float w_in[]; };
 layout(std430, binding = 3) readonly buffer NfNxB { float b_in[]; };
 layout(std430, binding = 4) writeonly buffer NfNxY { float y_out[]; };
-#if OP == OP_RESIDUAL_MIX_NORM
 layout(std430, binding = 0) buffer NfNxX4 { vec4 x4[]; };
 layout(std430, binding = 1) readonly buffer NfNxAdd4 { vec4 add4[]; };
 layout(std430, binding = 2) readonly buffer NfNxW4 { vec4 w4[]; };
 layout(std430, binding = 3) readonly buffer NfNxB4 { vec4 b4[]; };
 layout(std430, binding = 4) writeonly buffer NfNxY4 { vec4 y4[]; };
 #define NF_NX_VEC4_MAX 4   /* vec4 per invocation of the register-resident row: 4096 floats at 256 invocations */
-#endif
 layout(push_constant) uniform NfNxParams {
     int n_rows;
     int row_len;
@@ -230,10 +231,52 @@ float nf_norm_ext_value(uint xb, uint wb, uint i, float mean, float scale, float
 #if OP == OP_ROW_NORM_Q8 || OP == OP_RESIDUAL_MIX_NORM_Q8
 #include "common/rope_common.glsl"
 
+/* Rows of at most NF_Q8_STASH elements stash their y values in workgroup memory and write the Q8_1 blocks
+ * from there, one invocation per block, after a single barrier; the stash pads every 32-element block by one
+ * float so the invocations' block reads fall in distinct banks. Longer rows reduce each block over its 32
+ * invocations at every final-pass step (nf_norm_ext_q8). */
+#define NF_Q8_STASH 4096u
+shared float nf_q8_y[NF_Q8_STASH + NF_Q8_STASH / 32u];
+
+/* Stashes y value v of row element i (i < row_len <= NF_Q8_STASH). */
+void nf_q8_stash(uint i, float v) {
+    nf_q8_y[i + (i >> 5u)] = v;
+}
+
+/* Writes the Q8_1 blocks of the stashed row of row_len elements at byte q8b of q8, quantize_q8_1.comp's
+ * arithmetic block by block: amax, d = amax / 127, the codes and their sum. Every invocation calls it once,
+ * after its last nf_q8_stash. */
+void nf_q8_blocks(uint q8b, uint row_len) {
+    barrier();
+    const uint nb = row_len / 32u;
+    for (uint b = gl_LocalInvocationID.x; b < nb; b += gl_WorkGroupSize.x) {
+        const uint sb = b * 33u;
+        float amax = 0.0;
+        [[unroll]] for (uint j = 0u; j < 32u; j++) {
+            amax = max(amax, abs(nf_q8_y[sb + j]));
+        }
+        const float d = amax / 127.0;
+        const float id = d != 0.0 ? 1.0 / d : 0.0;
+        const uint ob = (q8b + b * 36u) >> 2u;
+        int sum = 0;
+        [[unroll]] for (uint w = 0u; w < 8u; w++) {
+            uint packed = 0u;
+            [[unroll]] for (uint e = 0u; e < 4u; e++) {
+                const int q = clamp(int(nf_roundf(nf_q8_y[sb + w * 4u + e] * id)), -127, 127);
+                sum += q;
+                packed |= (uint(q) & 0xFFu) << (8u * e);
+            }
+            q8_u32[ob + 1u + w] = packed;
+        }
+        q8_u32[ob] = nf_rope_f16_bits(d) | (nf_rope_f16_bits(float(sum) * d) << 16u);
+    }
+}
+
 /*
- * Element i of the row's Q8_1 form (nf_norm_ext_q8 of kernels/llm/norm_ext.cl, quantize_q8_1.comp's
- * arithmetic): every invocation calls it once per final-pass step, live = false past the row; the 32
- * elements of a block are the invocations of one aligned 32-wide segment. q8b is the row's first byte.
+ * Element i of the row's Q8_1 form for a row past the stash (nf_norm_ext_q8 of kernels/llm/norm_ext.cl,
+ * quantize_q8_1.comp's arithmetic): every invocation calls it once per final-pass step, live = false past the
+ * row; the 32 elements of a block are the invocations of one aligned 32-wide segment. q8b is the row's first
+ * byte.
  */
 void nf_norm_ext_q8(uint q8b, uint i, bool live, float v) {
     const float amax = nf_seg_max(live ? abs(v) : 0.0, 32u);
@@ -251,11 +294,21 @@ void nf_norm_ext_q8(uint q8b, uint i, bool live, float v) {
     }
 }
 
-/* The final pass of a Q8 row norm: every invocation runs ceil(row_len / L) steps. */
+/* The final pass of a Q8 row norm: the y values, then the row's blocks from the stash, or for a longer row
+ * every invocation runs ceil(row_len / L) steps of nf_norm_ext_q8. */
 void nf_norm_ext_store_q8(uint row, uint xb, uint yb, uint wb, uint row_len, float mean, float scale, float post) {
     const uint lsize = gl_WorkGroupSize.x;
-    const uint steps = (row_len + lsize - 1u) / lsize;
     const uint q8b = row * (row_len / 32u) * 36u;
+    if (row_len <= NF_Q8_STASH) {
+        for (uint i = gl_LocalInvocationID.x; i < row_len; i += lsize) {
+            const float v = nf_norm_ext_value(xb, wb, i, mean, scale, post);
+            y_out[yb + i] = v;
+            nf_q8_stash(i, v);
+        }
+        nf_q8_blocks(q8b, row_len);
+        return;
+    }
+    const uint steps = (row_len + lsize - 1u) / lsize;
     for (uint t = 0u; t < steps; ++t) {
         const uint i = t * lsize + gl_LocalInvocationID.x;
         const bool live = i < row_len;
@@ -286,10 +339,11 @@ vec3 nf_rmn_norm(float sum, float ss, float dev, float n) {
 }
 #endif
 
-#if OP == OP_RESIDUAL_MIX_NORM
+#if OP == OP_RESIDUAL_MIX_NORM || OP == OP_RESIDUAL_MIX_NORM_Q8
 /* The register-resident row: element offsets xb, ab, yb and wb are multiples of 4, row_len / 4 vec4 fit
- * NF_NX_VEC4_MAX per invocation. The weight and bias step rounds as nf_norm_ext_value's does. */
-void nf_rmn_row4(uint xb, uint ab, uint yb, uint wb, uint row_len) {
+ * NF_NX_VEC4_MAX per invocation (and, for the Q8 form, row_len is a multiple of 32 within NF_Q8_STASH, whose
+ * blocks the stash writes). The weight and bias step rounds as nf_norm_ext_value's does. */
+void nf_rmn_row4(uint row, uint xb, uint ab, uint yb, uint wb, uint row_len) {
     const uint lid = gl_LocalInvocationID.x;
     const uint n4 = row_len >> 2u;
     const float n = float(row_len);
@@ -329,8 +383,9 @@ void nf_rmn_row4(uint xb, uint ab, uint yb, uint wb, uint row_len) {
     const bool has_b = (pc.flags & NF_NORM_EXT_HAS_B) != 0;
     [[unroll]] for (uint k = 0u; k < uint(NF_NX_VEC4_MAX); k++) {
         const uint i = lid + k * gl_WorkGroupSize.x;
+        vec4 o = vec4(0.0);
         if (i < n4) {
-            vec4 o = (v[k] - msp.x) * msp.y;
+            o = (v[k] - msp.x) * msp.y;
             if (pc.mode == NF_NORM_EXT_L2_GDN) {
                 o *= msp.z;
             }
@@ -342,8 +397,17 @@ void nf_rmn_row4(uint xb, uint ab, uint yb, uint wb, uint row_len) {
                 o += b4[(wb >> 2u) + i];
             }
             y4[(yb >> 2u) + i] = o;
+#if OP == OP_RESIDUAL_MIX_NORM_Q8
+            nf_q8_stash(4u * i, o.x);
+            nf_q8_stash(4u * i + 1u, o.y);
+            nf_q8_stash(4u * i + 2u, o.z);
+            nf_q8_stash(4u * i + 3u, o.w);
+#endif
         }
     }
+#if OP == OP_RESIDUAL_MIX_NORM_Q8
+    nf_q8_blocks(row * (row_len / 32u) * 36u, row_len);
+#endif
 }
 #endif
 
@@ -472,13 +536,16 @@ void main() {
     const uint yb = uint(pc.y_off) + row * row_len;
     const uint wb = (pc.w_rows > 1 ? row % uint(pc.w_rows) : 0u) * row_len;
     const float n = float(pc.row_len);
-#if OP == OP_RESIDUAL_MIX_NORM
+#if OP == OP_RESIDUAL_MIX_NORM_Q8
+    const bool row4_fits = row_len <= NF_Q8_STASH;
+#else
+    const bool row4_fits = true;
+#endif
     if ((row_len & 3u) == 0u && row_len <= 4u * uint(NF_NX_VEC4_MAX) * gl_WorkGroupSize.x
-        && ((xb | ab | yb) & 3u) == 0u) {
-        nf_rmn_row4(xb, ab, yb, wb, row_len);
+        && ((xb | ab | yb) & 3u) == 0u && row4_fits) {
+        nf_rmn_row4(row, xb, ab, yb, wb, row_len);
         return;   /* uniform across the workgroup */
     }
-#endif
 
     float sum = 0.0;
     float ss = 0.0;

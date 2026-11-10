@@ -279,7 +279,7 @@ public final class GpuOps implements AutoCloseable {
                     + " is not a power of two of at most " + local);
         }
         this.signs = new HadamardSignBuffers(backend, queue);
-        this.q8 = new Q8Activations(scratch, kernels.caps(), int8Mode);
+        this.q8 = new Q8Activations(scratch, kernels.caps(), int8Mode, kernels.warpReductions());
         this.lanes = new FastGemmLanes(this, queue, kernels, scratch);
         this.projections = new GpuProjections(this, queue, kernels, scratch);
         this.embeddings = new GpuEmbeddings(this, queue, scratch);
@@ -528,28 +528,34 @@ public final class GpuOps implements AutoCloseable {
      * projection of the scope whose view is exactly the shared rows (element 0 of their buffer, the same token count)
      * reuses its lane's form, each bit for bit the per-projection staging and each in its own staging slot: the Q8_1
      * blocks of an integer-dot lane ({@link #blocks}: the blocks the rows' norm wrote when the scope opens right after
-     * it, {@link Q8Activations#take}, else quantized on first use) or the int8 MMQ GEMM's records ({@link #records},
+     * it, {@link Q8Activations#claim}, else quantized on first use) or the int8 MMQ GEMM's records ({@link #records},
      * staged on first use). Any other projection quantizes its own rows. The caller keeps the rows unchanged until the
-     * scope closes. Closing enqueues nothing and is idempotent.
+     * scope closes. Closing enqueues nothing and is idempotent; it reports norm-written blocks that no projection read
+     * ({@link Q8Activations#unused}), so that norm stops writing them.
      */
     public final class SharedQ8 implements AutoCloseable {
         private final GpuBuffer source;
         private final int cols;
         private final int rows;
+        /** The blocks the rows' norm wrote, taken as the scope opened, or null. */
+        private final Q8Activations.Claim claim;
         private GpuBuffer blocks;
         private ScratchSlot records;
+        private boolean blocksRead;
         private boolean closed;
 
         private SharedQ8(GpuBuffer source, int cols, int rows) {
             this.source = source;
             this.cols = cols;
             this.rows = rows;
-            this.blocks = q8.take(source, rows, cols);
+            this.claim = q8.claim(source, rows, cols);
+            this.blocks = claim != null ? claim.blocks : null;
         }
 
         /** The Q8_1 blocks of the shared rows, quantizing them on first use. */
         GpuBuffer blocks() {
             ensureShareOpen();
+            blocksRead = true;
             if (blocks == null) {
                 long n = (long) rows * (cols / Q8_1_BLOCK_SIZE);
                 ScratchSlot slot = scratch.staging(GpuScratch.Staging.SHARED_Q8_1, n * Q8_1_FLOATS);
@@ -591,6 +597,9 @@ public final class GpuOps implements AutoCloseable {
             closed = true;
             if (activeShare == this) {
                 activeShare = null;
+            }
+            if (claim != null && !blocksRead) {
+                q8.unused(claim);
             }
         }
     }
@@ -916,10 +925,10 @@ public final class GpuOps implements AutoCloseable {
         }
         Object[] args = NormKernels.rowNormArgs(k, eps, nRows, width, width, in, inOff, out, outOff, wb, bb, wRows,
                 placeholder());
-        if (emitsQ8(NormKernels.ROW_NORM_Q8, nRows, width, outOff, wRows)) {
+        if (emitsQ8(NormKernels.ROW_NORM_Q8, out, wb, nRows, width, outOff, wRows)) {
             GpuBuffer blocks = q8.target(nRows, width);
             launch(NormKernels.ROW_NORM_Q8, (long) nRows * local, NormKernels.withQ8Blocks(args, nRows, width, blocks));
-            q8.emitted(out, nRows, width, blocks);
+            q8.emitted(out, wb, nRows, width, blocks);
             return;
         }
         launch(ROW_NORM, (long) nRows * local, args);
@@ -929,8 +938,9 @@ public final class GpuOps implements AutoCloseable {
      * Whether a row norm writes its rows' Q8_1 blocks through {@code kernel}: {@link Q8Activations#emits}, the kernel
      * is ready, fusion is permitted, batch invariance is off and no {@link SharedQ8} scope holds the slot.
      */
-    private boolean emitsQ8(String kernel, int nRows, int width, int outOff, int wRows) {
-        return activeShare == null && q8.emits(nRows, width, outOff, wRows) && fusedMode.permitsFusion()
+    private boolean emitsQ8(String kernel, GpuBuffer out, GpuBuffer weight, int nRows, int width, int outOff,
+                            int wRows) {
+        return activeShare == null && q8.emits(out, weight, nRows, width, outOff, wRows) && fusedMode.permitsFusion()
                 && !BatchInvariance.enabled() && optionalReady(kernel, local);
     }
 
@@ -984,11 +994,11 @@ public final class GpuOps implements AutoCloseable {
         }
         Object[] args = NormKernels.residualMixNormArgs(mix, s, k, eps, nRows, width, xOff, addOff, outOff,
                 x, addend, wb, bb, wRows, out, placeholder());
-        if (emitsQ8(NormKernels.RESIDUAL_MIX_NORM_Q8, nRows, width, outOff, wRows)) {
+        if (emitsQ8(NormKernels.RESIDUAL_MIX_NORM_Q8, out, wb, nRows, width, outOff, wRows)) {
             GpuBuffer blocks = q8.target(nRows, width);
             launch(NormKernels.RESIDUAL_MIX_NORM_Q8, (long) nRows * local,
                     NormKernels.withQ8Blocks(args, nRows, width, blocks));
-            q8.emitted(out, nRows, width, blocks);
+            q8.emitted(out, wb, nRows, width, blocks);
             return true;
         }
         launch(NormKernels.RESIDUAL_MIX_NORM, (long) nRows * local, args);

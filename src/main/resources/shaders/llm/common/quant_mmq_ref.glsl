@@ -7,7 +7,18 @@
  * an fp32 scale), as llama.cpp's dequant_funcs_cm2.glsl reads its packed16 blocks. The value formulas
  * equal quant_mmq.glsl / quant_k.glsl; the result is rounded to fp16 once, as the KHR CM form rounds
  * its staged tile.
- * Requires: common/nf_common.glsl, common/quant_blocks.glsl (the QT_* ids); QTYPE selects the type.
+ *
+ * Staged scales (MMQ_REF_STAGED: Q4_K and Q5_K when the shader defines MMQ_REF_SCALE_ROWS): the two types
+ * share get_scale_min_k4's 6-bit packing, which costs the per-element decode three byte loads and the
+ * unpacking. A shader that walks one K block of a tile of MMQ_REF_SCALE_ROWS rows at a time instead decodes
+ * every row's eight (d * scale, dmin * min) pairs into workgroup memory once per block (mmq_ref_stage_fetch
+ * into registers, then mmq_ref_stage_store between barriers: llama.cpp's fetch_scales / store_scales), and
+ * the callback reads its pair from there by its row within the tile (blockCoords[0] % rows). Both products
+ * are exact in fp32 (an fp16 times a 6-bit integer), so the decoded values equal the unstaged formula's; the
+ * fetching invocations split a row's sub-blocks into equal parts. Q6_K keeps its per-element scale loads:
+ * its sixteen int8 scales are one byte load each with nothing to unpack, so staging them only adds the
+ * barriers and the shared-memory traffic.
+ * Requires the shader's NF_BUFFER_VIEWS(0, w) (the weight buffer at binding 0, word view w_u32).
  */
 /* Portions derived from llama.cpp/ggml (MIT License); see THIRD-PARTY-NOTICES.md. */
 #ifndef NF_QUANT_MMQ_REF_GLSL
@@ -59,6 +70,37 @@ uint mmq_ref_w(const in NfMmqRef b, const in uint o) { return uint(b.h[o >> 1u])
 uint mmq_ref_u8(const in NfMmqRef b, const in uint o) { return (uint(b.h[o >> 1u]) >> ((o & 1u) << 3u)) & 0xFFu; }
 /* The fp16 value at even byte offset o. */
 float mmq_ref_f16(const in NfMmqRef b, const in uint o) { return unpackHalf2x16(uint(b.h[o >> 1u])).x; }
+
+#if defined(MMQ_REF_SCALE_ROWS) && (QTYPE == QT_Q4_K || QTYPE == QT_Q5_K)
+#define MMQ_REF_STAGED 1
+/* Row stride of the staged scales: two words of padding keep the sub-block planes off one bank. */
+#define MMQ_REF_STAGE_STRIDE (MMQ_REF_SCALE_ROWS + 2u)
+#define MMQ_REF_STAGE_SUBS 8u
+shared vec2 mmq_ref_stage[MMQ_REF_STAGE_SUBS * MMQ_REF_STAGE_STRIDE];
+
+/* The first 16 bytes of the weight block of row `row`, K block `blk` (d, dmin and the 12 scale bytes, which
+ * every part's sub-blocks draw on); every block starts on a 16-byte boundary (MMQ_BB is a multiple of 16). */
+uvec4 mmq_ref_stage_fetch(const uint row, const uint blk, const uint blocks_per_row) {
+    const uint w0 = (row * blocks_per_row + blk) * (uint(MMQ_BB) / 4u);
+    return uvec4(w_u32[w0], w_u32[w0 + 1u], w_u32[w0 + 2u], w_u32[w0 + 3u]);
+}
+
+/* Stores sub-blocks part * 8 / parts on of the fetched block head v as the (d * scale, dmin * min) pairs of
+ * tile row lrow. */
+void mmq_ref_stage_store(const uvec4 v, const uint lrow, const uint part, const uint parts) {
+    const vec2 dm = unpackHalf2x16(v.x);
+    const uint sc_hi = (v.w & 0x0F0F0F0Fu) | ((v.y & 0xC0C0C0C0u) >> 2u);
+    const uint mb_hi = ((v.w & 0xF0F0F0F0u) >> 4u) | ((v.z & 0xC0C0C0C0u) >> 2u);
+    const uint count = MMQ_REF_STAGE_SUBS / parts;
+    for (uint i = 0u; i < count; i++) {
+        const uint j = part * count + i;
+        const uint shift = (j & 3u) << 3u;
+        const uint sc = ((j < 4u ? v.y : sc_hi) >> shift) & 63u;
+        const uint mb = ((j < 4u ? v.z : mb_hi) >> shift) & 63u;
+        mmq_ref_stage[j * MMQ_REF_STAGE_STRIDE + lrow] = vec2(dm.x * float(sc), dm.y * float(mb));
+    }
+}
+#endif
 
 /* get_scale_min_k4 of Q4_K/Q5_K (quant_blocks.glsl nf_k4_scale_min) over the 12 scale bytes at 4. */
 vec2 mmq_ref_k4_scale_min(const in NfMmqRef b, const in uint j) {
@@ -136,8 +178,13 @@ float16_t mmq_ref_decode(const in NfMmqRef b, const in uint bc[2], const in uint
     const uint e = e2[1];
     const uint si = e >> 5u;
     const uint code = (mmq_ref_u8(b, 16u + ((si >> 1u) << 5u) + (e & 31u)) >> ((si & 1u) << 2u)) & 0xFu;
+#ifdef MMQ_REF_STAGED
+    const vec2 s = mmq_ref_stage[si * MMQ_REF_STAGE_STRIDE + bc[0] % MMQ_REF_SCALE_ROWS];
+    return float16_t(s.x * float(code) - s.y);
+#else
     const vec2 sm = mmq_ref_k4_scale_min(b, si);
     return float16_t(mmq_ref_f16(b, 0u) * sm.x * float(code) - mmq_ref_f16(b, 2u) * sm.y);
+#endif
 }
 #elif QTYPE == QT_Q5_K
 /* d@0, dmin@2, scales[12]@4, qh[32]@16, qs[128]@48. */
@@ -146,8 +193,13 @@ float16_t mmq_ref_decode(const in NfMmqRef b, const in uint bc[2], const in uint
     const uint si = e >> 5u, l = e & 31u;
     const uint lo = (mmq_ref_u8(b, 48u + ((si >> 1u) << 5u) + l) >> ((si & 1u) << 2u)) & 0xFu;
     const uint code = lo | (((mmq_ref_u8(b, 16u + l) >> si) & 1u) << 4u);
+#ifdef MMQ_REF_STAGED
+    const vec2 s = mmq_ref_stage[si * MMQ_REF_STAGE_STRIDE + bc[0] % MMQ_REF_SCALE_ROWS];
+    return float16_t(s.x * float(code) - s.y);
+#else
     const vec2 sm = mmq_ref_k4_scale_min(b, si);
     return float16_t(mmq_ref_f16(b, 0u) * sm.x * float(code) - mmq_ref_f16(b, 2u) * sm.y);
+#endif
 }
 #elif QTYPE == QT_Q6_K
 /* ql[128]@0, qh[64]@128, scales[16] int8@192, d@208. */

@@ -2,7 +2,8 @@
  * Requires: common/dialect.h, common/config.h, common/attn_common.h */
 /*
  * CUDA-only twin of LLM_FlashDecode_F16 (flash_decode.cl) for the plain one-row step, with the same argument
- * list, grid, split partials and direct output, so the host swaps the kernel name and nothing else: the decode
+ * list, grid, split partials and direct output (its Vulkan twin is shaders/llm/flash_decode_row.comp), so the
+ * host swaps the kernel name and nothing else: the decode
  * patcher, the split plan (gguf.ops.attn.FlashAttnTiling.decodeSplit) and LLM_FlashAttn_Combine stay as they
  * are. The generic kernel serves every cache type, the paged and tree forms, sinks and the position biases in
  * one body, which compiles to tens of thousands of instructions and pays several dependent global round trips
@@ -236,4 +237,4 @@ NF_KERNEL void LLM_FlashDecodeRow_F16(
     }
 }
 
-#endif /* __CUDACC__ and not __HIP__: the OpenCL program, the HIP build and the Vulkan shader set define no row kernel */
+#endif /* __CUDACC__ and not __HIP__: the OpenCL program and the HIP build define no row kernel */

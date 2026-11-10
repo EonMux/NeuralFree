@@ -13,8 +13,10 @@ import org.apache.logging.log4j.Logger;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 
 /**
  * Decode-step graph replay over one queue, the device-graph capture of the decode trunk: once the trunk's
@@ -76,7 +78,7 @@ final class GpuDecodeReplay implements AutoCloseable {
     /** Consecutive stable decode steps before the first capture, the default of {@link #WARMUP_PROPERTY}. */
     static final int DEFAULT_WARMUP_STEPS = 2;
     /** Steps the body runs after a capture before the plan is trusted without it. */
-    private static final int VERIFY_STEPS = 2;
+    static final int VERIFY_STEPS = 2;
     /** Failed replays in a row after which the attempts stop until {@link #invalidate()}. */
     private static final int MAX_FAILED_REPLAYS = 2;
     /** Captures that failed after which the attempts stop until {@link #invalidate()}. */
@@ -104,6 +106,10 @@ final class GpuDecodeReplay implements AutoCloseable {
     private int stableSteps;
     private int failedReplays;
     private int abortedCaptures;
+    private int captures;
+    private int bodyReplays;
+    private int patchedReplays;
+    private int preparedSteps;
 
     GpuDecodeReplay(ComputeQueue queue) {
         this.queue = queue;
@@ -266,6 +272,7 @@ final class GpuDecodeReplay implements AutoCloseable {
         }
         if (replayed) {
             failedReplays = 0;
+            patchedReplays++;
             if (HOST_COST_PROBE) {
                 long prepared = System.nanoTime();
                 prepareFollowup(pos);
@@ -293,7 +300,9 @@ final class GpuDecodeReplay implements AutoCloseable {
      */
     private void prepareFollowup(int pos) {
         try {
-            graph.preparePatched(plan, pos + stepWidth, pos);
+            if (graph.preparePatched(plan, pos + stepWidth, pos)) {
+                preparedSteps++;
+            }
         } catch (RuntimeException e) {
             LOGGER.debug("Decode replay drops its graph after a failed follow-up patch: {}", e.getMessage());
             dropGraph();
@@ -326,6 +335,7 @@ final class GpuDecodeReplay implements AutoCloseable {
             body.run();
             return;
         }
+        bodyReplays++;
         verifiedSteps++;
         int[] changed = graph.takeReplayChanges();
         if (changed == null || !cover(changed)) {
@@ -419,6 +429,7 @@ final class GpuDecodeReplay implements AutoCloseable {
         try {
             graph.replay(body);
             failedReplays = 0;
+            bodyReplays++;
         } catch (GpuGraphMismatchException e) {
             LOGGER.debug("Decode replay re-captures after: {}", e.getMessage());
             closeGraph();
@@ -478,6 +489,7 @@ final class GpuDecodeReplay implements AutoCloseable {
         }
         // the capture executed nothing: submit it once so the step that recorded it reaches the device
         graph = captured;
+        captures++;
         plan = null;
         verifiedSteps = 0;
         if (patchedConfigured && patchers != null && !patchers.isEmpty() && graph.supportsPatchedReplay()) {
@@ -553,6 +565,22 @@ final class GpuDecodeReplay implements AutoCloseable {
         captured.close();
     }
 
+    /** What this replay has done since it was made, for diagnostics and tests. */
+    Counters counters() {
+        return new Counters(captures, bodyReplays, patchedReplays, preparedSteps);
+    }
+
+    /** The kernel names of the captured graph's dispatches, in first-dispatch order; empty while none is held. */
+    Set<String> capturedKernels() {
+        Set<String> out = new LinkedHashSet<>();
+        if (graph != null) {
+            for (GpuGraphDispatch d : graph.kernelDispatches()) {
+                out.add(d.kernelName());
+            }
+        }
+        return out;
+    }
+
     /** Releases the captured graph. Idempotent. */
     @Override
     public void close() {
@@ -566,5 +594,30 @@ final class GpuDecodeReplay implements AutoCloseable {
                 : ", body replay")
                 : ", " + stableSteps + "/" + warmupSteps + " warmup steps")
                 + (configured ? "" : ", disabled") + "}";
+    }
+
+    /**
+     * A snapshot of a replay's work: the graphs it captured, the steps whose body it replayed against a capture (the
+     * verify steps included), the trusted steps it submitted from the patch plan without the body, and the follow-up
+     * steps a backend prepared ahead of their patched replay. Immutable.
+     */
+    static final class Counters {
+        final int captures;
+        final int bodyReplays;
+        final int patchedReplays;
+        final int preparedSteps;
+
+        Counters(int captures, int bodyReplays, int patchedReplays, int preparedSteps) {
+            this.captures = captures;
+            this.bodyReplays = bodyReplays;
+            this.patchedReplays = patchedReplays;
+            this.preparedSteps = preparedSteps;
+        }
+
+        @Override
+        public String toString() {
+            return "Counters{captures=" + captures + ", bodyReplays=" + bodyReplays + ", patchedReplays="
+                    + patchedReplays + ", preparedSteps=" + preparedSteps + "}";
+        }
     }
 }

@@ -31,7 +31,8 @@ import java.util.Locale;
  * {@code NEURALFREE_BENCH_REPLAY_PARITY} environment variable, which the test task forwards): the same
  * greedy generation runs with the replay disabled and enabled — plain decode on the 4B target and a chain
  * speculation session over the real 4B target with its 0.6B drafter — and the report prints the token ids
- * and their first divergence. Asserts nothing; the verdict goes to the result report.
+ * and their first divergence. Asserts nothing; the verdict goes to the result report. The probe runs on CUDA, or on
+ * the backend {@code neuralfree.bench.replayParityBackend} names ({@code VULKAN}).
  */
 public class GpuDecodeReplayParityTest {
 
@@ -53,6 +54,8 @@ public class GpuDecodeReplayParityTest {
     private static final int CHAIN_DRAFT_MAX = 8;
     private static final int CHAIN_TOKENS = 48;
     private static final int CHAIN_REPS = 3;
+    private static final EngineConfig.BackendMode BACKEND = EngineConfig.BackendMode.valueOf(
+            System.getProperty("neuralfree.bench.replayParityBackend", "CUDA"));
 
     @Test
     public void replayedDecodeMatchesDirectDecode() throws IOException {
@@ -60,7 +63,11 @@ public class GpuDecodeReplayParityTest {
                 "1".equals(System.getProperty("neuralfree.bench.replayParity",
                         System.getenv(SWITCH))));
         Assume.assumeTrue("model absent", Files.exists(Path.of(MODEL)));
-        GpuTestUtil.assumeCudaAvailable();
+        if (BACKEND == EngineConfig.BackendMode.VULKAN) {
+            GpuTestUtil.assumeVulkanAvailable();
+        } else {
+            GpuTestUtil.assumeCudaAvailable();
+        }
         GpuDecodeReplayTimingTest.debugReplayLogs();
         List<Integer> direct = generate(MODEL, "false", null);
         List<Integer> replayed = generate(MODEL, "true", null);
@@ -114,7 +121,7 @@ public class GpuDecodeReplayParityTest {
         System.setProperty(GpuDecodeReplay.PROPERTY, replay);
         try {
             EngineConfig cfg = EngineConfig.builder()
-                    .backend(EngineConfig.BackendMode.CUDA)
+                    .backend(BACKEND)
                     .gpuLayers(EngineConfig.GPU_LAYERS_ALL)
                     .memory(MemoryConfig.builder().nCtx(256).build())
                     .build();
@@ -147,7 +154,7 @@ public class GpuDecodeReplayParityTest {
         System.setProperty(GpuDecodeReplay.PROPERTY, replay);
         try {
             EngineConfig cfg = EngineConfig.builder()
-                    .backend(EngineConfig.BackendMode.CUDA)
+                    .backend(BACKEND)
                     .gpuLayers(EngineConfig.GPU_LAYERS_ALL)
                     .memory(MemoryConfig.builder().nCtx(256).build())
                     .build();
@@ -179,7 +186,7 @@ public class GpuDecodeReplayParityTest {
         System.setProperty(GpuDecodeReplay.PROPERTY, replay);
         try {
             EngineConfig cfg = EngineConfig.builder()
-                    .backend(EngineConfig.BackendMode.CUDA)
+                    .backend(BACKEND)
                     .memory(MemoryConfig.builder().nCtx(CHAIN_N_CTX).ubatch(CHAIN_UBATCH).build())
                     .draftModelPath(DRAFTER).draftMax(CHAIN_DRAFT_MAX)
                     .speculativeOptions(SpeculativeOptions.builder().pSplit(0).treeVerify(false).build())
@@ -213,7 +220,7 @@ public class GpuDecodeReplayParityTest {
     /** The prompt's ids through the target's tokenizer. */
     private static int[] tokenize() throws IOException {
         EngineConfig cfg = EngineConfig.builder()
-                .backend(EngineConfig.BackendMode.CUDA)
+                .backend(BACKEND)
                 .memory(MemoryConfig.builder().nCtx(CHAIN_N_CTX).build())
                 .build();
         try (EngineModel model = LLMModelFactory.open(MODEL, cfg)) {

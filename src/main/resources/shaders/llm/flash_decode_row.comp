@@ -1,0 +1,278 @@
+/* flash_decode_row.comp - LLM_FlashDecodeRow_F16, the one-row decode attention over a dense F16 cache: the Vulkan twin
+ * of the CUDA-only kernels/llm/flash_decode_row.cl, with its argument list, grid, split partials, direct output and
+ * plan constraints (documented there), so the host swaps LLM_FlashDecode_F16 for it and nothing else.
+ * Requires: common/nf_common.glsl, common/act.glsl, common/kv_types.glsl, common/attn_common.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order), as LLM_FlashDecode_F16:
+ *   (i n_head, i n_head_kv, i d_k, i d_v, i g_tile, i n_split, i split_len, i kv_start, i kv_end, i q_pos,
+ *    i k_row_stride, i k_head_stride, i v_row_stride, i v_head_stride, f scale, f softcap, f max_bias,
+ *    i flags, i swa_type, i n_swa, i bias_mode, i n_buckets, i max_distance, i q_off, i out_off,
+ *    R q, R k, R v, R<int> kv_pos, R sinks, R rel_bias, W out, W partial, R kv_scales, R<uvec2> tree_mask)
+ * Dispatch: 2-D, global {n_split * 128, n_head}, local {128, 1, 1} (gguf.ops.attn.FlashAttnTiling.decodeGlobal with
+ * one query head per workgroup).
+ *
+ * Work-group (split s, head h): four lane groups of 32 invocations over the split's keys, group w taking keys
+ * w, w + 4, ...; lane l holds the query and output elements 4 (32 c + l) .. + 3 of every 128-element chunk c, so a
+ * key's K and V rows are d / 128 coalesced 256-byte loads per group (8 bytes per lane, or two 4-byte halves when a
+ * row or head stride is not a multiple of 4 elements). Each group issues the K row, the V row and the position of
+ * NF_FDR_KB keys before using the first, reduces each score over its 32 lanes, and keeps an online softmax (running
+ * max m, sum l, output o) in registers: one rescale per batch. The four groups' states merge once through shared
+ * memory at the end. Every group runs the same number of batches, so the shared-memory reduction stays in uniform
+ * control flow.
+ *
+ * Lane groups: under USE_SUBGROUPS on a device whose subgroups are 32 lanes wide (the module is bound with full
+ * subgroups) a lane group is a subgroup and its score reduction is subgroupAdd; otherwise (the plain module, or
+ * another subgroup width) the groups are the invocations 32 w .. 32 w + 31 and reduce through shared memory.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/act.glsl"
+#include "common/kv_types.glsl"
+#include "common/attn_common.glsl"
+
+#define NF_FDR_MAX_D  256                    /* largest head dim (gguf.ops.attn.AttnKernels.FLASH_DECODE_ROW_MAX_D) */
+#define NF_FDR_LANES  32                     /* invocations per lane group */
+#define NF_FDR_GROUPS (NF_FA_WG / NF_FDR_LANES)
+#define NF_FDR_MAX_C  (NF_FDR_MAX_D / (4 * NF_FDR_LANES)) /* 4-element chunks per lane */
+#define NF_FDR_KB     4                      /* keys per lane group in flight */
+
+layout(std430, binding = 0) readonly buffer NfFdrQ { float q_in[]; };
+layout(std430, binding = 1) readonly buffer NfFdrK2 { uvec2 k_u64[]; };
+layout(std430, binding = 1) readonly buffer NfFdrK1 { uint k_u32[]; };
+layout(std430, binding = 2) readonly buffer NfFdrV2 { uvec2 v_u64[]; };
+layout(std430, binding = 2) readonly buffer NfFdrV1 { uint v_u32[]; };
+layout(std430, binding = 3) readonly buffer NfFdrKvPos { int kv_pos[]; };
+layout(std430, binding = 4) readonly buffer NfFdrSinks { float sinks[]; };
+layout(std430, binding = 5) readonly buffer NfFdrRelBias { float rel_bias[]; };
+layout(std430, binding = 6) writeonly buffer NfFdrOut { float dst[]; };
+layout(std430, binding = 7) writeonly buffer NfFdrPartial { float partial[]; };
+layout(std430, binding = 8) readonly buffer NfFdrKvScales { float kv_scales[]; };
+layout(std430, binding = 9) readonly buffer NfFdrTreeMask { uvec2 tree_mask[]; };
+
+layout(push_constant) uniform NfFdrParams {
+    int n_head; int n_head_kv; int d_k; int d_v; int g_tile;
+    int n_split; int split_len; int kv_start; int kv_end; int q_pos;
+    int k_row_stride; int k_head_stride; int v_row_stride; int v_head_stride;
+    float scale; float softcap; float max_bias;
+    int flags; int swa_type; int n_swa;
+    int bias_mode; int n_buckets; int max_distance;
+    int q_off; int out_off;
+} pc;
+
+shared float o_s[NF_FDR_GROUPS * NF_FDR_MAX_D];
+shared float m_s[NF_FDR_GROUPS];
+shared float l_s[NF_FDR_GROUPS];
+/* One partial score per invocation and in-flight key, for the shared-memory lane-group reduction. */
+shared float red_s[NF_FDR_KB * NF_FA_WG];
+
+/* True when a lane group is one subgroup and reduces with subgroup arithmetic. */
+bool nf_fdr_subgroup_lanes() {
+#ifdef USE_SUBGROUPS
+    return gl_SubgroupSize == uint(NF_FDR_LANES);
+#else
+    return false;
+#endif
+}
+
+/* Four halves of a row at element e (e % 4 == 0) as two packed half2 words. */
+uvec2 nf_fdr_k4(uint e, bool aligned) {
+    return aligned ? k_u64[e >> 2] : uvec2(k_u32[e >> 1], k_u32[(e >> 1) + 1u]);
+}
+uvec2 nf_fdr_v4(uint e, bool aligned) {
+    return aligned ? v_u64[e >> 2] : uvec2(v_u32[e >> 1], v_u32[(e >> 1) + 1u]);
+}
+
+vec4 nf_fdr_unpack(uvec2 h) {
+    return vec4(unpackHalf2x16(h.x), unpackHalf2x16(h.y));
+}
+
+/* NaN outputs of a launch outside the plan constraints (the whole launch's rows, from work-group (0, 0) only). */
+void nf_fdr_poison(bool direct_out) {
+    if (gl_WorkGroupID.x != 0u || gl_WorkGroupID.y != 0u || pc.n_head <= 0 || pc.d_v <= 0 || pc.n_split <= 0) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    if (direct_out) {
+        for (uint i = lid; i < uint(pc.n_head * pc.d_v); i += uint(NF_FA_WG)) {
+            dst[uint(pc.out_off) + i] = NF_NAN;
+        }
+    } else {
+        const uint n = uint(pc.n_head) * uint(pc.n_split) * uint(pc.d_v + 2);
+        for (uint i = lid; i < n; i += uint(NF_FA_WG)) {
+            partial[i] = NF_NAN;
+        }
+    }
+}
+
+void main() {
+    const bool direct_out = (pc.flags & NF_ATTN_FLAG_DIRECT) != 0;
+    const int unsupported = NF_ATTN_FLAG_SINKS | NF_ATTN_FLAG_V_ALIAS | NF_ATTN_FLAG_TREE;
+    if (gl_WorkGroupSize.x != uint(NF_FA_WG) || pc.g_tile != 1 || pc.d_k != pc.d_v || pc.d_k <= 0
+            || pc.d_k % 64 != 0 || pc.d_k > NF_FDR_MAX_D || pc.n_head_kv <= 0 || pc.n_head % pc.n_head_kv != 0
+            || pc.split_len <= 0 || pc.bias_mode != NF_ATTN_BIAS_NONE || (pc.flags & unsupported) != 0
+            || ((pc.k_row_stride | pc.k_head_stride | pc.v_row_stride | pc.v_head_stride) & 1) != 0
+            || (direct_out && pc.n_split != 1)) {
+        nf_fdr_poison(direct_out);
+        return;   /* uniform: no barrier reached */
+    }
+
+    const bool sg = nf_fdr_subgroup_lanes();
+    const uint lid = gl_LocalInvocationID.x;
+#ifdef USE_SUBGROUPS
+    const uint w = sg ? gl_SubgroupID : lid / uint(NF_FDR_LANES);
+    const uint lane = sg ? gl_SubgroupInvocationID : lid % uint(NF_FDR_LANES);
+#else
+    const uint w = lid / uint(NF_FDR_LANES);
+    const uint lane = lid % uint(NF_FDR_LANES);
+#endif
+    const int split = int(gl_WorkGroupID.x);
+    const int h = int(gl_WorkGroupID.y);
+    const int kvh = h / (pc.n_head / pc.n_head_kv);
+    const int d = pc.d_k;
+    const int causal = pc.flags & NF_ATTN_FLAG_CAUSAL;
+    const int k_begin = pc.kv_start + split * pc.split_len;
+    const int k_stop = split < pc.n_split ? min(k_begin + pc.split_len, pc.kv_end) : k_begin;
+    const int n_keys = max(0, k_stop - k_begin);
+    const bool k_aligned = ((pc.k_row_stride | pc.k_head_stride) & 3) == 0;
+    const bool v_aligned = ((pc.v_row_stride | pc.v_head_stride) & 3) == 0;
+    const uint k_head = uint(kvh * pc.k_head_stride);
+    const uint v_head = uint(kvh * pc.v_head_stride);
+
+    vec4 qv[NF_FDR_MAX_C];
+    vec4 ov[NF_FDR_MAX_C];
+    [[unroll]] for (int c = 0; c < NF_FDR_MAX_C; c++) {
+        qv[c] = vec4(0.0);
+        ov[c] = vec4(0.0);
+        const int e = 4 * (NF_FDR_LANES * c + int(lane));
+        if (e < d) {
+            const uint qi = uint(pc.q_off + h * d + e);
+            qv[c] = vec4(q_in[qi], q_in[qi + 1u], q_in[qi + 2u], q_in[qi + 3u]);
+        }
+    }
+    float m = -NF_INF;
+    float l = 0.0;
+
+    const int step = NF_FDR_GROUPS * NF_FDR_KB;
+    for (int j0 = 0; j0 < n_keys; j0 += step) {
+        uvec2 kb[NF_FDR_KB][NF_FDR_MAX_C];
+        uvec2 vb[NF_FDR_KB][NF_FDR_MAX_C];
+        int pk[NF_FDR_KB];
+        [[unroll]] for (int b = 0; b < NF_FDR_KB; b++) {
+            const int j = j0 + int(w) + b * NF_FDR_GROUPS;
+            const int row = k_begin + j;
+            pk[b] = j < n_keys ? kv_pos[row] : -1;
+            [[unroll]] for (int c = 0; c < NF_FDR_MAX_C; c++) {
+                kb[b][c] = uvec2(0u);
+                vb[b][c] = uvec2(0u);
+                const int e = 4 * (NF_FDR_LANES * c + int(lane));
+                if (j < n_keys && e < d) {
+                    kb[b][c] = nf_fdr_k4(k_head + uint(row * pc.k_row_stride + e), k_aligned);
+                    vb[b][c] = nf_fdr_v4(v_head + uint(row * pc.v_row_stride + e), v_aligned);
+                }
+            }
+        }
+        float sc[NF_FDR_KB];
+        [[unroll]] for (int b = 0; b < NF_FDR_KB; b++) {
+            float acc = 0.0;
+            [[unroll]] for (int c = 0; c < NF_FDR_MAX_C; c++) {
+                acc += dot(qv[c], nf_fdr_unpack(kb[b][c]));
+            }
+            sc[b] = acc;
+        }
+#ifdef USE_SUBGROUPS
+        if (sg) {
+            [[unroll]] for (int b = 0; b < NF_FDR_KB; b++) {
+                sc[b] = subgroupAdd(sc[b]);
+            }
+        } else
+#endif
+        {
+            [[unroll]] for (int b = 0; b < NF_FDR_KB; b++) {
+                red_s[b * NF_FA_WG + int(lid)] = sc[b];
+            }
+            barrier();
+            const int base = int(w) * NF_FDR_LANES;
+            [[unroll]] for (int b = 0; b < NF_FDR_KB; b++) {
+                float t = 0.0;
+                for (int i = 0; i < NF_FDR_LANES; i++) {
+                    t += red_s[b * NF_FA_WG + base + i];
+                }
+                sc[b] = t;
+            }
+            barrier();
+        }
+        float s[NF_FDR_KB];
+        float mb = m;
+        [[unroll]] for (int b = 0; b < NF_FDR_KB; b++) {
+            /* the key's visibility is uniform across the lane group: one position per key */
+            const int vis = nf_attn_visible(pc.q_pos, pk[b], causal, pc.swa_type, pc.n_swa);
+            s[b] = vis != 0 ? nf_attn_score(sc[b], pc.scale, pc.softcap) : -NF_INF;
+            mb = max(mb, s[b]);
+        }
+        if (mb != -NF_INF) {
+            const float corr = m == -NF_INF ? 0.0 : exp(m - mb);
+            l *= corr;
+            [[unroll]] for (int c = 0; c < NF_FDR_MAX_C; c++) {
+                ov[c] *= corr;
+            }
+            [[unroll]] for (int b = 0; b < NF_FDR_KB; b++) {
+                if (s[b] != -NF_INF) {
+                    const float p = exp(s[b] - mb);
+                    l += p;
+                    [[unroll]] for (int c = 0; c < NF_FDR_MAX_C; c++) {
+                        ov[c] += p * nf_fdr_unpack(vb[b][c]);
+                    }
+                }
+            }
+            m = mb;
+        }
+    }
+
+    /* merge the four lane groups' (m, l, o) */
+    [[unroll]] for (int c = 0; c < NF_FDR_MAX_C; c++) {
+        const int e = 4 * (NF_FDR_LANES * c + int(lane));
+        if (e < d) {
+            const int o = int(w) * NF_FDR_MAX_D + e;
+            o_s[o] = ov[c].x;
+            o_s[o + 1] = ov[c].y;
+            o_s[o + 2] = ov[c].z;
+            o_s[o + 3] = ov[c].w;
+        }
+    }
+    if (lane == 0u) {
+        m_s[w] = m;
+        l_s[w] = l;
+    }
+    barrier();
+    if (split >= pc.n_split) {
+        return;   /* after the last barrier */
+    }
+    float mt = -NF_INF;
+    [[unroll]] for (int i = 0; i < NF_FDR_GROUPS; i++) {
+        mt = max(mt, m_s[i]);
+    }
+    float f[NF_FDR_GROUPS];
+    float lt = 0.0;
+    [[unroll]] for (int i = 0; i < NF_FDR_GROUPS; i++) {
+        f[i] = m_s[i] == -NF_INF ? 0.0 : exp(m_s[i] - mt);
+        lt += f[i] * l_s[i];
+    }
+    const uint pr = (uint(h) * uint(pc.n_split) + uint(split)) * uint(pc.d_v + 2);
+    for (int e = int(lid); e < pc.d_v; e += NF_FA_WG) {
+        float o = 0.0;
+        [[unroll]] for (int i = 0; i < NF_FDR_GROUPS; i++) {
+            o += f[i] * o_s[i * NF_FDR_MAX_D + e];
+        }
+        if (direct_out) {
+            dst[uint(pc.out_off + h * pc.d_v + e)] = lt > 0.0 ? o / lt : 0.0;
+        } else {
+            partial[pr + uint(e)] = o;
+        }
+    }
+    if (!direct_out && lid == 0u) {
+        partial[pr + uint(pc.d_v)] = mt;
+        partial[pr + uint(pc.d_v) + 1u] = lt;
+    }
+}

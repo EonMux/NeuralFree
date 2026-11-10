@@ -23,6 +23,9 @@ import java.util.Set;
  */
 public final class LlmKernels {
 
+    /** PCI vendor id of NVIDIA devices. */
+    private static final int PCI_VENDOR_NVIDIA = 0x10DE;
+
     private final KernelSet set;
 
     private LlmKernels(KernelSet set) {
@@ -109,12 +112,37 @@ public final class LlmKernels {
      * over, so a device with subgroup reductions and a fixed 32-lane subgroup size.
      */
     public boolean decodeWarpPath() {
+        return warpReductions();
+    }
+
+    /**
+     * Whether kernels reduce over 32-lane warps in registers on this backend: the subgroup shuffle (CUDA, HIP), or
+     * the Vulkan {@code __sg} modules on a device whose every subgroup is 32 lanes wide. The flash-decode fast path
+     * ({@link #decodeWarpPath}) and the Q8_1 blocks of the row norms (norm_ext.cl / norm_ext.comp
+     * {@code nf_norm_ext_q8}) take their register forms there; elsewhere they reduce through local memory.
+     */
+    public boolean warpReductions() {
         DeviceCapabilities caps = set.caps();
         if (caps.hasFeature(DeviceFeature.SUBGROUP_SHUFFLE)) {
             return true;
         }
         return set.backend().backendType() == ComputeBackend.BackendType.VULKAN && set.subgroups()
                 && caps.getMinSubgroupSize() == 32 && caps.getMaxSubgroupSize() == 32;
+    }
+
+    /**
+     * Whether the one-row flash decode ({@code LLM_FlashDecodeRow_F16}) may serve the plain decode step on this
+     * backend's device. Off Vulkan it serves wherever the build defines it (the CUDA fatbins; the OpenCL, HIP and
+     * Metal builds define none, so the planner also checks that the kernel exists). On Vulkan it serves NVIDIA devices
+     * only, the device kind it was measured on: other vendors' subgroup sizes run its shared-memory reduction or
+     * other lane counts, whose speed against the split flash decode no measurement covers.
+     */
+    public boolean flashDecodeRowPath() {
+        if (set.backend().backendType() != ComputeBackend.BackendType.VULKAN) {
+            return true;
+        }
+        DeviceCapabilities caps = set.caps();
+        return caps.getIdentity() != null && caps.getIdentity().vendorId() == PCI_VENDOR_NVIDIA;
     }
 
     /** Preferred work-group size of matvec kernels on this backend. */

@@ -497,7 +497,7 @@ On a CUDA device of compute capability 8.0 or newer, prefill attention (prompts,
 - both head dimensions are multiples of 16, at most 128;
 - the layer uses standard attention (MLA keeps its own path).
 
-Split-K over long contexts, sinks, softcap, ALiBi, the T5 relative bias, sliding windows, causal and bidirectional masks and paged caches behave as in the scalar kernels; the outputs differ only by the F16 rounding of the staged Q, K and V tiles. On CUDA, a single-row decode step over a dense F16 cache runs the one-row decode kernel `LLM_FlashDecodeRow_F16` instead, when the K and V head dimensions are equal multiples of 64 of at most 256 and the layer has no position bias and no sinks. The kernel puts four warps on each split and head with an online softmax in registers, the shape of llama.cpp's `fattn-vec`. On the RTX 5080 Laptop it takes 6.0-6.8 us per layer plus a 1.8-2.3 us merge (CUPTI, Qwen3-Embedding 0.6B and 4B), against 42-61 us for the one-row prefill it replaces. Other single-row steps run the tensor-core kernel as a one-row prefill (48 against 65 us per layer on the scalar decode kernel at 256 keys, 32 query and 8 KV heads of 128). The exception is a layer past 128 live keys whose KV heads each serve at most two query heads, on HIP or outside the one-row kernel's constraints on CUDA: those steps run the split-K decode kernel's warp-shuffle form. With four query heads per KV head, the one-row prefill stays ahead at every depth. The paged kernel's single-row steps keep the paged decode kernel; on CUDA with an F16 or BF16 cache that is the grouped-query `LLM_FlashDecodePagedGqa_F16` / `_BF16`, which reads each K and V row once for all query heads of a KV group (up to four) and splits the keys by the step's sequence count (16 sequences at 129 keys on Qwen3-Embedding-4B: 16 against 143 us per layer). On the RTX 5080 Laptop, a 512-token prefill over 1024 cached keys with 32 query and 8 KV heads of 128 takes 0.28 ms of kernel time. On Vulkan devices with `VK_NV_cooperative_matrix2` (fp16 x fp16 -> fp32 workgroup matrices of 64x64x64 at 128 invocations), the same kernels run as workgroup-scope cooperative-matrix shaders over 64-key tiles, the design of llama.cpp's `flash_attn_cm2`. Their single-row steps take the routes above without the CUDA one-row decode kernel: the one-row prefill, or, past 128 live keys with at most two query heads per KV head, the split-K decode kernel's warp form on devices whose subgroups are all 32 lanes wide. On the RTX 5080 Laptop, a 512-token prefill of Qwen3-Embedding-4B spends 179 us per layer in attention, against llama.cpp Vulkan's 76-79 us. OpenCL, and Vulkan devices without that extension, run the scalar kernels.
+Split-K over long contexts, sinks, softcap, ALiBi, the T5 relative bias, sliding windows, causal and bidirectional masks and paged caches behave as in the scalar kernels; the outputs differ only by the F16 rounding of the staged Q, K and V tiles. On CUDA, and on Vulkan NVIDIA devices, a single-row decode step over a dense F16 cache runs the one-row decode kernel `LLM_FlashDecodeRow_F16` instead, when the K and V head dimensions are equal multiples of 64 of at most 256 and the layer has no position bias and no sinks. The kernel puts four warps on each split and head with an online softmax in registers, the shape of llama.cpp's `fattn-vec`. On the RTX 5080 Laptop it takes 6.0-6.8 us per layer plus a 1.8-2.3 us merge (CUPTI, Qwen3-Embedding 0.6B and 4B), against 42-61 us for the one-row prefill it replaces. Other single-row steps run the tensor-core kernel as a one-row prefill (48 against 65 us per layer on the scalar decode kernel at 256 keys, 32 query and 8 KV heads of 128). The exception is a layer past 128 live keys whose KV heads each serve at most two query heads, on HIP or outside the one-row kernel's constraints on CUDA: those steps run the split-K decode kernel's warp-shuffle form. With four query heads per KV head, the one-row prefill stays ahead at every depth. The paged kernel's single-row steps keep the paged decode kernel; on CUDA with an F16 or BF16 cache that is the grouped-query `LLM_FlashDecodePagedGqa_F16` / `_BF16`, which reads each K and V row once for all query heads of a KV group (up to four) and splits the keys by the step's sequence count (16 sequences at 129 keys on Qwen3-Embedding-4B: 16 against 143 us per layer). On the RTX 5080 Laptop, a 512-token prefill over 1024 cached keys with 32 query and 8 KV heads of 128 takes 0.28 ms of kernel time. On Vulkan devices with `VK_NV_cooperative_matrix2` (fp16 x fp16 -> fp32 workgroup matrices of 64x64x64 at 128 invocations), the same kernels run as workgroup-scope cooperative-matrix shaders over 64-key tiles, the design of llama.cpp's `flash_attn_cm2`. Their single-row steps take the routes above: on NVIDIA devices the one-row decode kernel (its Vulkan twin `flash_decode_row.comp`, whose four lane groups reduce with subgroup arithmetic: 6.5-11.3 us per layer plus a 2.2-2.5 us merge on the RTX 5080 Laptop over Qwen3-Embedding 0.6B and 4B at up to 128 keys, `nftool bench --kernels`, against 22-43 us for the one-row prefill it replaces; other vendors, where no measurement covers it, take the routes that follow), else the one-row prefill, or, past 128 live keys with at most two query heads per KV head, the split-K decode kernel's warp form on devices whose subgroups are all 32 lanes wide. Where the subgroup flash kernels serve the layer (the Intel iGPU's pinned subgroup forms), those run instead. On the RTX 5080 Laptop, a 512-token prefill of Qwen3-Embedding-4B spends 179 us per layer in attention, against llama.cpp Vulkan's 76-79 us. OpenCL, and Vulkan devices without that extension, run the scalar kernels.
 
 ### Fast GEMM for prefill and batched decode
 
@@ -551,7 +551,7 @@ for Qwen3 0.6B in Q8_0 (llama.cpp 34100).
 | Weights | Fast lane | Where | Rounding vs. the exact tiled GEMM |
 |---|---|---|---|
 | Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, I8_B128 | int8 MMQ GEMM (`<T>_MatMul_MMQ`) | every backend: int8 tensor cores (`mma.m16n8k32` / `m16n8k16` s8) on CUDA sm_80+, dp4a or scalar int dots elsewhere | activations are rounded to 8-bit codes per 32-element (tensor) or 16-element chunk, as in llama.cpp `mmq.cuh`; with an `--act-quant checkpoint` int8 scheme they are the checkpoint's own codes |
-| same types | cooperative-matrix GEMM: `<T>_MatMul_CM2` (workgroup-scope `VK_NV_cooperative_matrix2`, 128x256 tiles, fp16 accumulation saturated at +-65504, as llama.cpp `mul_mm_cm2.comp`), otherwise `<T>_MatMul_CM` (`VK_KHR_cooperative_matrix`) | Vulkan devices with the extension (default `auto` mode) | activations staged as fp16 rows; the weights decode to fp16 in the tensor loads |
+| same types | cooperative-matrix GEMM: `<T>_MatMul_CM2` (workgroup-scope `VK_NV_cooperative_matrix2`, 128x256 tiles, fp16 accumulation saturated at +-65504, as llama.cpp `mul_mm_cm2.comp`; Q4_K and Q5_K decode each tile's block scales into shared memory once per block, fetched a block ahead, as its `fetch_scales` / `store_scales`), otherwise `<T>_MatMul_CM` (`VK_KHR_cooperative_matrix`) | Vulkan devices with the extension (default `auto` mode) | activations staged as fp16 rows; the weights decode to fp16 in the tensor loads |
 | F16 | tensor-core GEMM (`F16_MatMul_MMA`) | CUDA sm_80+, Vulkan with cooperative matrices | activations rounded to fp16; fp32 accumulation |
 | BF16 | tensor-core GEMM (`BF16_MatMul_MMA`, bf16 `mma`) | CUDA sm_80+ (Vulkan keeps the tiled GEMM for BF16) | activations rounded to bf16; fp32 accumulation |
 | F8_E4M3, F8_E4M3_B32, F8_E4M3_B128, MXFP8 | E4M3 GEMM over the checkpoint's own activation codes (`<T>_MatMul_MMQ`) | CUDA sm_89+ (`mma.sync` `e4m3.e4m3.f32`); elsewhere the exact tiled GEMM | activations staged as E4M3 codes with one scale per 32-element chunk; fp32 accumulation |
@@ -720,7 +720,8 @@ How it behaves:
   both match. A step that no longer matches drops the capture and the warmup restarts.
 - Following decode steps replay the capture as a single submission. On CUDA and HIP, per-token scalar
   arguments (key counts, query positions) and the grid are refreshed through `cuGraphExecKernelNodeSetParams`
-  and `hipGraphExecKernelNodeSetParams`; on Vulkan the pre-recorded command buffer is resubmitted; on OpenCL
+  and `hipGraphExecKernelNodeSetParams`; on Vulkan, whose recorded push constants and group counts cannot be
+  edited, the step is recorded again from the capture's dispatches with the new values; on OpenCL
   the recorded command buffer is resubmitted with `clEnqueueCommandBufferKHR`, and per-token scalar arguments
   are replaced in place with `clUpdateMutableCommandsKHR` when the device offers
   `cl_khr_command_buffer_mutable_dispatch`, otherwise the step is captured again.
@@ -728,13 +729,15 @@ How it behaves:
   per-step value (key counts, positions, split layout) derives from the token position; a step at the next position
   rewrites only the nodes whose values changed and submits the graph once. CUDA instantiates the capture twice and
   patches the idle copy for the next step while the current one runs, so a replayed step costs 0.03-0.08 ms of host
-  time; HIP and OpenCL patch the one instance before submitting.
+  time; HIP and OpenCL patch the one instance before submitting. Vulkan records the whole next step into one of
+  three command buffers while the current one runs (a buffer the device still executes is never rewritten), so a
+  step costs one `vkQueueSubmit` of one buffer.
 - A step the capture cannot express is never replayed: a position that does not follow the last or a changed
   command pattern records the trunk again. A flash-decode step at another split count is patched in place on
-  CUDA and HIP: the decode grid, the split arguments and the merge's split count change.
-  - On CUDA's one-row decode kernel, every row writes its partial and merges it, also at one split. A one-split
-    merge reproduces the direct output bit for bit, so the trunk keeps one command pattern at every depth and one
-    capture serves the whole generation.
+  CUDA, HIP and Vulkan: the decode grid, the split arguments and the merge's split count change.
+  - On the one-row decode kernel (CUDA, Vulkan on NVIDIA), every row writes its partial and merges it, also at
+    one split. A one-split merge reproduces the direct output bit for bit, so the trunk keeps one command pattern
+    at every depth and one capture serves the whole generation.
   - CUDA's grouped-query paged decode (the batched decode steps) merges at one split the same way where its
     launch aims at more than one split, whose keys split from 33 on. Where the sequences times the KV heads fill
     two work-groups per compute unit (16 sequences of a Qwen3 4B or 0.6B on the RTX 5080 Laptop's 60 units), it
@@ -752,8 +755,8 @@ How it behaves:
   session, medians of nine runs): Qwen3-Embedding-0.6B Q8_0 543 t/s (llama.cpp 632), 4B Q8_0 125 (llama.cpp 132),
   4B Q4_K_M 181 (llama.cpp 178; both engines' repetitions ranged from about 150 to 205 t/s in that session).
 - A step whose trunk cannot be captured or no longer matches runs directly: a hidden tap that wants
-  layer outputs, a host transfer inside the trunk, an MoE layer whose experts come from the host expert cache, a different dispatch sequence, Vulkan push
-  constants or OpenCL scalar arguments changed by per-step scalars where mutable dispatch is unavailable. After two mismatched replays or three aborted
+  layer outputs, a host transfer inside the trunk, an MoE layer whose experts come from the host expert cache, a different dispatch sequence, a changed Vulkan buffer binding,
+  or OpenCL scalar arguments changed by per-step scalars where mutable dispatch is unavailable. After two mismatched replays or three aborted
   captures, replay stops trying until the step shape changes again.
 - With `chainReplay` on (CUDA), a multi-row decode step of 2 to 16 rows (a speculative verify, a small decode
   batch) is captured once per row count and replayed the same way: after two verified body steps the step replays
@@ -770,8 +773,8 @@ How it behaves:
   -ntg 128`). A tree-masked verify step captures its trunk once per shape and replays it through the body. A paged step with a multi-row segment, a recurrent
   target's tree round, and context-parallel and dual-chunk steps always run directly. Output is the same token for
   token as running the step directly.
-- On CUDA, a one-row decode step over a dense F16 cache runs the one-row decode kernel `LLM_FlashDecodeRow_F16`
-  (see [tensor-core flash attention](#tensor-core-flash-attention)) at every depth.
+- On CUDA, and on Vulkan NVIDIA devices, a one-row decode step over a dense F16 cache runs the one-row decode
+  kernel `LLM_FlashDecodeRow_F16` (see [tensor-core flash attention](#tensor-core-flash-attention)) at every depth.
 - Elsewhere, where the layer runs tensor-core flash attention, a one-row decode step runs that kernel as a one-row
   prefill instead of the scalar split-K decode kernel, which measured slower even at one row (48 against 65 us
   per layer at 256 keys, 32 query and 8 KV heads of 128).
@@ -784,7 +787,7 @@ How it behaves:
 
 #### Graph capture and kernel batching (Java API)
 
-The decode replay is built on a capture API that Java callers can use directly. A `ComputeQueue` can record a sequence of device commands once and replay it with a single submission: a CUDA or HIP graph (kernels, device copies and fills; replays refresh kernel parameters in place), a Vulkan command buffer (kernel dispatches only; push constants are frozen, so per-step values must flow through buffers), or an OpenCL command buffer (kernel dispatches, device copies and fills; per-step scalar arguments are updated in place where `cl_khr_command_buffer_mutable_dispatch` is available, otherwise a changed argument needs a new capture). The CUDA backend can also submit a set of independent small kernels as one submission; OpenCL reports kernel batching as unsupported.
+The decode replay is built on a capture API that Java callers can use directly. A `ComputeQueue` can record a sequence of device commands once and replay it with a single submission: a CUDA or HIP graph (kernels, device copies and fills; replays refresh kernel parameters in place), a Vulkan command buffer (kernel dispatches only; a replay whose push constants or group counts changed records the step again into a buffer of its own, and a changed buffer binding needs a new capture), or an OpenCL command buffer (kernel dispatches, device copies and fills; per-step scalar arguments are updated in place where `cl_khr_command_buffer_mutable_dispatch` is available, otherwise a changed argument needs a new capture). The CUDA backend can also submit a set of independent small kernels as one submission; OpenCL reports kernel batching as unsupported.
 
 Capture one step of a fixed shape and replay it:
 
@@ -880,7 +883,11 @@ differs. `FusedKernelsGpuTest` compares them value by value on a device.
 ### Integer-dot (Q8_1) decode matvec
 
 GPU decode projections can run a Q8_1-activation integer-dot matvec instead of the F32-activation
-matvec. The projection input is quantized to Q8_1 blocks (`LLM_QuantizeQ8_1`). One quantized row serves every projection of
+matvec. The projection input is quantized to Q8_1 blocks (`LLM_QuantizeQ8_1`). Where the kernels reduce over 32-lane warps in
+registers (CUDA, HIP, and Vulkan devices whose subgroups are all 32 lanes wide), the row norm that produces the input writes
+its blocks in the same launch (`LLM_RowNormQ8`, `LLM_ResidualMixNormQ8`, the quantizer's bytes exactly). A norm whose blocks
+went unread (its consumer is off the int8 lane) stops writing them; norms are told apart by their output and weight buffers and
+row count, so the other norms of the same shape keep writing the blocks their projections read. One quantized row serves every projection of
 the layer step that reads it in the attention, dense feed-forward, Gated DeltaNet, KDA, Lightning, MLA, DSA-MLA,
 DeepSeek-V4, MSA, QSA, Step5 and Zamba2 layers; elsewhere each projection quantizes its own. The weight codes are combined with the activation codes by packed 4x8-bit
 integer dot products (Vulkan `GL_EXT_integer_dot_product`, CUDA `__dp4a`, portable integer

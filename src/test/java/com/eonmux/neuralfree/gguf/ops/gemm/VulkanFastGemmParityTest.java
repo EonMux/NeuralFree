@@ -127,14 +127,17 @@ public class VulkanFastGemmParityTest {
         }
     }
 
-    /** The split-K twin of the CM2 GEMM against its plain kernel, on clamped and interior row tiles: one-hot
-     *  products to the fp32 plane sum, full reductions within the fp16-accumulation bound. */
+    /** The split-K twin of the CM2 GEMM against its plain kernel, on clamped and interior row tiles and on
+     *  192-element slices that start inside a K-quant block (the staged Q4_K / Q5_K scales of a slice's first,
+     *  partial block): one-hot products to the fp32 plane sum, full reductions within the fp16-accumulation
+     *  bound. */
     @Test
     public void cm2SplitKTwinsMatchTheirPlainKernels() throws Exception {
         assumeCooperativeMatrix2();
         for (GGMLType type : GemmKernels.CM2_TYPES) {
             parity.cm2SplitKMatchesPlain(type, M, 768, N, 3);
             parity.cm2SplitKMatchesPlain(type, M3, 768, N3, 3);
+            parity.cm2SplitKMatchesPlain(type, M3, 768, N3, 4);
         }
     }
 

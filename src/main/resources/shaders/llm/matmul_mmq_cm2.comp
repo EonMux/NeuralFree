@@ -24,7 +24,8 @@
  * Compute: fp16 x fp16 -> fp16 cooperative matrix products of NF_CM2_BK reduction elements per stage
  * over an NF_CM2_BM x NF_CM2_BN (rows x tokens) tile. The weight tile decodes through
  * common/quant_mmq_ref.glsl (the callback's reference points at the element's weight block, the tensor
- * layout's block size is the type's MMQ_BS); the activation tile and the output use the engine's
+ * layout's block size is the type's MMQ_BS; Q4_K and Q5_K read their per-row scales from workgroup memory,
+ * staged once per K block and fetched one block ahead, as llama.cpp's fetch_scales / store_scales); the activation tile and the output use the engine's
  * row-major [tokens, K] / [tokens, rows] layouts through the transposed tensor view, as llama.cpp's
  * mul_mm_cm2 reads its B and stores its D matrices. The last token tile of a launch whose tokens end
  * within its first quarter or half runs at that narrower width (llama.cpp's BNover4 / BNover2
@@ -58,13 +59,16 @@
 #error "matmul_mmq_cm2.comp requires QTYPE"
 #endif
 
+#define NF_CM2_BM 128                         /* weight rows per workgroup tile */
+#define NF_CM2_BN 256                         /* tokens per workgroup tile */
+#define NF_CM2_BK 64                          /* reduction depth of one stage */
+#define NF_CM2_WG 256u                        /* invocations per workgroup: the dispatch's local size */
+#define MMQ_REF_SCALE_ROWS uint(NF_CM2_BM)    /* Q4_K and Q5_K stage their scales per tile row */
+
 NF_BUFFER_VIEWS(0, w)
 #include "common/quant_blocks.glsl"
 #include "common/quant_mmq_ref.glsl"
 
-#define NF_CM2_BM 128                         /* weight rows per workgroup tile */
-#define NF_CM2_BN 256                         /* tokens per workgroup tile */
-#define NF_CM2_BK 64                          /* reduction depth of one stage */
 #define NF_CM2_ACC_MAX float16_t(65504.0)      /* largest finite fp16 value: the accumulator's saturation */
 /* Reduction elements per unrolled group of an interior tile: one K-quant block, or eight stages of the
  * 32-element types (llama.cpp mul_mm_cm2 UNROLL_K). */
@@ -83,6 +87,46 @@ layout(push_constant) uniform NfCm2Params {
     int M; int K; int N; int x_stride; int x_off; int y_stride; int y_off;
 } pc;
 #define NF_CM2_OUT y_out
+#endif
+
+#ifdef MMQ_REF_STAGED
+/* Invocations per tile row of the scale staging; each stores 1 / NF_CM2_STAGE_TPR of the row's sub-block
+ * scales. */
+#define NF_CM2_STAGE_TPR (NF_CM2_WG / uint(NF_CM2_BM))
+uvec4 nf_cm2_stage_regs = uvec4(0u);
+
+/* Fetches into registers the scales of K block blk of this invocation's tile row (rows below M only). */
+void nf_cm2_stage_fetch(const uint m0, const uint blk) {
+    const uint row = m0 + gl_LocalInvocationID.x / NF_CM2_STAGE_TPR;
+    if (row < uint(pc.M)) {
+        nf_cm2_stage_regs = mmq_ref_stage_fetch(row, blk, uint(pc.K) / uint(MMQ_BS));
+    }
+}
+
+/* Before the first stage of a tile's k range kb .. ke: fetches the scales of kb's block. */
+void nf_cm2_scales_begin(const uint m0, const uint kb) {
+    nf_cm2_stage_fetch(m0, kb / uint(MMQ_BS));
+}
+
+/* Before the stage at k0: at the range's first stage and at every K block start, publishes the fetched scales of
+ * k0's block to the decode callbacks (once every invocation's loads of the previous block are done) and fetches
+ * the next block's, whose global-memory latency the block's stages then hide. k0, kb and ke are uniform. */
+void nf_cm2_scales(const uint m0, const uint k0, const uint kb, const uint ke) {
+    if (k0 != kb && k0 % uint(MMQ_BS) != 0u) {
+        return;
+    }
+    barrier();
+    mmq_ref_stage_store(nf_cm2_stage_regs, gl_LocalInvocationID.x / NF_CM2_STAGE_TPR,
+                        gl_LocalInvocationID.x % NF_CM2_STAGE_TPR, NF_CM2_STAGE_TPR);
+    barrier();
+    const uint next = k0 / uint(MMQ_BS) + 1u;
+    if (next * uint(MMQ_BS) < ke) {
+        nf_cm2_stage_fetch(m0, next);
+    }
+}
+#else
+#define nf_cm2_scales_begin(m0, kb)
+#define nf_cm2_scales(m0, k0, kb, ke)
 #endif
 
 #define NF_CM2_TW NF_CM2_BN
@@ -118,7 +162,12 @@ void main() {
     const uint stride_d = uint(pc.y_stride);
 #endif
     const uint n0 = gl_WorkGroupID.y * NF_CM2_BN;
-    const bool interior = m0 + NF_CM2_BM <= M && (ke - kb) % NF_CM2_BK == 0u;
+#ifdef MMQ_REF_STAGED
+    const bool block_start = kb % uint(MMQ_BS) == 0u;
+#else
+    const bool block_start = true;
+#endif
+    const bool interior = m0 + NF_CM2_BM <= M && (ke - kb) % NF_CM2_BK == 0u && block_start;
     if (n0 + NF_CM2_BN / 4u >= N) {
         nf_cm2_tile_quarter(m0, n0, kb, ke, pos_d, stride_d, interior);
     } else if (n0 + NF_CM2_BN / 2u >= N) {

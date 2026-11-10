@@ -22,13 +22,17 @@ import java.util.Locale;
  * {@code neuralfree.bench.replayTiming} property, which the test task forwards): one generation decodes with the
  * replay disabled and again enabled, and the report prints every step's wall time and the replay's state, so a
  * patched replay that never reaches the trusted state or recaptures shows up next to the direct steps. Asserts
- * nothing; the numbers go to the result report.
+ * nothing; the numbers go to the result report. The probe runs the 4B Q8_0 model on CUDA, or the model file
+ * {@code neuralfree.bench.replayTimingModel} names on the backend {@code neuralfree.bench.replayTimingBackend}
+ * names ({@code VULKAN}).
  */
 public class GpuDecodeReplayTimingTest {
 
     private static final String SWITCH = "NEURALFREE_BENCH_REPLAY_TIMING";
-    private static final String MODEL =
-            RealModels.path("Qwen3-Embedding-4B-GGUF/Qwen3-Embedding-4B-Q8_0.gguf");
+    private static final String MODEL = System.getProperty("neuralfree.bench.replayTimingModel",
+            RealModels.path("Qwen3-Embedding-4B-GGUF/Qwen3-Embedding-4B-Q8_0.gguf"));
+    private static final EngineConfig.BackendMode BACKEND = EngineConfig.BackendMode.valueOf(
+            System.getProperty("neuralfree.bench.replayTimingBackend", "CUDA"));
     private static final int WARMUP = 8;
     private static final int STEPS = 24;
 
@@ -38,7 +42,11 @@ public class GpuDecodeReplayTimingTest {
                 "1".equals(System.getProperty("neuralfree.bench.replayTiming",
                         System.getenv(SWITCH))));
         Assume.assumeTrue("model absent", Files.exists(Path.of(MODEL)));
-        GpuTestUtil.assumeCudaAvailable();
+        if (BACKEND == EngineConfig.BackendMode.VULKAN) {
+            GpuTestUtil.assumeVulkanAvailable();
+        } else {
+            GpuTestUtil.assumeCudaAvailable();
+        }
         run("direct", "false");
         run("patched replay", "true");
     }
@@ -89,7 +97,7 @@ public class GpuDecodeReplayTimingTest {
         System.setProperty(GpuDecodeReplay.PROPERTY, replay);
         try {
             EngineConfig cfg = EngineConfig.builder()
-                    .backend(EngineConfig.BackendMode.CUDA)
+                    .backend(BACKEND)
                     .gpuLayers(EngineConfig.GPU_LAYERS_ALL)
                     .memory(MemoryConfig.builder().nCtx(256).build())
                     .build();
