@@ -23,7 +23,9 @@ import java.util.Arrays;
  * query and output offset 0 and carries no tree mask; the merge launches are the ones that follow it immediately in
  * the order the launch enqueues them — the static sink partial when the layer has one, then the combine, then the
  * log-sum-exp merge. The captured sequence count fixes the launch geometry. A step whose merge pattern would leave
- * the capture (a direct launch against a captured split one, or the reverse) is refused, so the caller recaptures;
+ * the capture (a direct launch against a captured split one, or the reverse; on the grouped-query kernel only where
+ * its sequences keep one split up to its longest split, since it merges at every split count elsewhere:
+ * {@link GpuPagedFlashAttention#decodeWritesDirect}) is refused, so the caller recaptures;
  * a step that only changes the split count and length patches the grid with them. {@link #verify(int)} checks the
  * same values against the kernels' current bindings after a body replay, which is how the plan earns the right to
  * skip the body. Not thread-safe.</p>
@@ -233,7 +235,8 @@ final class PagedDecodePatcher implements GpuStepPatcher {
         } catch (IllegalStateException e) {
             return null;
         }
-        boolean direct = s.direct() && !hasSink && !hasLse;
+        boolean direct = GpuPagedFlashAttention.decodeWritesDirect(s, grouped && decodePlan.decodeGqaSplitsEarly(nSeq),
+                hasSink, hasLse);
         return new Step(s.count(), s.length(), s.count() + (hasSink ? 1 : 0),
                 baseFlags | (direct ? AttnKernels.FLAG_DIRECT : 0), !direct);
     }

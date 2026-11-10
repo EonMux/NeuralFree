@@ -13,6 +13,7 @@ import java.util.List;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThrows;
@@ -356,5 +357,27 @@ public class FlashAttnTilingPagedTest {
             }
         }
         return body.toString();
+    }
+
+    /**
+     * The grouped-query paged decode splits its keys past one {@link FlashAttnTiling#MIN_SPLIT}-key split where its
+     * launch aims at more than one split, and keeps one split up to {@link FlashAttnTiling#GQA_MAX_SPLIT} keys where
+     * its sequences and KV heads alone fill {@link FlashAttnTiling#GQA_GROUPS_PER_UNIT} work-groups per unit.
+     */
+    @Test
+    public void theGroupedDecodeKeepsOneLongSplitWhereItsGroupsFillTheDevice() {
+        int nHeadKv = 8;
+        FlashAttnTiling paged = FlashAttnTiling.decodePaged(16, 32, nHeadKv, 128, 128, MAX_KV, SMEM_48K, CU, true);
+        assertTrue(paged.gqaDecodeUsable());
+        int filling = FlashAttnTiling.GQA_GROUPS_PER_UNIT * CU / nHeadKv;
+        assertTrue(paged.decodeGqaSplitsEarly(filling - 1));
+        assertEquals(1, paged.decodeGqaSplit(FlashAttnTiling.MIN_SPLIT, filling - 1).count());
+        assertEquals(2, paged.decodeGqaSplit(FlashAttnTiling.MIN_SPLIT + 1, filling - 1).count());
+        for (int nSeq : new int[]{filling, 16}) {
+            assertFalse(paged.decodeGqaSplitsEarly(nSeq));
+            assertEquals(1, paged.decodeGqaSplit(FlashAttnTiling.GQA_MAX_SPLIT, nSeq).count());
+            assertEquals(2, paged.decodeGqaSplit(FlashAttnTiling.GQA_MAX_SPLIT + 1, nSeq).count());
+        }
+        assertThrows(IllegalArgumentException.class, () -> paged.decodeGqaSplitsEarly(0));
     }
 }

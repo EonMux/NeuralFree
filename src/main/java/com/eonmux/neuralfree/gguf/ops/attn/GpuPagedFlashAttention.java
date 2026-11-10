@@ -291,7 +291,8 @@ final class GpuPagedFlashAttention {
         boolean grouped = gqaDecode != null;
         FlashAttnTiling.Split sp = grouped ? decodePlan.decodeGqaSplit(keys, nSeq) : decodePlan.decodeSplit(keys);
         PreparedDispatch d = grouped ? gqaDecode : decode;
-        boolean direct = sp.direct() && sinkPartial == null && lse == null;
+        boolean direct = decodeWritesDirect(sp, grouped && decodePlan.decodeGqaSplitsEarly(nSeq), sinkPartial != null,
+                lse != null);
         int layoutSplits = sp.count() + (sinkPartial != null ? 1 : 0);
         d.setInt(AttnKernels.ARG_FD_N_SPLIT, layoutSplits);
         d.setInt(AttnKernels.ARG_FD_SPLIT_LEN, sp.length());
@@ -314,6 +315,23 @@ final class GpuPagedFlashAttention {
                 writeLse(nSeq * nHead, splits, (qOff / qDim) * nHead);
             }
         }
+    }
+
+    /**
+     * Whether a paged decode launch of split {@code sp} writes its normalized output itself instead of partials the
+     * merge combines: one split, no static sink partial and no log-sum-exp capture, unless the launch merges its one
+     * split too ({@code mergesOneSplit}). The grouped-query kernel does where its plan splits the keys as soon as
+     * they outgrow one split ({@link FlashAttnTiling#decodeGqaSplitsEarly}, at 33 keys): the merge of one partial
+     * reproduces the direct output bit for bit (it rescales the partial by exp(0) = 1 and divides by the same sum),
+     * so a decode trunk keeps one node sequence from its first key on and a captured step graph serves the steps
+     * past that boundary instead of being recaptured there. Where the sequences alone fill the device, the plan
+     * keeps one split up to {@link FlashAttnTiling#GQA_MAX_SPLIT} keys, so the launch writes directly and every
+     * step there is spared the combine launch; a trunk that outgrows that split is recaptured once.
+     * {@link PagedDecodePatcher} derives the same rule.
+     */
+    static boolean decodeWritesDirect(FlashAttnTiling.Split sp, boolean mergesOneSplit, boolean hasSink,
+                                      boolean hasLse) {
+        return sp.direct() && !mergesOneSplit && !hasSink && !hasLse;
     }
 
     /** Writes the merged log-sum-exp of {@code splits} partials of {@code rows} rows at {@code offset}. */

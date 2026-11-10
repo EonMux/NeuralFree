@@ -63,7 +63,7 @@ import static org.junit.Assert.assertTrue;
  * The decode replay wiring over the real forward backend on the capture-capable fake queue: the first
  * one-token step after a shape change captures the trunk and launches the capture once, the following
  * steps replay it as one REPLAY op with no trunk dispatches, a tap or the disabled property run every
- * trunk directly, and a prefill invalidates the capture so the next decode captures again.
+ * trunk directly, and a prefill or a reset keeps the capture, which the next decode verifies and replays.
  */
 public class GpuDecodeReplayTest {
 
@@ -299,7 +299,7 @@ public class GpuDecodeReplayTest {
     }
 
     @Test
-    public void aPrefillInvalidatesTheCaptureAndTheNextDecodeCapturesAgain() {
+    public void aPrefillKeepsTheCaptureAndTheNextDecodeReplaysIt() {
         GpuForwardBackend fb = open(true);
 
         fb.decode(1, 0);
@@ -310,11 +310,34 @@ public class GpuDecodeReplayTest {
         assertEquals(1, replayOps());
 
         fb.decode(7, 5);
-        // the invalidation made this step capture again instead of replaying
-        assertEquals(1, replayOps());
+        // the kept capture verified against this step's body and replayed it: no second capture
+        assertEquals(2, replayOps());
+        assertEquals(1, launchOps());
 
         fb.decode(8, 6);
-        assertEquals(2, replayOps());
+        assertEquals(3, replayOps());
+        assertEquals(1, launchOps());
+    }
+
+    @Test
+    public void aResetKeepsTheCaptureAndItsReplaysMatchADirectRun() {
+        GpuForwardBackend replayed = open(true);
+        replayed.decode(1, 0);
+        replayed.decode(2, 1);
+        replayed.decode(3, 2);
+        replayed.reset();
+        float[][] afterReset = new float[][]{replayed.decode(4, 0), replayed.decode(5, 1), replayed.decode(6, 2)};
+        assertEquals("the decode run after the reset replays the first run's capture", 1, launchOps());
+        assertEquals(5, replayOps());
+        replayed.close();
+
+        GpuForwardBackend direct = open(false);
+        float[][] withoutReplay = new float[][]{direct.decode(4, 0), direct.decode(5, 1), direct.decode(6, 2)};
+        direct.close();
+
+        for (int i = 0; i < afterReset.length; i++) {
+            assertArrayEquals(withoutReplay[i], afterReset[i], 0.0f);
+        }
     }
 
     @Test

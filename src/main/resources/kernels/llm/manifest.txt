@@ -52,6 +52,7 @@ quantize_q8_1.cl
 matmul_mmq.cl
 [opencl] matmul_mmq_sg.cl
 [cuda] matvec_mma.cl
+[cuda] matvec_row.cl
 [cuda] matmul_mmq_stream.cl
 [cuda] matmul_fp8.cl
 matmul_mma.cl

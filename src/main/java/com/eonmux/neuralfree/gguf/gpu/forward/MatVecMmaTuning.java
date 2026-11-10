@@ -13,21 +13,31 @@ import com.eonmux.neuralfree.gguf.ops.gemm.MatVecMmaPlan;
  * counted forms keep the launch). Device kinds and types without measurements answer 0.
  *
  * <p>The evidence is {@code MatVecMmaMeasureTest} on the RTX 5080 Laptop (CUDA, sm_120), per launch from DRAM over
- * the 4B and 0.6B Qwen3 projection shapes at 4, 8, 9 and 16 tokens (2 also for Q6_K). The tensor-core form's
- * cost is flat in the token count inside a token tile while the counted forms grow per token, so each rule is
- * a smallest token count:</p>
+ * the 4B and 0.6B Qwen3 projection shapes at every token count from 2 to 9 and at 12 and 16 (the small
+ * projections, near the per-launch floor, cross-checked by back-to-back launch loops). The tensor-core form's cost is flat in the token
+ * count inside a token tile while the counted forms grow per token, so each rule is a smallest token count; the
+ * 8-token tile ({@code n <= 8}) and the 16-token tile have their own rules, since the 16-token tile costs more:</p>
  * <ul>
- *   <li>Q4_K from 4 tokens on every shape, at 4 warps (9728x2560 at 4: 26.4 us against the pair's 46.1; at 16:
- *       43.4 against 144.8; the 2560-column head at 16: 510 against 2250).</li>
- *   <li>Q6_K from 8 tokens at 8 warps (2560x9728 at 8: 51.6 against 67.2; at 16: 56.2 against 95.0), the head
- *       from 9 tokens at 2 warps (151936x2560 at 16: 801 against 1617).</li>
- *   <li>Q8_0 through the 16-token form from 9 tokens on projections of at least {@value #Q8_0_WIDE_ROWS} rows
- *       (9728x2560 at 9: 49.2 against 59.2; at 16: 59.5 against 99.8), from 11 where the reduction is more
- *       than twice the row count (2560x9728 at 9: 61.9 against 53.3; at 16: 67.8 against 93.8) and from 10 on
- *       narrower projections (1024x2560 at 9: 13.6 against 12.7; at 16: 12.7 against 20.8); at 8 warps. Through
- *       the 8-token form only a head over a reduction of at most {@value #Q8_0_SHORT_HEAD_COLS} columns, from 4
- *       tokens (151936x1024 at 8: 233 against 530); the 2560-column head keeps the pair there (893 against
- *       771).</li>
+ *   <li>Q4_K from 2 tokens on every shape, at 4 warps (9728x2560 at 2: 26.4 us against the pair's 30.9, at 4:
+ *       26.4 against 46.1; at 16: 43.4 against 144.8; the 1024-column head at 2: 139 against 204; the
+ *       2560-column head at 16: 510 against 2250). The 1024-row projections tie at 2 and 3 tokens.</li>
+ *   <li>Q6_K through the 8-token tile at 4 warps on projections of at least {@value #Q6_K_WIDE_ROWS} rows: an
+ *       output head from 3 tokens (151936x1024 at 3: 211 against 318; 151936x2560 at 3: 551 against 609, at 8:
+ *       561 against 779 at 8 warps), the others from 4 (9728x2560 at 4: 39.0 against 42.6; 2560x9728 at 4: 42.5
+ *       against 43.8, at 8: 42.7 against 48.2 at 8 warps). Narrower projections from 6 tokens at 8 warps
+ *       (1024x2560 at 6: 11.9 against 13.2; 1024x3072 at 6: 11.8 against 14.0). Through the 16-token tile at 8
+ *       warps (2560x9728 at 9: 70.0 against 84.3; at 16: 56.2 against 95.0), the head at 2 warps (151936x2560 at
+ *       16: 801 against 1617).</li>
+ *   <li>Q8_0 through the 8-token tile at 8 warps: a head over a reduction of at most
+ *       {@value #Q8_0_SHORT_COLS} columns from 4 tokens (151936x1024 at 8: 233 against 530), a wider head from 5
+ *       (151936x2560 at 5: 672 against 833), other projections over at most {@value #Q8_0_SHORT_COLS} columns
+ *       from 6 (3072x1024 at 6: 13.7 against 16.1; 1024x1024 at 6: 8.1 against 9.3), and the wider ones at 8
+ *       (9728x2560: 52.5 against 58.6; 1024x2560: 12.2 against 13.8) except a projection of at least
+ *       {@value #Q8_0_WIDE_ROWS} rows over a longer reduction (2560x4096 at 8: 30.4 against 27.2). Through the
+ *       16-token tile from 9 tokens on projections of at least {@value #Q8_0_WIDE_ROWS} rows (9728x2560 at 9:
+ *       49.2 against 59.2; at 16: 59.5 against 99.8), from 11 where the reduction is more than twice the row
+ *       count (2560x9728 at 9: 61.9 against 53.3; at 16: 67.8 against 93.8) and from 10 on narrower projections
+ *       (1024x2560 at 9: 13.6 against 12.7; at 16: 12.7 against 20.8).</li>
  * </ul>
  */
 public final class MatVecMmaTuning {
@@ -36,8 +46,12 @@ public final class MatVecMmaTuning {
     static final int HEAD_ROWS = 65536;
     /** Rows from which the Q8_0 16-token form serves from 9 tokens. */
     static final int Q8_0_WIDE_ROWS = 2048;
-    /** Widest reduction of a head the Q8_0 8-token form serves. */
-    static final int Q8_0_SHORT_HEAD_COLS = 1024;
+    /** Widest reduction the Q8_0 8-token form serves from fewer than 8 tokens off a head. */
+    static final int Q8_0_SHORT_COLS = 1024;
+    /** Rows from which the Q6_K 8-token form serves at 4 warps from 4 tokens. */
+    static final int Q6_K_WIDE_ROWS = 2048;
+    /** Largest token count of the 8-token tile. */
+    private static final int EIGHT_TILE = 8;
 
     private MatVecMmaTuning() {
     }
@@ -54,25 +68,45 @@ public final class MatVecMmaTuning {
         }
         switch (type) {
             case Q4_K:
-                return nTokens >= 4 ? 4 : 0;
+                return 4;
             case Q6_K:
-                if (nTokens < 8) {
-                    return 0;
-                }
-                return rows >= HEAD_ROWS && nTokens >= 9 ? 2 : 8;
+                return q6kWarps(rows, nTokens);
             case Q8_0:
-                return nTokens >= q8_0MinTokens(rows, cols) ? 8 : 0;
+                return nTokens >= q8_0MinTokens(rows, cols, nTokens) ? 8 : 0;
             default:
                 return 0;
         }
     }
 
-    /** The smallest token count the Q8_0 tensor-core form serves a {@code rows x cols} projection from. */
-    private static int q8_0MinTokens(int rows, int cols) {
-        if (rows >= HEAD_ROWS && cols <= Q8_0_SHORT_HEAD_COLS) {
-            return 4;
+    /** The Q6_K tensor-core form's warps for {@code nTokens} rows through a projection of {@code rows} rows, or 0. */
+    private static int q6kWarps(int rows, int nTokens) {
+        boolean head = rows >= HEAD_ROWS;
+        if (nTokens > EIGHT_TILE) {
+            return head ? 2 : 8;
         }
-        if (rows < Q8_0_WIDE_ROWS) {
+        if (rows < Q6_K_WIDE_ROWS) {
+            return nTokens >= 6 ? 8 : 0;
+        }
+        return nTokens >= (head ? 3 : 4) ? 4 : 0;
+    }
+
+    /**
+     * The smallest token count the Q8_0 tensor-core form serves a {@code rows x cols} projection from, inside the
+     * token tile of {@code nTokens}; past {@link MatVecMmaPlan#MAX_TOKENS} where the tile never serves the shape.
+     */
+    private static int q8_0MinTokens(int rows, int cols, int nTokens) {
+        boolean head = rows >= HEAD_ROWS;
+        boolean wide = rows >= Q8_0_WIDE_ROWS;
+        if (nTokens <= EIGHT_TILE) {
+            if (head) {
+                return cols <= Q8_0_SHORT_COLS ? 4 : 5;
+            }
+            if (cols <= Q8_0_SHORT_COLS) {
+                return 6;
+            }
+            return wide && cols > rows ? MatVecMmaPlan.MAX_TOKENS + 1 : EIGHT_TILE;
+        }
+        if (!wide) {
             return 10;
         }
         return (long) cols > 2L * rows ? 11 : 9;

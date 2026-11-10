@@ -46,8 +46,9 @@ import java.util.Objects;
  * <p>A call without memory evaluates all tokens in one step (non-causal attention cannot be split), so it needs
  * {@code tokens.length <= ubatch}. A one-token causal step ({@code StepMode.DECODE}) runs its trunk through the
  * {@link GpuDecodeReplay}: after {@code neuralfree.gpu.graphWarmupSteps} consecutive steps of the same shape the
- * trunk's dispatches are captured, and the following ones replay them as a single submission; every other call
- * shape invalidates the capture. Not thread-safe.</p>
+ * trunk's dispatches are captured, and the following ones replay them as a single submission. A single-sequence
+ * prompt pass and a memory reset keep the capture and re-verify it on the next steps; a batched call invalidates
+ * it. Not thread-safe.</p>
  */
 public final class GpuPrefillDriver {
 
@@ -758,11 +759,21 @@ public final class GpuPrefillDriver {
 
     /**
      * Drops every captured trunk-replay graph, so the next step captures again: anything that can change a
-     * trunk's dispatch sequence outside its steps (memory reset, a compressed plan's rollback, context shift,
-     * a new hidden tap) calls this.
+     * trunk's dispatch sequence outside its steps (a compressed plan's rollback, context shift, a new hidden tap)
+     * calls this.
      */
     void invalidateReplay() {
         decodeReplay.invalidate();
+        invalidateStepReplay();
+    }
+
+    /**
+     * Keeps the one-token decode capture through a memory reset ({@link GpuDecodeReplay#distrust()}: the next decode
+     * steps verify it against the body before it is trusted again) and drops the multi-row step captures, whose
+     * shapes follow the batches.
+     */
+    void distrustReplay() {
+        decodeReplay.distrust();
         invalidateStepReplay();
     }
 
@@ -1116,11 +1127,11 @@ public final class GpuPrefillDriver {
                     !replayDisabled && !taps.wantsAny(executor.layers().size()) && executor.capturableDecode(),
                     () -> executor.run(p, n, mode, taps));
         } else if (trunk) {
-            decodeReplay.invalidate();
+            decodeReplay.distrust();
             invalidateStepReplay();
             trunkRunner.runTrunk(p, n, mode, taps);
         } else {
-            decodeReplay.invalidate();
+            decodeReplay.distrust();
             // the memory-backed multi-row step (a speculative round's verify of k + 1 rows) captures its own
             // trunk only when the speculative round's replay is on (GpuForwardBackend.CHAIN_REPLAY_PROPERTY)
             stepReplay.trunk(p, n, executor.stepReplayPatchers(),

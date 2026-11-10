@@ -62,10 +62,26 @@ public class Int8MatvecLaneTest {
     /** A vendor id outside the measured device kinds (NVIDIA, Intel), so its kind keeps the default dispatch. */
     private static final int UNMEASURED_VENDOR_ID = 0x1ED2;
 
+    /**
+     * The CUDA modules' warp-row twins ({@link WarpRowMatvec}), which replace the family's single-token forms on the
+     * shapes they serve; the tests of the family's selection on the CUDA kind withhold them.
+     */
+    private static final String[] CUDA_ROW_TWINS = cudaRowTwins();
+
     private FakeComputeBackend backend;
     private GpuScratch scratch;
     private GpuPlaceholders placeholders;
     private GpuOps ops;
+
+    private static String[] cudaRowTwins() {
+        List<String> names = new ArrayList<>();
+        for (GGMLType type : WarpRowMatvec.TYPES) {
+            for (String form : new String[]{"MatVec", "MatVecAdd", "MatVecFusedGateUp"}) {
+                names.add(WarpRowMatvec.twinName(type.name() + "_" + form + "_Q8", type));
+            }
+        }
+        return names.toArray(new String[0]);
+    }
 
     private void open(Int8MatvecMode mode, String... unavailable) {
         open(mode, null, ComputeBackend.BackendType.OPENCL, unavailable);
@@ -312,7 +328,8 @@ public class Int8MatvecLaneTest {
 
     @Test
     public void autoKeepsTheFloatMatvecForAProjectionBelowTheMeasuredLaneThreshold() {
-        open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.CUDA);
+        open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.CUDA,
+                CUDA_ROW_TWINS);
         // Q6_K measured slower with the lane at 1024x2560 elements, faster from 4096x4096 up.
         GpuWeight w = weight(GGMLType.Q6_K);
         List<String> names = run(() -> ops.matvec(w, backend.allocateBuffer((long) COLS * 4), 0,
@@ -324,7 +341,8 @@ public class Int8MatvecLaneTest {
 
     @Test
     public void autoUsesTheInt8MatvecForATypeWithoutAMeasuredLoss() {
-        open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.CUDA);
+        open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.CUDA,
+                CUDA_ROW_TWINS);
         GpuWeight w = autoWeight(GGMLType.Q4_K);
         List<String> names = run(() -> ops.matvec(w, autoInput(), 0, autoOutput(), 0, 1));
         assertTrue(names.toString(), names.contains("Q4_K_MatVec_Q8"));
@@ -333,7 +351,8 @@ public class Int8MatvecLaneTest {
 
     @Test
     public void autoTakesTheQ8_0LaneOnSmallAndLargeCudaProjections() {
-        open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.CUDA);
+        open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.CUDA,
+                CUDA_ROW_TWINS);
         // The small decoder projections measured faster with the lane once its activation rows cost a
         // warp-per-block quantizer launch or none (norm-emitted), so a 32x256 projection takes it too.
         GpuWeight small = weight(GGMLType.Q8_0);
@@ -394,6 +413,101 @@ public class Int8MatvecLaneTest {
         List<String> nvfp4Names = run(() -> ops.matvec(nvfp4, autoInput(), 0, autoOutput(), 0, 1));
         assertTrue(nvfp4Names.toString(), nvfp4Names.contains("NVFP4_MatVec_Q8"));
         assertFalse(nvfp4Names.toString(), nvfp4Names.contains("NVFP4_MatVec"));
+    }
+
+    /**
+     * The CUDA modules' warp-row twins take the single-token Q8_0, Q4_K and Q6_K products, their accumulating form
+     * and the fused gate/up on the shapes {@link WarpRowMatvec#warps} gives them, at that many warps per work-group
+     * and one warp per row, whatever the family's lane evidence says (a 32x256 Q6_K projection sits below its
+     * measured lane threshold); a Q8_0 row wider than {@link WarpRowMatvec#NARROW_COLS} and a wide Q6_K head keep
+     * the family, and OFF keeps the float matvec.
+     */
+    @Test
+    public void warpRowTwinsServeTheSingleTokenLaneOnCuda() {
+        open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.CUDA);
+        GpuBuffer in = backend.allocateBuffer((long) COLS * 4);
+        GpuBuffer out = backend.allocateBuffer((long) ROWS * 4);
+        for (GGMLType type : new GGMLType[]{GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K}) {
+            int warps = WarpRowMatvec.warps(type, ROWS, COLS);
+            assertTrue(type.toString(), warps > 0);
+            GpuWeight w = weight(type);
+            backend.clearLog();
+            ops.matvec(w, in, 0, out, 0, 1);
+            List<FakeDispatch> ds = backend.dispatches();
+            assertEquals(GpuOps.QUANTIZE_Q8_1, ds.get(0).kernelName());
+            FakeDispatch row = ds.get(1);
+            assertEquals(type.name() + "_MatVecRow_Q8", row.kernelName());
+            assertArrayEquals("one warp per row", new long[]{(long) GpuOps.ceilDiv(ROWS, warps) * 32 * warps},
+                    row.global());
+            assertArrayEquals(new long[]{32L * warps}, row.local());
+            assertEquals(Arrays.asList(GpuOps.QUANTIZE_Q8_1, type.name() + "_MatVecAddRow_Q8"),
+                    run(() -> ops.matvecAdd(w, in, 0, out, 0, 1)));
+            GpuWeight gate = weight(type, 1024);
+            GpuWeight up = weight(type, 1024);
+            GpuBuffer gateOut = backend.allocateBuffer(1024L * 4);
+            assertEquals(Arrays.asList(GpuOps.QUANTIZE_Q8_1, type.name() + "_MatVecFusedGateUpRow_Q8"),
+                    run(() -> ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, gateOut, 1)));
+        }
+        GpuWeight wideQ8 = autoWeight(GGMLType.Q8_0);
+        List<String> wide = run(() -> ops.matvec(wideQ8, autoInput(), 0, autoOutput(), 0, 1));
+        assertTrue(wide.toString(), wide.contains("Q8_0_MatVec_Q8"));
+        int headRows = WarpRowMatvec.HEAD_ROWS;
+        int headCols = 5 * GGMLType.Q6_K.getBlockSize();
+        GpuWeight head = GpuWeight.of("output.weight", GGMLType.Q6_K, new long[]{headCols, headRows},
+                backend.allocateBuffer((long) headRows * (headCols / GGMLType.Q6_K.getBlockSize())
+                        * GGMLType.Q6_K.getTypeSize(), true));
+        List<String> headNames = run(() -> ops.matvec(head, backend.allocateBuffer((long) headCols * 4), 0,
+                backend.allocateBuffer((long) headRows * 4), 0, 1));
+        assertFalse(headNames.toString(), headNames.contains("Q6_K_MatVecRow_Q8"));
+
+        open(Int8MatvecMode.OFF, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.CUDA);
+        GpuWeight offWeight = weight(GGMLType.Q4_K);
+        assertEquals(Collections.singletonList("Q4_K_MatVec"), run(() -> ops.matvec(offWeight,
+                backend.allocateBuffer((long) COLS * 4), 0, backend.allocateBuffer((long) ROWS * 4), 0, 1)));
+    }
+
+    /**
+     * A projection held in shards takes the twin and the warps per work-group its whole shape picks on every shard,
+     * the shape the lane was judged on: a Q8_0 head of two shards runs four warps per work-group (a shard alone would
+     * count as a decoder projection and run one), and a Q6_K head over more than
+     * {@link WarpRowMatvec#NARROW_COLS} columns keeps the family on both shards.
+     */
+    @Test
+    public void aShardedHeadTakesTheFormOfItsWholeShapeOnEveryShard() {
+        open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.CUDA);
+        int shardRows = WarpRowMatvec.HEAD_ROWS / 2 + 8;
+        int narrow = WarpRowMatvec.NARROW_COLS;
+        assertEquals(4, WarpRowMatvec.warps(GGMLType.Q8_0, 2 * shardRows, narrow));
+        assertEquals(1, WarpRowMatvec.warps(GGMLType.Q8_0, shardRows, narrow));
+        backend.clearLog();
+        ops.matvec(shardedHead(GGMLType.Q8_0, narrow, shardRows), backend.allocateBuffer((long) narrow * 4), 0,
+                backend.allocateBuffer(2L * shardRows * 4), 0, 1);
+        List<FakeDispatch> launches = new ArrayList<>();
+        for (FakeDispatch d : backend.dispatches()) {
+            if (d.kernelName().equals("Q8_0_MatVecRow_Q8")) {
+                launches.add(d);
+            }
+        }
+        assertEquals("one launch per shard", 2, launches.size());
+        for (FakeDispatch d : launches) {
+            assertArrayEquals(new long[]{4L * 32}, d.local());
+            assertArrayEquals(new long[]{(long) GpuOps.ceilDiv(shardRows, 4) * 4 * 32}, d.global());
+        }
+
+        int wide = 5 * GGMLType.Q6_K.getBlockSize();
+        assertEquals(0, WarpRowMatvec.warps(GGMLType.Q6_K, 2 * shardRows, wide));
+        assertEquals(1, WarpRowMatvec.warps(GGMLType.Q6_K, shardRows, wide));
+        List<String> names = run(() -> ops.matvec(shardedHead(GGMLType.Q6_K, wide, shardRows),
+                backend.allocateBuffer((long) wide * 4), 0, backend.allocateBuffer(2L * shardRows * 4), 0, 1));
+        assertFalse(names.toString(), names.contains("Q6_K_MatVecRow_Q8"));
+    }
+
+    /** An output head of two shards of {@code shardRows} rows of {@code cols} elements of {@code type}. */
+    private GpuWeight shardedHead(GGMLType type, int cols, int shardRows) {
+        long shardBytes = (long) shardRows * (cols / type.getBlockSize()) * type.getTypeSize();
+        return GpuWeight.sharded("output.weight", type, new long[]{cols, 2L * shardRows},
+                Arrays.asList(backend.allocateBuffer(shardBytes, true), backend.allocateBuffer(shardBytes, true)),
+                new long[]{shardRows, shardRows});
     }
 
     /**
@@ -774,7 +888,8 @@ public class Int8MatvecLaneTest {
 
     @Test
     public void measuredQ4KPairingLossOnCudaKeepsTheSingleRowInt8Matvec() {
-        open(Int8MatvecMode.ON, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.CUDA);
+        open(Int8MatvecMode.ON, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.CUDA,
+                CUDA_ROW_TWINS);
         int rows = 1024;
         GpuWeight w = weight(GGMLType.Q4_K, rows);
         List<String> names = run(() -> ops.matvec(w, backend.allocateBuffer((long) COLS * 4), 0,
@@ -785,7 +900,8 @@ public class Int8MatvecLaneTest {
 
     @Test
     public void measuredQ8_0PairingLossOnCudaKeepsTheSingleRowInt8Matvec() {
-        open(Int8MatvecMode.ON, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.CUDA);
+        open(Int8MatvecMode.ON, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.CUDA,
+                CUDA_ROW_TWINS);
         int rows = 1024;
         GpuWeight w = weight(GGMLType.Q8_0, rows);
         List<String> names = run(() -> ops.matvec(w, backend.allocateBuffer((long) COLS * 4), 0,

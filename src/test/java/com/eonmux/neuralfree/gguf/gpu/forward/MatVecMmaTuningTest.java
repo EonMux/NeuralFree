@@ -19,36 +19,63 @@ public class MatVecMmaTuningTest {
             DeviceClass.DISCRETE, DeviceKind.CudaBand.TENSOR);
 
     @Test
-    public void q4kServesFromFourTokensOnEveryShape() {
+    public void q4kServesFromTwoTokensOnEveryShape() {
         for (int[] s : new int[][]{{9728, 2560}, {2560, 9728}, {1024, 2560}, {151936, 2560}, {1024, 1024}}) {
-            assertEquals(0, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q4_K, s[0], s[1], 3));
-            for (int n = 4; n <= 16; n++) {
+            for (int n = 2; n <= 16; n++) {
                 assertEquals(4, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q4_K, s[0], s[1], n));
             }
         }
     }
 
     @Test
-    public void q6kServesFromEightTokensAndTheHeadAtTwoWarpsFromNine() {
-        assertEquals(0, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q6_K, 2560, 9728, 7));
-        assertEquals(8, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q6_K, 2560, 9728, 8));
-        assertEquals(8, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q6_K, 2560, 9728, 16));
-        assertEquals(8, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q6_K, 151936, 2560, 8));
-        assertEquals(2, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q6_K, 151936, 2560, 9));
+    public void q6kServesTheEightTokenTileByRowClassAndTheSixteenTokenTileFromNine() {
+        assertEquals(0, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q6_K, 2560, 9728, 3));
+        for (int n = 4; n <= 8; n++) {
+            assertEquals(4, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q6_K, 2560, 9728, n));
+            assertEquals(4, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q6_K, 2048, 1024, n));
+        }
+        assertEquals(0, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q6_K, 151936, 2560, 2));
+        assertEquals(4, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q6_K, 151936, 2560, 3));
+        assertEquals(4, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q6_K, 151936, 1024, 8));
+        assertEquals(0, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q6_K, 1024, 2560, 5));
+        assertEquals(8, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q6_K, 1024, 2560, 6));
+        assertEquals(8, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q6_K, 1024, 3072, 8));
+        for (int n = 9; n <= 16; n++) {
+            assertEquals(8, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q6_K, 2560, 9728, n));
+            assertEquals(8, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q6_K, 1024, 2560, n));
+            assertEquals(2, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q6_K, 151936, 2560, n));
+        }
     }
 
     @Test
-    public void q80CrossesOverPerShapeClass() {
-        assertEquals(0, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q8_0, 9728, 2560, 8));
+    public void q80EightTokenTileServesPerShapeClass() {
+        assertEquals(0, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q8_0, 151936, 1024, 3));
+        assertEquals(8, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q8_0, 151936, 1024, 4));
+        assertEquals(0, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q8_0, 151936, 2560, 4));
+        assertEquals(8, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q8_0, 151936, 2560, 5));
+        for (int[] s : new int[][]{{3072, 1024}, {2048, 1024}, {1024, 1024}}) {
+            assertEquals(0, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q8_0, s[0], s[1], 5));
+            assertEquals(8, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q8_0, s[0], s[1], 6));
+        }
+        for (int[] s : new int[][]{{9728, 2560}, {4096, 2560}, {1024, 2560}, {1024, 3072}, {1024, 2048}}) {
+            assertEquals(0, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q8_0, s[0], s[1], 7));
+            assertEquals(8, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q8_0, s[0], s[1], 8));
+        }
+        for (int n = 2; n <= 8; n++) {
+            assertEquals(0, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q8_0, 2560, 4096, n));
+            assertEquals(0, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q8_0, 2560, 9728, n));
+        }
+    }
+
+    @Test
+    public void q80SixteenTokenTileCrossesOverPerShapeClass() {
         assertEquals(8, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q8_0, 9728, 2560, 9));
         assertEquals(0, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q8_0, 2560, 9728, 10));
         assertEquals(8, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q8_0, 2560, 9728, 11));
         assertEquals(0, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q8_0, 1024, 2560, 9));
         assertEquals(8, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q8_0, 1024, 2560, 10));
-        assertEquals(0, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q8_0, 151936, 2560, 8));
         assertEquals(8, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q8_0, 151936, 2560, 9));
-        assertEquals(0, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q8_0, 151936, 1024, 3));
-        assertEquals(8, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q8_0, 151936, 1024, 4));
+        assertEquals(8, MatVecMmaTuning.warps(CUDA_TENSOR, GGMLType.Q8_0, 151936, 1024, 16));
     }
 
     @Test

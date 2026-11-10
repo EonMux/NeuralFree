@@ -43,10 +43,12 @@ import java.util.Locale;
  *
  * <p>Warmup ({@code neuralfree.gpu.graphWarmupSteps}, default {@value #DEFAULT_WARMUP_STEPS}): a capture
  * happens only after that many consecutive eligible decode steps have run with the same trunk shape, so
- * a step that is still settling (lazily growing caches, the first steps after a prefill) runs directly
- * and is not recorded. Every call that changes the trunk's dispatch sequence (a prefill, a rollback, a
- * memory reset, a context shift, a tap change) calls {@link #invalidate()}, which closes the graph and
- * restarts the warmup count. A value of 0 captures the first eligible step.
+ * a step that is still settling (lazily growing caches) runs directly and is not recorded. A call that can
+ * change the trunk's dispatch sequence (a rollback, a context shift, a tap change, a batched call) calls
+ * {@link #invalidate()}, which closes the graph and restarts the warmup count. A single-sequence prefill and a
+ * memory reset, which leave the trunk's shape alone, call {@link #distrust()} instead: the graph is kept and
+ * verified against the next steps' bodies before it is trusted again. A value of 0 captures the first eligible
+ * step.
  *
  * <p>Eligibility ({@code capturable}): the caller decides, per step, that the trunk only enqueues kernel
  * dispatches (no tap reads, no host transfers, one token against memory), which a capture can hold — and
@@ -208,8 +210,16 @@ final class GpuDecodeReplay implements AutoCloseable {
         if (LOGGER.isDebugEnabled()) {
             LOGGER.debug("decode step pos={} {}", pos, this);
         }
+        if (graph != null && !capturable) {
+            /* A step that enqueues more than the capture (a tap read, a host transfer) can neither replay nor
+             * verify the graph. */
+            LOGGER.debug("Decode replay re-captures: the trunk is not capturable");
+            dropGraph();
+            body.run();
+            return;
+        }
         if (graph != null && plan != null && verifiedSteps >= VERIFY_STEPS) {
-            trusted(pos, patchers, capturable, body);
+            trusted(pos, patchers, body);
             return;
         }
         if (graph != null && plan != null) {
@@ -226,22 +236,13 @@ final class GpuDecodeReplay implements AutoCloseable {
     }
 
     /** Replays a trusted plan: patches and submits, never touching the body. */
-    private void trusted(int pos, List<GpuStepPatcher> patchers, boolean capturable, Runnable body) {
-        if (!capturable) {
-            /* A step that enqueues more than the capture: the graph cannot represent it, so it is
-             * never replayed. */
-            LOGGER.debug("Decode replay re-captures: the trunk is not capturable");
-            dropGraph();
-            body.run();
-            return;
-        }
+    private void trusted(int pos, List<GpuStepPatcher> patchers, Runnable body) {
         if (pos != lastPos + stepWidth) {
             if (stepWidth == 1) {
                 /* The one-token trunk: a position that does not follow means the flow left the
                  * contiguous run the capture was taken in (a rewind, a foreign call), so the graph is
                  * never replayed. */
-                LOGGER.debug("Decode replay re-captures: step {} does not follow {} or the trunk is not"
-                        + " capturable", pos, lastPos);
+                LOGGER.debug("Decode replay re-captures: step {} does not follow {}", pos, lastPos);
                 dropGraph();
                 body.run();
                 return;
@@ -495,11 +496,30 @@ final class GpuDecodeReplay implements AutoCloseable {
     }
 
     /**
-     * Drops the captured graph and the attempt limits: anything that can change the trunk's dispatch
-     * sequence between steps (a non-decode call, a memory rollback, shift or reset) calls this.
+     * Drops the captured graph and the attempt limits: anything that can change the trunk's dispatch sequence
+     * between steps (a batched call, a memory rollback or shift, a tap change) calls this. A single-sequence prefill
+     * and a memory reset keep the graph through {@link #distrust()}.
      */
     void invalidate() {
         closeGraph();
+        lastPos = -1;
+        stableSteps = 0;
+        failedReplays = 0;
+        abortedCaptures = 0;
+    }
+
+    /**
+     * Keeps the capture through a call that may have changed the trunk's dispatches without changing its shape (a
+     * memory reset, a prefill between decode runs), and trusts it again only once it has been verified as after a
+     * capture: the next {@link #VERIFY_STEPS} steps run the body through {@link GpuGraph#replay(Runnable)}, which
+     * matches every dispatch against the capture and rewrites what moved (a reallocated buffer, a new position),
+     * and the patchers must find exactly the values they predict. A body that leaves the capture or a change no
+     * patcher claims drops the graph, and the warmup restarts as after {@link #invalidate()}. A step that is
+     * not capturable drops it too. The kept capture saves the warmup's direct steps and the capture's
+     * instantiations on every decode run after the first.
+     */
+    void distrust() {
+        verifiedSteps = 0;
         lastPos = -1;
         stableSteps = 0;
         failedReplays = 0;

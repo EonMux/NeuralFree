@@ -57,6 +57,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
@@ -330,5 +331,19 @@ public class GpuPagedFlashAttentionTest {
         assertEquals(2L * N_HEAD_KV, d.global()[1]);
         assertTrue("every split holds keys", (long) splits * d.intArg(AttnKernels.ARG_FD_SPLIT_LEN) >= 6);
         assertTrue((d.intArg(AttnKernels.ARG_FD_FLAGS) & AttnKernels.FLAG_CAUSAL) != 0);
+    }
+
+    /** A one-split launch writes directly unless it merges its one split, carries a sink partial or captures lse. */
+    @Test
+    public void onlyAOneSplitDecodeThatDoesNotMergeItWritesDirect() {
+        FlashAttnTiling.Split one = new FlashAttnTiling.Split(1, 64);
+        FlashAttnTiling.Split two = new FlashAttnTiling.Split(2, 32);
+        assertTrue(GpuPagedFlashAttention.decodeWritesDirect(one, false, false, false));
+        assertFalse("a launch that merges its one split",
+                GpuPagedFlashAttention.decodeWritesDirect(one, true, false, false));
+        assertFalse(GpuPagedFlashAttention.decodeWritesDirect(one, false, true, false));
+        assertFalse(GpuPagedFlashAttention.decodeWritesDirect(one, false, false, true));
+        assertFalse(GpuPagedFlashAttention.decodeWritesDirect(two, false, false, false));
+        assertFalse(GpuPagedFlashAttention.decodeWritesDirect(two, true, false, false));
     }
 }

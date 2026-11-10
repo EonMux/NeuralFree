@@ -645,11 +645,31 @@ public final class FlashAttnTiling {
         if (nSeq <= 0) {
             throw new IllegalArgumentException("paged decode needs at least one sequence, got " + nSeq);
         }
-        long groups = (long) nSeq * nHeadKv;
-        int wanted = (int) Math.max(1L, ceilDiv((long) GQA_GROUPS_PER_UNIT * computeUnits, groups));
+        int wanted = gqaWantedSplits(nSeq);
         int len = Math.min(Math.max(roundUp(ceilDiv(nKeys, wanted), SPLIT_QUANTUM), MIN_SPLIT), GQA_MAX_SPLIT);
         len = Math.max(len, roundUp(ceilDiv(nKeys, maxSplits), SPLIT_QUANTUM));
         return new Split(Math.max(1, ceilDiv(nKeys, len)), len);
+    }
+
+    /**
+     * Whether a grouped-query paged decode of {@code nSeq} sequences ({@link #decodeGqaSplit}) splits its keys as
+     * soon as they outgrow one {@link #MIN_SPLIT}-key split: true when it aims at more than one split, false when
+     * its sequences and KV heads alone fill {@link #GQA_GROUPS_PER_UNIT} work-groups per compute unit, so it keeps
+     * one split up to {@link #GQA_MAX_SPLIT} keys.
+     *
+     * @throws IllegalArgumentException when {@code nSeq} is not positive
+     */
+    public boolean decodeGqaSplitsEarly(int nSeq) {
+        if (nSeq <= 0) {
+            throw new IllegalArgumentException("paged decode needs at least one sequence, got " + nSeq);
+        }
+        return gqaWantedSplits(nSeq) > 1;
+    }
+
+    /** The split count a grouped-query paged decode of {@code nSeq} sequences aims at. */
+    private int gqaWantedSplits(int nSeq) {
+        long groups = (long) nSeq * nHeadKv;
+        return (int) Math.max(1L, ceilDiv((long) GQA_GROUPS_PER_UNIT * computeUnits, groups));
     }
 
     /**

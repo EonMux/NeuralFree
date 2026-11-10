@@ -10,8 +10,10 @@ import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Random;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
@@ -109,6 +111,46 @@ public class BenchCommandTest {
                 lines.contains("nftool bench: benchmark 1/2: warmup prompt run"));
         assertTrue("each repetition announces itself: " + lines,
                 lines.contains("nftool bench: benchmark 1/2: run 1/2"));
+    }
+
+    /**
+     * The generation warmup decodes the test's tokens up to {@link BenchCommand#WARMUP_DECODES}, enough for a decode
+     * replay to capture and verify its trunk before the first timed repetition.
+     */
+    @Test
+    public void theGenerationWarmupDecodesUpToItsCap() throws Exception {
+        Path model = SyntheticModels.llama().writeTempFile();
+        ByteArrayOutputStream errBytes = new ByteArrayOutputStream();
+        BenchCommand.bench(args(model, "-ngl", "0", "-p", "0", "-n", "3," + (BenchCommand.WARMUP_DECODES + 4), "-r",
+                "1", "--progress", "-o", "none"), print(new ByteArrayOutputStream()), print(errBytes));
+        List<String> lines = Arrays.asList(errBytes.toString(StandardCharsets.UTF_8).split("\n"));
+        assertTrue("a short generation warms up with all of its tokens: " + lines,
+                lines.contains("nftool bench: benchmark 1/2: warmup generation run of 3 tokens"));
+        assertTrue("a long one with the cap: " + lines, lines.contains("nftool bench: benchmark 2/2: warmup generation"
+                + " run of " + BenchCommand.WARMUP_DECODES + " tokens"));
+    }
+
+    /**
+     * The warmup decodes each of its tokens in turn from position 0, the first the given one and the rest drawn from
+     * the generator below the vocab, and runs the test's token count up to {@link BenchCommand#WARMUP_DECODES}.
+     */
+    @Test
+    public void theWarmupDecodesItsCountFromPositionZero() throws Exception {
+        assertEquals(3, BenchCommand.warmupDecodes(3));
+        assertEquals(BenchCommand.WARMUP_DECODES, BenchCommand.warmupDecodes(BenchCommand.WARMUP_DECODES + 4));
+        List<Integer> tokens = new ArrayList<>();
+        List<Integer> positions = new ArrayList<>();
+        int vocab = 50;
+        BenchCommand.decodeWarmup(5, 7, new Random(3L), vocab, (token, pos) -> {
+            tokens.add(token);
+            positions.add(pos);
+        });
+        assertEquals(Arrays.asList(0, 1, 2, 3, 4), positions);
+        assertEquals("the first decode takes the given token", Integer.valueOf(7), tokens.get(0));
+        Random draws = new Random(3L);
+        for (int i = 1; i < tokens.size(); i++) {
+            assertEquals("decode " + i, Integer.valueOf(draws.nextInt(vocab)), tokens.get(i));
+        }
     }
 
     @Test

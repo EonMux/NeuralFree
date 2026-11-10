@@ -365,6 +365,8 @@ The Vulkan backend carries the same forms as GLSL ports in `shaders/llm` (`matve
 
 The portable kernels' decode figures were measured over 128 tokens. Their 4B Q8_0 prefill ran 88 ms projections at 128 tokens, and the i915 driver reset the GPU during its 512-token pass; the subgroup forms' longest dispatch on these models is about 26 ms.
 
+The CUDA modules carry their own one-token forms in the `[cuda]` source `matvec_row.cl`: `{T}_MatVecRow_Q8`, `{T}_MatVecAddRow_Q8` and `{T}_MatVecFusedGateUpRow_Q8` (Q8_0, Q4_K, Q6_K), llama.cpp's `mmvq` shape for one column. Each output row takes one warp, whose lane groups read every weight byte once (4 lanes per Q8_0 block, 16 per K-quant super-block) and reduce through warp shuffles without shared memory or barriers. `WarpRowMatvec` picks them per shape over the 64-lane work-group forms from the RTX 5080 Laptop's measurements (weights streamed from DRAM): Q4_K at two warps per work-group on every shape (9728x2560 23.6 against 26.2 us, the fused gate/up 43.3 against 50.7), Q6_K at one except on an output head over more than 1024 columns, and Q8_0 on rows of at most 1024 columns (one warp, four on a head: 240 against 266 us at 151669x1024); wider Q8_0 rows measured no faster and keep the family. Like the subgroup forms they sum in another order, so `-Dneuralfree.batch.invariant=true` keeps the family's forms.
+
 What each API needs to run a library:
 
 | API | `llm` | `train` |
@@ -515,9 +517,12 @@ device of the same API. The measured kinds (`SmallBatchCrossover`):
 The "Fast lane from rows" numbers for the measured quantized types are where the GEMM lane takes over from the
 integer-dot matvec: the matvec's exact-token-count forms hold the rows below it where they measured faster. On
 CUDA (NVIDIA discrete, sm_80+) the integer-dot lane runs its tensor-core form `<T>_MatVecMma{8,16}_Q8` where
-`MatVecMmaTuning` measured it faster: Q4_K from 4 rows, Q6_K from 8, and Q8_0 from 9 rows on projections of 2048 rows
-and up, from 10 on narrower ones and from 11 where the reduction is more than twice the row count; the counted forms
-keep the rows below, and other types keep them through 16; on OpenCL NVIDIA they win through 15 on
+`MatVecMmaTuning` measured it faster: Q4_K from 2 rows; Q6_K from 4 rows on projections of 2048 rows and up (from 3
+on an output head) and from 6 on narrower ones; Q8_0 through its 8-row tile from 4 rows on an output head over at most
+1024 columns, 5 on a wider head, 6 on other projections over at most 1024 columns and at exactly 8 on the wider ones
+(not on projections of 2048 rows and up over a longer reduction), and through its 16-row tile from 9 rows on
+projections of 2048 rows and up, from 10 on narrower ones and from 11 where the reduction is more than twice the row
+count; the counted forms keep the rows below, and other types keep them through 16; on OpenCL NVIDIA they win through 15 on
 the 8M-element shapes, while a 16-row step stays with the lane (its tile wins 9728x2560, 19456x2560 and the head
 at 16 rows). The single counted form and its paired twin are chosen per launch: on OpenCL NVIDIA, Q4_K, Q5_K and
 IQ4_XS take the single form at 9 or more tokens on launches of 9728 rows and up (the paired form wins the
@@ -704,9 +709,15 @@ decode runs directly there, so both properties have no effect on that device. HI
 `hipStreamBeginCapture`.
 
 How it behaves:
-- After load, a prefill, a rollback/reset, a context shift or a hidden-tap change, the warmup count restarts;
-  once that many decode steps of one shape have run directly, the next records the trunk's dispatches and submits
-  that capture once.
+- After load, a rollback, a context shift, a hidden-tap change or a batched call (`forwardBatch`,
+  `forwardBatchTopK`, `hiddenBatch`, `treeAcceptForward`, and `hiddenRows` on a model with memory), the warmup
+  count restarts; once that many decode steps of one shape have run directly, the next records the trunk's
+  dispatches and submits that capture once.
+- A memory reset (`reset()`: a new conversation, a benchmark repetition) or a prompt pass through the
+  single-sequence calls (`forwardRows`, `forwardRowsGreedy`, `forwardRowsTopK`, `prefillEmbeddings`, `forwardAll`)
+  keeps the capture: the next two decode steps replay its dispatches through the graph's match-and-patch path,
+  which checks every dispatch against the capture and rewrites what moved, and the replay is trusted again once
+  both match. A step that no longer matches drops the capture and the warmup restarts.
 - Following decode steps replay the capture as a single submission. On CUDA and HIP, per-token scalar
   arguments (key counts, query positions) and the grid are refreshed through `cuGraphExecKernelNodeSetParams`
   and `hipGraphExecKernelNodeSetParams`; on Vulkan the pre-recorded command buffer is resubmitted; on OpenCL
@@ -724,6 +735,11 @@ How it behaves:
   - On CUDA's one-row decode kernel, every row writes its partial and merges it, also at one split. A one-split
     merge reproduces the direct output bit for bit, so the trunk keeps one command pattern at every depth and one
     capture serves the whole generation.
+  - CUDA's grouped-query paged decode (the batched decode steps) merges at one split the same way where its
+    launch aims at more than one split, whose keys split from 33 on. Where the sequences times the KV heads fill
+    two work-groups per compute unit (16 sequences of a Qwen3 4B or 0.6B on the RTX 5080 Laptop's 60 units), it
+    keeps one split up to 512 keys and writes its output directly, sparing every step a merge launch per layer;
+    a generation past 512 keys records the trunk once more there.
   - Elsewhere, the step that first needs a merge (33 keys) records the trunk once more.
   - On OpenCL, whose command buffers cannot change a grid, every new split count records the trunk again.
 - Measured on the RTX 5080 Laptop (CUDA, best of three 48-token runs): the pplx-embed 0.6B F16 model decodes at
@@ -733,8 +749,8 @@ How it behaves:
   measured pair (32.9 against 31.7 tokens/s for the 4B target with a 0.6B drafter). NVIDIA's OpenCL offers no
   `cl_khr_command_buffer`, so decode there always runs directly.
 - tg128 on CUDA (`nftool bench -p 0 -n 128`, RTX 5080 Laptop, alternating with `llama-bench -fa 1` in one
-  session): Qwen3-Embedding-0.6B Q8_0 542 t/s (llama.cpp 605), 4B Q8_0 124 (llama.cpp 133), 4B Q4_K_M 162
-  (llama.cpp 186).
+  session, medians of nine runs): Qwen3-Embedding-0.6B Q8_0 543 t/s (llama.cpp 632), 4B Q8_0 125 (llama.cpp 132),
+  4B Q4_K_M 181 (llama.cpp 178; both engines' repetitions ranged from about 150 to 205 t/s in that session).
 - A step whose trunk cannot be captured or no longer matches runs directly: a hidden tap that wants
   layer outputs, a host transfer inside the trunk, an MoE layer whose experts come from the host expert cache, a different dispatch sequence, Vulkan push
   constants or OpenCL scalar arguments changed by per-step scalars where mutable dispatch is unavailable. After two mismatched replays or three aborted
@@ -3881,7 +3897,7 @@ Every parameter takes a comma-separated list or a range (`first-last`, `first-la
 | `-hf`, `-hfr`, `--hf-repo U/M[:Q]`; `-hff`, `--hf-file F`; `-hft`, `--hf-token T` | A Hugging Face Hub model resolved (or read from the cache) into a model path; `-hff` names the file and overrides the quant tag, `-hft` supplies the token (default: `HF_TOKEN`, then the `hf auth login` token file; see [Hub token](#hugging-face-hub-download)) | unused |
 | `-r`, `--repetitions N` | Timed repetitions per test; rows report `avg ± stddev` | 5 |
 | `-o`, `--output FMT`; `-oe`, `--output-err FMT` | `md`, `csv`, `json`, `jsonl`, `sql` or `none`, on stdout and stderr | `md`, `none` |
-| `--progress`, `--no-warmup`, `--delay S` | Progress lines on stderr; skip the warmup pass; pause before each test | |
+| `--progress`, `--no-warmup`, `--delay S` | Progress lines on stderr; skip the warmup pass (one prompt pass and up to 8 decodes, enough for decode-step replay to capture and verify its trunk before the first timed repetition); pause before each test | |
 | `--kernels` | Time every GPU dispatch of each test and print the per-kernel device time (count, total, mean, share) on stderr, cumulative over the warmup and the repetitions: OpenCL profiling events, CUDA event pairs around each launch, Vulkan timestamp queries around each dispatch (`-Dneuralfree.gpu.profile=true`; HIP and Metal time nothing). Each timed dispatch waits for the previous one, and decode-step replay is off, so the totals measure the kernels rather than the run's throughput | off |
 
 Rows carry the model facts (file, type, size, parameter count), the run's settings — including `n_threads`, `n_cpu_moe`, `split_mode`, `main_gpu`, `no_kv_offload`, `devices`, `tensor_split`, `tensor_buft_overrides`, `load_mode` and `embeddings` in `csv`, `json`, `jsonl` and `sql`, and as `threads`, `n_cpu_moe`, `sm`, `main_gpu`, `nkvo`, `dev`, `ts`, `ot`, `lm` and `embd` in the Markdown table when they vary — and its statistics; json and jsonl add the raw `samples_ns` and `samples_ts`. A parameter that is not swept takes its value from the `-Dneuralfree.*` properties. Prompt tokens come from a fixed-seed generator, so a sweep is reproducible. `-fa`/`--flash-attn` (attention always runs the fused kernels, so `off` cannot be honored), `-nopo`/`--no-op-offload` (operations follow their tensors, so there is no separate host-operation offload), `-fitt`/`--fit-target` (the load has no per-device reserve margin; `neuralfree.gpu.vram.limit` caps the allocation instead) and `-fitc`/`--fit-ctx` (there is no minimum-context floor for the fit) are refused by name, as is every other llama-bench parameter the bench does not sweep.

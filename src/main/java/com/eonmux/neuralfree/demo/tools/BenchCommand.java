@@ -37,7 +37,8 @@ import java.util.stream.Stream;
  * {@code -ncmoe}, {@code -sm}, {@code -lm}, {@code -mg}, {@code -dev}, {@code -ts}, {@code -ot}, {@code -embd},
  * {@code -nkvo});
  * runs that share one model load run together, the context sized for the largest shape of the group. Each run
- * warms up (a full prompt pass and one decode, {@code --no-warmup} skips), then repeats its timed section
+ * warms up (a full prompt pass and up to {@link #WARMUP_DECODES} decodes, {@code --no-warmup} skips), then repeats
+ * its timed section
  * {@code -r} times: the depth prefill runs untimed, and the clock covers the prompt pass and the decodes. In the
  * embedding mode ({@code -embd 1}) the timed prompt pass runs the model's embedding output instead, and the
  * models without a decoder loop may bench their prompt shapes. The samples land in a {@link BenchTest} whose
@@ -46,6 +47,18 @@ import java.util.stream.Stream;
  * are refused by name, never ignored.
  */
 final class BenchCommand {
+
+    /**
+     * Most decodes the warmup runs (fewer when the test generates fewer tokens): enough for a decode-step replay to
+     * run its direct steps, record the trunk and verify the capture (two, one and two steps by default), so every
+     * timed repetition starts from a kept capture, as llama.cpp's warmup leaves its CUDA graph built.
+     */
+    static final int WARMUP_DECODES = 8;
+
+    /** One decode of the generation warmup: {@code token} at {@code pos}. */
+    interface WarmupStep {
+        void decode(int token, int pos) throws IOException;
+    }
 
     /** The command surface: {@code --help} and every error print it. */
     static final String USAGE =
@@ -640,10 +653,11 @@ final class BenchCommand {
                 f.prefillPrompt(inst, 0);
             }
             if (inst.nGen > 0) {
+                int decodes = warmupDecodes(inst.nGen);
                 if (grid.progress) {
-                    progress(err, "benchmark %d/%d: warmup generation run", idx, count);
+                    progress(err, "benchmark %d/%d: warmup generation run of %d tokens", idx, count, decodes);
                 }
-                f.decodeWarmup();
+                f.decodeWarmup(decodes);
             }
             f.reset();
         }
@@ -725,6 +739,21 @@ final class BenchCommand {
      * One open model and the group of runs on it: the model facts every {@link BenchTest} of the group
      * carries and the forward calls of a run.
      */
+    /** The decodes the generation warmup of a test generating {@code nGen} tokens runs. */
+    static int warmupDecodes(int nGen) {
+        return Math.min(nGen, WARMUP_DECODES);
+    }
+
+    /**
+     * Runs a generation warmup of {@code n} decodes through {@code step} from position 0: {@code first} there, then
+     * tokens {@code random} draws below {@code vocab}.
+     */
+    static void decodeWarmup(int n, int first, Random random, int vocab, WarmupStep step) throws IOException {
+        for (int pos = 0; pos < n; pos++) {
+            step.decode(pos == 0 ? first : random.nextInt(vocab), pos);
+        }
+    }
+
     private static final class Forwarder {
 
         /** The seed of every token generator, so a sweep is reproducible. */
@@ -796,13 +825,12 @@ final class BenchCommand {
             }
         }
 
-        /** Decodes the warmup's one token at position 0, the first the generation would use. */
-        void decodeWarmup() throws IOException {
-            if (embeddingMode) {
-                forwardToken(nextToken(new Random(TOKEN_SEED + 2L)), 0);
-                return;
-            }
-            model.forwardBackend().decode(nextToken(new Random(TOKEN_SEED + 2L)), 0);
+        /** Decodes the warmup's {@code n} tokens from position 0, the first the generation would use. */
+        void decodeWarmup(int n) throws IOException {
+            Random random = new Random(TOKEN_SEED + 2L);
+            int first = nextToken(random);
+            BenchCommand.decodeWarmup(n, first, random, model.vocabSize(), embeddingMode ? this::forwardToken
+                    : (token, pos) -> model.forwardBackend().decode(token, pos));
         }
 
         /**

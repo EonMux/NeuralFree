@@ -199,6 +199,79 @@ public class GpuDecodeReplayPatchedTest {
     }
 
     @Test
+    public void aDistrustedCaptureIsVerifiedByTwoBodyStepsAndThenTrustedAgain() {
+        try (Harness h = new Harness(false, false, Integer.MIN_VALUE, true)) {
+            for (int pos = 0; pos <= 5; pos++) {
+                step(h, pos);
+            }
+            assertEquals("the capture and its two verified steps run the body", 3, h.bodyRuns);
+            h.replay.distrust();
+
+            step(h, 0);
+            step(h, 1);
+            assertEquals("the two steps after the distrust verify the kept capture through the body", 5,
+                    h.bodyRuns);
+            step(h, 2);
+            step(h, 3);
+            assertEquals("the verified capture is trusted again: no body", 5, h.bodyRuns);
+            assertEquals("the kept capture is never submitted again", 1, h.count(FakeOpKind.LAUNCH));
+            assertEquals("every step after the capture reaches the device as one replay", 9,
+                    h.count(FakeOpKind.REPLAY));
+            assertEquals("the device saw every step's argument and work size from the rewound position on",
+                    List.of(0, 1, 2, 3, 4, 5, 0, 1, 2, 3), h.executedArgs);
+            assertEquals(List.of(1L, 2L, 3L, 4L, 5L, 6L, 1L, 2L, 3L, 4L), h.executedGlobals);
+        }
+    }
+
+    @Test
+    public void aDistrustedCaptureWhoseBodyLeavesItIsDroppedAndCapturedAgain() {
+        try (Harness h = new Harness(false, false, Integer.MIN_VALUE, false)) {
+            for (int pos = 0; pos <= 3; pos++) {
+                step(h, pos);
+            }
+            h.replay.distrust();
+            KernelHandle other = h.backend.compileKernel(KERNEL + "_OTHER", "void " + KERNEL + "_OTHER(){}", null);
+            h.replay.trunk(0, List.of(h.patcher), true, () -> {
+                h.bodyRuns++;
+                h.backend.computeQueue().enqueueKernelNoEvent(other, new long[]{1}, new long[]{1},
+                        new Object[]{0});
+            });
+            assertEquals("the diverging body ran directly once its replay mismatched", 5, h.bodyRuns);
+            assertEquals("the diverging step did not capture", 1, h.count(FakeOpKind.LAUNCH));
+
+            step(h, 1);
+            assertEquals("the dropped capture is recorded again from the next step", 2, h.count(FakeOpKind.LAUNCH));
+            step(h, 2);
+            step(h, 3);
+            step(h, 4);
+            assertEquals("the recapture verifies twice and then trusts", 8, h.bodyRuns);
+            assertEquals(List.of(0, 1, 2, 3, 1, 2, 3, 4), h.executedArgs);
+        }
+    }
+
+    @Test
+    public void aStepThatIsNotCapturableDropsAKeptCapture() {
+        try (Harness h = new Harness(false, false, Integer.MIN_VALUE, false)) {
+            for (int pos = 0; pos <= 3; pos++) {
+                step(h, pos);
+            }
+            h.replay.distrust();
+            h.patcher.setStepValue(0);
+            h.replay.trunk(0, List.of(h.patcher), false, () -> {
+                h.bodyRuns++;
+                h.backend.computeQueue().enqueueKernelNoEvent(h.kernel, new long[]{1}, new long[]{1},
+                        new Object[]{0});
+            });
+            assertEquals("the uncapturable step ran its body directly", 4, h.bodyRuns);
+            long replays = h.count(FakeOpKind.REPLAY);
+            step(h, 1);
+            assertEquals("the kept capture was dropped: the next step captures again", 2,
+                    h.count(FakeOpKind.LAUNCH));
+            assertEquals("no replay of the dropped capture", replays, h.count(FakeOpKind.REPLAY));
+        }
+    }
+
+    @Test
     public void aPredictionThatMissesTheCapturedArgumentsKeepsTheBodyReplay() {
         try (Harness h = new Harness(true, false, Integer.MIN_VALUE, false)) {
             for (int pos = 0; pos <= 7; pos++) {

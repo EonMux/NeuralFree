@@ -788,7 +788,7 @@ public final class GpuForwardBackend implements ForwardBackend {
         if (ctx.hasMemory()) {
             ctx.memory().reset();
         }
-        driver.invalidateReplay();
+        driver.distrustReplay();
     }
 
     @Override
