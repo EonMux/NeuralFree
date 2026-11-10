@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
 import com.eonmux.neuralfree.gguf.engine.GenerationRequest;
 import com.eonmux.neuralfree.gguf.engine.GenerationResult;
+import com.eonmux.neuralfree.gguf.engine.SamplerConfig;
 import com.eonmux.neuralfree.gguf.testutil.SyntheticModels;
 import org.junit.Test;
 
@@ -36,8 +37,11 @@ public class GGUFModelGpuPlacementTest {
             assertNotNull(model.gpuWeights().find("blk.0.ffn_up_exps.weight"));
             assertNotNull(model.gpuWeights().find("blk.3.attn_q.weight"));
 
+            // greedy and past the end token: the default sampler draws with a fresh seed, and a random synthetic
+            // model can draw its end token first
             GenerationResult result = model.generate(model.tokenizer().encode("hello"),
-                    GenerationRequest.builder().maxNewTokens(2).build(), null);
+                    GenerationRequest.builder().maxNewTokens(2).sampler(SamplerConfig.greedyDecoding())
+                            .ignoreEos(true).build(), null);
             assertEquals(2, result.tokens().length);
             assertTrue(model.kvCacheContext() > 0);
         } finally {
