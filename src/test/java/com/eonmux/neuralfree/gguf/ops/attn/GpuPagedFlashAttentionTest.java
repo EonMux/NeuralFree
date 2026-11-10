@@ -2,7 +2,9 @@ package com.eonmux.neuralfree.gguf.ops.attn;
 
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
+import com.eonmux.neuralfree.acceleration.backend.DeviceClass;
 import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
+import com.eonmux.neuralfree.acceleration.backend.DeviceIdentity;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.arch.Arch;
 import com.eonmux.neuralfree.gguf.arch.ArchRegistry;
@@ -127,8 +129,11 @@ public class GpuPagedFlashAttentionTest {
                 .supportsSubgroups(true)
                 .maxLocalMemoryBytes(48L * 1024)
                 .maxWorkGroupCount(new long[]{65535, 65535, 65535})
-                .computeCapability(89)
+                .computeCapability(120)
                 .feature(DeviceFeature.COOPERATIVE_MATRIX)
+                .feature(DeviceFeature.BF16_COOPERATIVE_MATRIX)
+                .deviceClass(DeviceClass.DISCRETE)
+                .identity(new DeviceIdentity("FakeTensorCores", FakeComputeBackend.NVIDIA_VENDOR_ID, null, null))
                 .build();
     }
 
@@ -165,14 +170,16 @@ public class GpuPagedFlashAttentionTest {
     }
 
     /**
-     * Binds the llama mixer over a paged F16 cache of {@link #PARALLEL} sequences on a tensor-core backend whose
-     * paged mma prefill is missing, with the grouped-query paged decode when {@code gqa} is set.
+     * Binds the llama mixer over a paged F16 cache of {@link #PARALLEL} sequences on a CUDA tensor-core backend
+     * (the build whose kernels include the tensor-core flash attention and the grouped-query paged decode, both
+     * {@code [cuda]} entries) whose paged mma prefill is missing, with the grouped-query paged decode when
+     * {@code gqa} is set.
      */
     private void bindPaged(boolean gqa) {
         String[] missing = gqa ? new String[]{AttnKernels.flashAttnMmaPaged(KvDType.F16)}
                 : new String[]{AttnKernels.flashAttnMmaPaged(KvDType.F16),
                         AttnKernels.flashDecodePagedGqa(KvDType.F16, KvDType.F16)};
-        backend = FakeComputeBackend.builder().strictLlmArgs(true).backendType(ComputeBackend.BackendType.OPENCL)
+        backend = FakeComputeBackend.builder().strictLlmArgs(true).backendType(ComputeBackend.BackendType.CUDA)
                 .capabilities(tensorCoreCaps()).unavailableKernels(missing)
                 .build();
         ModelSpec spec = llama();

@@ -295,6 +295,35 @@ public final class KernelManifest {
     }
 
     /**
+     * The kernels of a library root that only the CUDA build defines: the inventory rows whose source file (the
+     * second column) is a {@code [cuda]} entry of the manifest. Empty when the root has no inventory.
+     *
+     * @throws IllegalArgumentException when the manifest or the inventory is malformed
+     * @throws UncheckedIOException     when either cannot be read
+     */
+    public static Set<String> cudaOnlyKernels(ClassLoader cl, String root) {
+        Objects.requireNonNull(cl, "class loader must not be null");
+        String r = requireRoot(root);
+        String text = readText(cl, r + "/" + INVENTORY_FILE);
+        if (text == null) {
+            return Collections.emptySet();
+        }
+        Set<String> cudaPaths = new HashSet<>(load(cl, r).cudaOnlyPaths());
+        Set<String> out = new LinkedHashSet<>();
+        for (String line : text.split("\r?\n", -1)) {
+            String t = line.trim();
+            if (t.isEmpty() || t.startsWith("#")) {
+                continue;
+            }
+            String[] cols = t.split("[\\t ]+", 3);
+            if (cols.length >= 2 && cudaPaths.contains(cols[1])) {
+                out.add(cols[0]);
+            }
+        }
+        return Collections.unmodifiableSet(out);
+    }
+
+    /**
      * Parses inventory text: one kernel per line, the name in the first column; further columns
      * (scalar and buffer counts) are ignored; {@code #} lines and blank lines are skipped.
      *

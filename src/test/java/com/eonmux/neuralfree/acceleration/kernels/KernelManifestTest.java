@@ -9,6 +9,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -229,6 +230,30 @@ public class KernelManifestTest {
             assertEquals(2, inv.get().size());
             assertTrue(inv.get().contains("K1") && inv.get().contains("K2"));
         }
+    }
+
+    @Test
+    public void cudaOnlyKernelsAreTheInventoryRowsOfCudaEntries() throws IOException {
+        Path dir = Files.createTempDirectory("nf-manifest");
+        try (URLClassLoader cl = loaderFor(dir)) {
+            write(dir.resolve("lib/manifest.txt"), "a.cl\n[cuda] mma.cl\n[opencl] sg.cl\n");
+            write(dir.resolve("lib/inventory.txt"), "# name\tfile\nA1\ta.cl\t1\t2\nM1\tmma.cl\t0\t1\nM2\tmma.cl\t3\t3\n");
+            assertEquals(new LinkedHashSet<>(Arrays.asList("M1", "M2")),
+                    KernelManifest.cudaOnlyKernels(cl, "lib"));
+        }
+        try (URLClassLoader cl = loaderFor(Files.createTempDirectory("nf-manifest"))) {
+            assertTrue(KernelManifest.cudaOnlyKernels(cl, "lib").isEmpty());
+        }
+    }
+
+    @Test
+    public void theLlmLibrarysCudaOnlyKernelsLeaveThePortableOnesOut() {
+        Set<String> cuda = KernelManifest.cudaOnlyKernels(getClass().getClassLoader(),
+                KernelLibraries.LLM_CONFIG.sourceRoot());
+        assertTrue(cuda.contains("LLM_FlashDecodeRow_F16"));
+        assertTrue(cuda.contains("LLM_FlashDecodePagedGqa_F16"));
+        assertFalse(cuda.contains("LLM_FlashDecode_F16"));
+        assertFalse(cuda.contains("LLM_FlashAttn_Combine"));
     }
 
     @Test

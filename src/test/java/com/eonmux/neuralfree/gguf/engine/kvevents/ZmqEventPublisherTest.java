@@ -219,10 +219,11 @@ public class ZmqEventPublisherTest {
         assertTrue(assertThrows(IllegalArgumentException.class,
                 () -> ZmqEventPublisherConfig.offsetEndpointPort("tcp://*:65535", 1)).getMessage().contains("65535"));
 
-        int port = freePort();
-        try (ZmqEventPublisher ranked = new ZmqEventPublisher(new ZmqEventPublisherConfig("tcp://*:" + port, null,
-                0, 0, 0, "", 1))) {
-            assertEquals("tcp://*:" + (port + 1), ranked.endpoint());
+        // rank 1 binds the configured port plus one, so the port it binds is the one probed free
+        int bound = freePort();
+        try (ZmqEventPublisher ranked = new ZmqEventPublisher(new ZmqEventPublisherConfig("tcp://*:" + (bound - 1),
+                null, 0, 0, 0, "", 1))) {
+            assertEquals("tcp://*:" + bound, ranked.endpoint());
         }
     }
 

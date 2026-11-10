@@ -8,6 +8,8 @@ import com.eonmux.neuralfree.acceleration.backend.DeviceClass;
 import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.DeviceIdentity;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
+import com.eonmux.neuralfree.acceleration.kernels.KernelLibraries;
+import com.eonmux.neuralfree.acceleration.kernels.KernelManifest;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.arch.GluOp;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
@@ -30,6 +32,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -167,8 +170,11 @@ public class GpuOpsTest {
     public void constructionPreparesEveryHelperKernel() {
         open();
         List<String> prepared = backend.preparedKernels();
+        Set<String> cudaOnly = KernelManifest.cudaOnlyKernels(getClass().getClassLoader(),
+                KernelLibraries.LLM_CONFIG.sourceRoot());
         for (String kernel : GpuOps.HELPER_KERNELS) {
-            assertTrue(kernel + " not in " + prepared, prepared.contains(kernel));
+            // the OpenCL program leaves out the [cuda] entries, so their helpers are skipped, not prepared
+            assertEquals(kernel + " in " + prepared, !cudaOnly.contains(kernel), prepared.contains(kernel));
         }
     }
 

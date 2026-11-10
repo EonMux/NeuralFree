@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.acceleration.kernels;
 
+import com.eonmux.neuralfree.acceleration.UnsupportedKernelException;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
 import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
@@ -241,6 +242,19 @@ public class KernelSourceAssemblerTest {
         KernelArtifact train = new OpenClKernelLibrary(KernelLibraries.TRAIN_CONFIG).resolve("K", backend);
         assertEquals(OpenClKernelLibrary.programKey(KernelLibraries.TRAIN, false, smem), train.programKey());
         assertEquals("-cl-std=CL1.2 -DNF_FA_SMEM_FLOATS=" + smem, train.buildOptions());
+    }
+
+    @Test
+    public void openClLibraryRejectsTheKernelsOfCudaEntries() {
+        FakeComputeBackend backend = FakeComputeBackend.builder().build();
+        OpenClKernelLibrary llm = new OpenClKernelLibrary(KernelLibraries.LLM_CONFIG);
+        try {
+            llm.resolve("LLM_FlashDecodeRow_F16", backend);
+            fail("a [cuda] entry's kernel resolved on OpenCL");
+        } catch (UnsupportedKernelException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("CUDA-only"));
+        }
+        assertEquals("LLM_FlashDecode_F16", llm.resolve("LLM_FlashDecode_F16", backend).kernelName());
     }
 
     @Test

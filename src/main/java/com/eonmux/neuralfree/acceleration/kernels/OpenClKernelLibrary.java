@@ -47,6 +47,11 @@ public final class OpenClKernelLibrary implements KernelLibrary {
     private final ClassLoader classLoader;
     private final Object sourceLock = new Object();
     private volatile String source;
+    /**
+     * The inventory kernels of {@code [cuda]} entries, which the assembled program leaves out; computed on first
+     * use.
+     */
+    private volatile Set<String> cudaOnly;
 
     public OpenClKernelLibrary(KernelLibraryConfig config) {
         this(config, OpenClKernelLibrary.class.getClassLoader());
@@ -209,6 +214,10 @@ public final class OpenClKernelLibrary implements KernelLibrary {
             throw new UnsupportedKernelException("kernel " + kernelName + ": the OpenCL " + libraryId()
                     + " library cannot serve a " + backend.backendType() + " backend");
         }
+        if (cudaOnlyKernels().contains(kernelName)) {
+            throw new UnsupportedKernelException("kernel " + kernelName + " is CUDA-only: the OpenCL " + libraryId()
+                    + " program leaves out the [cuda] entries that define it");
+        }
         DeviceCapabilities caps = backend.capabilities();
         boolean sg = config.subgroupVariants() && useSubgroups(caps);
         int reqdSg = requiredSubgroupSize(caps, sg);
@@ -251,6 +260,20 @@ public final class OpenClKernelLibrary implements KernelLibrary {
     public Set<String> kernelNames() {
         Optional<Set<String>> inventory = KernelManifest.inventory(classLoader, config.sourceRoot());
         return inventory.isPresent() ? inventory.get() : Collections.<String>emptySet();
+    }
+
+    private Set<String> cudaOnlyKernels() {
+        Set<String> c = cudaOnly;
+        if (c == null) {
+            try {
+                c = KernelManifest.cudaOnlyKernels(classLoader, config.sourceRoot());
+            } catch (RuntimeException e) {
+                throw new UnsupportedKernelException("cannot read the OpenCL " + libraryId() + " kernel inventory from"
+                        + " classpath:" + config.sourceRoot() + ": " + e.getMessage(), e);
+            }
+            cudaOnly = c;
+        }
+        return c;
     }
 
     /**
