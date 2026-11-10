@@ -77,10 +77,11 @@ public class MetalShaderLibraryTest {
             Properties spirv = properties(e.getValue().spvRoot() + "/index.properties");
             Assume.assumeNotNull(metal);
             Assume.assumeNotNull(spirv);
-            // a pinned SPIR-V module (.sgsize, written for one subgroup width) has no Metal translation
+            // a pinned SPIR-V module (.sgsize, written for one subgroup width) and a Vulkan-only one (.vulkan=1)
+            // have no Metal translation
             Set<String> portable = new TreeSet<>();
             for (String name : kernelNames(spirv)) {
-                if (spirv.getProperty(name + ".sgsize") == null) {
+                if (spirv.getProperty(name + ".sgsize") == null && !"1".equals(spirv.getProperty(name + ".vulkan"))) {
                     portable.add(name);
                 }
             }

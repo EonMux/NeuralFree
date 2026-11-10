@@ -139,7 +139,11 @@ public final class FlashAttnTiling {
     private static final int[] BK_CHOICES = {32, 16};
     /** Query rows per mma work-group ({@code NF_FM_BM}); {@code bq * g_tile == MMA_ROWS} always. */
     public static final int MMA_ROWS = 64;
-    /** Keys per mma tile ({@code NF_FM_BN}). */
+    /**
+     * Keys per mma tile ({@code NF_FM_BN} of kernels/llm/flash_mma.cl and of its Vulkan twin
+     * shaders/llm/flash_mma_cm2.comp), the granularity the mma plan rounds its split lengths to; the Vulkan twin
+     * also masks a split's partial last tile.
+     */
     public static final int MMA_BK = 64;
     /** Longest split of the grouped-query paged decode ({@code NF_FDG_MAX_SPLIT}, its staged key rows). */
     public static final int GQA_MAX_SPLIT = 512;
@@ -198,15 +202,16 @@ public final class FlashAttnTiling {
     }
 
     /**
-     * Whether the decode kernels' shuffle fast path ({@code nf_fd_fast_ok} in flash_decode.cl) serves these
-     * caches and head dims on a backend that compiles it (the backend reports {@code SUBGROUP_SHUFFLE}: CUDA and
-     * HIP, whose dialect defines {@code NF_HAS_SG_SHUFFLE}): plain F32/F16/BF16 cache element types only, head
+     * Whether the decode kernels' warp fast path ({@code nf_fd_fast_ok} in flash_decode.cl and flash_decode.comp)
+     * serves these caches and head dims on a backend that runs it ({@code LlmKernels.decodeWarpPath()}: CUDA and HIP,
+     * whose dialect defines {@code NF_HAS_SG_SHUFFLE}, and Vulkan devices whose {@code __sg} modules run on 32-lane
+     * subgroups): plain F32/F16/BF16 cache element types only, head
      * dims of at most {@link #FAST_DIM} (one coalesced row float4 per lane), and the decode plans'
      * {@code g_tile} of 1 (at most {@link #PASS2_GROUPS} lane groups of registers). Quantized, FP8 and latent
-     * caches, wider head dims and backends without subgroup shuffle run the portable scalar body.
+     * caches, wider head dims and backends without the warp path run the portable scalar body.
      */
-    public static boolean decodeFastPath(boolean subgroupShuffle, KvDType typeK, KvDType typeV, int dK, int dV) {
-        return subgroupShuffle
+    public static boolean decodeFastPath(boolean warpPath, KvDType typeK, KvDType typeV, int dK, int dV) {
+        return warpPath
                 && (typeK == KvDType.F32 || typeK == KvDType.F16 || typeK == KvDType.BF16)
                 && (typeV == KvDType.F32 || typeV == KvDType.F16 || typeV == KvDType.BF16)
                 && dK <= FAST_DIM && dV <= FAST_DIM;

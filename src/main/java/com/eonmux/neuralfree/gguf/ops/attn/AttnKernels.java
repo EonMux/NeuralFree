@@ -84,9 +84,9 @@ public final class AttnKernels {
     public static final String FLASH_DECODE_PAGED_MIXED = "LLM_FlashDecodePaged_Mixed";
     /** Paged prefill over K and V caches of different types: the {@code LLM_FlashAttnPaged_<KV>} args + kv_types. */
     public static final String FLASH_ATTN_PAGED_MIXED = "LLM_FlashAttnPaged_Mixed";
-    /** Name prefix of the tensor-core ({@code LLM_FlashAttnMma_<KV>}) tiled prefill variants; CUDA only. */
+    /** Name prefix of the tensor-core ({@code LLM_FlashAttnMma_<KV>}) tiled prefill variants; CUDA and Vulkan. */
     public static final String FLASH_ATTN_MMA_PREFIX = "LLM_FlashAttnMma_";
-    /** Name prefix of the tensor-core paged ({@code LLM_FlashAttnMmaPaged_<KV>}) variants; CUDA only. */
+    /** Name prefix of the tensor-core paged ({@code LLM_FlashAttnMmaPaged_<KV>}) variants; CUDA and Vulkan. */
     public static final String FLASH_ATTN_MMA_PAGED_PREFIX = "LLM_FlashAttnMmaPaged_";
     /**
      * The one-row decode attention of the plain step over a dense F16 cache ({@code kernels/llm/flash_decode_row.cl},
@@ -557,7 +557,7 @@ public final class AttnKernels {
     }
 
     /**
-     * Tensor-core tiled prefill kernel ({@code LLM_FlashAttnMma_<KV>}, CUDA only) for a KV element type whose
+     * Tensor-core tiled prefill kernel ({@code LLM_FlashAttnMma_<KV>}, CUDA and Vulkan) for a KV element type whose
      * mma variant exists: the F16 cache; null for every other type, so only a caller that has checked the
      * mma plan reaches it.
      */

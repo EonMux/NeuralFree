@@ -1,6 +1,5 @@
 package com.eonmux.neuralfree.gguf.ops.attn;
 
-import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuStepPatcher;
 import com.eonmux.neuralfree.gguf.GGMLType;
@@ -76,10 +75,10 @@ import java.util.Objects;
  *       per {@link FlashAttnTiling} with {@code smemFloats = LlmKernels.faSmemFloats()}, the per-row decode
  *       fallback ({@link FlashAttnTiling.Plan#PER_ROW_DECODE}, over a paged cache {@link PagedRowFallback}),
  *       split-K partials merged by
- *       {@code LLM_FlashAttn_Combine}; on a backend with tensor cores ({@link DeviceFeature#COOPERATIVE_MATRIX})
- *       and F16 caches the prefill runs the mma kernel ({@link FlashAttnTiling.Plan#MMA}, {@code
- *       LLM_FlashAttnMma*}); sinks, softcap, ALiBi and the T5 relative bias are kernel arguments; K and V
- *       caches of different types use the mixed-type flash kernels
+ *       {@code LLM_FlashAttn_Combine}; on a device that runs the tensor-core attention
+ *       ({@code LlmKernels.flashMmaPath()}) and F16 caches the prefill runs the mma kernel
+ *       ({@link FlashAttnTiling.Plan#MMA}, {@code LLM_FlashAttnMma*}); sinks, softcap, ALiBi and the T5 relative
+ *       bias are kernel arguments; K and V caches of different types use the mixed-type flash kernels
  *       ({@link AttnKernels#flashDecode(KvDType, KvDType)}); the static sinks are bound by {@link GpuStaticSinks};</li>
  *   <li>output ({@link GpuOutputStages}): the V rotation undone, muse-spark's weightless per-head RMS norm
  *       ({@code LLM_RowNorm}), limite's

@@ -1,6 +1,5 @@
 package com.eonmux.neuralfree.gguf.ops.attn;
 
-import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.spec.AttentionSpec;
@@ -9,12 +8,12 @@ import com.eonmux.neuralfree.gguf.spec.AttentionSpec.BiasMode;
 /**
  * The flash-attention plans of one softmax-attention layer, made once at bind with
  * {@code smemFloats = LlmKernels.faSmemFloats()}: the decode plan, the prefill plan
- * ({@link FlashAttnTiling.Plan#TILED}, the tensor-core {@link FlashAttnTiling.Plan#MMA} on a backend with
- * {@link DeviceFeature#COOPERATIVE_MATRIX} and F16 caches, or the per-row decode fallback), the paged decode plan
- * and paged prefill kernel of a paged cache (with the CUDA grouped-query paged decode kernel where it serves the
- * caches), the one-row decode kernel ({@link #rowKernel}) and the split-K partial capacity every plan's launches fit
- * in. The dense and paged decode plans and the tiled prefill plan share one form: the subgroup kernels where
- * {@link SubgroupFlashAttention#serves} holds, the portable ones otherwise, with the kernel names of
+ * ({@link FlashAttnTiling.Plan#TILED}, the tensor-core {@link FlashAttnTiling.Plan#MMA} on a backend whose device
+ * runs the mma attention ({@link LlmKernels#flashMmaPath()}) with F16 caches, or the per-row decode fallback), the
+ * paged decode plan and paged prefill kernel of a paged cache (with the CUDA grouped-query paged decode kernel where
+ * it serves the caches), the one-row decode kernel ({@link #rowKernel}) and the split-K partial capacity every
+ * plan's launches fit in. The dense and paged decode plans and the tiled prefill plan share one form: the subgroup
+ * kernels where {@link SubgroupFlashAttention#serves} holds, the portable ones otherwise, with the kernel names of
  * {@link #decodeKernel}, {@link #pagedDecodeKernel}, {@link #tiledKernel} and {@link #pagedPrefillKernel}.
  * Immutable.
  */
@@ -70,7 +69,7 @@ final class FlashPlan {
         int smem = kernels.faSmemFloats();
         int cu = FlashAttnTiling.planningUnits(kernels.caps());
         int rows = keys.rows();
-        boolean fast = FlashAttnTiling.decodeFastPath(kernels.caps().hasFeature(DeviceFeature.SUBGROUP_SHUFFLE),
+        boolean fast = FlashAttnTiling.decodeFastPath(kernels.decodeWarpPath(),
                 keys.typeK(), keys.typeV(), a.headDimK(), a.headDimV());
         boolean subgroup = SubgroupFlashAttention.serves(kernels, keys.typeK(), keys.typeV(), a.headDimK(),
                 a.headDimV());
@@ -81,7 +80,7 @@ final class FlashPlan {
                 : AttnKernels.flashDecode(keys.typeK(), keys.typeV());
         String pagedDecodeKernel = subgroup ? SubgroupFlashAttention.pagedKernel(keys.typeK())
                 : AttnKernels.flashDecodePaged(keys.typeK(), keys.typeV());
-        String mmaName = mmaKernelName(kernels.caps().hasFeature(DeviceFeature.COOPERATIVE_MATRIX), keys.typeK(),
+        String mmaName = mmaKernelName(kernels.flashMmaPath(), keys.typeK(),
                 keys.typeV(), a.headDimK(), a.headDimV());
         String mma = mmaName != null && kernels.has(mmaName) ? mmaName : null;
         FlashAttnTiling prefill;
@@ -140,15 +139,15 @@ final class FlashPlan {
     }
 
     /**
-     * The tensor-core prefill kernel name for these caches and head dims when the backend reports the
-     * {@link DeviceFeature#COOPERATIVE_MATRIX} feature: F16 K and V caches only, and head dims that are multiples of
+     * The tensor-core prefill kernel name for these caches and head dims when the device runs the mma attention
+     * ({@code mmaPath}, {@link LlmKernels#flashMmaPath()}): F16 K and V caches only, and head dims that are multiples of
      * 16 of at most {@link FlashAttnTiling#MMA_MAX_HEAD_DIM}. Null otherwise. The caller still requires
      * {@code kernels.has(name)} before preparing it. The dense launches run the base kernel (its identity paging,
      * page_shift = -1) because a dense cache has no page table; the paged kernel {@code LLM_FlashAttnMmaPaged_F16}
      * serves launches over a paginated cache.
      */
-    static String mmaKernelName(boolean cooperativeMatrix, KvDType typeK, KvDType typeV, int dK, int dV) {
-        if (!cooperativeMatrix || typeK != KvDType.F16 || typeV != KvDType.F16) {
+    static String mmaKernelName(boolean mmaPath, KvDType typeK, KvDType typeV, int dK, int dV) {
+        if (!mmaPath || typeK != KvDType.F16 || typeV != KvDType.F16) {
             return null;
         }
         if (dK > FlashAttnTiling.MMA_MAX_HEAD_DIM || dV > FlashAttnTiling.MMA_MAX_HEAD_DIM

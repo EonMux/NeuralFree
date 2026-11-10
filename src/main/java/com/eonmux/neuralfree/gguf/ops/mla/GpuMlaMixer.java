@@ -1,6 +1,5 @@
 package com.eonmux.neuralfree.gguf.ops.mla;
 
-import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
 import com.eonmux.neuralfree.gguf.BatchInvariance;
@@ -526,7 +525,7 @@ public final class GpuMlaMixer implements GpuMixer {
         FlashBindGuard.requireServable(ctx.kernels(), "MLA layer " + il, g.nHead, g.nHeadKv, g.dQ, g.dV);
         int smem = ctx.kernels().faSmemFloats();
         int cus = FlashAttnTiling.planningUnits(ctx.kernels().caps());
-        boolean fast = FlashAttnTiling.decodeFastPath(ctx.kernels().caps().hasFeature(DeviceFeature.SUBGROUP_SHUFFLE),
+        boolean fast = FlashAttnTiling.decodeFastPath(ctx.kernels().decodeWarpPath(),
                 layout.dtypeK(), layout.dtypeV(), g.dQ, g.dV);
         decodeTiling = FlashAttnTiling.decode(g.nHead, g.nHeadKv, g.dQ, g.dV, layout.rows(), smem, cus, fast);
         prefillTiling = FlashAttnTiling.prefill(g.nHead, g.nHeadKv, g.dQ, g.dV, layout.rows(), smem, cus);

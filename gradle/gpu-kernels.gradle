@@ -34,8 +34,13 @@
  *                                 with clang, or with nvcc when clang is absent; without either, inventoryCheck
  *                                 checks the file's format and shader-variant coverage only, and the file is
  *                                 used as checked in.
- *   shaders/<lib>/variants/*.tsv  kernel_name<TAB>source.comp<TAB>defines (NAME=VALUE ...)<TAB>flags (sg; only
- *                                 for libraries with subgroup variants)
+ *   shaders/<lib>/variants/*.tsv  kernel_name<TAB>source.comp<TAB>defines (NAME=VALUE ...)<TAB>flags (sg or sg<N>, only
+ *                                 for libraries with subgroup variants; vk13, compile and validate for the
+ *                                 Vulkan 1.3 SPIR-V environment instead of 1.2; vulkan, a Vulkan-only kernel;
+ *                                 noopt, ship the module without the spirv-opt pass, for the workgroup-scope
+ *                                 cooperative-matrix shaders whose unrolled loops spirv-opt flattens into
+ *                                 modules the driver compiles several times slower, as llama.cpp
+ *                                 vulkan-shaders-gen skips spirv-opt for its coopmat shaders)
  *   kernels/common/               shared dual-dialect headers ([shared] entries, e.g. common/dialect.h)
  *   shaders/common/               shared GLSL includes (common/nf_base.glsl); library shaders compile with the include
  *                                 directories [shaders/<lib>, shaders]; no library has its own copy of one
@@ -59,8 +64,8 @@
  *   metal-shim/                   libmetalshim.dylib, the JNI shim of native/metal/metalshim.m (buildMetalShim;
  *                                 macOS only; run with -Dneuralfree.metal.shim.path=...)
  *   spv/shaders/<lib>/            <Kernel>.spv, <Kernel>__sg.spv for rows flagged sg, and index.properties
- *                                 (<Kernel>.buffers, .ro, .push, .sg, and .sgsize for rows flagged sg<N>;
- *                                 read by KernelSignature.parse)
+ *                                 (<Kernel>.buffers, .ro, .push, .sg, .sgsize for rows flagged sg<N>, and
+ *                                 .vulkan=1 for rows flagged vulkan; read by KernelSignature.parse)
  *   spv-test/shaders/test/        backend test shaders
  *   metal/shaders/<lib>/metal/    <Kernel>.metal plus index.properties, generated from the same SPIR-V modules by
  *                                 SPIRV-Cross (compileMetalShaders, via the build-only org.lwjgl:lwjgl-spvc
@@ -275,11 +280,11 @@ def gpuShaderToolsFingerprint = { ->
     ['compiler', 'dis', 'opt', 'val'].collect { GpuBuildTools.fingerprint((File) t[it]) }.join(' | ')
 }
 
-/** Compiles one GLSL compute shader for Vulkan 1.2 without optimization. */
-def gpuCompileGlsl = { Map tools, File src, File out, List<File> includes, List<String> defines, String what ->
+/** Compiles one GLSL compute shader for Vulkan 1.2, or the given target environment, without optimization. */
+def gpuCompileGlsl = { Map tools, File src, File out, List<File> includes, List<String> defines, String what, String targetEnv = 'vulkan1.2' ->
     List<Object> cmd = tools.glslc
-            ? [tools.compiler, '--target-env=vulkan1.2', '-fshader-stage=compute']
-            : [tools.compiler, '-V', '--target-env', 'vulkan1.2', '-S', 'comp']
+            ? [tools.compiler, "--target-env=${targetEnv}", '-fshader-stage=compute']
+            : [tools.compiler, '-V', '--target-env', targetEnv, '-S', 'comp']
     includes.each { File dir -> cmd.addAll(tools.glslc ? ['-I', dir.absolutePath] : ['-I' + dir.absolutePath]) }
     defines.each { String d -> cmd.add('-D' + d) }
     cmd.addAll([src, '-o', out])
@@ -287,9 +292,9 @@ def gpuCompileGlsl = { Map tools, File src, File out, List<File> includes, List<
     GpuBuildTools.runChecked(cmd, null, "compiling ${what}")
 }
 
-def gpuValidateSpirv = { Map tools, File spv, String what ->
+def gpuValidateSpirv = { Map tools, File spv, String what, String targetEnv = 'vulkan1.2' ->
     if (tools.val != null) {
-        GpuBuildTools.runChecked([tools.val, '--target-env', 'vulkan1.2', spv], null, "spirv-val of ${what}")
+        GpuBuildTools.runChecked([tools.val, '--target-env', targetEnv, spv], null, "spirv-val of ${what}")
     }
 }
 
@@ -310,28 +315,30 @@ def gpuCompileShaderTree = { Map tools, List<File> sources, File out, String wha
 /**
  * Builds one library variant (or its __sg twin): compile without -O with the include directories
  * [shaders/<lib>, shaders], record the signature from the unoptimized module, optimize with bindings and spec
- * constants preserved, validate. A pinned row (sg<N>, row.sgSize > 0) builds its only module <name>.spv with
- * USE_SUBGROUPS=1 and NF_SG_ROW_SIZE=<N>.
+ * constants preserved (unless the row is flagged noopt), validate. A pinned row (sg<N>, row.sgSize > 0) builds its
+ * only module <name>.spv with USE_SUBGROUPS=1 and NF_SG_ROW_SIZE=<N>; a row flagged vk13 compiles and validates for
+ * the Vulkan 1.3 SPIR-V environment.
  */
 def gpuBuildVariant = { Map tools, GpuKernelLibrary lib, Map row, boolean sg, File tmp, File libOut ->
     String name = row.name + (sg ? '__sg' : '')
+    String env = row.vk13 ? 'vulkan1.3' : 'vulkan1.2'
     int pinned = (int) (row.sgSize ?: 0)
     List<String> defines = row.defines + (sg || pinned > 0 ? ['USE_SUBGROUPS=1'] : []) +
             (pinned > 0 ? ['NF_SG_ROW_SIZE=' + pinned] : [])
     String what = "${lib.shaderRootPath}/variants/${row.location} ${name} (${row.source} ${defines.join(' ')})"
     File unoptimized = new File(tmp, name + '.spv')
     gpuCompileGlsl(tools, new File(lib.shaderRoot, (String) row.source), unoptimized, [lib.shaderRoot, gpuShaderRoot],
-            defines, what)
+            defines, what, env)
     String dis = GpuBuildTools.runChecked([tools.dis, '--raw-id', unoptimized], null, "spirv-dis of ${what}")
     Map signature = GpuSpirvSignature.parse(dis, what)
     File spv = new File(libOut, name + '.spv')
-    if (tools.opt != null) {
+    if (tools.opt != null && !row.noopt) {
         GpuBuildTools.runChecked([tools.opt, '-O', '--preserve-bindings', '--preserve-spec-constants', unoptimized, '-o', spv],
                 null, "spirv-opt of ${what}")
     } else {
         GpuBuildTools.copy(unoptimized, spv)
     }
-    gpuValidateSpirv(tools, spv, what)
+    gpuValidateSpirv(tools, spv, what, env)
     return signature
 }
 
@@ -733,7 +740,7 @@ tasks.register('compileShaders') {
                             throw new GradleException("${lib.shaderRootPath}/variants/${row.location} ${row.name}: the __sg variant's arguments ${sgSignature} differ from the plain variant's ${signature}")
                         }
                     }
-                    [library: lib, name: row.name, sg: row.sg, sgSize: row.sgSize, signature: signature]
+                    [library: lib, name: row.name, sg: row.sg, sgSize: row.sgSize, vulkan: row.vulkan, signature: signature]
                 }) as Callable<Map>)
             }
         }
@@ -741,7 +748,7 @@ tasks.register('compileShaders') {
         List<String> summary = []
         rowsByLibrary.keySet().each { GpuKernelLibrary lib ->
             List<Map> libBuilt = built.findAll { it.library.is(lib) }.sort { it.name }
-            StringBuilder index = new StringBuilder("# ${lib.label} kernel signatures: buffers, read-only flag per binding, push-constant scalar kinds, __sg variant, pinned subgroup size\n")
+            StringBuilder index = new StringBuilder("# ${lib.label} kernel signatures: buffers, read-only flag per binding, push-constant scalar kinds, __sg variant, pinned subgroup size, Vulkan-only\n")
             libBuilt.each { Map b ->
                 index.append("${b.name}.buffers=${b.signature.buffers}\n")
                 index.append("${b.name}.ro=${b.signature.ro}\n")
@@ -749,6 +756,9 @@ tasks.register('compileShaders') {
                 index.append("${b.name}.sg=${b.sg ? 1 : 0}\n")
                 if (b.sgSize > 0) {
                     index.append("${b.name}.sgsize=${b.sgSize}\n")
+                }
+                if (b.vulkan) {
+                    index.append("${b.name}.vulkan=1\n")
                 }
             }
             GpuBuildTools.writeText(new File(new File(out, lib.shaderRootPath), 'index.properties'), index.toString())
@@ -1098,16 +1108,21 @@ tasks.register('verifyGpuKernels') {
         List<String> summary = []
         gpuLibraries.each { GpuKernelLibrary lib ->
             Map<String, Map> inventory = GpuInventory.read(lib, gpuInventoryCommand)
-            // Kernels of [cuda] manifest entries exist only in the CUDA fatbins; the HIP build and the Vulkan
-            // shader set never serve them and hosts select them through the COOPERATIVE_MATRIX feature.
+            // Kernels of [cuda] manifest entries are required only of the CUDA fatbins; the HIP build never
+            // serves them, and the Vulkan shader set may carry vulkan-flagged twins (the cooperative-matrix-2
+            // attention), whose signatures are compared below like every other SPIR-V kernel of the inventory.
             Set<String> cudaOnlyPaths = lib.manifest(gpuSharedKernelRoot).findAll { it.cudaOnly }
                     .collect { (String) it.path } as Set
             Set<String> portableInventory = inventory.findAll { !(it.value.file in cudaOnlyPaths) }.keySet()
             List<String> covered = []
-            Closure coverage = { String what, Set<String> built ->
+            // Rows flagged vulkan name kernels of the Vulkan shader set alone: the SPIR-V index carries them,
+            // while CUDA, HIP and Metal never build them and the Metal generator skips their modules.
+            Set<String> vulkanOnly = GpuShaderVariants.read(lib.variantsDir, lib.shaderRoot, lib.subgroupVariants)
+                    .findAll { it.vulkan }.collect { (String) it.name } as Set
+            Closure coverage = { String what, Set<String> built, Set<String> allowedExtras = [] as Set ->
                 Set<String> required = what == 'CUDA' ? inventory.keySet() : portableInventory
                 List<String> missing = (required - built).sort()
-                List<String> extra = (built - inventory.keySet()).sort()
+                List<String> extra = (built - inventory.keySet() - allowedExtras).sort()
                 if (!missing.isEmpty()) {
                     problems.add("${lib.id}: ${what} index lacks ${missing.size()} kernels: ${missing.join(', ')}")
                 }
@@ -1142,7 +1157,7 @@ tasks.register('verifyGpuKernels') {
                 if (!pinnedPortable.isEmpty()) {
                     problems.add("${lib.id}: SPIR-V pins the subgroup width of portable kernels: ${pinnedPortable.join(', ')}")
                 }
-                coverage('SPIR-V', spv - pinned)
+                coverage('SPIR-V', spv - pinned, vulkanOnly)
                 // 'i' and 'u' are both 32-bit integers on the Java side; without compareKinds only the count matters.
                 Closure<String> kindClass = { String kind -> lib.compareKinds ? (kind == 'f' ? 'f' : 'i') : 's' }
                 (inventory.keySet().intersect(spv)).sort().each { String name ->

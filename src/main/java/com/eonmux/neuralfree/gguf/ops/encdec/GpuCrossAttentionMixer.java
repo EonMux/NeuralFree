@@ -1,6 +1,5 @@
 package com.eonmux.neuralfree.gguf.ops.encdec;
 
-import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.gguf.arch.SwaType;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuMixer;
@@ -207,7 +206,7 @@ public final class GpuCrossAttentionMixer implements GpuMixer {
         KvDType typeV = l.dtypeV();
         decodePlan = FlashAttnTiling.decode(cross.nHead(), cross.nHeadKv(), cross.headDimK(), cross.headDimV(),
                 l.rows(), smem, cus,
-                FlashAttnTiling.decodeFastPath(ctx.kernels().caps().hasFeature(DeviceFeature.SUBGROUP_SHUFFLE),
+                FlashAttnTiling.decodeFastPath(ctx.kernels().decodeWarpPath(),
                         typeK, typeV, cross.headDimK(), cross.headDimV()));
         prefillPlan = FlashAttnTiling.prefill(cross.nHead(), cross.nHeadKv(), cross.headDimK(), cross.headDimV(),
                 l.rows(), smem, cus);

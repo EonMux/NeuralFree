@@ -202,6 +202,17 @@ public final class VkComputeBackend implements ComputeBackend {
                 computeContexts.length, transferContext.family() == computeContexts[0].family() ? "shared"
                         : String.valueOf(transferContext.family()),
                 descriptorStrategy.getClass().getSimpleName(), capabilities.getMaxAllocSizeBytes() / (1024 * 1024));
+        VkPhysicalDeviceInfo.QueueFamily computeQueueFamily = info.queueFamilies().get(info.computeQueueFamily());
+        LOGGER.info("Vulkan compute features - subgroup {} ({}..{}), size-control {}, integer-dot {}, "
+                        + "KHR cooperative-matrix {}, NV cooperative-matrix2 {} (attention {}), timestamp {} ns/tick "
+                        + "({} valid bits)",
+                info.subgroupSize(), info.minSubgroupSize(), info.maxSubgroupSize(),
+                info.supports(VkPhysicalDeviceInfo.Feature.SUBGROUP_SIZE_CONTROL),
+                info.supports(VkPhysicalDeviceInfo.Feature.SHADER_INTEGER_DOT_PRODUCT),
+                info.supports(VkPhysicalDeviceInfo.Feature.COOPERATIVE_MATRIX),
+                info.supports(VkPhysicalDeviceInfo.Feature.COOPERATIVE_MATRIX_2),
+                info.supports(VkPhysicalDeviceInfo.Feature.COOPERATIVE_MATRIX_2_ATTENTION),
+                info.timestampPeriod(), computeQueueFamily.timestampValidBits());
     }
 
     @Override

@@ -17,6 +17,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.regex.Pattern;
 
 import static org.junit.Assert.assertEquals;
@@ -47,6 +48,8 @@ public final class KernelInventoryChecks {
             "NF_LOCAL", "NF_LOCAL_PTR", "__local", "local"));
     /** The variant-row flag that pins a module's subgroup width ({@code sg<N>}). */
     private static final Pattern PINNED_FLAG = Pattern.compile("sg(8|16|32|64)");
+    /** The other flags a variant row may carry, as in the build's GpuShaderVariants. */
+    private static final Set<String> KNOWN_FLAGS = new HashSet<>(Arrays.asList("sg", "vk13", "vulkan", "noopt"));
 
     private final Path kernelRoot;
     private final Path variantsDir;
@@ -54,17 +57,19 @@ public final class KernelInventoryChecks {
     private final List<KernelSig> kernels;
     private final Map<String, List<String>> variantRows;
     private final Map<String, List<String>> pinnedRows;
+    private final Set<String> vulkanOnlyRows;
     private final List<String> variantFormatErrors;
 
     private KernelInventoryChecks(Path kernelRoot, Path variantsDir, KernelManifest manifest, List<KernelSig> kernels,
                                   Map<String, List<String>> variantRows, Map<String, List<String>> pinnedRows,
-                                  List<String> variantFormatErrors) {
+                                  Set<String> vulkanOnlyRows, List<String> variantFormatErrors) {
         this.kernelRoot = kernelRoot;
         this.variantsDir = variantsDir;
         this.manifest = manifest;
         this.kernels = Collections.unmodifiableList(kernels);
         this.variantRows = Collections.unmodifiableMap(variantRows);
         this.pinnedRows = Collections.unmodifiableMap(pinnedRows);
+        this.vulkanOnlyRows = Collections.unmodifiableSet(vulkanOnlyRows);
         this.variantFormatErrors = Collections.unmodifiableList(variantFormatErrors);
     }
 
@@ -81,6 +86,7 @@ public final class KernelInventoryChecks {
         }
         Map<String, List<String>> rows = new TreeMap<>();
         Map<String, List<String>> pinned = new TreeMap<>();
+        Set<String> vulkanOnly = new TreeSet<>();
         List<String> errors = new ArrayList<>();
         if (Files.isDirectory(variantsDir)) {
             List<Path> tsvs = new ArrayList<>();
@@ -101,14 +107,38 @@ public final class KernelInventoryChecks {
                         errors.add(where + ": expected kernel_name<TAB>source.comp[<TAB>defines[<TAB>flags]]");
                         continue;
                     }
-                    boolean pins = cols.length == 4 && Arrays.stream(cols[3].split(","))
-                            .anyMatch(f -> PINNED_FLAG.matcher(f.trim()).matches());
+                    List<String> flags = flags(cols, where, errors);
+                    if (flags.contains("vulkan")) {
+                        vulkanOnly.add(cols[0].trim());
+                    }
+                    boolean pins = flags.stream().anyMatch(f -> PINNED_FLAG.matcher(f).matches());
                     (pins ? pinned : rows).computeIfAbsent(cols[0].trim(), n -> new ArrayList<>()).add(where);
                 }
             }
         }
         return new KernelInventoryChecks(kernelRoot, variantsDir, manifest, new Scanner(files).scan(), rows, pinned,
-                errors);
+                vulkanOnly, errors);
+    }
+
+    /** The comma-separated flags of a variant row (column 4), reporting unknown ones as malformed. */
+    private static List<String> flags(String[] cols, String where, List<String> errors) {
+        if (cols.length < 4 || cols[3].trim().isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<String> flags = new ArrayList<>();
+        for (String flag : cols[3].trim().split(",")) {
+            String f = flag.trim();
+            if (!f.isEmpty()) {
+                flags.add(f);
+            }
+        }
+        for (String f : flags) {
+            if (!KNOWN_FLAGS.contains(f) && !PINNED_FLAG.matcher(f).matches()) {
+                errors.add(where + ": unknown flag '" + f + "' (known: " + String.join(", ", KNOWN_FLAGS)
+                        + ", sg8, sg16, sg32, sg64)");
+            }
+        }
+        return flags;
     }
 
     /** The parsed manifest of the library. */
@@ -180,7 +210,7 @@ public final class KernelInventoryChecks {
     /**
      * Variant rows that name no inventory kernel (a kernel of a file outside {@code openClOnly}), then the malformed
      * rows. A {@code [cuda]} file's kernel may have a row, its optional Vulkan twin, as the build's inventory
-     * coverage check allows.
+     * coverage check allows; a row flagged {@code vulkan} names a kernel of the Vulkan shader set alone.
      */
     public List<String> orphanVariantRowViolations(Set<String> openClOnly) {
         Set<String> inventory = new HashSet<>();
@@ -191,7 +221,7 @@ public final class KernelInventoryChecks {
         }
         List<String> violations = new ArrayList<>();
         for (Map.Entry<String, List<String>> e : variantRows.entrySet()) {
-            if (!inventory.contains(e.getKey())) {
+            if (!inventory.contains(e.getKey()) && !vulkanOnlyRows.contains(e.getKey())) {
                 violations.add(e.getKey() + " (" + e.getValue() + ") is not a kernel of an inventory manifest file");
             }
         }

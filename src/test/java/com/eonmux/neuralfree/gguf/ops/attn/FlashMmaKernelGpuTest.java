@@ -6,6 +6,9 @@ import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
+import com.eonmux.neuralfree.acceleration.backend.vulkan.VkComputeBackend;
+import com.eonmux.neuralfree.acceleration.vulkan.VkInstanceManager;
+import com.eonmux.neuralfree.acceleration.vulkan.VkPhysicalDeviceInfo;
 import com.eonmux.neuralfree.gguf.arch.SwaType;
 import com.eonmux.neuralfree.gguf.spec.AttentionSpec.BiasMode;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
@@ -15,36 +18,73 @@ import org.junit.After;
 import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
+import java.util.Arrays;
 import java.util.EnumSet;
+import java.util.List;
 import java.util.Random;
 
 import static org.junit.Assert.assertTrue;
 
 /**
- * Parity of the tensor-core mma prefill kernel ({@code LLM_FlashAttnMma_F16} of kernels/llm/flash_mma.cl)
- * against the CPU reference {@link CpuAttentionCore} on a device that reports the cooperative-matrix feature:
- * causal prefill and multi-row decode (split-K partials merged by {@code LLM_FlashAttn_Combine}), GQA packing,
- * softcap, ALiBi, sinks and the SWA windows, with F16 K and V caches. Skipped when no CUDA device offers the
- * kernel (the OpenCL and Vulkan builds define no mma kernels).
+ * Parity of the tensor-core mma prefill kernels ({@code LLM_FlashAttnMma_F16} of kernels/llm/flash_mma.cl on CUDA,
+ * of shaders/llm/flash_mma_cm2.comp on Vulkan) against the CPU reference {@link CpuAttentionCore} on a device that
+ * runs them ({@link LlmKernels#flashMmaPath()}): causal prefill and multi-row decode (split-K partials merged by
+ * {@code LLM_FlashAttn_Combine}), GQA packing, softcap, ALiBi, sinks and the SWA windows, with F16 K and V caches.
+ * The Vulkan case opens the first device reporting {@link DeviceFeature#COOPERATIVE_MATRIX_2_ATTENTION}. Skipped
+ * where no device offers the kernel (the OpenCL and HIP builds define no mma attention).
  */
+@RunWith(Parameterized.class)
 public class FlashMmaKernelGpuTest {
 
+    @Parameterized.Parameters(name = "{0}")
+    public static List<Object[]> backends() {
+        return Arrays.asList(new Object[]{ComputeBackend.BackendType.CUDA},
+                new Object[]{ComputeBackend.BackendType.VULKAN});
+    }
+
+    private final ComputeBackend.BackendType api;
     private HWAcceleration hw;
     private ComputeBackend backend;
     private LlmKernels kernels;
 
+    public FlashMmaKernelGpuTest(ComputeBackend.BackendType api) {
+        this.api = api;
+    }
+
     @Before
     public void open() {
-        GpuTestUtil.assumeCudaAvailable();
-        hw = new HWAcceleration(EnumSet.of(ComputeBackend.BackendType.CUDA));
-        Assume.assumeTrue("no CUDA device", !hw.getCUDevices().isEmpty());
-        backend = hw.createBackend(hw.getCUDevices().get(0));
-        Assume.assumeTrue("LLM kernels unavailable on CUDA", LlmKernels.availability(backend).available());
+        if (api == ComputeBackend.BackendType.CUDA) {
+            GpuTestUtil.assumeCudaAvailable();
+            hw = new HWAcceleration(EnumSet.of(ComputeBackend.BackendType.CUDA));
+            Assume.assumeTrue("no CUDA device", !hw.getCUDevices().isEmpty());
+            backend = hw.createBackend(hw.getCUDevices().get(0));
+        } else {
+            GpuTestUtil.assumeVulkanAvailable();
+            backend = openVulkanAttentionDevice();
+            Assume.assumeTrue("no Vulkan device with the cooperative-matrix-2 attention tile", backend != null);
+        }
+        Assume.assumeTrue("LLM kernels unavailable on " + api, LlmKernels.availability(backend).available());
         kernels = LlmKernels.open(backend);
-        Assume.assumeTrue("device has no tensor-core feature",
-                backend.capabilities().hasFeature(DeviceFeature.COOPERATIVE_MATRIX));
-        Assume.assumeTrue("no mma kernel in the CUDA index", kernels.has("LLM_FlashAttnMma_F16"));
+        Assume.assumeTrue("device runs no mma attention", kernels.flashMmaPath());
+        Assume.assumeTrue("no mma kernel in the " + api + " index", kernels.has("LLM_FlashAttnMma_F16"));
+    }
+
+    /** The first Vulkan device reporting the cooperative-matrix-2 attention tile, or null. */
+    private static ComputeBackend openVulkanAttentionDevice() {
+        VkInstanceManager manager = VkInstanceManager.acquire();
+        try {
+            for (VkPhysicalDeviceInfo info : manager.devices()) {
+                if (info.supports(VkPhysicalDeviceInfo.Feature.COOPERATIVE_MATRIX_2_ATTENTION)) {
+                    return new VkComputeBackend(manager, info);
+                }
+            }
+            return null;
+        } finally {
+            manager.release();
+        }
     }
 
     @After
@@ -57,13 +97,18 @@ public class FlashMmaKernelGpuTest {
         }
     }
 
+    /** Cache layout of a case: dense rows, or 64-key pages mapped in order or in reverse. */
+    private enum Paging { DENSE, IDENTITY, REVERSED }
+
     /**
      * Runs one shape twice against the reference: split-K prefill over all {@code nKv} rows with the combine,
-     * then the direct-out form of the same call, and asserts both within {@code tol}. With {@code paged}, the
-     * launches go through {@code LLM_FlashAttnMmaPaged_F16} with an identity page table of 64-key pages.
+     * then the direct-out form of the same call, and asserts both within {@code tol}. A paged case launches
+     * {@code LLM_FlashAttnMmaPaged_F16} over 64-key pages: the K, V and position rows of logical page p sit at
+     * physical page {@code pages[p]}, the identity or the reversed map.
      */
     private void runCase(int nHead, int nHeadKv, int d, int nKv, int nTokens, CpuAttentionCore.Params params,
-                         float tol, boolean paged) {
+                         float tol, Paging paging) {
+        final boolean paged = paging != Paging.DENSE;
         final int G = nHead / nHeadKv;
         final int gTile = Math.min(Math.min(G, FlashAttnTiling.MMA_MAX_G_TILE), FlashAttnTiling.MMA_ROWS);
         final int bq = FlashAttnTiling.MMA_ROWS / gTile;
@@ -111,29 +156,41 @@ public class FlashMmaKernelGpuTest {
         CpuAttentionCore.attendRows(reference, nTokens, q, 0, nHead * d, qPos, 0, dense, 0, nKv, want, 0,
                 nHead * d);
 
+        int[] pages = new int[(nKv + 63) / 64];
+        for (int p = 0; p < pages.length; p++) {
+            pages[p] = paging == Paging.REVERSED ? pages.length - 1 - p : p;
+        }
+        int rows = paged ? pages.length * 64 : nKv;
+        int rowLen = nHeadKv * d;
+        short[] kRows = new short[rows * rowLen];
+        short[] vRows = new short[rows * rowLen];
+        int[] posRows = new int[rows];
+        Arrays.fill(posRows, -1);
+        for (int j = 0; j < nKv; j++) {
+            int row = paged ? pages[j / 64] * 64 + j % 64 : j;
+            System.arraycopy(k, j * rowLen, kRows, row * rowLen, rowLen);
+            System.arraycopy(v, j * rowLen, vRows, row * rowLen, rowLen);
+            posRows[row] = kvPos[j];
+        }
         GpuBuffer dq = backend.allocateBuffer((long) q.length * 4, true);
-        GpuBuffer dk = backend.allocateBuffer((long) k.length * 2, true);
-        GpuBuffer dv = backend.allocateBuffer((long) v.length * 2, true);
+        GpuBuffer dk = backend.allocateBuffer((long) kRows.length * 2, true);
+        GpuBuffer dv = backend.allocateBuffer((long) vRows.length * 2, true);
         GpuBuffer dqp = backend.allocateBuffer((long) nTokens * 4, true);
-        GpuBuffer dkv = backend.allocateBuffer((long) nKv * 4, true);
+        GpuBuffer dkv = backend.allocateBuffer((long) rows * 4, true);
         GpuBuffer dsinks = backend.allocateBuffer((long) nHead * 4, true);
         GpuBuffer drel = backend.allocateBuffer((long) relBias.length * 4, true);
         GpuBuffer dout = backend.allocateBuffer((long) nTokens * nHead * d * 4, true);
         GpuBuffer dph = backend.allocateBuffer(4, true);
         // the mask slot stays bound as in the engine's launches; the tree flag alone admits it
         GpuBuffer dmask = backend.allocateBuffer((long) nTokens * 8, true);
-        GpuBuffer dpt = backend.allocateBuffer((long) ((nKv + 63) / 64) * 4, true);
-        int[] pages = new int[(nKv + 63) / 64];
-        for (int p = 0; p < pages.length; p++) {
-            pages[p] = p;
-        }
+        GpuBuffer dpt = backend.allocateBuffer((long) pages.length * 4, true);
         enqueue(dpt, pages);
         try {
             enqueue(dq, q);
-            enqueueHalfs(dk, k);
-            enqueueHalfs(dv, v);
+            enqueueHalfs(dk, kRows);
+            enqueueHalfs(dv, vRows);
             enqueue(dqp, qPos);
-            enqueue(dkv, kvPos);
+            enqueue(dkv, posRows);
             enqueue(dsinks, sinks);
             enqueue(drel, relBias);
 
@@ -225,8 +282,8 @@ public class FlashMmaKernelGpuTest {
 
     /**
      * The {@code LLM_FlashAttnMmaPaged_F16} argument list: page_shift and pt_off follow the base scalars
-     * (positions 29, 30), the base buffers shift behind them, and the page-table buffer closes the list. The
-     * table is the identity map of 64-key pages.
+     * (positions 29, 30), the base buffers shift behind them, and the page-table buffer closes the list (64-key
+     * pages).
      */
     private static Object[] mmaPagedArgs(int nTokens, int nHead, int nHeadKv, int d, FlashAttnTiling plan,
                                          int nSplit, int splitLen, int nKv, CpuAttentionCore.Params params,
@@ -239,8 +296,9 @@ public class FlashMmaKernelGpuTest {
         System.arraycopy(base, 0, args, 0, 29);
         args[29] = 6;                                            // page_shift: 64-key pages
         args[30] = 0;                                            // pt_off
-        System.arraycopy(base, 29, args, 31, 10);                // the ten base buffers
-        args[41] = pageTable;
+        System.arraycopy(base, 29, args, 31, 9);                 // q .. partial
+        args[40] = pageTable;
+        args[41] = base[38];                                     // the tree mask follows the page table
         return args;
     }
 
@@ -358,42 +416,55 @@ public class FlashMmaKernelGpuTest {
     @Test
     public void causalGqaPrefillMatchesTheReference() {
         runCase(8, 2, 64, 96, 8, CpuAttentionCore.Params.builder(8).scale(0.125f)
-                .window(KvWindow.FULL_CAUSAL).build(), 3e-3f, false);
+                .window(KvWindow.FULL_CAUSAL).build(), 3e-3f, Paging.DENSE);
     }
 
     @Test
     public void causalGqaHeadDim128MatchesTheReference() {
         runCase(8, 2, 128, 160, 8, CpuAttentionCore.Params.builder(8).scale(0.125f)
-                .window(KvWindow.FULL_CAUSAL).build(), 4e-3f, false);
+                .window(KvWindow.FULL_CAUSAL).build(), 4e-3f, Paging.DENSE);
     }
 
     @Test
     public void batchedVerifyWithSinksAndSoftcapMatchesTheReference() {
         runCase(16, 2, 64, 400, 32, CpuAttentionCore.Params.builder(16).scale(0.125f).softcap(8f)
-                .window(KvWindow.FULL_CAUSAL).sinks(new float[16]).build(), 3e-3f, false);
+                .window(KvWindow.FULL_CAUSAL).sinks(new float[16]).build(), 3e-3f, Paging.DENSE);
     }
 
     @Test
     public void alibiMatchesTheReference() {
         runCase(8, 8, 64, 128, 8, CpuAttentionCore.Params.builder(8).scale(0.125f).alibi(8f)
-                .window(KvWindow.FULL_CAUSAL).build(), 3e-3f, false);
+                .window(KvWindow.FULL_CAUSAL).build(), 3e-3f, Paging.DENSE);
     }
 
     @Test
     public void swaStandardMatchesTheReference() {
         runCase(8, 2, 64, 300, 8, CpuAttentionCore.Params.builder(8).scale(0.125f)
-                .window(KvWindow.of(SwaType.STANDARD, 64, true)).build(), 3e-3f, false);
+                .window(KvWindow.of(SwaType.STANDARD, 64, true)).build(), 3e-3f, Paging.DENSE);
     }
 
     @Test
     public void bidirectionalMatchesTheReference() {
         runCase(8, 2, 64, 96, 8, CpuAttentionCore.Params.builder(8).scale(0.125f)
-                .window(KvWindow.FULL_BIDIRECTIONAL).build(), 3e-3f, false);
+                .window(KvWindow.FULL_BIDIRECTIONAL).build(), 3e-3f, Paging.DENSE);
     }
 
     @Test
     public void pagedIdentityPagesMatchTheReference() {
         runCase(8, 2, 64, 160, 8, CpuAttentionCore.Params.builder(8).scale(0.125f)
-                .window(KvWindow.FULL_CAUSAL).build(), 3e-3f, true);
+                .window(KvWindow.FULL_CAUSAL).build(), 3e-3f, Paging.IDENTITY);
+    }
+
+    @Test
+    public void pagedReversedPagesMatchTheReference() {
+        runCase(8, 2, 128, 300, 40, CpuAttentionCore.Params.builder(8).scale(0.0884f)
+                .window(KvWindow.FULL_CAUSAL).build(), 4e-3f, Paging.REVERSED);
+    }
+
+    @Test
+    public void t5BidirectionalBiasMatchesTheReference() {
+        runCase(8, 2, 64, 96, 8, CpuAttentionCore.Params.builder(8).scale(0.125f)
+                .t5(true, 32, 128, new float[32 * 8]).window(KvWindow.FULL_BIDIRECTIONAL).build(), 3e-3f,
+                Paging.DENSE);
     }
 }

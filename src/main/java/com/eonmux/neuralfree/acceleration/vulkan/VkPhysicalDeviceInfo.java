@@ -19,7 +19,10 @@ import org.lwjgl.vulkan.VkPhysicalDeviceMaintenance3Properties;
 import org.lwjgl.vulkan.VkPhysicalDeviceMaintenance4Properties;
 import org.lwjgl.vulkan.VkPhysicalDeviceMemoryProperties;
 import org.lwjgl.vulkan.VkCooperativeMatrixPropertiesKHR;
+import org.lwjgl.vulkan.VkCooperativeMatrixFlexibleDimensionsPropertiesNV;
 import org.lwjgl.vulkan.VkPhysicalDeviceCooperativeMatrixFeaturesKHR;
+import org.lwjgl.vulkan.VkPhysicalDeviceCooperativeMatrix2FeaturesNV;
+import org.lwjgl.vulkan.VkPhysicalDeviceCooperativeMatrix2PropertiesNV;
 import org.lwjgl.vulkan.VkPhysicalDeviceShaderBfloat16FeaturesKHR;
 import org.lwjgl.vulkan.VkPhysicalDevicePCIBusInfoPropertiesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties;
@@ -52,8 +55,11 @@ import static org.lwjgl.vulkan.KHRPushDescriptor.VK_KHR_PUSH_DESCRIPTOR_EXTENSIO
 import static org.lwjgl.vulkan.KHRCooperativeMatrix.VK_COMPONENT_TYPE_FLOAT16_KHR;
 import static org.lwjgl.vulkan.KHRCooperativeMatrix.VK_COMPONENT_TYPE_FLOAT32_KHR;
 import static org.lwjgl.vulkan.KHRCooperativeMatrix.VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
+import static org.lwjgl.vulkan.NVCooperativeMatrix2.VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME;
 import static org.lwjgl.vulkan.KHRCooperativeMatrix.VK_SCOPE_SUBGROUP_KHR;
+import static org.lwjgl.vulkan.KHRCooperativeMatrix.VK_SCOPE_WORKGROUP_KHR;
 import static org.lwjgl.vulkan.KHRCooperativeMatrix.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR;
+import static org.lwjgl.vulkan.NVCooperativeMatrix2.vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV;
 import static org.lwjgl.vulkan.KHRShaderBfloat16.VK_COMPONENT_TYPE_BFLOAT16_KHR;
 import static org.lwjgl.vulkan.KHRShaderBfloat16.VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME;
 import static org.lwjgl.vulkan.KHRShaderIntegerDotProduct.VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME;
@@ -113,12 +119,23 @@ public final class VkPhysicalDeviceInfo {
         SHADER_FLOAT16,
         TIMELINE_SEMAPHORE,
         SUBGROUP_BROADCAST_DYNAMIC_ID,
+        /** {@code vulkanMemoryModel} together with {@code vulkanMemoryModelDeviceScope}, enabled as a pair. */
         VULKAN_MEMORY_MODEL,
         SUBGROUP_SIZE_CONTROL,
         COMPUTE_FULL_SUBGROUPS,
         MAINTENANCE4,
         SHADER_INTEGER_DOT_PRODUCT,
         COOPERATIVE_MATRIX,
+        /** {@code VkPhysicalDeviceVulkan12Features.bufferDeviceAddress}: physical-storage-buffer addressing
+         *  ({@code GL_EXT_buffer_reference}), which the {@code VK_NV_cooperative_matrix2} tensor layouts use. */
+        BUFFER_DEVICE_ADDRESS,
+        /** {@code VK_NV_cooperative_matrix2} with flexible workgroup-scope dimensions matching the CM2 GEMM's
+         *  fp16 128-row x 64-deep tiles (token widths 256, 128 and 64), tensor layouts and per-element operations. */
+        COOPERATIVE_MATRIX_2,
+        /** {@link #COOPERATIVE_MATRIX_2} plus {@code cooperativeMatrixConversions} (accumulator to operand) and
+         *  flexible dimensions matching the tensor-core prefill attention's fp16 x fp16 -> fp32 tiles of 128
+         *  invocations: 64 query rows, 64 keys, head dims of 16-multiples. */
+        COOPERATIVE_MATRIX_2_ATTENTION,
         /** {@code VkPhysicalDeviceShaderBfloat16FeaturesKHR.shaderBFloat16Type} ({@code VK_KHR_shader_bfloat16}). */
         SHADER_BFLOAT16_TYPE,
         /** {@code VK_KHR_shader_bfloat16} with {@code bfloat16CooperativeMatrix} and a bf16 x bf16 -> fp32
@@ -206,6 +223,8 @@ public final class VkPhysicalDeviceInfo {
     private final float timestampPeriod;
     private final int maxPushDescriptors;
     private final int shaderCoreCount;
+    private final int coopMat2MaxWorkgroupSize;
+    private final int coopMat2ReservedSharedBytes;
 
     private VkPhysicalDeviceInfo(Snapshot s) {
         this.handle = s.handle;
@@ -252,6 +271,8 @@ public final class VkPhysicalDeviceInfo {
         this.timestampPeriod = s.timestampPeriod;
         this.maxPushDescriptors = s.maxPushDescriptors;
         this.shaderCoreCount = s.shaderCoreCount;
+        this.coopMat2MaxWorkgroupSize = s.coopMat2MaxWorkgroupSize;
+        this.coopMat2ReservedSharedBytes = s.coopMat2ReservedSharedBytes;
     }
 
     /**
@@ -457,6 +478,18 @@ public final class VkPhysicalDeviceInfo {
 
     public long nonCoherentAtomSize() {
         return nonCoherentAtomSize;
+    }
+
+    /** {@code cooperativeMatrixWorkgroupScopeMaxWorkgroupSize} of {@code VK_NV_cooperative_matrix2}, or 0
+     *  when the device does not list the extension. */
+    public int coopMat2MaxWorkgroupSize() {
+        return coopMat2MaxWorkgroupSize;
+    }
+
+    /** {@code cooperativeMatrixWorkgroupScopeReservedSharedMemory} of {@code VK_NV_cooperative_matrix2}, or
+     *  0 when the device does not list the extension. */
+    public int coopMat2ReservedSharedBytes() {
+        return coopMat2ReservedSharedBytes;
     }
 
     /** {@code maxMemoryAllocationSize} (Maintenance3), or 0 when the device is below Vulkan 1.2. */
@@ -676,6 +709,7 @@ public final class VkPhysicalDeviceInfo {
         boolean pushDescriptor = s.extensions.contains(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
         boolean smBuiltins = s.extensions.contains(VK_NV_SHADER_SM_BUILTINS_EXTENSION_NAME);
         boolean amdCore2 = s.extensions.contains(VK_AMD_SHADER_CORE_PROPERTIES_2_EXTENSION_NAME);
+        boolean coopMat2 = s.extensions.contains(VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME);
 
         VkPhysicalDeviceProperties2 props2 = VkPhysicalDeviceProperties2.calloc(stack).sType$Default();
         VkPhysicalDeviceIDProperties id = VkPhysicalDeviceIDProperties.calloc(stack).sType$Default();
@@ -694,6 +728,8 @@ public final class VkPhysicalDeviceInfo {
                 VkPhysicalDeviceShaderSMBuiltinsPropertiesNV.calloc(stack).sType$Default();
         VkPhysicalDeviceShaderCoreProperties2AMD amd =
                 VkPhysicalDeviceShaderCoreProperties2AMD.calloc(stack).sType$Default();
+        VkPhysicalDeviceCooperativeMatrix2PropertiesNV coopMat2Props =
+                VkPhysicalDeviceCooperativeMatrix2PropertiesNV.calloc(stack).sType$Default();
 
         List<Struct<?>> chain = new ArrayList<>();
         chain.add(props2);
@@ -718,6 +754,9 @@ public final class VkPhysicalDeviceInfo {
         }
         if (amdCore2) {
             chain.add(amd);
+        }
+        if (coopMat2) {
+            chain.add(coopMat2Props);
         }
         link(chain);
         vkGetPhysicalDeviceProperties2(device, props2);
@@ -747,6 +786,10 @@ public final class VkPhysicalDeviceInfo {
         } else if (amdCore2) {
             s.shaderCoreCount = clampU32(amd.activeComputeUnitCount());
         }
+        if (coopMat2) {
+            s.coopMat2MaxWorkgroupSize = clampU32(coopMat2Props.cooperativeMatrixWorkgroupScopeMaxWorkgroupSize());
+            s.coopMat2ReservedSharedBytes = clampU32(coopMat2Props.cooperativeMatrixWorkgroupScopeReservedSharedMemory());
+        }
     }
 
     /** Features chain: Features2 → Vulkan11 → Vulkan12 → Vulkan13 (1.3) or the 1.2 extension structs,
@@ -768,6 +811,9 @@ public final class VkPhysicalDeviceInfo {
                 VkPhysicalDeviceShaderIntegerDotProductFeatures.calloc(stack).sType$Default();
         VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopMat =
                 VkPhysicalDeviceCooperativeMatrixFeaturesKHR.calloc(stack).sType$Default();
+        boolean coopMat2Ext = s.extensions.contains(VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME);
+        VkPhysicalDeviceCooperativeMatrix2FeaturesNV coopMat2 =
+                VkPhysicalDeviceCooperativeMatrix2FeaturesNV.calloc(stack).sType$Default();
         VkPhysicalDeviceShaderBfloat16FeaturesKHR bfloat16 =
                 VkPhysicalDeviceShaderBfloat16FeaturesKHR.calloc(stack).sType$Default();
 
@@ -787,6 +833,9 @@ public final class VkPhysicalDeviceInfo {
         if (coopMatExt) {
             chain.add(coopMat);
         }
+        if (coopMat2Ext) {
+            chain.add(coopMat2);
+        }
         if (bfloat16Ext) {
             chain.add(bfloat16);
         }
@@ -802,7 +851,11 @@ public final class VkPhysicalDeviceInfo {
         put(s, Feature.SHADER_FLOAT16, v12.shaderFloat16());
         put(s, Feature.TIMELINE_SEMAPHORE, v12.timelineSemaphore());
         put(s, Feature.SUBGROUP_BROADCAST_DYNAMIC_ID, v12.subgroupBroadcastDynamicId());
-        put(s, Feature.VULKAN_MEMORY_MODEL, v12.vulkanMemoryModel());
+        /* The shader set uses Device-scope memory operations (buffer memory barriers, buffer atomics), which
+         * VUID-RuntimeSpirv-vulkanMemoryModel-06265 forbids once the memory model is enabled without its device
+         * scope, so the backend takes the memory model only together with vulkanMemoryModelDeviceScope (llama.cpp
+         * enables every Vulkan 1.2 feature the device reports, the device scope among them). */
+        put(s, Feature.VULKAN_MEMORY_MODEL, v12.vulkanMemoryModel() && v12.vulkanMemoryModelDeviceScope());
         if (v13) {
             put(s, Feature.SUBGROUP_SIZE_CONTROL, v13f.subgroupSizeControl());
             put(s, Feature.COMPUTE_FULL_SUBGROUPS, v13f.computeFullSubgroups());
@@ -818,6 +871,28 @@ public final class VkPhysicalDeviceInfo {
         }
         put(s, Feature.COOPERATIVE_MATRIX,
                 coopMatExt && coopMat.cooperativeMatrix() && hasCoopMatF16MulAdd(device, stack));
+        put(s, Feature.BUFFER_DEVICE_ADDRESS, v12.bufferDeviceAddress());
+        /* The NV_cooperative_matrix2 kernels use workgroup-scope cooperative matrices with tensor-layout
+         * loads and decode callbacks (CooperativeMatrixTensorAddressingNV, CooperativeMatrixBlockLoadsNV),
+         * per-element operations and reductions for the attention softmax, over buffer references; they
+         * keep the KHR cooperative-matrix requirements (fp16 arithmetic, full subgroups, memory model). */
+        put(s, Feature.COOPERATIVE_MATRIX_2, coopMat2Ext
+                && v12.bufferDeviceAddress()
+                && coopMat2.cooperativeMatrixWorkgroupScope()
+                && coopMat2.cooperativeMatrixFlexibleDimensions()
+                && hasCoopMat2Tile(device, stack, VK_COMPONENT_TYPE_FLOAT16_KHR, 256, 128, 64, 64)
+                && coopMat2.cooperativeMatrixTensorAddressing()
+                && coopMat2.cooperativeMatrixBlockLoads()
+                && coopMat2.cooperativeMatrixPerElementOperations()
+                && coopMat2.cooperativeMatrixReductions()
+                && s.features.contains(Feature.COOPERATIVE_MATRIX)
+                && s.coopMat2MaxWorkgroupSize >= 256
+                && s.coopMat2ReservedSharedBytes <= s.maxComputeSharedMemorySize);
+        /* The prefill attention (shaders/llm/flash_mma_cm2.comp) converts its fp32 probability tile into the fp16
+         * operand of the P V product, so it also needs use conversions and the fp32-accumulator tile tuple. */
+        put(s, Feature.COOPERATIVE_MATRIX_2_ATTENTION, s.features.contains(Feature.COOPERATIVE_MATRIX_2)
+                && coopMat2.cooperativeMatrixConversions()
+                && hasCoopMat2Tile(device, stack, VK_COMPONENT_TYPE_FLOAT32_KHR, 128, 64, 64, 64));
         put(s, Feature.SHADER_BFLOAT16_TYPE, bfloat16Ext && bfloat16.shaderBFloat16Type());
         put(s, Feature.SHADER_BFLOAT16_COOP_MATRIX,
                 bfloat16Ext && bfloat16.shaderBFloat16CooperativeMatrix() && hasCoopMatBf16MulAdd(device, stack));
@@ -836,6 +911,9 @@ public final class VkPhysicalDeviceInfo {
         }
         VkCooperativeMatrixPropertiesKHR.Buffer props =
                 VkCooperativeMatrixPropertiesKHR.calloc(count.get(0), stack);
+        for (int i = 0; i < props.capacity(); i++) {
+            props.get(i).sType$Default();
+        }
         rc = vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(device, count, props);
         if (rc != VK_SUCCESS) {
             return false;
@@ -849,6 +927,46 @@ public final class VkPhysicalDeviceInfo {
                     && p.ResultType() == VK_COMPONENT_TYPE_FLOAT32_KHR
                     && p.scope() == VK_SCOPE_SUBGROUP_KHR
                     && !p.saturatingAccumulation()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether NV flexible dimensions advertise a workgroup tile of {@code invocations} invocations multiplying fp16
+     * operands into an {@code accType} accumulator and result, not saturating, whose granularities divide
+     * {@code m}, {@code n} and {@code k}: every matrix of the kernel then has a matching tuple, since its dimensions
+     * are multiples of those. The CM2 GEMM (matmul_mmq_cm2.comp) asks for fp16 accumulation at 256 invocations over
+     * 128 rows, 64-token tails and 64-deep stages; the prefill attention (flash_mma_cm2.comp) for fp32 accumulation
+     * at 128 invocations over 64 query rows and 64-key tiles. The extension requires a matching property tuple when
+     * flexible dimensions are enabled; the KHR subgroup property list does not describe workgroup-scope matrices.
+     */
+    private static boolean hasCoopMat2Tile(VkPhysicalDevice device, MemoryStack stack, int accType, int invocations,
+                                           int m, int n, int k) {
+        IntBuffer count = stack.mallocInt(1);
+        int rc = vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV(device, count, null);
+        if (rc != VK_SUCCESS || count.get(0) == 0) {
+            return false;
+        }
+        VkCooperativeMatrixFlexibleDimensionsPropertiesNV.Buffer props =
+                VkCooperativeMatrixFlexibleDimensionsPropertiesNV.calloc(count.get(0), stack);
+        for (int i = 0; i < props.capacity(); i++) {
+            props.get(i).sType$Default();
+        }
+        rc = vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV(device, count, props);
+        if (rc != VK_SUCCESS) {
+            return false;
+        }
+        for (int i = 0; i < props.remaining(); i++) {
+            VkCooperativeMatrixFlexibleDimensionsPropertiesNV p = props.get(i);
+            if (p.AType() == VK_COMPONENT_TYPE_FLOAT16_KHR && p.BType() == VK_COMPONENT_TYPE_FLOAT16_KHR
+                    && p.CType() == accType && p.ResultType() == accType
+                    && !p.saturatingAccumulation()
+                    && p.scope() == VK_SCOPE_WORKGROUP_KHR && p.workgroupInvocations() == invocations
+                    && p.MGranularity() > 0 && m % p.MGranularity() == 0
+                    && p.NGranularity() > 0 && n % p.NGranularity() == 0
+                    && p.KGranularity() > 0 && k % p.KGranularity() == 0) {
                 return true;
             }
         }
@@ -974,5 +1092,7 @@ public final class VkPhysicalDeviceInfo {
         float timestampPeriod;
         int maxPushDescriptors;
         int shaderCoreCount;
+        int coopMat2MaxWorkgroupSize;
+        int coopMat2ReservedSharedBytes;
     }
 }

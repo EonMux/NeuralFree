@@ -1,11 +1,13 @@
 package com.eonmux.neuralfree.demo.tools;
 
+import com.eonmux.neuralfree.acceleration.backend.KernelTiming;
 import com.eonmux.neuralfree.demo.EngineLoadFlags;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
 import com.eonmux.neuralfree.gguf.engine.EngineModel;
 import com.eonmux.neuralfree.gguf.engine.ForwardBatch;
 import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
 import com.eonmux.neuralfree.gguf.engine.LLMModelFactory;
+import com.eonmux.neuralfree.gguf.gpu.forward.GpuForwardBackend;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
 import com.eonmux.neuralfree.gguf.memory.MemoryFullException;
 import com.eonmux.neuralfree.gguf.memory.ModelMemory;
@@ -72,6 +74,8 @@ final class BatchedBenchCommand {
             + "  -ub, --ubatch <n>        tokens per forward step (default " + MemoryConfig.DEFAULT_UBATCH + ")\n"
             + "  -s, --seed <n>           seed of the random tokens (default " + DEFAULT_SEED + ", C rand's)\n"
             + "  --output-format <f>      md (the table, default) or jsonl\n"
+            + "  --kernels                time the GPU dispatches of every cell (disables the decode-step replay)\n"
+            + "                           and print its per-kernel device time on standard error\n"
             + "  --help, -h               this text\n"
             + EngineLoadFlags.usageSection("engine load options (as LLMDemo's):")
             + "example: nftool batched-bench model.gguf -c 2048 -ub 512 -npp 128,256,512 -ntg 128,256"
@@ -112,12 +116,14 @@ final class BatchedBenchCommand {
         final boolean ppShared;
         final boolean tgSeparate;
         final boolean jsonl;
+        /** {@code --kernels}: each cell's per-kernel device time goes to standard error. */
+        final boolean kernels;
         final int ctx;
         final int ubatch;
         final long seed;
 
         Plan(Path model, EngineConfig engine, List<Integer> npp, List<Integer> ntg, List<Integer> npl,
-                boolean ppShared, boolean tgSeparate, boolean jsonl, int ctx, int ubatch, long seed) {
+                boolean ppShared, boolean tgSeparate, boolean jsonl, boolean kernels, int ctx, int ubatch, long seed) {
             this.model = model;
             this.engine = engine;
             this.npp = List.copyOf(npp);
@@ -127,6 +133,7 @@ final class BatchedBenchCommand {
             this.ppShared = ppShared;
             this.tgSeparate = tgSeparate;
             this.jsonl = jsonl;
+            this.kernels = kernels;
             this.ctx = ctx;
             this.ubatch = ubatch;
             this.seed = seed;
@@ -221,6 +228,7 @@ final class BatchedBenchCommand {
         boolean ppShared = false;
         boolean tgSeparate = false;
         boolean jsonl = false;
+        boolean kernels = false;
         int ctx = DEFAULT_CTX;
         int ubatch = MemoryConfig.DEFAULT_UBATCH;
         long seed = DEFAULT_SEED;
@@ -256,6 +264,9 @@ final class BatchedBenchCommand {
                     break;
                 case "--output-format":
                     jsonl = outputFormat(a, value(a, args, i++));
+                    break;
+                case "--kernels":
+                    kernels = true;
                     break;
                 case "-m":
                 case "--model":
@@ -293,7 +304,8 @@ final class BatchedBenchCommand {
             throw new UsageException("batched-bench needs " + String.join(", ", missing)
                     + " (comma-separated integer lists), as the llama.cpp usage shows");
         }
-        return new Plan(model, load.build(), npp, ntg, npl, ppShared, tgSeparate, jsonl, ctx, ubatch, seed);
+        return new Plan(model, load.build(), npp, ntg, npl, ppShared, tgSeparate, jsonl, kernels, ctx, ubatch,
+                seed);
     }
 
     /**
@@ -303,6 +315,21 @@ final class BatchedBenchCommand {
      * @throws IOException when the model cannot be read, opens without paged memory or a forward pass fails
      */
     static List<BenchRow> execute(Plan plan, Appendable out, Appendable err) throws IOException {
+        if (!plan.kernels) {
+            return executeGrid(plan, out, err);
+        }
+        String priorProfile = System.setProperty(KernelTiming.PROFILE_PROPERTY, "true");
+        String priorReplay = System.setProperty(GpuForwardBackend.DECODE_REPLAY_PROPERTY, "false");
+        try {
+            return executeGrid(plan, out, err);
+        } finally {
+            BenchCommand.restoreProperty(KernelTiming.PROFILE_PROPERTY, priorProfile);
+            BenchCommand.restoreProperty(GpuForwardBackend.DECODE_REPLAY_PROPERTY, priorReplay);
+        }
+    }
+
+    /** {@link #execute} with the {@code --kernels} properties already in place. */
+    private static List<BenchRow> executeGrid(Plan plan, Appendable out, Appendable err) throws IOException {
         EngineConfig cfg;
         try {
             cfg = plan.engineConfig();
@@ -329,7 +356,16 @@ final class BatchedBenchCommand {
             for (int pp : plan.npp) {
                 for (int tg : plan.ntg) {
                     for (int pl : plan.npl) {
+                        KernelTiming timing = plan.kernels ? BenchCommand.gpuTiming(backend) : null;
+                        if (timing != null) {
+                            timing.reset();
+                        }
                         BenchRow row = runCell(plan, backend, paged, pp, tg, pl, nVocab, rng, err);
+                        if (plan.kernels && row != null) {
+                            BenchCommand.printKernelTiming(timing, String.format(Locale.ROOT,
+                                    "nftool batched-bench: per-kernel device time of pp=%d tg=%d pl=%d", pp, tg, pl),
+                                    err);
+                        }
                         if (row != null) {
                             measured.add(row);
                             out.append(plan.jsonl ? jsonl(row, plan, nKvMax) : tableRow(row));

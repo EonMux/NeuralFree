@@ -4,7 +4,6 @@ import com.eonmux.neuralfree.acceleration.GpuTestUtil;
 import com.eonmux.neuralfree.acceleration.HWAcceleration;
 import com.eonmux.neuralfree.acceleration.HardwareDevice;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
-import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
 import com.eonmux.neuralfree.acceleration.kernels.Availability;
@@ -12,6 +11,7 @@ import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.memory.KvWindow;
 import com.eonmux.neuralfree.tensor.HalfFloats;
+import com.eonmux.neuralfree.acceleration.vulkan.VkDeviceRanking;
 import org.junit.After;
 import org.junit.Assume;
 import org.junit.Before;
@@ -29,14 +29,14 @@ import static org.junit.Assert.assertTrue;
 
 /**
  * The dense flash-decode kernel ({@code LLM_FlashDecode_F16}) against the CPU reference at the head dims that
- * surround the shuffle fast path's limit ({@code NF_FA_FAST_DIM}): one coalesced row float4 per lane covers at
- * most 32 * 4 dims, so d = 128 and the non-multiple-of-128 dims (96, 80) run the fast path on a shuffle backend,
+ * surround the warp fast path's limit ({@code NF_FA_FAST_DIM}): one coalesced row float4 per lane covers at
+ * most 32 * 4 dims, so d = 128 and the non-multiple-of-128 dims (96, 80) run the fast path on a warp-path backend,
  * while d = 256 must take the scalar body (one lane cannot hold the row, and the mma plan refuses the shape
  * anyway). Every case checks both step shapes of a decode: a direct launch over one workgroup of keys and a
  * split-K launch with its combine.
  *
- * <p>Every test repeats over the machine's OpenCL, CUDA and Vulkan devices, so the fast path (CUDA) and the
- * scalar body (OpenCL, Vulkan) answer the same reference.</p>
+ * <p>Every test repeats over the machine's OpenCL, CUDA and Vulkan devices, so the fast path (CUDA, and Vulkan on
+ * 32-lane subgroups) and the scalar body (OpenCL, other Vulkan devices) answer the same reference.</p>
  */
 @RunWith(Parameterized.class)
 public class FlashDecodeKernelGpuTest {
@@ -115,15 +115,14 @@ public class FlashDecodeKernelGpuTest {
             case CUDA:
                 return hw.getCUDevices().isEmpty() ? null : hw.getCUDevices().get(0);
             default:
-                return hw.getVkDevices().isEmpty() ? null : hw.getVkDevices().get(0);
+                return VkDeviceRanking.fastestDevice(hw.getVkDevices(), null);
         }
     }
 
     @Test
     public void decodeMatchesTheCpuReferenceAroundTheFastPathDimLimit() {
-        // The plan must mirror the kernel gate: over the 128-dim limit no shuffle backend runs the fast path.
-        boolean expectFast = FlashAttnTiling.decodeFastPath(
-                backend.capabilities().hasFeature(DeviceFeature.SUBGROUP_SHUFFLE), KvDType.F16, KvDType.F16,
+        // The plan must mirror the kernel gate: over the 128-dim limit no warp-path backend runs the fast path.
+        boolean expectFast = FlashAttnTiling.decodeFastPath(kernels.decodeWarpPath(), KvDType.F16, KvDType.F16,
                 dK, dV);
         FlashAttnTiling tiling = FlashAttnTiling.decode(N_HEAD, N_HEAD_KV, dK, dV, N_KV, kernels.faSmemFloats(),
                 Math.max(1, backend.capabilities().getComputeUnits()), expectFast);

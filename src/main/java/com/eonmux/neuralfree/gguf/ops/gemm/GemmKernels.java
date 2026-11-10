@@ -110,6 +110,10 @@ public final class GemmKernels {
     public static final String MATMUL_CM_SUFFIX = "_MatMul_CM";
     /** Name suffix of the split-K twins of the CM GEMM kernels, {@code <T>_MatMul_CM_KSplit}. */
     public static final String MATMUL_CM_KSPLIT_SUFFIX = "_MatMul_CM_KSplit";
+    /** Name suffix of the workgroup-scope cooperative-matrix GEMM kernels, {@code <T>_MatMul_CM2}. */
+    public static final String MATMUL_CM2_SUFFIX = "_MatMul_CM2";
+    /** Name suffix of the split-K twins of the CM2 GEMM kernels, {@code <T>_MatMul_CM2_KSplit}. */
+    public static final String MATMUL_CM2_KSPLIT_SUFFIX = "_MatMul_CM2_KSplit";
     /** Name suffix of the E4M3 GEMM kernels of the 4-bit weight types, {@code <T>_MatMul_W4A8}. */
     public static final String MATMUL_W4A8_SUFFIX = "_MatMul_W4A8";
     /** Name suffix of the split-K twins of the W4A8 GEMM kernels, {@code <T>_MatMul_W4A8_KSplit}. */
@@ -304,6 +308,15 @@ public final class GemmKernels {
     /** Weight types of the tensor-core MMA GEMM family: the dense 16-bit types F16 and BF16. */
     public static final Set<GGMLType> MMA_TYPES = Collections.unmodifiableSet(EnumSet.of(
             GGMLType.F16, GGMLType.BF16));
+
+    /** Weight types of the workgroup-scope cooperative-matrix GEMM ({@code <T>_MatMul_CM2},
+     *  VK_NV_cooperative_matrix2): the MMQ set whose blocks decode per element without the shared
+     *  grid tables, i.e. every {@link #MMQ_TYPES} entry except the i-quants, which keep the KHR
+     *  {@code <T>_MatMul_CM} lane. */
+    public static final Set<GGMLType> CM2_TYPES = Collections.unmodifiableSet(EnumSet.of(
+            GGMLType.Q4_0, GGMLType.Q4_1, GGMLType.Q5_0, GGMLType.Q5_1, GGMLType.Q8_0,
+            GGMLType.Q2_K, GGMLType.Q3_K, GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.Q6_K,
+            GGMLType.I8_B128));
 
     private GemmKernels() {
     }
@@ -567,6 +580,15 @@ public final class GemmKernels {
         return hasMmq(type) && !FP8_TYPES.contains(type);
     }
 
+    /**
+     * Whether {@code type} has a workgroup-scope cooperative-matrix {@code <T>_MatMul_CM2} GEMM kernel
+     * ({@link #CM2_TYPES}), the Vulkan form a device with {@code DeviceFeature.COOPERATIVE_MATRIX_2}
+     * prefers over the KHR {@code <T>_MatMul_CM} one.
+     */
+    public static boolean hasCm2(GGMLType type) {
+        return type != null && CM2_TYPES.contains(type);
+    }
+
     /** Whether {@code type} is an E4M3 weight type of the FP8 lane ({@link #FP8_TYPES}). */
     public static boolean isFp8(GGMLType type) {
         return type != null && FP8_TYPES.contains(type);
@@ -664,13 +686,41 @@ public final class GemmKernels {
         return type.name() + MATMUL_CM_KSPLIT_SUFFIX;
     }
 
+    /**
+     * Name of the workgroup-scope cooperative-matrix GEMM kernel of a CM2 weight type
+     * ({@code <T>_MatMul_CM2}).
+     *
+     * @throws IllegalArgumentException when the type has no CM2 GEMM kernel
+     */
+    public static String matmulCm2(GGMLType type) {
+        if (!hasCm2(type)) {
+            throw new IllegalArgumentException("no CM2 GEMM kernel for weight type " + type
+                    + "; supported: " + CM2_TYPES);
+        }
+        return type.name() + MATMUL_CM2_SUFFIX;
+    }
+
+    /**
+     * Name of the split-K twin of the CM2 GEMM kernel of a CM2 weight type
+     * ({@code <T>_MatMul_CM2_KSplit}).
+     *
+     * @throws IllegalArgumentException when the type has no CM2 GEMM kernel
+     */
+    public static String matmulCm2KSplit(GGMLType type) {
+        if (!hasCm2(type)) {
+            throw new IllegalArgumentException("no split-K CM2 GEMM kernel for weight type " + type
+                    + "; supported: " + CM2_TYPES);
+        }
+        return type.name() + MATMUL_CM2_KSPLIT_SUFFIX;
+    }
+
     /** Every kernel name of this family: tiled, MMQ, MMQ KSplit, MMQ S, MMQ S64, MMQ SKSplit,
-     *  MMQ SKSplit64, CM and CM KSplit GEMM kernels in {@link GGMLType} order, the FP8 and W4A8 E4M3
-     *  GEMMs with their S, S64, SKSplit and SKSplit64 twins, then the activation staging kernels,
-     *  the reduce and the top-k. */
+     *  MMQ SKSplit64, CM and CM KSplit GEMM kernels in {@link GGMLType} order, the CM2 pair of the
+     *  non-i-quant types, the FP8 and W4A8 E4M3 GEMMs with their S, S64, SKSplit and SKSplit64
+     *  twins, then the activation staging kernels, the reduce and the top-k. */
     public static List<String> kernelNames() {
-        List<String> names = new ArrayList<>(TILED_TYPES.size() + 8 * MMQ_TYPES.size() + 6 * FP8_TYPES.size()
-                + MMA_TYPES.size() + 6 * W4A8_TYPES.size() + 7);
+        List<String> names = new ArrayList<>(TILED_TYPES.size() + 8 * MMQ_TYPES.size() + 2 * CM2_TYPES.size()
+                + 6 * FP8_TYPES.size() + MMA_TYPES.size() + 6 * W4A8_TYPES.size() + 7);
         for (GGMLType type : TILED_TYPES) {
             names.add(matmulTiled(type));
         }
@@ -683,6 +733,10 @@ public final class GemmKernels {
             names.add(matmulMmqSmallSplit(type, MmqConfig.TWIN_MAX_TOKENS));
             names.add(matmulCm(type));
             names.add(matmulCmKSplit(type));
+            if (hasCm2(type)) {
+                names.add(matmulCm2(type));
+                names.add(matmulCm2KSplit(type));
+            }
         }
         for (GGMLType type : FP8_TYPES) {
             names.add(matmulMmq(type));

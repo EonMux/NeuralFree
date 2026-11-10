@@ -4,6 +4,7 @@ import com.eonmux.neuralfree.acceleration.BackendRequirement;
 import com.eonmux.neuralfree.acceleration.UnsupportedKernelException;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
+import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.KernelHandle;
 import com.eonmux.neuralfree.acceleration.kernels.Availability;
 import com.eonmux.neuralfree.acceleration.kernels.KernelLibraries;
@@ -85,6 +86,35 @@ public final class LlmKernels {
     /** Whether the kernels use subgroup reductions on this backend. */
     public boolean subgroups() {
         return set.subgroups();
+    }
+
+    /**
+     * Whether the tensor-core prefill attention ({@code LLM_FlashAttnMma_F16} and its paged twin) can run on this
+     * backend's device: the CUDA mma.sync form (kernels/llm/flash_mma.cl) needs {@link DeviceFeature#COOPERATIVE_MATRIX},
+     * the Vulkan form (shaders/llm/flash_mma_cm2.comp) the workgroup-scope cooperative matrices of
+     * {@link DeviceFeature#COOPERATIVE_MATRIX_2_ATTENTION}. OpenCL, HIP and Metal build no mma attention, so the
+     * planner also checks that the kernel exists.
+     */
+    public boolean flashMmaPath() {
+        DeviceFeature needed = set.backend().backendType() == ComputeBackend.BackendType.VULKAN
+                ? DeviceFeature.COOPERATIVE_MATRIX_2_ATTENTION : DeviceFeature.COOPERATIVE_MATRIX;
+        return set.caps().hasFeature(needed);
+    }
+
+    /**
+     * Whether the flash-decode kernels run their warp fast path on this backend (flash_decode.cl and
+     * flash_decode.comp {@code nf_fd_fast_ok}), which the decode planner serves with splits of at most one
+     * workgroup of keys: CUDA and HIP compile it over the subgroup shuffle ({@link DeviceFeature#SUBGROUP_SHUFFLE});
+     * the Vulkan {@code __sg} modules run it where every subgroup is 32 lanes wide, the warp the fast path reduces
+     * over, so a device with subgroup reductions and a fixed 32-lane subgroup size.
+     */
+    public boolean decodeWarpPath() {
+        DeviceCapabilities caps = set.caps();
+        if (caps.hasFeature(DeviceFeature.SUBGROUP_SHUFFLE)) {
+            return true;
+        }
+        return set.backend().backendType() == ComputeBackend.BackendType.VULKAN && set.subgroups()
+                && caps.getMinSubgroupSize() == 32 && caps.getMaxSubgroupSize() == 32;
     }
 
     /** Preferred work-group size of matvec kernels on this backend. */

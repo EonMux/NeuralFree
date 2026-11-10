@@ -73,6 +73,9 @@ public final class SplitKGemmPlan {
         MMA(GemmKernels.MATMUL_MMA_KSPLIT_SUFFIX),
         /** The dequantizing CM GEMM over a quantized weight, 16-deep stages. */
         CM(GemmKernels.MATMUL_CM_KSPLIT_SUFFIX),
+        /** The workgroup-scope cooperative-matrix CM2 GEMM over a quantized weight (VK_NV_cooperative_matrix2),
+         *  stages of {@link Cm2GemmPlan#TILE_DEPTH} and the CM2 tile. */
+        CM2(GemmKernels.MATMUL_CM2_KSPLIT_SUFFIX),
         /** The int8 MMQ GEMM over staged activations, stages of the device's {@link MmqConfig}. */
         MMQ(GemmKernels.MATMUL_MMQ_KSPLIT_SUFFIX),
         /** The E4M3 GEMM over a 4-bit weight, stages of the device's {@link MmqConfig}. */
@@ -99,9 +102,16 @@ public final class SplitKGemmPlan {
             return this == MMQ || this == W4A8;
         }
 
+        /** Bytes of one activation element unit the partial kernel reads: a staged record word (MMQ, W4A8), an
+         *  fp16 element of the staged rows (CM2), or an fp32 element (MMA, CM). */
+        int activationBytes() {
+            return staged() ? Integer.BYTES : this == CM2 ? Short.BYTES : Float.BYTES;
+        }
+
         /** The family's fixed slice depth, or 0 when it follows the device's {@link MmqConfig} (MMQ, W4A8). */
         int fixedSliceDepth() {
-            return this == MMA || this == CM ? MmaGemmPlan.TILE_DEPTH : 0;
+            return this == CM2 ? Cm2GemmPlan.TILE_DEPTH
+                    : this == MMA || this == CM ? MmaGemmPlan.TILE_DEPTH : 0;
         }
 
         /** Bytes of one weight row of {@code k} elements over {@code type}. */
@@ -213,8 +223,10 @@ public final class SplitKGemmPlan {
             throw new IllegalArgumentException(family + " split-K plans come from their staged factory"
                     + " (the staged records follow the device's MmqConfig)");
         }
-        if (family == Family.MMA ? !GemmKernels.hasMma(type) : !GemmKernels.hasCm(type)) {
+        if (family == Family.MMA ? !GemmKernels.hasMma(type)
+                : family == Family.CM2 ? !GemmKernels.hasCm2(type) : !GemmKernels.hasCm(type)) {
             throw new IllegalArgumentException((family == Family.MMA ? "no split-K MMA GEMM kernel"
+                    : family == Family.CM2 ? "no split-K CM2 GEMM kernel"
                     : "no split-K CM GEMM kernel") + " for weight type " + type);
         }
         return of(family, type, m, k, n, xStride, xOff, splits, kSlice, tileTokens, null, false, reduceLocal);
@@ -342,8 +354,10 @@ public final class SplitKGemmPlan {
                     + " follow a device MmqConfig");
         }
         int stageDepth = staged != null ? staged.stageDepth() : MmaGemmPlan.TILE_DEPTH;
-        int tileRows = staged != null ? staged.tileRows() : MmaGemmPlan.TILE_ROWS;
-        int workGroupSize = staged != null ? staged.workGroupSize() : MmaGemmPlan.WORKGROUP_SIZE;
+        int tileRows = staged != null ? staged.tileRows()
+                : family == Family.CM2 ? Cm2GemmPlan.TILE_ROWS : MmaGemmPlan.TILE_ROWS;
+        int workGroupSize = staged != null ? staged.workGroupSize()
+                : family == Family.CM2 ? Cm2GemmPlan.WORKGROUP_SIZE : MmaGemmPlan.WORKGROUP_SIZE;
         int depth = family.fixedSliceDepth() > 0 ? family.fixedSliceDepth() : stageDepth;
         if (m < 1 || k < 1 || n < 1) {
             throw new IllegalArgumentException("split-K GEMM needs M, K, N >= 1, got M=" + m + ", K=" + k
@@ -402,6 +416,17 @@ public final class SplitKGemmPlan {
     public static SplitKGemmPlan of(CmGemmPlan base, int computeUnits, int reduceLocal) {
         int splits = splitsFor(computeUnits, base.rowTiles(), base.tokenTiles(), base.k());
         return finished(Family.CM, base.type(), base.m(), base.k(), base.n(), base.xStride(), base.xOff(), splits,
+                base.tileTokens(), null, false, reduceLocal);
+    }
+
+    /**
+     * {@link #of(MmaGemmPlan, int, int)} for a CM2 launch (the workgroup-scope tile and slice depth). The partial
+     * kernel reads the base's staged fp16 rows ({@link Cm2GemmPlan#stagedRows()} rows of stride {@code K} at
+     * offset 0), not the fp32 view the staging pass reads.
+     */
+    public static SplitKGemmPlan of(Cm2GemmPlan base, int computeUnits, int reduceLocal) {
+        int splits = cm2SplitsFor(computeUnits, base.rowTiles(), base.tokenTiles(), base.k());
+        return finished(Family.CM2, base.type(), base.m(), base.k(), base.n(), base.k(), 0, splits,
                 base.tileTokens(), null, false, reduceLocal);
     }
 
@@ -485,6 +510,20 @@ public final class SplitKGemmPlan {
             return 1;
         }
         return Math.max(1, Math.min(splits, MAX_SPLITS));
+    }
+
+    /**
+     * The CM2 slice count ({@link #of(Cm2GemmPlan, int, int)}): {@link #splitsFor}'s answer where the tile grid
+     * fills at most half the device, so the slices still run in one wave, and 1 in its two-thirds band, whose
+     * three slices per tile run past one wave of the CM2 workgroups. Measured on the RTX 5080 Laptop (60 compute
+     * units, 512 tokens, staging included, medians of interleaved rounds): the 40-tile grids of the 2560-row
+     * projections ran slower as three slices than whole (Q8_0 2560x9728: 733 against 539us, Q4_K: 1002 against
+     * 647, Q6_K: 781 against 605), while the 16-tile grids of the 1024-row ones gained from the same three slices
+     * (Q8_0 1024x3072: 106 against 126us, Q6_K: 118 against 159; Q8_0 1024x2560: 101 against 108).
+     */
+    static int cm2SplitsFor(int computeUnits, int rowTiles, int tokenTiles, int k) {
+        int splits = splitsFor(computeUnits, rowTiles, tokenTiles, k);
+        return (long) rowTiles * tokenTiles <= computeUnits / 2 ? splits : 1;
     }
 
     /**
@@ -649,12 +688,14 @@ public final class SplitKGemmPlan {
     }
 
     /**
-     * Smallest activation buffer length in the family's units (floats, or 32-bit staged record units
-     * for {@link Family#MMQ} and {@link Family#W4A8}): {@code xOff + the rows before the last, plus one row}.
+     * Smallest activation buffer length in the family's units (floats, 32-bit staged record units for
+     * {@link Family#MMQ} and {@link Family#W4A8}, or halves for {@link Family#CM2}, whose staged rows are padded
+     * to whole token tiles): {@code xOff + the rows before the last, plus one row}.
      */
     public long xElementsRequired() {
         long row = family.staged() ? (long) (k / stageDepth) * recordUnits : k;
-        long rowsBefore = family.staged() ? (long) (n - 1) * xStride * recordUnits : (long) (n - 1) * xStride;
+        long rows = family == Family.CM2 ? ((long) n + tileTokens - 1) / tileTokens * tileTokens : n;
+        long rowsBefore = family.staged() ? (rows - 1) * xStride * recordUnits : (rows - 1) * xStride;
         return (long) xOff + rowsBefore + row;
     }
 
@@ -687,6 +728,7 @@ public final class SplitKGemmPlan {
         Objects.requireNonNull(caps, "caps");
         String reason = family == Family.MMA ? MmaGemmPlan.deviceSupport(caps)
                 : family == Family.CM ? CmGemmPlan.deviceSupport(type, caps)
+                : family == Family.CM2 ? Cm2GemmPlan.deviceSupport(type, caps)
                 : MmqGemmPlan.stagedTileSupport(stagedConfig, type, caps);
         if (reason != null) {
             return reason;
@@ -718,7 +760,7 @@ public final class SplitKGemmPlan {
         Objects.requireNonNull(x, "x");
         Objects.requireNonNull(partial, "partial");
         requireBytes("weight", weight, weightBytes());
-        requireBytes("activation", x, xElementsRequired() * (family.staged() ? Integer.BYTES : Float.BYTES));
+        requireBytes("activation", x, xElementsRequired() * family.activationBytes());
         requireBytes("partial", partial, partialElements() * Float.BYTES);
         Object[] args = new Object[GemmKernels.KSPLIT_ARG_COUNT];
         args[GemmKernels.KSPLIT_ARG_M] = m;

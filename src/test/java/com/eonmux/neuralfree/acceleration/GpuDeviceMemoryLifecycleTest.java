@@ -7,6 +7,7 @@ import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.tensor.gpu.TrainGpu;
 import com.eonmux.neuralfree.tensor.gpu.TrainParity;
+import com.eonmux.neuralfree.acceleration.vulkan.VkDeviceRanking;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -169,7 +170,7 @@ public class GpuDeviceMemoryLifecycleTest {
             case CUDA:
                 return hw.getCUDevices().isEmpty() ? null : hw.getCUDevices().get(0);
             default:
-                return hw.getVkDevices().isEmpty() ? null : hw.getVkDevices().get(0);
+                return VkDeviceRanking.fastestDevice(hw.getVkDevices(), null);
         }
     }
 

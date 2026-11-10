@@ -9,6 +9,7 @@ import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.ops.gemm.CmGemmPlan;
+import com.eonmux.neuralfree.gguf.ops.gemm.Cm2GemmPlan;
 import com.eonmux.neuralfree.gguf.ops.gemm.GemmKernels;
 import com.eonmux.neuralfree.gguf.ops.gemm.MmaGemmPlan;
 import com.eonmux.neuralfree.gguf.ops.gemm.MmqConfig;
@@ -23,8 +24,10 @@ import com.eonmux.neuralfree.gguf.quant.InputTransform;
  * Fast-GEMM lane dispatch of one {@link GpuOps}: the lane a weight type takes, whether the lane can run a
  * launch, the staged activation records of the int8 MMQ lane (the dynamic per-chunk codes, or the checkpoint
  * activation scheme's own int8 codes), and the split-K planning and launches. The
- * lanes are the fast quantized-weight GEMM ({@code <T>_MatMul_MMQ}, in the fp16-tile cooperative-matrix
- * form {@code <T>_MatMul_CM} on Vulkan devices with cooperative matrices) and the tensor-core MMA GEMM
+ * lanes are the fast quantized-weight GEMM ({@code <T>_MatMul_MMQ}, in the workgroup-scope
+ * cooperative-matrix form {@code <T>_MatMul_CM2} on Vulkan devices with VK_NV_cooperative_matrix2, in the
+ * fp16-tile cooperative-matrix form {@code <T>_MatMul_CM} on the other cooperative-matrix Vulkan devices)
+ * and the tensor-core MMA GEMM
  * ({@code <T>_MatMul_MMA}); every lane splits its tall-skinny launches into the {@code <T>_MatMul_*_KSplit}
  * twin plus the shared {@code LLM_SplitK_Reduce}, and a staged launch of fewer tokens than the device tile
  * runs the twin tile of its ladder row ({@code <T>_MatMul_MMQ_S} at up to 16 tokens,
@@ -35,7 +38,8 @@ import com.eonmux.neuralfree.gguf.quant.InputTransform;
  * <p>A lane kernel that the backend does not provide, or that cannot run the 256-work-item tile on the
  * device, is never launched ({@link GpuOps#optionalReady}) and the next slower form serves the product.
  * The split-K heuristic ({@link SplitKGemmPlan#of}) follows the lane: the staged MMQ plans carry the
- * device's {@link MmqConfig}, the CM plans the {@link CmGemmPlan} tiles and the MMA plans the
+ * device's {@link MmqConfig}, the CM2 plans the {@link Cm2GemmPlan} tiles, the CM plans the
+ * {@link CmGemmPlan} tiles and the MMA plans the
  * {@link MmaGemmPlan} tiles. Not thread-safe; owned by its GpuOps.
  */
 final class FastGemmLanes {
@@ -88,6 +92,9 @@ final class FastGemmLanes {
         if (GemmKernels.hasMmq(type)) {
             if (!mmqMode.fastQuantGemm()) {
                 return null;
+            }
+            if (mmqMode.prefersCm() && cm2Form() && GemmKernels.hasCm2(type)) {
+                return GemmKernels.matmulCm2(type);
             }
             return mmqMode.prefersCm() && cmForm() && GemmKernels.hasCm(type)
                     ? GemmKernels.matmulCm(type) : GemmKernels.matmulMmq(type);
@@ -255,6 +262,9 @@ final class FastGemmLanes {
         if (twin > 0) {
             return twin;
         }
+        if (cm2Fast(fastKernel)) {
+            return Cm2GemmPlan.TILE_TOKENS;
+        }
         return stagedFast(fastKernel) ? mmqConfig.tileTokens() : MmaGemmPlan.TILE_TOKENS;
     }
 
@@ -266,6 +276,9 @@ final class FastGemmLanes {
         if (twin > 0) {
             return MmqConfig.smallTile(mmqConfig, twin).tileRows();
         }
+        if (cm2Fast(fastKernel)) {
+            return Cm2GemmPlan.TILE_ROWS;
+        }
         return stagedFast(fastKernel) ? mmqConfig.tileRows() : MmaGemmPlan.TILE_ROWS;
     }
 
@@ -276,7 +289,15 @@ final class FastGemmLanes {
         if (twin > 0) {
             return MmqConfig.smallTile(mmqConfig, twin).workGroupSize();
         }
+        if (cm2Fast(fastKernel)) {
+            return Cm2GemmPlan.WORKGROUP_SIZE;
+        }
         return stagedFast(fastKernel) ? mmqConfig.workGroupSize() : MmaGemmPlan.WORKGROUP_SIZE;
+    }
+
+    /** Whether a fast kernel is a workgroup-scope cooperative-matrix form ({@code <T>_MatMul_CM2}). */
+    static boolean cm2Fast(String fastKernel) {
+        return fastKernel.endsWith(GemmKernels.MATMUL_CM2_SUFFIX);
     }
 
     /** Whether a fast kernel reads the staged activation records of the MMQ and W4A8 lanes, the
@@ -411,7 +432,7 @@ final class FastGemmLanes {
 
     /**
      * Cooperative-matrix support of the Vulkan backend: there the fast quantized-weight GEMM runs the fp16-tile CM form
-     * ({@code <T>_MatMul_CM}) instead of the int8 MMQ GEMM, as llama.cpp's mul_mm_cm2 pipelines do.
+     * ({@code <T>_MatMul_CM}) instead of the int8 MMQ GEMM, as llama.cpp's mul_mm pipelines do.
      */
     private boolean cmForm() {
         return backend.backendType() == ComputeBackend.BackendType.VULKAN
@@ -419,11 +440,27 @@ final class FastGemmLanes {
     }
 
     /**
+     * The workgroup-scope cooperative-matrix form of the Vulkan backend ({@code <T>_MatMul_CM2},
+     * VK_NV_cooperative_matrix2 with tensor-layout loads and per-element decode callbacks, llama.cpp
+     * {@code coopmat2}): preferred over the KHR CM form wherever the type has a CM2 kernel, since its
+     * 128 x 256 tile reads the weight through the driver's tensor loads instead of a shader-staged tile. The
+     * i-quants keep the CM lane.
+     */
+    private boolean cm2Form() {
+        return backend.backendType() == ComputeBackend.BackendType.VULKAN
+                && kernels.caps().hasFeature(DeviceFeature.COOPERATIVE_MATRIX_2);
+    }
+
+    /**
      * Whether a fast GEMM kernel can run this launch: the work-group size and group counts of its tile
-     * ({@code tiledUsable} with the fast tile) and {@link GpuOps#optionalReady}.
+     * ({@code tiledUsable} with the fast tile) and {@link GpuOps#optionalReady}, of the CM2 lane's activation
+     * staging as well.
      */
     boolean fastUsable(String fastKernel, int tileRows, int tileTokens, int workGroup, GpuWeight w, int nTokens) {
         if (maxWorkGroupSize < workGroup || GpuOps.ceilDiv(nTokens, tileTokens) > maxGroups[1]) {
+            return false;
+        }
+        if (cm2Fast(fastKernel) && !ops.optionalReady(Cm2GemmPlan.STAGE_KERNEL, Cm2GemmPlan.STAGE_LOCAL)) {
             return false;
         }
         for (int s = 0; s < w.shardCount(); s++) {
@@ -443,8 +480,9 @@ final class FastGemmLanes {
      * fewer tokens than the device tile ({@code smallTile}, the {@code _S} twin's regime) splits by the wave-fill
      * heuristic ({@link SplitKGemmPlan#ofSmallTiles}) instead, whose partial grid gives every compute unit several
      * blocks. The family follows the lane: {@link SplitKGemmPlan.Family#MMA} for F16/BF16,
-     * {@link SplitKGemmPlan.Family#MMQ} for the staged int8 GEMM and {@link SplitKGemmPlan.Family#CM} for the
-     * quantized-weight cooperative-matrix form.
+     * {@link SplitKGemmPlan.Family#MMQ} for the staged int8 GEMM, {@link SplitKGemmPlan.Family#CM2} for the
+     * workgroup-scope cooperative-matrix form and {@link SplitKGemmPlan.Family#CM} for the fp16-tile
+     * cooperative-matrix form.
      *
      * @param xOff    offset of the activation view the launch reads, in floats or, for the staged MMQ lane, in staged
      *                record units; the plan carries it into the partial kernel's arguments
@@ -465,6 +503,9 @@ final class FastGemmLanes {
                             mmqConfig, computeUnits, local)
                     : SplitKGemmPlan.ofW4a8(w.type(), m, cols, nTokens, mmqConfig.rowRecords(cols), xOff,
                             mmqConfig, computeUnits, local);
+        } else if (cm2Fast(fastKernel)) {
+            plan = SplitKGemmPlan.of(Cm2GemmPlan.of(w.type(), m, cols, nTokens, cols, xOff, yStride, yOff),
+                    computeUnits, local);
         } else if (fastKernel.endsWith(GemmKernels.MATMUL_CM_SUFFIX)) {
             plan = SplitKGemmPlan.of(CmGemmPlan.of(w.type(), m, cols, nTokens, cols, xOff, yStride, yOff),
                     computeUnits, local);
@@ -485,7 +526,7 @@ final class FastGemmLanes {
     /**
      * One split-K launch: the shard's k-slice planes into their own staging slot (offset 0, never a view of the
      * projection's input or output), then the reduce into the output. The activation buffer is the projection input
-     * (MMA and CM), or the staged records of {@link GemmKernels#QUANT_MMQ_Q8_1} (MMQ), at the offset
+     * (MMA, CM and CM2), or the staged records of {@link GemmKernels#QUANT_MMQ_Q8_1} (MMQ), at the offset
      * {@link SplitKGemmPlan#xOff()} carries.
      */
     void splitKLaunch(SplitKGemmPlan plan, GpuBuffer shard, GpuBuffer x, GpuBuffer out, int yOff, int yStride) {
@@ -535,6 +576,21 @@ final class FastGemmLanes {
             queue.enqueueKernelNoEvent(kernels.get(GemmKernels.STREAM_K_FIXUP), plan.fixupGlobalWorkSize(),
                     plan.localWorkSize(), plan.fixupArgs(fixup.buffer(), out));
         }
+    }
+
+    /**
+     * The staged activations of the cooperative-matrix2 lane: one {@link Cm2GemmPlan#STAGE_KERNEL} launch rounding
+     * the whole projection input to fp16 rows of stride {@code cols}, zero-padded to whole token tiles, into its own
+     * staging slot (offset 0, never a view of the input), shared by all row tiles and shards of the projection
+     * (llama.cpp converts src1 to fp16 once before its coopmat2 mul_mm).
+     */
+    ScratchSlot stageF16(GGMLType type, GpuBuffer x, int xOff, int nTokens, int cols) {
+        Cm2GemmPlan plan = Cm2GemmPlan.of(type, 1, cols, nTokens, cols, xOff, 1, 0);
+        ScratchSlot slot = scratch.staging(GpuScratch.Staging.F16, (plan.stagedHalves() + 1) / 2);
+        ops.q8.invalidate();
+        queue.enqueueKernelNoEvent(kernels.get(Cm2GemmPlan.STAGE_KERNEL), plan.stageGlobalWorkSize(),
+                Cm2GemmPlan.stageLocalWorkSize(), plan.stageArgs(x, slot.buffer()));
+        return slot;
     }
 
     /**
@@ -637,6 +693,9 @@ final class FastGemmLanes {
                 ops.optionalReady(GemmKernels.matmulMmqSmallSplit(type, tokens), group, 1);
             });
             prewarmFp8Staging();
+        } else if (cm2Fast(fast)) {
+            ops.optionalReady(GemmKernels.matmulCm2KSplit(type), workGroup, 1);
+            ops.optionalReady(Cm2GemmPlan.STAGE_KERNEL, Cm2GemmPlan.STAGE_LOCAL);
         } else if (fast.endsWith(GemmKernels.MATMUL_CM_SUFFIX)) {
             ops.optionalReady(GemmKernels.matmulCmKSplit(type), workGroup, 1);
         } else {

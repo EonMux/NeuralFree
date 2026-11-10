@@ -243,10 +243,11 @@ public class SmallBatchCrossoverTest {
         open(BackendType.VULKAN, capabilities(BackendType.VULKAN, FakeComputeBackend.NVIDIA_VENDOR_ID,
                 DeviceClass.DISCRETE));
         assertEquals(Arrays.asList("F16_MatMul_MMA"), run(GGMLType.F16, 8));
-        // The NVIDIA dGPU's entry also pins the integer-dot matvec off the rows below its lane,
-        // which the default dispatch would serve there.
+        // The NVIDIA dGPU's paired counted integer-dot matvec serves a small weight from
+        // Int8MatvecTuning.COUNTED_SMALL_MIN_TOKENS rows (it beat the batched matvec and the CM2 lane
+        // there), and two rows keep the batched matvec, which won them on the small projections.
         assertEquals(Arrays.asList("LLM_Batch_Q8_0_MatMul_2D"), run(GGMLType.Q8_0, 2));
-        assertEquals(Arrays.asList("Q8_0_MatMul_CM"), run(GGMLType.Q8_0, 4));
+        assertEquals(Arrays.asList("LLM_QuantizeQ8_1", "Q8_0_MatVec2N4_Q8"), run(GGMLType.Q8_0, 4));
         // OpenCL: the NVIDIA dGPU's counted portable-integer matvec serves two rows (its measured
         // wins over the float multi-column matvec hold without the packed-dot feature), while the
         // Intel iGPU's entry keeps the batched matvec there (its measured Q8_0 loss keeps the
@@ -328,15 +329,31 @@ public class SmallBatchCrossoverTest {
         assertEquals(0, SmallBatchCrossover.floatMatvecNMax(cudaNvidia, GGMLType.Q8_0, large));
         assertEquals(SmallBatchCrossover.FLOAT_MATVEC_N_DISPATCH_MAX + 1,
                 SmallBatchCrossover.fastGemmMinTokens(cudaNvidia, GGMLType.Q8_0, small));
-        // Vulkan NVIDIA discrete: the lane keeps the default crossover and the integer-dot matvec
-        // stays off below it (the batched matvec measured faster at 2 and 3 rows).
+        // Vulkan NVIDIA discrete: the counted integer-dot matvec serves the rows where it measured
+        // faster than the CM2 lane (per type and size class), the lane the rest.
         assertEquals(SmallBatchCrossover.DEFAULT_FAST_GEMM_MIN_TOKENS,
                 SmallBatchCrossover.fastGemmMinTokens(vulkanNvidia, GGMLType.Q8_0, small));
-        assertEquals(1, SmallBatchCrossover.int8MatvecNMax(vulkanNvidia, GGMLType.Q8_0, small, true));
+        assertEquals(8, SmallBatchCrossover.int8MatvecNMax(vulkanNvidia, GGMLType.Q8_0, small, true));
         assertEquals(0, SmallBatchCrossover.floatMatvecNMax(vulkanNvidia, GGMLType.Q8_0, small));
         assertEquals(SmallBatchCrossover.DEFAULT_FAST_GEMM_MIN_TOKENS,
                 SmallBatchCrossover.fastGemmMinTokens(vulkanNvidia, GGMLType.Q8_0, large));
-        assertEquals(1, SmallBatchCrossover.int8MatvecNMax(vulkanNvidia, GGMLType.Q8_0, large, true));
+        assertEquals(14, SmallBatchCrossover.int8MatvecNMax(vulkanNvidia, GGMLType.Q8_0, large, true));
+        assertEquals(14, SmallBatchCrossover.int8MatvecNMax(vulkanNvidia, GGMLType.Q4_K, small, true));
+        assertEquals(LlmKernelConstants.MATVEC_N_COUNTED_MAX,
+                SmallBatchCrossover.int8MatvecNMax(vulkanNvidia, GGMLType.Q4_K, large, true));
+        assertEquals(10, SmallBatchCrossover.int8MatvecNMax(vulkanNvidia, GGMLType.Q6_K, small, true));
+        // Its tiny shapes (below TINY_SHAPE_MAX_ELEMENTS) have their own entry: the counted lane serves the
+        // whole counted range on Q8_0 and Q4_K and 14 rows on Q6_K; a kind without one keeps its small side.
+        long tiny = 3072L * 1024;
+        assertEquals(LlmKernelConstants.MATVEC_N_COUNTED_MAX,
+                SmallBatchCrossover.int8MatvecNMax(vulkanNvidia, GGMLType.Q8_0, tiny, true));
+        assertEquals(LlmKernelConstants.MATVEC_N_COUNTED_MAX,
+                SmallBatchCrossover.int8MatvecNMax(vulkanNvidia, GGMLType.Q4_K, tiny, true));
+        assertEquals(14, SmallBatchCrossover.int8MatvecNMax(vulkanNvidia, GGMLType.Q6_K, tiny, true));
+        assertEquals(SmallBatchCrossover.int8MatvecNMax(cudaNvidia, GGMLType.Q4_K, small, true),
+                SmallBatchCrossover.int8MatvecNMax(cudaNvidia, GGMLType.Q4_K, tiny, true));
+        assertEquals(LlmKernelConstants.MATVEC_N_COUNTED_MAX,
+                SmallBatchCrossover.int8MatvecNMax(vulkanNvidia, GGMLType.Q6_K, large, true));
         assertEquals(SmallBatchCrossover.DEFAULT_FAST_GEMM_MIN_TOKENS,
                 SmallBatchCrossover.fastGemmMinTokens(vulkanNvidia, GGMLType.F16, small));
         assertEquals(0, SmallBatchCrossover.floatMatvecNMax(vulkanNvidia, GGMLType.F16, small));
@@ -398,16 +415,13 @@ public class SmallBatchCrossoverTest {
         // forms won the 4B-class shapes summed over the measured projections at every count of
         // 9..15: Q4_K 2560x9728 129.9-208.1us against the fast lane's 730.0-805.4) and keeps the
         // MMQ fast lane above it — the 16-row prefill measured the lane faster at step level (71.1
-        // against 75.1ms on the 4B Q4_K_M), so the large side stops one row below the counted cap;
-        // the unmeasured Vulkan kind keeps the previous dispatch.
+        // against 75.1ms on the 4B Q4_K_M), so the large side stops one row below the counted cap.
         assertEquals(SmallBatchCrossover.DEFAULT_FAST_GEMM_MIN_TOKENS,
                 SmallBatchCrossover.fastGemmMinTokens(openclNvidia, GGMLType.Q4_K, small));
         assertEquals(LlmKernelConstants.MATVEC_N_COUNTED_MAX,
                 SmallBatchCrossover.int8MatvecNMax(openclNvidia, GGMLType.Q4_K, small, false));
         assertEquals(LlmKernelConstants.MATVEC_N_COUNTED_MAX - 1,
                 SmallBatchCrossover.int8MatvecNMax(openclNvidia, GGMLType.Q4_K, large, true));
-        assertEquals(SmallBatchCrossover.DEFAULT_FAST_GEMM_MIN_TOKENS - 1,
-                SmallBatchCrossover.int8MatvecNMax(vulkanNvidia, GGMLType.Q4_K, small, true));
     }
 
     /** The device kind of one backend's vendor and class, banded on the tensor side of sm_80 for CUDA. */

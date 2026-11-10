@@ -4,7 +4,6 @@ import com.eonmux.neuralfree.acceleration.GpuTestUtil;
 import com.eonmux.neuralfree.acceleration.HWAcceleration;
 import com.eonmux.neuralfree.acceleration.HardwareDevice;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
-import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
 import com.eonmux.neuralfree.acceleration.kernels.Availability;
@@ -13,6 +12,7 @@ import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.memory.KvVendorCodec;
 import com.eonmux.neuralfree.gguf.memory.KvWindow;
 import com.eonmux.neuralfree.gguf.ops.rope.RopeKernels;
+import com.eonmux.neuralfree.acceleration.vulkan.VkDeviceRanking;
 import org.junit.After;
 import org.junit.Assume;
 import org.junit.Before;
@@ -104,7 +104,7 @@ public class LatentFlashKernelGpuTest {
             case CUDA:
                 return hw.getCUDevices().isEmpty() ? null : hw.getCUDevices().get(0);
             default:
-                return hw.getVkDevices().isEmpty() ? null : hw.getVkDevices().get(0);
+                return VkDeviceRanking.fastestDevice(hw.getVkDevices(), null);
         }
     }
 
@@ -186,7 +186,7 @@ public class LatentFlashKernelGpuTest {
 
             FlashAttnTiling tiling = FlashAttnTiling.decode(N_HEAD, N_HEAD_KV, D_Q, D_V, N_KV,
                     kernels.faSmemFloats(), Math.max(1, backend.capabilities().getComputeUnits()),
-                    FlashAttnTiling.decodeFastPath(backend.capabilities().hasFeature(DeviceFeature.SUBGROUP_SHUFFLE),
+                    FlashAttnTiling.decodeFastPath(kernels.decodeWarpPath(),
                             type, type, D_Q, D_V));
             Assume.assumeTrue("no decode plan for this shape: " + tiling,
                     tiling.plan() == FlashAttnTiling.Plan.DECODE);

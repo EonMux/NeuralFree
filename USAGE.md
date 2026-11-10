@@ -459,6 +459,8 @@ vkHw.shutdown();
 
 The per-API properties `neuralfree.opencl.device`, `neuralfree.cuda.device`, `neuralfree.vulkan.device` and `neuralfree.hip.device` override `neuralfree.device` within one API. `neuralfree.backend.order=cuda,opencl`, for example, keeps AUTO off Vulkan.
 
+NeuralFree enables the Vulkan memory model only together with `vulkanMemoryModelDeviceScope`. Some kernels use device-scope barriers and atomics, and enabling the memory model without the device scope makes their SPIR-V invalid (VUID-RuntimeSpirv-vulkanMemoryModel-06265). That invalid SPIR-V was the one validation error found in the investigation of a sporadic SIGSEGV inside NVIDIA's shader compiler (`libnvidia-gpucomp`, driver 615.71.09). A device without the device scope gets neither feature, so it runs without the cooperative-matrix lanes.
+
 **Requirements.** `createBackend(mode, requirement)` adds a condition the backend must meet: AUTO skips, closes and logs every backend the requirement rejects, and an explicit mode fails with `<API> backend unavailable: <reason>`.
 
 **LLM inference** uses the requirement `KernelLibraryRequirement.of(KernelLibraries.LLM)`, so AUTO never selects a backend that cannot serve the LLM kernels. Choose the LLM backend with `--backend auto|opencl|cuda|vulkan|hip|cpu`, `--cpu`, `--device <substr>` or a multi-GPU `--device <d1,d2>`, or with the `neuralfree.backend` and `neuralfree.device` properties. If the GPU load fails, the model opens on the CPU engine.
@@ -493,7 +495,7 @@ On a CUDA device of compute capability 8.0 or newer, prefill attention (prompts,
 - both head dimensions are multiples of 16, at most 128;
 - the layer uses standard attention (MLA keeps its own path).
 
-Split-K over long contexts, sinks, softcap, ALiBi, the T5 relative bias, sliding windows, causal and bidirectional masks and paged caches behave as in the scalar kernels; the outputs differ only by the F16 rounding of the staged Q, K and V tiles. On CUDA, a single-row decode step over a dense F16 cache runs the one-row decode kernel `LLM_FlashDecodeRow_F16` instead, when the K and V head dimensions are equal multiples of 64 of at most 256 and the layer has no position bias and no sinks. The kernel puts four warps on each split and head with an online softmax in registers, the shape of llama.cpp's `fattn-vec`. On the RTX 5080 Laptop it takes 6.0-6.8 us per layer plus a 1.8-2.3 us merge (CUPTI, Qwen3-Embedding 0.6B and 4B), against 42-61 us for the one-row prefill it replaces. Other single-row steps run the tensor-core kernel as a one-row prefill (48 against 65 us per layer on the scalar decode kernel at 256 keys, 32 query and 8 KV heads of 128). The exception is a layer past 128 live keys whose KV heads each serve at most two query heads, on HIP or outside the one-row kernel's constraints on CUDA: those steps run the split-K decode kernel's warp-shuffle form. With four query heads per KV head, the one-row prefill stays ahead at every depth. The paged kernel's single-row steps keep the paged decode kernel; on CUDA with an F16 or BF16 cache that is the grouped-query `LLM_FlashDecodePagedGqa_F16` / `_BF16`, which reads each K and V row once for all query heads of a KV group (up to four) and splits the keys by the step's sequence count (16 sequences at 129 keys on Qwen3-Embedding-4B: 16 against 143 us per layer). On the RTX 5080 Laptop, a 512-token prefill over 1024 cached keys with 32 query and 8 KV heads of 128 takes 0.28 ms of kernel time. OpenCL and Vulkan run the scalar kernels.
+Split-K over long contexts, sinks, softcap, ALiBi, the T5 relative bias, sliding windows, causal and bidirectional masks and paged caches behave as in the scalar kernels; the outputs differ only by the F16 rounding of the staged Q, K and V tiles. On CUDA, a single-row decode step over a dense F16 cache runs the one-row decode kernel `LLM_FlashDecodeRow_F16` instead, when the K and V head dimensions are equal multiples of 64 of at most 256 and the layer has no position bias and no sinks. The kernel puts four warps on each split and head with an online softmax in registers, the shape of llama.cpp's `fattn-vec`. On the RTX 5080 Laptop it takes 6.0-6.8 us per layer plus a 1.8-2.3 us merge (CUPTI, Qwen3-Embedding 0.6B and 4B), against 42-61 us for the one-row prefill it replaces. Other single-row steps run the tensor-core kernel as a one-row prefill (48 against 65 us per layer on the scalar decode kernel at 256 keys, 32 query and 8 KV heads of 128). The exception is a layer past 128 live keys whose KV heads each serve at most two query heads, on HIP or outside the one-row kernel's constraints on CUDA: those steps run the split-K decode kernel's warp-shuffle form. With four query heads per KV head, the one-row prefill stays ahead at every depth. The paged kernel's single-row steps keep the paged decode kernel; on CUDA with an F16 or BF16 cache that is the grouped-query `LLM_FlashDecodePagedGqa_F16` / `_BF16`, which reads each K and V row once for all query heads of a KV group (up to four) and splits the keys by the step's sequence count (16 sequences at 129 keys on Qwen3-Embedding-4B: 16 against 143 us per layer). On the RTX 5080 Laptop, a 512-token prefill over 1024 cached keys with 32 query and 8 KV heads of 128 takes 0.28 ms of kernel time. On Vulkan devices with `VK_NV_cooperative_matrix2` (fp16 x fp16 -> fp32 workgroup matrices of 64x64x64 at 128 invocations), the same kernels run as workgroup-scope cooperative-matrix shaders over 64-key tiles, the design of llama.cpp's `flash_attn_cm2`. Their single-row steps take the routes above without the CUDA one-row decode kernel: the one-row prefill, or, past 128 live keys with at most two query heads per KV head, the split-K decode kernel's warp form on devices whose subgroups are all 32 lanes wide. On the RTX 5080 Laptop, a 512-token prefill of Qwen3-Embedding-4B spends 179 us per layer in attention, against llama.cpp Vulkan's 76-79 us. OpenCL, and Vulkan devices without that extension, run the scalar kernels.
 
 ### Fast GEMM for prefill and batched decode
 
@@ -505,7 +507,7 @@ device of the same API. The measured kinds (`SmallBatchCrossover`):
 | Device kind | Fast lane from rows | Float `<T>_MatVecN` up to rows | Int8 multi-column matvec up to rows |
 |---|---|---|---|
 | CUDA, NVIDIA discrete, sm_80+ | Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, IQ4_XS: 17, past the counted matvec (MMQ); F16: 4 (MMA) | none | Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, IQ4_XS: 16 |
-| Vulkan, NVIDIA discrete | Q8_0: 4 (cooperative matrix); F16: 4 (MMA) | none | none |
+| Vulkan, NVIDIA discrete | Q8_0, Q4_K, Q6_K: 4 (cooperative matrix 2) on the rows the counted matvec does not serve; F16: 4 (MMA) | none | Q8_0: 16 below 4M elements, 8 below 8M, 14 from 8M; Q4_K: 16 below 4M, 14 below 8M, 16 from 8M; Q6_K: 14 below 4M, 10 below 8M, 16 from 8M (below 4M from 3 rows, and from 2 rows at 2.5M elements and up) |
 | OpenCL, NVIDIA discrete | Q8_0, F16: none; Q4_0: 9 (MMQ, portable integer arithmetic); Q4_K, Q5_K, Q6_K, IQ4_XS: 17 below 8M elements, 16 on 8M-element projections and up (MMQ; the counted matvec serves through 15) | Q8_0 and F16: 16 | Q8_0: 16; Q4_K, Q5_K, Q6_K, IQ4_XS: 16 below 8M elements and 15 on 8M-element projections and up; Q4_0: 15 on 8M-element projections and up, 8 below |
 | Vulkan, Intel integrated | Q8_0: 4 (cooperative matrix); F16: none | none | none |
 | OpenCL, Intel integrated | Q8_0: 4 (MMQ); F16: none | F16: 16 | Q8_0: 3 |
@@ -542,7 +544,7 @@ at an 8-row step of 11.0 ms in Q8_0 and 7.3 ms in Q4_K_M, and a 16-row step of 1
 | Weights | Fast lane | Where | Rounding vs. the exact tiled GEMM |
 |---|---|---|---|
 | Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, I8_B128 | int8 MMQ GEMM (`<T>_MatMul_MMQ`) | every backend: int8 tensor cores (`mma.m16n8k32` / `m16n8k16` s8) on CUDA sm_80+, dp4a or scalar int dots elsewhere | activations are rounded to 8-bit codes per 32-element (tensor) or 16-element chunk, as in llama.cpp `mmq.cuh`; with an `--act-quant checkpoint` int8 scheme they are the checkpoint's own codes |
-| same types | cooperative-matrix GEMM (`<T>_MatMul_CM`) | Vulkan devices with `VK_KHR_cooperative_matrix` (default `auto` mode) | weights and activations are staged as fp16 tiles, as in llama.cpp `mul_mm_cm2.comp` |
+| same types | cooperative-matrix GEMM: `<T>_MatMul_CM2` (workgroup-scope `VK_NV_cooperative_matrix2`, 128x256 tiles, fp16 accumulation saturated at +-65504, as llama.cpp `mul_mm_cm2.comp`), otherwise `<T>_MatMul_CM` (`VK_KHR_cooperative_matrix`) | Vulkan devices with the extension (default `auto` mode) | activations staged as fp16 rows; the weights decode to fp16 in the tensor loads |
 | F16 | tensor-core GEMM (`F16_MatMul_MMA`) | CUDA sm_80+, Vulkan with cooperative matrices | activations rounded to fp16; fp32 accumulation |
 | BF16 | tensor-core GEMM (`BF16_MatMul_MMA`, bf16 `mma`) | CUDA sm_80+ (Vulkan keeps the tiled GEMM for BF16) | activations rounded to bf16; fp32 accumulation |
 | F8_E4M3, F8_E4M3_B32, F8_E4M3_B128, MXFP8 | E4M3 GEMM over the checkpoint's own activation codes (`<T>_MatMul_MMQ`) | CUDA sm_89+ (`mma.sync` `e4m3.e4m3.f32`); elsewhere the exact tiled GEMM | activations staged as E4M3 codes with one scale per 32-element chunk; fp32 accumulation |
@@ -599,14 +601,14 @@ than the tiled GEMM over fake-quantized activations (13.9 TFLOP/s at 512 tokens)
 `MXFP4_MatMul_W4A8` 2.75x and 3.94x (17.7 TFLOP/s), the staging pass included.
 
 A kernel the backend cannot build or prepare is skipped, the next form serves the product, and the
-skip is logged once at info. The dispatch geometry is in `MmqGemmPlan`, `CmGemmPlan` and
+skip is logged once at info. The dispatch geometry is in `MmqGemmPlan`, `Cm2GemmPlan`, `CmGemmPlan` and
 `MmaGemmPlan`.
 
 #### Choosing the quantized-weight lane: `-Dneuralfree.gemm.mmq`
 
 | Value | Effect |
 |---|---|
-| `auto` (default) | int8 MMQ GEMM, or the cooperative-matrix form on Vulkan devices that support it |
+| `auto` (default) | int8 MMQ GEMM, or the cooperative-matrix form on Vulkan devices that support it (the workgroup-scope CM2 form where `VK_NV_cooperative_matrix2` is present) |
 | `on` | int8 MMQ GEMM on every device, also where `auto` would pick the cooperative-matrix form (llama.cpp `GGML_CUDA_FORCE_MMQ`) |
 | `off` | the exact tiled GEMM for these weight types, for workloads that do not accept the 8-bit activation rounding (llama.cpp `GGML_CUDA_FORCE_CUBLAS`) |
 
@@ -648,7 +650,7 @@ With the MoE expert cache on (`--moe-cache`), multi-token steps of a cached laye
 
 The grouped GEMM runs on tensor cores (`{T}_GroupedGemmMma`, `{T}_GroupedGemmMmaInd` for the cache) in two cases, with fp32 accumulation:
 - **CUDA, compute capability 8.0 or higher** (`mma.sync`). Weights and activations enter the tensor cores as fp16, or as bfloat16 for BF16 experts so that their weights stay exact.
-- **Vulkan with `VK_KHR_cooperative_matrix`.** The device needs 16x16x16 fp16 x fp16 -> fp32 subgroup matrices, `shaderFloat16`, `computeFullSubgroups` and `vulkanMemoryModel`. Operands are fp16.
+- **Vulkan with `VK_KHR_cooperative_matrix`.** The device needs 16x16x16 fp16 x fp16 -> fp32 subgroup matrices, `shaderFloat16`, `computeFullSubgroups` and `vulkanMemoryModel` together with `vulkanMemoryModelDeviceScope`. Operands are fp16.
 
 F32 experts, BF16 experts on Vulkan, and all other devices use the scalar kernels. The tensor-core kernel is chosen when the device reports the capability and the kernel prepares; otherwise the layer logs the fallback once and uses the scalar kernel.
 
@@ -4145,6 +4147,7 @@ The header's `backend = ...` names the backend the model opened on.
 | `-ub`, `--ubatch` | tokens per forward step (default 512) |
 | `-s`, `--seed` | seed of the random tokens (default 1) |
 | `--output-format md\|jsonl` | the Markdown table (default) or one JSON object per cell |
+| `--kernels` | time every GPU dispatch of each measured cell and print the cell's per-kernel device time on stderr, as `nftool bench --kernels` does (`-Dneuralfree.gpu.profile=true`, decode-step replay off), so the cell's throughput then measures the timed kernels rather than a normal run |
 | `--backend`, `--cpu`/`--gpu`, `--device`, `-ngl`, `-ot`, `--cpu-moe`, `--n-cpu-moe`, `-t` | where the model loads and computes, as for [LLMDemo](#backend-and-weights) (default: the best GPU backend, `-ngl auto`) |
 | `-ctk`, `-ctv`, `--kv-type` | KV cache types (default `f16`) |
 | `-fa on\|auto` | flash attention, which is always on; `-fa off` is refused |

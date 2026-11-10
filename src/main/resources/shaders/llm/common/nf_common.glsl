@@ -26,7 +26,9 @@ layout(constant_id = 3) const int NF_FA_SMEM_FLOATS = 3072;
 #define LLM_DIMX      256   /* max local size of every row-reduce kernel; power of 2 */
 #endif
 #define NF_FA_WG      128   /* flash kernels' workgroup size */
+#define NF_FA_LG      (NF_FA_WG / 32) /* flash-decode lane groups per workgroup; pass 2 splits the keys across them */
 #define NF_FA_ACC_MAX 32    /* per-invocation output accumulators in flash kernels */
+#define NF_FA_FAST_DIM 128  /* head-dim limit of the flash-decode subgroup fast path: one vec4 per lane of 32 */
 #define NF_FD_MAX_G   16    /* max q-heads per flash-decode workgroup */
 
 /* Op ids of the weight-type family templates (matvec_quant.comp, matvec_dense.comp, embed.comp),

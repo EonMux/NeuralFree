@@ -11,6 +11,7 @@ import com.eonmux.neuralfree.gguf.arch.SwaType;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.memory.KvWindow;
+import com.eonmux.neuralfree.acceleration.vulkan.VkDeviceRanking;
 import org.junit.After;
 import org.junit.Assume;
 import org.junit.Before;
@@ -102,7 +103,7 @@ public class FlashAttnPagedKernelGpuTest {
             case CUDA:
                 return hw.getCUDevices().isEmpty() ? null : hw.getCUDevices().get(0);
             default:
-                return hw.getVkDevices().isEmpty() ? null : hw.getVkDevices().get(0);
+                return VkDeviceRanking.fastestDevice(hw.getVkDevices(), null);
         }
     }
 

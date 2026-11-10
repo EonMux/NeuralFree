@@ -1,0 +1,42 @@
+/* stage_f16.comp - LLM_Stage_F16_Rows: the fp16 activation rows the cooperative-matrix2 GEMM reads
+ * (matmul_mmq_cm2.comp), staged once per projection launch as llama.cpp converts src1 to fp16 before its
+ * coopmat2 mul_mm. Vulkan-only, a member of the CM2 lane.
+ * Requires: common/nf_common.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n, i rows, i k, i x_stride, i x_off, R float x, W half out)
+ *   out[t * k + i] = fp16(x[x_off + t * x_stride + i]) for t < n, i < k (round to nearest even), and
+ *   out[t * k + i] = 0 for n <= t < rows: the GEMM's token tiles read whole padded tiles unclamped.
+ * k is a multiple of 4 (the CM2 weight types' blocks are 32 or more elements), so an invocation
+ * converts four consecutive elements of one row and stores them as one 8-byte pair of packed halves.
+ *
+ * Dispatch: 1-D, global = rows * k / 4 work-items (folded group counts recovered by nf_global_id()),
+ * any local size.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfStageInput { float x_in[]; };
+layout(std430, binding = 1) writeonly buffer NfStageOutput { uvec2 h_out[]; };
+layout(push_constant) uniform NfStageParams {
+    int n; int rows; int k; int x_stride; int x_off;
+} pc;
+
+void main() {
+    const uint gid = nf_global_id();
+    const uint quads = uint(pc.k) >> 2u;
+    if (gid >= uint(pc.rows) * quads) {
+        return;
+    }
+    const uint t = gid / quads;
+    if (t >= uint(pc.n)) {
+        h_out[gid] = uvec2(0u);
+        return;
+    }
+    const uint i = (gid - t * quads) << 2u;
+    const uint src = uint(pc.x_off) + t * uint(pc.x_stride) + i;
+    const vec4 v = vec4(x_in[src], x_in[src + 1u], x_in[src + 2u], x_in[src + 3u]);
+    h_out[gid] = uvec2(packHalf2x16(v.xy), packHalf2x16(v.zw));
+}

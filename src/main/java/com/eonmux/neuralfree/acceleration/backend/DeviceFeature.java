@@ -44,6 +44,21 @@ public enum DeviceFeature {
      */
     COOPERATIVE_MATRIX,
     /**
+     * The {@code VK_NV_cooperative_matrix2} form of the tensor cores is usable: flexible workgroup-scope
+     * dimensions match the CM2 GEMM's fp16 tiles (128 rows, 64 deep, 256/128/64 tokens), with tensor-layout loads
+     * (per-element decode callbacks over physical-storage-buffer references), per-element operations and
+     * reductions, next to the fp16 cooperative-matrix requirements (llama.cpp {@code coopmat2}). CUDA and OpenCL
+     * have no equivalent; they never report it.
+     */
+    COOPERATIVE_MATRIX_2,
+    /**
+     * {@link #COOPERATIVE_MATRIX_2} also serves the tensor-core prefill attention ({@code LLM_FlashAttnMma_F16} of
+     * shaders/llm/flash_mma_cm2.comp): accumulator-to-operand conversions and flexible workgroup-scope dimensions for
+     * fp16 x fp16 -> fp32 tiles of 128 invocations (64 query rows, 64 keys), as llama.cpp's flash_attn_cm2 needs.
+     * Vulkan only; CUDA serves its mma attention through {@link #COOPERATIVE_MATRIX}.
+     */
+    COOPERATIVE_MATRIX_2_ATTENTION,
+    /**
      * Bfloat16 matrix multiply-accumulate on the tensor cores is usable in kernels: CUDA compute capability 8.0+
      * ({@code mma.sync.f32.bf16.bf16.f32}), or Vulkan {@code VK_KHR_shader_bfloat16} with the
      * {@code bfloat16CooperativeMatrix} feature and a 16-multiple bf16 x bf16 -> fp32 subgroup multiply-add (llama.cpp

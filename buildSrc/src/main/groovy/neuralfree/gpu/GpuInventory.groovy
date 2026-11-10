@@ -65,11 +65,13 @@ class GpuInventory {
      * Problems of a library's portable kernel-name set against its variants rows (exactly one row per kernel,
      * except the cudaOnly ones, which only the CUDA fatbins build and the Vulkan backend never serves). A pinned row
      * (sg<N>) is the Vulkan twin of an [opencl] kernel and must not name a portable one; LlmKernelInventoryTest checks
-     * that it names a kernel of an [opencl] manifest file.
+     * that it names a kernel of an [opencl] manifest file. Rows flagged vulkan name kernels with no OpenCL or HIP form
+     * (Vulkan-only kernels, or Vulkan twins of CUDA-only ones), so they are exempt from naming a portable kernel, as
+     * the CUDA-only kernels are from carrying a row.
      */
     static List<String> variantCoverageProblems(GpuKernelLibrary lib, Set<String> kernelNames, Set<String> cudaOnly) {
         List<Map> rows = GpuShaderVariants.read(lib.variantsDir, lib.shaderRoot, lib.subgroupVariants)
-        Set<String> rowNames = rows.findAll { !it.sgSize }.collect { (String) it.name } as Set
+        Set<String> rowNames = rows.findAll { !it.sgSize && !it.vulkan }.collect { (String) it.name } as Set
         Set<String> pinnedNames = rows.findAll { it.sgSize }.collect { (String) it.name } as Set
         List<String> withoutRow = ((kernelNames - cudaOnly) - rowNames).sort()
         List<String> withoutKernel = (rowNames - kernelNames).sort()

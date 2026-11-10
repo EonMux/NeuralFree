@@ -2,14 +2,19 @@ package com.eonmux.neuralfree.gguf.gpu.forward;
 
 import com.eonmux.neuralfree.acceleration.HWAcceleration;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
+import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.cuda.CudaComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.ocl.OclComputeBackend;
+import com.eonmux.neuralfree.acceleration.backend.vulkan.VkComputeBackend;
 import com.eonmux.neuralfree.acceleration.cuda.CUDevice;
 import com.eonmux.neuralfree.acceleration.kernels.Availability;
+import com.eonmux.neuralfree.acceleration.vulkan.VkInstanceManager;
+import com.eonmux.neuralfree.acceleration.vulkan.VkPhysicalDeviceInfo;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
+import com.eonmux.neuralfree.gguf.ops.gemm.Cm2GemmPlan;
 import com.eonmux.neuralfree.gguf.ops.gemm.GemmKernels;
 import com.eonmux.neuralfree.gguf.ops.gemm.MmqConfig;
 import com.eonmux.neuralfree.gguf.ops.gemm.MmqGemmPlan;
@@ -39,6 +44,9 @@ import java.util.Random;
  * same-order rounds would time one form on the slower state; the median round is reported), the whole
  * per-projection cost each lane pays:
  * <ul>
+ *   <li>{@code batched} &mdash; the float-input batched matvec's 2-D launch ({@code LLM_Batch_Q8_0_MatMul_2D},
+ *       {@code {T}_BatchMatMul_2D}), the dispatch's lane below the fast GEMM lane where neither multi-column
+ *       matvec serves;</li>
  *   <li>{@code runtime} &mdash; the Q8_1 quantizer plus {@code {T}_MatVecN_Q8} with the runtime token
  *       count (the incumbent multi-column lane);</li>
  *   <li>{@code counted} &mdash; quantizer plus {@code {T}_MatVecN<n>_Q8} at every count the type
@@ -47,8 +55,14 @@ import java.util.Random;
  *       work-group (same counts);</li>
  *   <li>{@code mmq} &mdash; {@code LLM_Quant_MMQ_Q8_1} plus the fast GEMM lane the dispatch serves:
  *       the {@code <T>_MatMul_MMQ_S} 16-token twin for n below the device tile where the device has
- *       one, the plain tile otherwise.</li>
+ *       one, the plain tile otherwise;</li>
+ *   <li>{@code cm2} &mdash; on a Vulkan device with cooperative matrices 2, {@code LLM_Stage_F16_Rows} plus
+ *       the {@code <T>_MatMul_CM2} GEMM, the fast lane the Vulkan dispatch serves there.</li>
  * </ul>
+ * The Vulkan form measures the device whose name contains {@code -Dneuralfree.test.counted.measure.vk}
+ * (default NVIDIA); {@code -Dneuralfree.test.counted.measure.types} (comma-separated type names) narrows the
+ * measured types and {@code -Dneuralfree.test.counted.measure.shapes} (comma-separated {@code <rows>x<cols>})
+ * replaces the measured shapes.
  * Asserts nothing; the numbers set the per-kind dispatch entries of {@link SmallBatchCrossover} and the
  * counted-lane evidence of {@link Int8MatvecTuning}.
  */
@@ -59,6 +73,12 @@ public class CountedMatvecNMeasureTest {
     public static final String MEASURE_PROPERTY = "neuralfree.test.counted.measure";
     /** System property that selects the backend device to measure by index (CUDA and OpenCL device order). */
     public static final String DEVICE_PROPERTY = "neuralfree.test.counted.measure.device";
+    /** System property naming a substring of the measured Vulkan device. */
+    public static final String VK_DEVICE_PROPERTY = "neuralfree.test.counted.measure.vk";
+    /** System property listing the measured weight types (comma-separated names); unset measures {@link #TYPES}. */
+    public static final String TYPES_PROPERTY = "neuralfree.test.counted.measure.types";
+    /** System property listing the measured shapes ({@code <rows>x<cols>}, comma-separated); unset measures {@link #SHAPES}. */
+    public static final String SHAPES_PROPERTY = "neuralfree.test.counted.measure.shapes";
     private static final int WARMUP = 20;
     /** Interleaved rounds per comparison; the median round is reported. */
     private static final int ROUNDS = 9;
@@ -78,7 +98,7 @@ public class CountedMatvecNMeasureTest {
 
     @Parameterized.Parameters(name = "{0}")
     public static List<Object[]> backends() {
-        return Arrays.asList(new Object[]{"opencl"}, new Object[]{"cuda"});
+        return Arrays.asList(new Object[]{"opencl"}, new Object[]{"cuda"}, new Object[]{"vulkan"});
     }
 
     private final String api;
@@ -126,6 +146,20 @@ public class CountedMatvecNMeasureTest {
             CUDevice device = accel.getCUDevices().get(index);
             return new CudaComputeBackend(device);
         }
+        if (api.equals("vulkan")) {
+            String wanted = System.getProperty(VK_DEVICE_PROPERTY, "NVIDIA");
+            VkInstanceManager manager = VkInstanceManager.acquire();
+            try {
+                for (VkPhysicalDeviceInfo info : manager.devices()) {
+                    if (info.name().contains(wanted)) {
+                        return new VkComputeBackend(manager, info);
+                    }
+                }
+            } finally {
+                manager.release();
+            }
+            Assume.assumeTrue("no Vulkan device named " + wanted, false);
+        }
         HWAcceleration accel = new HWAcceleration(EnumSet.of(ComputeBackend.BackendType.OPENCL));
         hwAccel = accel;
         Assume.assumeFalse("no OpenCL device", accel.getCLDevices().isEmpty());
@@ -154,11 +188,40 @@ public class CountedMatvecNMeasureTest {
     public void countedMatvecFormsAgainstTheDispatchLanes() throws Exception {
         System.out.println("device " + backend.capabilities().getDeviceName() + " (" + api
                 + ", index " + deviceIndex() + "), matvec local " + local + ", mmq " + mmqConfig);
-        for (GGMLType type : TYPES) {
-            for (int[] shape : SHAPES) {
+        for (GGMLType type : measuredTypes()) {
+            for (int[] shape : measuredShapes()) {
                 measure(type, shape[0], shape[1]);
             }
         }
+    }
+
+    private static List<int[]> measuredShapes() {
+        String spec = System.getProperty(SHAPES_PROPERTY);
+        if (spec == null || spec.isEmpty()) {
+            return Arrays.asList(SHAPES);
+        }
+        List<int[]> shapes = new ArrayList<>();
+        for (String shape : spec.split(",")) {
+            String[] dims = shape.trim().split("x");
+            if (dims.length != 2) {
+                throw new IllegalArgumentException("-D" + SHAPES_PROPERTY + " takes <rows>x<cols> entries, got '"
+                        + shape + "'");
+            }
+            shapes.add(new int[]{Integer.parseInt(dims[0].trim()), Integer.parseInt(dims[1].trim())});
+        }
+        return shapes;
+    }
+
+    private static List<GGMLType> measuredTypes() {
+        String names = System.getProperty(TYPES_PROPERTY);
+        if (names == null || names.isEmpty()) {
+            return Arrays.asList(TYPES);
+        }
+        List<GGMLType> types = new ArrayList<>();
+        for (String name : names.split(",")) {
+            types.add(GGMLType.valueOf(name.trim()));
+        }
+        return types;
     }
 
     /** One named timed form: the kernel launches of one projection lane at one token count. */
@@ -186,12 +249,14 @@ public class CountedMatvecNMeasureTest {
         GpuBuffer yBuf = backend.allocateBuffer(
                 (long) LlmKernelConstants.MATVEC_N_MAX_TOKENS * rows * 4);
         GpuBuffer staged = null;
+        GpuBuffer half = null;
         try {
             backend.computeQueue().enqueueWriteBuffer(wBuf, 0, weights.length, weights).awaitCompletion();
             backend.computeQueue().enqueueWriteBuffer(xBuf, 0, (long) x.length * 4, x).awaitCompletion();
             staged = allocateStaged(cols);
+            half = allocateHalfRows(type, rows, cols);
             for (int n = 2; n <= LlmKernelConstants.MATVEC_N_MAX_TOKENS; n++) {
-                measureTokenCount(type, rows, cols, n, wBuf, xBuf, qBuf, yBuf, staged);
+                measureTokenCount(type, rows, cols, n, wBuf, xBuf, qBuf, yBuf, staged, half);
             }
         } finally {
             wBuf.close();
@@ -200,6 +265,9 @@ public class CountedMatvecNMeasureTest {
             yBuf.close();
             if (staged != null) {
                 staged.close();
+            }
+            if (half != null) {
+                half.close();
             }
         }
     }
@@ -213,14 +281,32 @@ public class CountedMatvecNMeasureTest {
         return backend.allocateBuffer(records * mmqConfig.recordUnits() * 4L);
     }
 
+    /**
+     * The fp16 activation rows of the CM2 lane at the largest measured token count (the staging pads them to a whole
+     * token tile), or null on a device without the lane.
+     */
+    private GpuBuffer allocateHalfRows(GGMLType type, int rows, int cols) {
+        if (!backend.capabilities().hasFeature(DeviceFeature.COOPERATIVE_MATRIX_2) || !GemmKernels.hasCm2(type)) {
+            return null;
+        }
+        Cm2GemmPlan plan = Cm2GemmPlan.contiguous(type, rows, cols, LlmKernelConstants.MATVEC_N_MAX_TOKENS);
+        return backend.allocateBuffer(plan.stagedHalves() * Short.BYTES);
+    }
+
     /** Lanes and their interleaved-round medians at one token count; one printed line. */
     private void measureTokenCount(GGMLType type, int rows, int cols, int n, GpuBuffer wBuf, GpuBuffer xBuf,
-                                   GpuBuffer qBuf, GpuBuffer yBuf, GpuBuffer staged) {
+                                   GpuBuffer qBuf, GpuBuffer yBuf, GpuBuffer staged, GpuBuffer half) {
         final int tokens = n;
         Runnable quantize = () -> backend.computeQueue().enqueueKernel(kernels.get(GpuOps.QUANTIZE_Q8_1),
                 new long[]{roundUp((long) tokens * (cols / 32))}, new long[]{local},
                 new Object[]{tokens * cols, xBuf, qBuf});
         List<Lane> lanes = new ArrayList<>();
+        String batchedKernel = type == GGMLType.Q8_0 ? "LLM_Batch_Q8_0_MatMul_2D" : type.name() + "_BatchMatMul_2D";
+        if (kernels.has(batchedKernel)) {
+            lanes.add(new Lane("batched", () -> backend.computeQueue().enqueueKernel(kernels.get(batchedKernel),
+                    new long[]{(long) rows * local, tokens}, new long[]{local, 1},
+                    new Object[]{rows, cols, tokens, wBuf, xBuf, yBuf})));
+        }
         String runtimeKernel = type.name() + "_MatVecN_Q8";
         if (kernels.has(runtimeKernel)) {
             lanes.add(new Lane("runtime", () -> {
@@ -257,6 +343,12 @@ public class CountedMatvecNMeasureTest {
                 lanes.add(mmq);
             }
         }
+        if (half != null) {
+            Lane cm2 = cm2Lane(type, rows, cols, n, wBuf, xBuf, yBuf, half);
+            if (cm2 != null) {
+                lanes.add(cm2);
+            }
+        }
         if (lanes.isEmpty()) {
             return;
         }
@@ -267,6 +359,24 @@ public class CountedMatvecNMeasureTest {
             line.append(String.format(Locale.ROOT, "  %s %9.2f", lanes.get(f).name, medians[f]));
         }
         System.out.println(line.append("  us").toString());
+    }
+
+    /** The Vulkan cooperative-matrix-2 lane at {@code n}: the fp16 activation staging plus the CM2 GEMM, or null. */
+    private Lane cm2Lane(GGMLType type, int rows, int cols, int n, GpuBuffer wBuf, GpuBuffer xBuf, GpuBuffer yBuf,
+                         GpuBuffer half) {
+        if (!GemmKernels.hasCm2(type)) {
+            return null;
+        }
+        Cm2GemmPlan plan = Cm2GemmPlan.contiguous(type, rows, cols, n);
+        if (!kernels.has(plan.kernelName()) || !kernels.has(Cm2GemmPlan.STAGE_KERNEL)) {
+            return null;
+        }
+        return new Lane("cm2", () -> {
+            backend.computeQueue().enqueueKernel(kernels.get(Cm2GemmPlan.STAGE_KERNEL), plan.stageGlobalWorkSize(),
+                    Cm2GemmPlan.stageLocalWorkSize(), plan.stageArgs(xBuf, half));
+            backend.computeQueue().enqueueKernel(kernels.get(plan.kernelName()), plan.globalWorkSize(),
+                    plan.localWorkSize(), plan.args(wBuf, half, yBuf));
+        });
     }
 
     /** The fast GEMM lane the dispatch serves at {@code n}: the twin of the launch's ladder row below

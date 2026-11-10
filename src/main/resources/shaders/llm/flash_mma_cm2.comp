@@ -1,0 +1,468 @@
+/* flash_mma_cm2.comp - LLM_FlashAttnMma_F16 and LLM_FlashAttnMmaPaged_F16 tensor-core tiled prefill attention over
+ * the workgroup-scope cooperative matrices of VK_NV_cooperative_matrix2 (the llama.cpp flash_attn_cm2.comp design):
+ * the Vulkan twin of kernels/llm/flash_mma.cl, with the same argument lists, grid, plan and semantics, so the host
+ * plans both through gguf.ops.attn.FlashAttnTiling.mma.
+ * Requires: common/nf_common.glsl, common/act.glsl, common/attn_common.glsl.
+ *
+ * Variant rows (Vulkan-only; vk13 for the cooperative-matrix-2 SPIR-V, noopt as for the other CM2 modules):
+ *     LLM_FlashAttnMma_F16       flash_mma_cm2.comp                vk13,vulkan,noopt
+ *     LLM_FlashAttnMmaPaged_F16  flash_mma_cm2.comp  PAGED=1      vk13,vulkan,noopt
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order), as flash_mma.cl:
+ *   (i n_tokens, i n_head, i n_head_kv, i d_k, i d_v, i bq, i bk, i g_tile, i n_split, i split_len,
+ *    i kv_start, i kv_end, i q_row_stride, i out_row_stride, i k_row_stride, i k_head_stride,
+ *    i v_row_stride, i v_head_stride, f scale, f softcap, f max_bias, i flags, i swa_type, i n_swa,
+ *    i bias_mode, i n_buckets, i max_distance, i q_off, i out_off,
+ *    R q, R half k, R half v, R<int> q_pos, R<int> kv_pos, R sinks, R rel_bias, W out, W partial,
+ *    R<uvec2> tree_mask | PAGED: i page_shift, i pt_off after out_off, R<int> page_table before tree_mask)
+ * Layouts, flags, the tree mask, the paged slot addressing and the (o, m, l) partials are those of flash_prefill.comp
+ * and kernels/llm/flash_mma.cl.
+ *
+ * Grid: global {ceil(n_tokens / bq) * 128, n_head_kv * ceil(G / g_tile), n_split}, local {128, 1, 1}, with
+ * R = bq * g_tile == NF_FM_BM: workgroup (b, y, s) owns the R query rows r (token t0 + r / g_tile, head
+ * h0 + r % g_tile) and the keys [kv_start + s * split_len, min(+ split_len, kv_end)) in tiles of NF_FM_BN. The plan's
+ * bk (FlashAttnTiling.MMA_BK, the CUDA twin's key tile) only rounds the split lengths here: a split that ends inside a
+ * tile reads its last tile clamped and masked.
+ *
+ * Compute: the Q tile is staged once as fp16 in shared memory (rows outside the launch are zeros) and held as one
+ * R x NF_FM_D matrix; per key tile, K and V load as fp16 tensor tiles straight from the cache (the paged rows
+ * through a decode callback that resolves each slot's physical row), S = Q K^T accumulates in fp32, and the online
+ * softmax runs on row reductions of the fp32 tile: M = max(M, rowmax S), P = e^(S - M), L = L e^(M_old - M) +
+ * rowsum fp16(P), O = O e^(M_old - M) + fp16(P) V with an fp32 O, the row sums a product with a ones matrix. Q, K, V
+ * and P are fp16 operands with fp32 accumulation, as the CUDA mma twin. Head dims below NF_FM_D read zeros past
+ * d_k / d_v through the clamped tensor layouts. A per-tile scan of the key positions against the query rows skips the
+ * tiles invisible to every row; a whole tile every valid row sees, under the plain score (no softcap, no position
+ * bias), scales S in place, and every other tile applies the capped score, the position bias and the -INF mask per
+ * element.
+ * Finally rows apply sinks and 1 / l (l == 0 writes 0) or emit the (o, m, l) partials.
+ *
+ * Plan constraints (FlashAttnTiling.mma guarantees them; a violation writes NaN outputs): d_k and d_v positive
+ * multiples of 16 of at most NF_FM_D, R == NF_FM_BM, g_tile in 1..NF_FD_MAX_G, bk >= 1, split_len > 0,
+ * local size == NF_FM_WG, direct_out only with n_split == 1, paged page_shift in 0..20 and pt_off >= 0.
+ * Requires VK_NV_cooperative_matrix2 with workgroup scope, flexible dimensions, tensor addressing, per-element
+ * operations, reductions and use conversions, fp16 x fp16 -> fp32 workgroup tiles of NF_FM_WG invocations, and
+ * bufferDeviceAddress for the paged decode callback (DeviceFeature.COOPERATIVE_MATRIX_2_ATTENTION).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_NV_cooperative_matrix2 : require
+#extension GL_EXT_buffer_reference : require
+
+#include "common/nf_common.glsl"
+#include "common/act.glsl"
+#include "common/attn_common.glsl"
+
+#define NF_FM_WG 128                 /* workgroup size */
+#define NF_FM_BM 64                  /* query rows per workgroup (bq * g_tile) */
+#define NF_FM_BN 64                  /* keys per tile (llama.cpp's coopmat2 Bc for fp16 head dims up to 128) */
+#define NF_FM_D  128                 /* matrix head dim: the largest d_k / d_v (FlashAttnTiling.MMA_MAX_HEAD_DIM) */
+#define NF_FM_QS (NF_FM_D + 8)       /* padded half stride of a staged Q row */
+
+layout(std430, binding = 0) readonly buffer NfFmQ { float q_in[]; };
+layout(std430, binding = 1) readonly buffer NfFmK { float16_t k_h[]; };
+layout(std430, binding = 2) readonly buffer NfFmV { float16_t v_h[]; };
+layout(std430, binding = 3) readonly buffer NfFmQPos { int q_pos[]; };
+layout(std430, binding = 4) readonly buffer NfFmKvPos { int kv_pos[]; };
+layout(std430, binding = 5) readonly buffer NfFmSinks { float sinks[]; };
+layout(std430, binding = 6) readonly buffer NfFmRelBias { float rel_bias[]; };
+layout(std430, binding = 7) writeonly buffer NfFmOut { float dst[]; };
+layout(std430, binding = 8) writeonly buffer NfFmPartial { float partial[]; };
+#if defined(PAGED)
+layout(std430, binding = 9) readonly buffer NfFmPages { int page_table[]; };
+layout(std430, binding = 10) readonly buffer NfFmTreeMask { uvec2 tree_mask[]; };
+#else
+layout(std430, binding = 9) readonly buffer NfFmTreeMask { uvec2 tree_mask[]; };
+#endif
+
+layout(push_constant) uniform NfFmParams {
+    int n_tokens; int n_head; int n_head_kv; int d_k; int d_v;
+    int bq; int bk; int g_tile; int n_split; int split_len;
+    int kv_start; int kv_end;
+    int q_row_stride; int out_row_stride;
+    int k_row_stride; int k_head_stride; int v_row_stride; int v_head_stride;
+    float scale; float softcap; float max_bias;
+    int flags; int swa_type; int n_swa;
+    int bias_mode; int n_buckets; int max_distance;
+    int q_off; int out_off;
+#if defined(PAGED)
+    int page_shift; int pt_off;
+#endif
+} pc;
+
+/* Staged Q rows, and per query row r: its position (-1 for a row outside the launch), token, head, ALiBi slope and
+ * tree bits; per tile column c the key position (-1 for a missing key or page); per subgroup its tile visibility. */
+shared float16_t fm_q[NF_FM_BM * NF_FM_QS];
+shared int fm_qpos[NF_FM_BM];
+shared int fm_tok[NF_FM_BM];
+shared int fm_head[NF_FM_BM];
+shared float fm_slope[NF_FM_BM];
+shared uvec2 fm_tree[NF_FM_BM];
+shared int fm_kpos[2 * NF_FM_BN];   /* two tile buffers, alternating by tile parity */
+shared uint fm_any[NF_FM_WG];
+shared uint fm_all[NF_FM_WG];
+
+/* The workgroup's split, its K / V head offsets and the current tile's key-position buffer, read by the per-element
+ * callbacks. */
+uint g_split;
+uint g_kbuf;
+uint g_k_head;
+uint g_v_head;
+
+bool nf_fm_plan_ok() {
+    return pc.n_head > 0 && pc.n_head_kv > 0 && pc.n_head % pc.n_head_kv == 0
+        && pc.g_tile >= 1 && pc.g_tile <= NF_FD_MAX_G && pc.bq >= 1 && pc.bq * pc.g_tile == NF_FM_BM
+        && pc.bk >= 1
+        && pc.d_k > 0 && pc.d_v > 0 && pc.d_k <= NF_FM_D && pc.d_v <= NF_FM_D
+        && (pc.d_k & 15) == 0 && (pc.d_v & 15) == 0
+        && pc.n_split >= 1 && pc.split_len > 0
+        && ((pc.flags & NF_ATTN_FLAG_DIRECT) == 0 || pc.n_split == 1)
+#if defined(PAGED)
+        && pc.page_shift >= 0 && pc.page_shift <= 20 && pc.pt_off >= 0
+#endif
+        && gl_WorkGroupSize.x == uint(NF_FM_WG);
+}
+
+/* NaN over the outputs of a call that violates the plan (workgroup (0, 0, 0) only). */
+void nf_fm_poison() {
+    if (gl_WorkGroupID.x != 0u || gl_WorkGroupID.y != 0u || gl_WorkGroupID.z != 0u
+        || pc.n_tokens <= 0 || pc.n_head <= 0 || pc.d_v <= 0 || pc.n_split <= 0) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    if ((pc.flags & NF_ATTN_FLAG_DIRECT) != 0) {
+        const uint n = uint(pc.n_head * pc.d_v);
+        for (int t = 0; t < pc.n_tokens; t++) {
+            for (uint i = lid; i < n; i += gl_WorkGroupSize.x) {
+                dst[uint(pc.out_off + t * pc.out_row_stride) + i] = NF_NAN;
+            }
+        }
+    } else {
+        const uint n = uint(pc.n_tokens * pc.n_head * pc.n_split * (pc.d_v + 2));
+        for (uint i = lid; i < n; i += gl_WorkGroupSize.x) {
+            partial[i] = NF_NAN;
+        }
+    }
+}
+
+/* Position bias of head h (flash_prefill.comp nf_fa_bias); slope = ALiBi slope of h, q_row = the query token. */
+float nf_fm_bias(int h, int p_q, int p_k, float slope, int q_row) {
+    if (pc.bias_mode == NF_ATTN_BIAS_ALIBI) {
+        return slope * (-float(abs(p_q - p_k)));
+    }
+    if (pc.bias_mode == NF_ATTN_BIAS_ALIBI_SQRT) {
+        return p_k <= p_q ? slope * (-sqrt(float(p_q - p_k))) : 0.0;
+    }
+    if (pc.bias_mode == NF_ATTN_BIAS_T5_CAUSAL || pc.bias_mode == NF_ATTN_BIAS_T5_BIDIR) {
+        const int bucket = nf_t5_bucket(p_k, p_q, pc.n_buckets, pc.max_distance,
+                                        pc.bias_mode == NF_ATTN_BIAS_T5_BIDIR ? 1 : 0);
+        return rel_bias[bucket * pc.n_head + h];
+    }
+    if (pc.bias_mode == NF_ATTN_BIAS_INKLING) {
+        const int dist = p_q - p_k;
+        if (dist < 0 || dist >= pc.n_buckets) {
+            return 0.0;
+        }
+        return rel_bias[(q_row * pc.n_head + h) * pc.n_buckets + dist];
+    }
+    return 0.0;
+}
+
+/* Whether query row r sees the key at tile column c (both staged; the slot rules of flash_prefill.comp). */
+bool nf_fm_visible(const uint r, const uint c) {
+    const int p_q = fm_qpos[r];
+    const int p_k = fm_kpos[g_kbuf + c];
+    return p_q >= 0 && p_k >= 0
+        && nf_attn_tree_visible(p_k, fm_tree[r], pc.kv_end, nf_attn_flag_fresh(pc.flags), p_q,
+                                pc.flags & NF_ATTN_FLAG_CAUSAL, pc.swa_type, pc.n_swa) != 0;
+}
+
+/* Per-element score of S: the capped, scaled logit plus the position bias, -INF where the key is masked. */
+float nf_fm_score(const in uint r, const in uint c, const in float dot_qk) {
+    if (!nf_fm_visible(r, c)) {
+        return -NF_INF;
+    }
+    return nf_attn_score(dot_qk, pc.scale, pc.softcap)
+         + nf_fm_bias(fm_head[r], fm_qpos[r], fm_kpos[g_kbuf + c], fm_slope[r], fm_tok[r]);
+}
+
+float nf_fm_max_op(const in uint r, const in uint c, const in float a, const in float b) {
+    return max(a, b);
+}
+
+/* e^(x - m), exactly 0 for a masked x (common/attn_common.glsl nf_attn_rescale). */
+float nf_fm_rescale_op(const in uint r, const in uint c, const in float x, const in float m) {
+    return nf_attn_rescale(x, m);
+}
+
+float nf_fm_max_reduce(const in float a, const in float b) {
+    return max(a, b);
+}
+
+float nf_fm_smear_reduce(const in float a, const in float b) {
+    return a;
+}
+
+/* Partial plane of row r: ((t * n_head + h) * n_split + split) * (d_v + 2). */
+uint nf_fm_partial_base(const uint r) {
+    return uint(((fm_tok[r] * pc.n_head + fm_head[r]) * pc.n_split + int(g_split)) * (pc.d_v + 2));
+}
+
+/* Stores o of a valid row and value column as its partial; returns o. */
+float nf_fm_store_partial_o(const in uint r, const in uint c, const in float o) {
+    if (fm_qpos[r] >= 0 && c < uint(pc.d_v)) {
+        partial[nf_fm_partial_base(r) + c] = o;
+    }
+    return o;
+}
+
+/* Stores the row's (m, l) after its partial o from column 0 of the smeared l; returns l. */
+float nf_fm_store_partial_ml(const in uint r, const in uint c, const in float l, const in float m) {
+    if (fm_qpos[r] >= 0 && c == 0u) {
+        const uint b = nf_fm_partial_base(r) + uint(pc.d_v);
+        partial[b] = m;
+        partial[b + 1u] = l;
+    }
+    return l;
+}
+
+/* Stores o of a valid row normalized by its sum and sink: fl = (o factor, sum), 0 when the sum is 0; returns o. */
+float nf_fm_store_out(const in uint r, const in uint c, const in float o, const in float m, const in float l) {
+    if (fm_qpos[r] >= 0 && c < uint(pc.d_v)) {
+        const int h = fm_head[r];
+        const vec2 fl = (pc.flags & NF_ATTN_FLAG_SINKS) != 0 ? nf_attn_sink(m, l, sinks[h]) : vec2(1.0, l);
+        dst[uint(pc.out_off + fm_tok[r] * pc.out_row_stride + h * pc.d_v) + c] = fl.y > 0.0 ? o * fl.x / fl.y : 0.0;
+    }
+    return o;
+}
+
+#if defined(PAGED)
+/* One fp16 element: the paged tensor loads use 1 x 1 blocks whose callbacks resolve the slot's physical row. */
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer NfFmHalf { float16_t h; };
+
+int nf_fm_page_id(int slot) {
+    return page_table[uint(pc.pt_off + (slot >> pc.page_shift))];
+}
+
+/* Element (slot, d) of the K / V cache head of the workgroup at the slot's physical row; 0 for a missing page. */
+float16_t nf_fm_paged_k(const in NfFmHalf ref, const in uint block[2], const in uint inner[2]) {
+    const int slot = int(block[0]);
+    const int pid = nf_fm_page_id(slot);
+    if (pid < 0) {
+        return float16_t(0.0);
+    }
+    return k_h[uint(nf_kv_row(slot, pc.page_shift, pid)) * uint(pc.k_row_stride) + g_k_head + block[1]];
+}
+
+float16_t nf_fm_paged_v(const in NfFmHalf ref, const in uint block[2], const in uint inner[2]) {
+    const int slot = int(block[0]);
+    const int pid = nf_fm_page_id(slot);
+    if (pid < 0) {
+        return float16_t(0.0);
+    }
+    return v_h[uint(nf_kv_row(slot, pc.page_shift, pid)) * uint(pc.v_row_stride) + g_v_head + block[1]];
+}
+
+/* Position of the key at slot, -1 for a missing page. */
+int nf_fm_key_pos(int slot) {
+    const int pid = nf_fm_page_id(slot);
+    return pid >= 0 ? kv_pos[uint(nf_kv_row(slot, pc.page_shift, pid))] : -1;
+}
+#else
+int nf_fm_key_pos(int slot) {
+    return kv_pos[uint(slot)];
+}
+#endif
+
+void main() {
+    if (!nf_fm_plan_ok()) {
+        nf_fm_poison();
+        return;   /* uniform across the workgroup: no barrier has been reached */
+    }
+
+    const uint lid = gl_LocalInvocationID.x;
+    const int g_tile = pc.g_tile;
+    const int G = pc.n_head / pc.n_head_kv;
+    const int n_gt = (G + g_tile - 1) / g_tile;
+    const int kvh = int(gl_WorkGroupID.y) / n_gt;
+    const int gt = int(gl_WorkGroupID.y) - kvh * n_gt;
+    const int h0 = kvh * G + gt * g_tile;
+    const int g_cnt = min(g_tile, G - gt * g_tile);
+    const int t0 = int(gl_WorkGroupID.x) * pc.bq;
+    const int split = int(gl_WorkGroupID.z);
+    const int k_begin = pc.kv_start + split * pc.split_len;
+    const int k_stop = split < pc.n_split ? min(k_begin + pc.split_len, pc.kv_end) : k_begin;
+    const bool tree = (pc.flags & NF_ATTN_FLAG_TREE) != 0;
+    g_split = uint(split);
+    g_k_head = uint(kvh * pc.k_head_stride);
+    g_v_head = uint(kvh * pc.v_head_stride);
+
+    /* 0. Stage the row identities and the Q tile as fp16 (rows outside the launch and columns past d_k are 0). */
+    if (lid < uint(NF_FM_BM)) {
+        const int r = int(lid);
+        const int i = r / g_tile;
+        const int g = r - i * g_tile;
+        const int t = t0 + i;
+        const bool ok = t < pc.n_tokens && g < g_cnt;
+        fm_qpos[r] = ok ? q_pos[t] : -1;
+        fm_tok[r] = t;
+        fm_head[r] = h0 + g;
+        fm_slope[r] = (pc.bias_mode == NF_ATTN_BIAS_ALIBI || pc.bias_mode == NF_ATTN_BIAS_ALIBI_SQRT) && ok
+                      ? nf_alibi_slope(h0 + g, pc.n_head, pc.max_bias) : 1.0;
+        fm_tree[r] = tree && ok ? tree_mask[t] : uvec2(0u);
+    }
+    for (uint idx = lid; idx < uint(NF_FM_BM * (NF_FM_D / 4)); idx += uint(NF_FM_WG)) {
+        const int r = int(idx) / (NF_FM_D / 4);
+        const int d = 4 * (int(idx) - r * (NF_FM_D / 4));
+        const int i = r / g_tile;
+        const int g = r - i * g_tile;
+        const int t = t0 + i;
+        vec4 f = vec4(0.0);
+        if (t < pc.n_tokens && g < g_cnt && d < pc.d_k) {
+            const uint qi = uint(pc.q_off + t * pc.q_row_stride + (h0 + g) * pc.d_k + d);
+            f = vec4(q_in[qi], q_in[qi + 1u], q_in[qi + 2u], q_in[qi + 3u]);
+        }
+        const uint b = uint(r * NF_FM_QS + d);
+        fm_q[b] = float16_t(f.x);
+        fm_q[b + 1u] = float16_t(f.y);
+        fm_q[b + 2u] = float16_t(f.z);
+        fm_q[b + 3u] = float16_t(f.w);
+    }
+    barrier();
+
+    coopmat<float16_t, gl_ScopeWorkgroup, NF_FM_BM, NF_FM_D, gl_MatrixUseA> qa;
+    coopMatLoad(qa, fm_q, 0u, uint(NF_FM_QS), gl_CooperativeMatrixLayoutRowMajor);
+
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> lk =
+        createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> lv =
+        createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    lk = setTensorLayoutDimensionNV(lk, uint(max(k_stop, 0)), uint(pc.d_k));
+    lv = setTensorLayoutDimensionNV(lv, uint(max(k_stop, 0)), uint(pc.d_v));
+#if defined(PAGED)
+    lk = setTensorLayoutBlockSizeNV(lk, 1u, 1u);
+    lv = setTensorLayoutBlockSizeNV(lv, 1u, 1u);
+    lk = setTensorLayoutStrideNV(lk, uint(pc.d_k), 1u);
+    lv = setTensorLayoutStrideNV(lv, uint(pc.d_v), 1u);
+#else
+    lk = setTensorLayoutStrideNV(lk, uint(pc.k_row_stride), 1u);
+    lv = setTensorLayoutStrideNV(lv, uint(pc.v_row_stride), 1u);
+#endif
+    tensorViewNV<2, false, 1, 0> transpose = createTensorViewNV(2, false, 1, 0);
+
+    coopmat<float, gl_ScopeWorkgroup, NF_FM_BM, NF_FM_D, gl_MatrixUseAccumulator> o =
+        coopmat<float, gl_ScopeWorkgroup, NF_FM_BM, NF_FM_D, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeWorkgroup, NF_FM_BM, NF_FM_BN, gl_MatrixUseAccumulator> m =
+        coopmat<float, gl_ScopeWorkgroup, NF_FM_BM, NF_FM_BN, gl_MatrixUseAccumulator>(-NF_INF);
+    coopmat<float, gl_ScopeWorkgroup, NF_FM_BM, NF_FM_BN, gl_MatrixUseAccumulator> l =
+        coopmat<float, gl_ScopeWorkgroup, NF_FM_BM, NF_FM_BN, gl_MatrixUseAccumulator>(0.0);
+
+    /* A tile every valid row sees whole, under the plain score (no softcap, no position bias), takes S * scale in
+     * place of the per-element score; any other tile applies nf_fm_score per element. */
+    const bool plain_score = pc.softcap <= 0.0 && pc.bias_mode == NF_ATTN_BIAS_NONE;
+    const coopmat<float16_t, gl_ScopeWorkgroup, NF_FM_BN, NF_FM_BN, gl_MatrixUseB> ones =
+        coopmat<float16_t, gl_ScopeWorkgroup, NF_FM_BN, NF_FM_BN, gl_MatrixUseB>(float16_t(1.0));
+    uint parity = 0u;
+    for (int kt = k_begin; kt < k_stop; kt += NF_FM_BN) {
+        const int nk = min(NF_FM_BN, k_stop - kt);
+
+        /* 1. Stage the tile's key positions (missing keys -1) into the buffer of this tile's parity, which no
+         * invocation still reads: the previous reader of that buffer, two tiles back, passed the barrier below of the
+         * previous tile first. Then skip a tile invisible to every row, and note a tile every valid row sees whole. */
+        g_kbuf = parity * uint(NF_FM_BN);
+        parity ^= 1u;
+        if (lid < uint(NF_FM_BN)) {
+            fm_kpos[g_kbuf + lid] = int(lid) < nk ? nf_fm_key_pos(kt + int(lid)) : -1;
+        }
+        barrier();
+        bool any = false;
+        bool all = nk == NF_FM_BN;
+        for (int idx = int(lid); idx < pc.bq * NF_FM_BN; idx += NF_FM_WG) {
+            const int i = idx / NF_FM_BN;
+            const uint r = uint(i * g_tile);
+            if (fm_qpos[r] >= 0) {
+                const bool v = nf_fm_visible(r, uint(idx - i * NF_FM_BN));
+                any = any || v;
+                all = all && v;
+            }
+        }
+        any = subgroupAny(any);
+        all = subgroupAll(all);
+        if (subgroupElect()) {
+            fm_any[gl_SubgroupID] = any ? 1u : 0u;
+            fm_all[gl_SubgroupID] = all ? 1u : 0u;
+        }
+        barrier();
+        uint vis = 0u;
+        uint whole = 1u;
+        for (uint sg = 0u; sg < gl_NumSubgroups; sg++) {
+            vis |= fm_any[sg];
+            whole &= fm_all[sg];
+        }
+        if (vis == 0u) {
+            continue;
+        }
+
+        /* 2. S = Q K^T with the scores, bias and mask applied per element. */
+        coopmat<float16_t, gl_ScopeWorkgroup, NF_FM_D, NF_FM_BN, gl_MatrixUseB> kt_mat;
+#if defined(PAGED)
+        coopMatLoadTensorNV(kt_mat, k_h, 0u, sliceTensorLayoutNV(lk, uint(kt), NF_FM_BN, 0u, NF_FM_D), transpose,
+                            nf_fm_paged_k);
+#else
+        coopMatLoadTensorNV(kt_mat, k_h, g_k_head, sliceTensorLayoutNV(lk, uint(kt), NF_FM_BN, 0u, NF_FM_D),
+                            transpose);
+#endif
+        coopmat<float, gl_ScopeWorkgroup, NF_FM_BM, NF_FM_BN, gl_MatrixUseAccumulator> s =
+            coopmat<float, gl_ScopeWorkgroup, NF_FM_BM, NF_FM_BN, gl_MatrixUseAccumulator>(0.0);
+        s = coopMatMulAdd(qa, kt_mat, s);
+        if (whole != 0u && plain_score) {
+            s = s * pc.scale;
+        } else {
+            coopMatPerElementNV(s, s, nf_fm_score);
+        }
+
+        /* 3. Online softmax over the row reductions (every column of m, l and rowmax holds its row's value). */
+        coopmat<float, gl_ScopeWorkgroup, NF_FM_BM, NF_FM_BN, gl_MatrixUseAccumulator> rowmax, m_new, p, alpha;
+        coopMatReduceNV(rowmax, s, gl_CooperativeMatrixReduceRowNV, nf_fm_max_reduce);
+        coopMatPerElementNV(m_new, rowmax, nf_fm_max_op, m);
+        coopMatPerElementNV(p, s, nf_fm_rescale_op, m_new);
+        coopMatPerElementNV(alpha, m, nf_fm_rescale_op, m_new);
+        m = m_new;
+
+        /* The row sums come from the fp16 P that multiplies V, as a product with a ones matrix on the tensor cores
+         * (llama.cpp's flash_attn_cm2), so L and O sum the same weights. */
+        const coopmat<float16_t, gl_ScopeWorkgroup, NF_FM_BM, NF_FM_BN, gl_MatrixUseA> pa =
+            coopmat<float16_t, gl_ScopeWorkgroup, NF_FM_BM, NF_FM_BN, gl_MatrixUseA>(p);
+        coopmat<float, gl_ScopeWorkgroup, NF_FM_BM, NF_FM_BN, gl_MatrixUseAccumulator> rowsum =
+            coopmat<float, gl_ScopeWorkgroup, NF_FM_BM, NF_FM_BN, gl_MatrixUseAccumulator>(0.0);
+        rowsum = coopMatMulAdd(pa, ones, rowsum);
+        l = l * alpha + rowsum;
+
+        /* 4. O = O * alpha + fp16(P) V. */
+        coopmat<float16_t, gl_ScopeWorkgroup, NF_FM_BN, NF_FM_D, gl_MatrixUseB> v_mat;
+#if defined(PAGED)
+        coopMatLoadTensorNV(v_mat, v_h, 0u, sliceTensorLayoutNV(lv, uint(kt), NF_FM_BN, 0u, NF_FM_D), nf_fm_paged_v);
+#else
+        coopMatLoadTensorNV(v_mat, v_h, g_v_head, sliceTensorLayoutNV(lv, uint(kt), NF_FM_BN, 0u, NF_FM_D));
+#endif
+        coopmat<float, gl_ScopeWorkgroup, NF_FM_BM, NF_FM_D, gl_MatrixUseAccumulator> alpha_d;
+        coopMatReduceNV(alpha_d, alpha, gl_CooperativeMatrixReduceRowNV, nf_fm_smear_reduce);
+        o = o * alpha_d;
+        o = coopMatMulAdd(pa, v_mat, o);
+    }
+
+    /* 5. Output: the (o, m, l) partials, or o normalized by its sum and sink. */
+    if ((pc.flags & NF_ATTN_FLAG_DIRECT) == 0) {
+        coopMatPerElementNV(o, o, nf_fm_store_partial_o);
+        coopMatPerElementNV(l, l, nf_fm_store_partial_ml, m);
+        return;
+    }
+    coopmat<float, gl_ScopeWorkgroup, NF_FM_BM, NF_FM_D, gl_MatrixUseAccumulator> m_d, l_d;
+    coopMatReduceNV(m_d, m, gl_CooperativeMatrixReduceRowNV, nf_fm_smear_reduce);
+    coopMatReduceNV(l_d, l, gl_CooperativeMatrixReduceRowNV, nf_fm_smear_reduce);
+    coopMatPerElementNV(o, o, nf_fm_store_out, m_d, l_d);
+}

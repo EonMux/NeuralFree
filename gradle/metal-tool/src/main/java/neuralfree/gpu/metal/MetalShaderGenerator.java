@@ -34,7 +34,9 @@ import java.util.regex.Pattern;
  * keeps its subgroup reductions as {@code simd_*} calls. A kernel the index pins to one subgroup width
  * ({@code <name>.sgsize}, the Vulkan twin of an OpenCL kernel written for Intel's 16-lane subgroups) is skipped:
  * Apple SIMD groups have a fixed width of 32 lanes, so the module's lane arithmetic cannot run there, and such a
- * kernel is outside the portable inventory the Metal library must cover.</p>
+ * kernel is outside the portable inventory the Metal library must cover. A kernel the index marks Vulkan-only
+ * ({@code <name>.vulkan=1}) is skipped too: it uses SPIR-V extensions MSL cannot express, such as
+ * {@code VK_NV_cooperative_matrix2}'s tensor opcodes, and has no Metal counterpart.</p>
  *
  * <p>Usage: {@code MetalShaderGenerator --spv <spirvDir> --out <metalDir>}.</p>
  */
@@ -188,7 +190,7 @@ public final class MetalShaderGenerator {
                 continue;
             }
             String name = key.substring(0, key.length() - ".buffers".length());
-            if (props.getProperty(name + ".sgsize") != null) {
+            if (props.getProperty(name + ".sgsize") != null || "1".equals(props.getProperty(name + ".vulkan"))) {
                 continue;
             }
             String buffers = props.getProperty(key);

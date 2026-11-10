@@ -22,11 +22,15 @@
  *   OP_RESIDUAL_MIX_NORM (i n_rows, i row_len, i mode, f eps, i flags, i w_rows, i mix_mode, f mix_s,
  *                       i x_off, i add_off, i y_off, float x, R float addend, R float w, R float b, float y)
  *       the OP_RESIDUAL_MIX modes 0/1 of x's row with addend's row, written back to x, then the OP_ROW_NORM
- *       of the sum into y, in one workgroup per row; x and y must not overlap.
+ *       of the sum into y, in one workgroup per row; x and y must not overlap. A row of a multiple of 4 floats
+ *       at 16-byte aligned offsets that fits NF_NX_VEC4_MAX vec4 per invocation stays in registers between the
+ *       mix and the norm (vec4 loads and stores, no re-read of x): the one-workgroup row is latency-bound, so the
+ *       independent vec4 loads replace serial scalar round trips. Other rows take the scalar strided loop.
  *   OP_ROW_NORM_Q8     (OP_ROW_NORM's arguments, then W uchar q8)
  *   OP_RESIDUAL_MIX_NORM_Q8 (OP_RESIDUAL_MIX_NORM's arguments, then W uchar q8)
  *       the same y (and x) plus row r's Q8_1 blocks at byte r * (row_len / 32) * 36 of q8, with the bits
- *       LLM_QuantizeQ8_1 (quantize_q8_1.comp) writes for the y values; row_len a multiple of 32.
+ *       LLM_QuantizeQ8_1 (quantize_q8_1.comp) writes for the y values; row_len a multiple of 32. The Q8 forms
+ *       always take the scalar strided loop.
  *   OP_MUL_ROW_SCALE   (i n_rows, i row_len, i scale_len, R float scale, float x)
  *       x[r*row_len + c] *= scale[scale_len == 1 ? 0 : c].
  * Buffers take bindings 0.. in argument order; scalars fill the push block in argument order. Operands that
@@ -140,6 +144,14 @@ layout(std430, binding = 1) readonly buffer NfNxAdd { float add_in[]; };
 layout(std430, binding = 2) readonly buffer NfNxW { float w_in[]; };
 layout(std430, binding = 3) readonly buffer NfNxB { float b_in[]; };
 layout(std430, binding = 4) writeonly buffer NfNxY { float y_out[]; };
+#if OP == OP_RESIDUAL_MIX_NORM
+layout(std430, binding = 0) buffer NfNxX4 { vec4 x4[]; };
+layout(std430, binding = 1) readonly buffer NfNxAdd4 { vec4 add4[]; };
+layout(std430, binding = 2) readonly buffer NfNxW4 { vec4 w4[]; };
+layout(std430, binding = 3) readonly buffer NfNxB4 { vec4 b4[]; };
+layout(std430, binding = 4) writeonly buffer NfNxY4 { vec4 y4[]; };
+#define NF_NX_VEC4_MAX 4   /* vec4 per invocation of the register-resident row: 4096 floats at 256 invocations */
+#endif
 layout(push_constant) uniform NfNxParams {
     int n_rows;
     int row_len;
@@ -253,6 +265,84 @@ void nf_norm_ext_store_q8(uint row, uint xb, uint yb, uint wb, uint row_len, flo
             y_out[yb + i] = v;
         }
         nf_norm_ext_q8(q8b, i, live, v);
+    }
+}
+#endif
+
+#if OP == OP_RESIDUAL_MIX_NORM || OP == OP_RESIDUAL_MIX_NORM_Q8
+/* The normalization of a row from its sum, its sum of squares and (LAYER) its squared deviation from the mean:
+ * (mean, scale, post) with y = (x - mean) * scale * post before the weight and bias. */
+vec3 nf_rmn_norm(float sum, float ss, float dev, float n) {
+    if (pc.mode == NF_NORM_EXT_LAYER) {
+        return vec3(sum / n, inversesqrt(dev / n + pc.eps), 1.0);
+    }
+    if (pc.mode == NF_NORM_EXT_L2_CLAMP) {
+        return vec3(0.0, 1.0 / max(sqrt(ss), pc.eps), 1.0);
+    }
+    if (pc.mode == NF_NORM_EXT_L2_GDN) {
+        return vec3(0.0, inversesqrt(ss / n + pc.eps / n), inversesqrt(n));
+    }
+    return vec3(0.0, inversesqrt(ss / n + pc.eps), 1.0);
+}
+#endif
+
+#if OP == OP_RESIDUAL_MIX_NORM
+/* The register-resident row: element offsets xb, ab, yb and wb are multiples of 4, row_len / 4 vec4 fit
+ * NF_NX_VEC4_MAX per invocation. The weight and bias step rounds as nf_norm_ext_value's does. */
+void nf_rmn_row4(uint xb, uint ab, uint yb, uint wb, uint row_len) {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint n4 = row_len >> 2u;
+    const float n = float(row_len);
+    vec4 v[NF_NX_VEC4_MAX];
+    float sum = 0.0;
+    float ss = 0.0;
+    [[unroll]] for (uint k = 0u; k < uint(NF_NX_VEC4_MAX); k++) {
+        const uint i = lid + k * gl_WorkGroupSize.x;
+        v[k] = vec4(0.0);
+        if (i < n4) {
+            const vec4 c = add4[(ab >> 2u) + i];
+            const vec4 a = x4[(xb >> 2u) + i];
+            v[k] = pc.mix_mode == NF_MIX_SCALED ? a + pc.mix_s * c : a + c;
+            x4[(xb >> 2u) + i] = v[k];
+            sum += (v[k].x + v[k].y) + (v[k].z + v[k].w);
+            ss += dot(v[k], v[k]);
+        }
+    }
+    float dev = 0.0;
+    float tsum = 0.0;
+    float tss = 0.0;
+    if (pc.mode == NF_NORM_EXT_LAYER) {
+        tsum = nf_wg_sum(sum);
+        const float mean = tsum / n;
+        [[unroll]] for (uint k = 0u; k < uint(NF_NX_VEC4_MAX); k++) {
+            if (lid + k * gl_WorkGroupSize.x < n4) {
+                const vec4 d = v[k] - mean;
+                dev += dot(d, d);
+            }
+        }
+        dev = nf_wg_sum(dev);
+    } else {
+        tss = nf_wg_sum(ss);
+    }
+    const vec3 msp = nf_rmn_norm(tsum, tss, dev, n);
+    const bool has_w = (pc.flags & NF_NORM_EXT_HAS_W) != 0;
+    const bool has_b = (pc.flags & NF_NORM_EXT_HAS_B) != 0;
+    [[unroll]] for (uint k = 0u; k < uint(NF_NX_VEC4_MAX); k++) {
+        const uint i = lid + k * gl_WorkGroupSize.x;
+        if (i < n4) {
+            vec4 o = (v[k] - msp.x) * msp.y;
+            if (pc.mode == NF_NORM_EXT_L2_GDN) {
+                o *= msp.z;
+            }
+            if (has_w && has_b) {
+                o = fma(o, w4[(wb >> 2u) + i], b4[(wb >> 2u) + i]);
+            } else if (has_w) {
+                o *= w4[(wb >> 2u) + i];
+            } else if (has_b) {
+                o += b4[(wb >> 2u) + i];
+            }
+            y4[(yb >> 2u) + i] = o;
+        }
     }
 }
 #endif
@@ -380,7 +470,15 @@ void main() {
     const uint xb = uint(pc.x_off) + row * row_len;
     const uint ab = uint(pc.add_off) + row * row_len;
     const uint yb = uint(pc.y_off) + row * row_len;
+    const uint wb = (pc.w_rows > 1 ? row % uint(pc.w_rows) : 0u) * row_len;
     const float n = float(pc.row_len);
+#if OP == OP_RESIDUAL_MIX_NORM
+    if ((row_len & 3u) == 0u && row_len <= 4u * uint(NF_NX_VEC4_MAX) * gl_WorkGroupSize.x
+        && ((xb | ab | yb) & 3u) == 0u) {
+        nf_rmn_row4(xb, ab, yb, wb, row_len);
+        return;   /* uniform across the workgroup */
+    }
+#endif
 
     float sum = 0.0;
     float ss = 0.0;
@@ -392,35 +490,27 @@ void main() {
         ss += v * v;
     }
 
-    float mean = 0.0;
-    float scale;
-    float post = 1.0;
+    float tsum = 0.0;
+    float tss = 0.0;
+    float dev = 0.0;
     if (pc.mode == NF_NORM_EXT_LAYER) {
-        mean = nf_wg_sum(sum) / n;
-        float dev = 0.0;
+        tsum = nf_wg_sum(sum);
+        const float mean = tsum / n;
         for (uint i = gl_LocalInvocationID.x; i < row_len; i += gl_WorkGroupSize.x) {
             const float d = x_in[xb + i] - mean;
             dev += d * d;
         }
-        scale = inversesqrt(nf_wg_sum(dev) / n + pc.eps);
+        dev = nf_wg_sum(dev);
     } else {
-        const float tss = nf_wg_sum(ss);
-        if (pc.mode == NF_NORM_EXT_L2_CLAMP) {
-            scale = 1.0 / max(sqrt(tss), pc.eps);
-        } else if (pc.mode == NF_NORM_EXT_L2_GDN) {
-            scale = inversesqrt(tss / n + pc.eps / n);
-            post = inversesqrt(n);
-        } else {
-            scale = inversesqrt(tss / n + pc.eps);
-        }
+        tss = nf_wg_sum(ss);
     }
+    const vec3 msp = nf_rmn_norm(tsum, tss, dev, n);
 
-    const uint wb = (pc.w_rows > 1 ? row % uint(pc.w_rows) : 0u) * row_len;
-#if OP == OP_ROW_NORM_Q8 || OP == OP_RESIDUAL_MIX_NORM_Q8
-    nf_norm_ext_store_q8(row, xb, yb, wb, row_len, mean, scale, post);
+#if OP == OP_RESIDUAL_MIX_NORM_Q8
+    nf_norm_ext_store_q8(row, xb, yb, wb, row_len, msp.x, msp.y, msp.z);
 #else
     for (uint i = gl_LocalInvocationID.x; i < row_len; i += gl_WorkGroupSize.x) {
-        y_out[yb + i] = nf_norm_ext_value(xb, wb, i, mean, scale, post);
+        y_out[yb + i] = nf_norm_ext_value(xb, wb, i, msp.x, msp.y, msp.z);
     }
 #endif
 #endif

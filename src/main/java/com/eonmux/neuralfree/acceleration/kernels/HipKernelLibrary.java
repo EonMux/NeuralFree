@@ -47,7 +47,8 @@ import java.util.Set;
  * when a kernel of the inventory whose source is not a {@code [cuda]} manifest entry is missing
  * from the index. The {@code [cuda]} sources (the PTX-only mma.sync kernels) compile on no HIP
  * pass, so the HIP index holds the scalar-twin and non-mma kernels only; the host selects the
- * mma kernels through DeviceFeature.COOPERATIVE_MATRIX on CUDA and Vulkan.</p>
+ * mma kernels through DeviceFeature.COOPERATIVE_MATRIX on CUDA (Vulkan has its own workgroup-scope twins of the
+ * attention ones).</p>
  */
 public final class HipKernelLibrary implements KernelLibrary {
 

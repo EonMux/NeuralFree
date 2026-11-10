@@ -217,7 +217,7 @@ public class FlashSmallBatchBenchTest {
         int smem = kernels.faSmemFloats();
         int cu = Math.max(1, backend.capabilities().getComputeUnits());
         FlashAttnTiling decodePlan = FlashAttnTiling.decode(N_HEAD, N_HEAD_KV, D, D, nKv, smem, cu,
-                backend.capabilities().hasFeature(DeviceFeature.SUBGROUP_SHUFFLE));
+                kernels.decodeWarpPath());
         FlashAttnTiling tiledPlan = FlashAttnTiling.prefill(N_HEAD, N_HEAD_KV, D, D, nKv, smem, cu);
         FlashAttnTiling mmaPlan = FlashAttnTiling.mma(N_HEAD, N_HEAD_KV, D, D, nKv, smem, cu);
 

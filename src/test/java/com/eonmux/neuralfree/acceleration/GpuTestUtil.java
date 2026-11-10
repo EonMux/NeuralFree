@@ -4,6 +4,7 @@ import com.eonmux.neuralfree.acceleration.backend.ComputeBackend.BackendType;
 import com.eonmux.neuralfree.acceleration.cuda.CUDevice;
 import com.eonmux.neuralfree.acceleration.ocl.CLDevice;
 import com.eonmux.neuralfree.acceleration.vulkan.VkDevice;
+import com.eonmux.neuralfree.acceleration.vulkan.VkDeviceRanking;
 import org.junit.Assume;
 
 import java.util.EnumSet;
@@ -156,9 +157,9 @@ public final class GpuTestUtil {
         HWAcceleration hwAccel = null;
         try {
             hwAccel = new HWAcceleration(EnumSet.of(BackendType.VULKAN));
-            if (!hwAccel.getVkDevices().isEmpty()) {
+            VkDevice device = VkDeviceRanking.fastestDevice(hwAccel.getVkDevices(), null);
+            if (device != null) {
                 vulkanAvailable.set(true);
-                VkDevice device = hwAccel.getVkDevices().get(0);
                 vulkanDeviceName.set(device.getBackend().capabilities().getDeviceName());
                 System.out.println("Vulkan GPU available: " + vulkanDeviceName.get());
             } else {

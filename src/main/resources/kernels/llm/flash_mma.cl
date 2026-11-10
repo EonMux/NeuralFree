@@ -8,10 +8,10 @@
  * grid, same online softmax, split-K partials, GQA packing, sinks, softcap, ALiBi, T5 bias, SWA
  * and the paged KV addressing of flash_prefill.cl. K and V caches are F16; Q, the score state and
  * the output stay F32, P and the staged tiles are F16 (as in ggml-cuda/fattn-mma-f16.cuh). The
- * OpenCL program and the Vulkan shader set define no mma kernels: devices reached through them
- * have no matrix-unit access here, so the host runs the scalar kernels (gguf.ops.attn
- * .FlashAttnTiling.Plan.MMA is selected only on a backend that reports DeviceFeature
- * .COOPERATIVE_MATRIX and this kernel).
+ * OpenCL program and the HIP build define no mma kernels, so the host runs the scalar kernels there;
+ * the Vulkan twins are the workgroup-scope cooperative-matrix shaders of
+ * shaders/llm/flash_mma_cm2.comp (gguf.ops.attn.FlashAttnTiling.Plan.MMA is selected only where
+ * gguf.kernels.LlmKernels.flashMmaPath() holds and the backend has the kernel).
  *
  * Layouts (offsets in elements, 64-bit inside the kernel): as flash_prefill.cl, with
  *   q        q[q_off + t * q_row_stride + h * d_k + d], query position q_pos[t]
@@ -766,4 +766,4 @@ NF_KERNEL void LLM_FlashAttnMmaPaged_F16(
 
 #endif /* NF_CUDA_PREPROCESS, or mma.sync.m16n8k16 on compute capability 8.0+ */
 
-#endif /* __CUDACC__ and not __HIP__: the OpenCL program, the HIP build and the Vulkan shader set define no mma kernels */
+#endif /* __CUDACC__ and not __HIP__: the OpenCL program and the HIP build define no mma kernels */

@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.demo.tools;
 
 import com.eonmux.neuralfree.acceleration.GpuTestUtil;
+import com.eonmux.neuralfree.acceleration.backend.KernelTiming;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
@@ -61,7 +62,7 @@ public class BatchedBenchCommandTest {
     private static BatchedBenchCommand.Plan plan(Path model, int[] npp, int[] ntg, int[] npl,
             boolean pps, boolean tgs, boolean jsonl, int ctx) {
         return new BatchedBenchCommand.Plan(model, CPU, list(npp), list(ntg), list(npl),
-                pps, tgs, jsonl, ctx, 8, 1L);
+                pps, tgs, jsonl, false, ctx, 8, 1L);
     }
 
     private static List<Integer> list(int[] values) {
@@ -333,6 +334,34 @@ public class BatchedBenchCommandTest {
         assertTrue(note, note.contains("pp=50 tg=20 pl=1"));
         assertTrue(note, note.contains("n_kv 70") && note.contains("n_kv_max 64"));
         assertFalse("the skipped cell prints no table row", out.toString().contains("|   50 "));
+    }
+
+    /**
+     * {@code --kernels} reports each measured cell's per-kernel device time on standard error, under the cell's grid
+     * coordinates; the CPU engine times no dispatch and says so, and the profiling properties the run sets are
+     * restored afterwards.
+     */
+    @Test
+    public void kernelsReportsEachCellsDeviceTimeOnStandardError() throws Exception {
+        BatchedBenchCommand.Plan parsed = BatchedBenchCommand.parse(new String[] {"m.gguf",
+                "-npp", "4", "-ntg", "3", "-npl", "1", "--kernels"});
+        assertTrue(parsed.kernels);
+        assertFalse(BatchedBenchCommand.parse(new String[] {"m.gguf", "-npp", "4", "-ntg", "3", "-npl", "1"}).kernels);
+
+        Path model = model();
+        BatchedBenchCommand.Plan p = new BatchedBenchCommand.Plan(model, CPU, list(new int[] {4}), list(new int[] {3}),
+                list(new int[] {1, 2}), false, false, false, true, 64, 8, 1L);
+        String priorProfile = System.getProperty(KernelTiming.PROFILE_PROPERTY);
+        StringBuilder out = new StringBuilder();
+        StringBuilder err = new StringBuilder();
+        List<BatchedBenchCommand.BenchRow> measured = BatchedBenchCommand.execute(p, out, err);
+        assertEquals(2, measured.size());
+        String note = err.toString();
+        assertTrue(note, note.contains("nftool batched-bench: per-kernel device time of pp=4 tg=3 pl=1\n"));
+        assertTrue(note, note.contains("nftool batched-bench: per-kernel device time of pp=4 tg=3 pl=2\n"));
+        assertTrue(note, note.contains("(the backend timed no dispatch; --kernels needs the GPU engine)"));
+        assertEquals("the profiling property is restored", priorProfile,
+                System.getProperty(KernelTiming.PROFILE_PROPERTY));
     }
 
     @Test

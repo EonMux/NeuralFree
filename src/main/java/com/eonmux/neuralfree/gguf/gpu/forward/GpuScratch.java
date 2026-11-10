@@ -63,6 +63,8 @@ public final class GpuScratch implements AutoCloseable {
          * per-projection {@link #Q8_1} staging so an intervening projection cannot overwrite them.
          */
         SHARED_Q8_1("gpuops.stage.shared_q8_1"),
+        /** The fp16 activation rows of the cooperative-matrix2 GEMM lane (LLM_Stage_F16_Rows' output). */
+        F16("gpuops.stage.f16"),
         /**
          * The BF16 mirror a W12 projection decodes its weight into (GpuOps.w12Bf16Mirror), apart from every
          * staging view the projection on the mirror touches.

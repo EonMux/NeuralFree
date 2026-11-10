@@ -78,6 +78,28 @@ public final class Int8MatvecTuning {
     private static final Set<GGMLType> COUNTED_PAST_EIGHT_TALL =
             Collections.unmodifiableSet(EnumSet.of(GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.IQ4_XS));
 
+    /**
+     * Smallest row count from which the Vulkan NVIDIA kind's {@link #COUNTED_SMALL_MEASURED} types measured
+     * the paired counted form faster than the lanes it replaces on the projections below
+     * {@link #LANE_MIN_ELEMENTS} (see {@link #countedLaneIsFaster(DeviceKind, GGMLType, long, int)}).
+     */
+    public static final int COUNTED_SMALL_MIN_TOKENS = 3;
+
+    /**
+     * Smallest projection, in weight elements, at which the Vulkan NVIDIA kind's {@link #COUNTED_SMALL_MEASURED}
+     * types measured the paired counted form faster than the batched matvec at two rows below
+     * {@link #LANE_MIN_ELEMENTS}: above the 0.6B q, k, v and o projections the batched matvec keeps (1024x1024,
+     * 2048x1024, a tie at 1024x2048) and no larger than the smallest winning shape (1024x2560).
+     */
+    public static final long COUNTED_SMALL_TWO_ROW_MIN_ELEMENTS = 2_500_000L;
+
+    /**
+     * The Vulkan NVIDIA types whose projections below {@link #LANE_MIN_ELEMENTS} measured the counted lane faster
+     * from {@link #COUNTED_SMALL_MIN_TOKENS} rows, and at two rows from {@link #COUNTED_SMALL_TWO_ROW_MIN_ELEMENTS}.
+     */
+    private static final Set<GGMLType> COUNTED_SMALL_MEASURED =
+            Collections.unmodifiableSet(EnumSet.of(GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K));
+
     private static final Map<DeviceKind, Set<GGMLType>> SLOWER = slower();
     private static final Map<DeviceKind, Set<GGMLType>> LARGE_ONLY = largeOnly();
     private static final Map<DeviceKind, Set<GGMLType>> PAIRED_SLOWER = pairedSlower();
@@ -139,6 +161,32 @@ public final class Int8MatvecTuning {
         }
         return (elements >= LANE_MIN_ELEMENTS && countedFormsRedeem(device, type))
                 || laneIsFaster(device, type, elements);
+    }
+
+    /**
+     * Whether the counted multi-column lane measured faster for a launch of {@code nTokens} rows (2 to
+     * {@link com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants#MATVEC_N_COUNTED_MAX}) over a projection of
+     * {@code elements} weight elements: {@link #countedLaneIsFaster(DeviceKind, GGMLType, long)}, and on the
+     * Vulkan NVIDIA kind also the {@link #COUNTED_SMALL_MEASURED} types' projections below
+     * {@link #LANE_MIN_ELEMENTS} from {@link #COUNTED_SMALL_MIN_TOKENS} rows up, and at two rows from
+     * {@link #COUNTED_SMALL_TWO_ROW_MIN_ELEMENTS} up. There the single-row lane's
+     * small-shape loss is the quantizer launch against the float matvec, while the paired counted form
+     * competes with the batched matvec below the CM2 lane's crossover and with the CM2 lane above it, whose
+     * 64-token tile pays a floor of 24-88us on these shapes. Medians of nine interleaved rounds on the RTX
+     * 5080 Laptop (CountedMatvecNMeasureTest; the pair against the batched matvec at 2 and 3 rows, against
+     * the CM2 lane from 4): Q8_0 2048x1024 16.1 against 19.0us at 3 rows and 17.0 against 24.8 at 8,
+     * 1024x3072 19.3 against 55.1 at 8, 3072x1024 18.0 against 27.7 at 3; Q4_K 1024x3072 13.0 against
+     * 24.3 at 3 and 18.8 against 102.4 at 8; Q6_K wins every count from 3 on every shape below 4M. At two
+     * rows the pair wins from 2.5M elements (Q8_0 1024x2560 13.9 against 16.8us, 1024x3072 15.9 against
+     * 18.8, 3072x1024 20.9 against 29.0) and the batched matvec keeps the smaller shapes below it (Q8_0
+     * 1024x1024: 10.1 against the pair's 14.0us, 2048x1024: 18.6 against 22.7, 1024x2048: 24.2 against 24.9;
+     * Q4_K and Q6_K within 0.9us either way there). Q8_0 1024x1024 at 3 rows is the one loss from 3 up
+     * (12.9 against 13.9us).
+     */
+    public static boolean countedLaneIsFaster(DeviceKind device, GGMLType type, long elements, int nTokens) {
+        boolean smallMeasured = (nTokens >= COUNTED_SMALL_MIN_TOKENS || elements >= COUNTED_SMALL_TWO_ROW_MIN_ELEMENTS)
+                && COUNTED_SMALL_MEASURED.contains(type) && device.equals(nvidiaDiscrete(BackendType.VULKAN));
+        return smallMeasured || countedLaneIsFaster(device, type, elements);
     }
 
     /**

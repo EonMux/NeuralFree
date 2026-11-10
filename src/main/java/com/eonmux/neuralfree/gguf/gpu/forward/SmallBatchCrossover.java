@@ -44,6 +44,14 @@ public final class SmallBatchCrossover {
     public static final long SHAPE_MIN_ELEMENTS = 8_000_000L;
 
     /**
+     * Upper bound (exclusive) of the projections a device kind's tiny-shape entry decides, where it has one:
+     * the 0.6B-class projections and a 4B decoder's K/V (1024x1024 to 1024x3072), below
+     * {@link Int8MatvecTuning#LANE_MIN_ELEMENTS}. Above it, and for a kind without a tiny-shape entry, the small
+     * side of {@link #SHAPE_MIN_ELEMENTS} decides.
+     */
+    public static final long TINY_SHAPE_MAX_ELEMENTS = Int8MatvecTuning.LANE_MIN_ELEMENTS;
+
+    /**
      * The fast GEMM lane's first served row count for projections without a measured entry: the global
      * crossover the dispatch used before (the GEMM lanes' cost is flat in the row count while the matvec
      * pays its dots per row; on an RTX 5080 Laptop over Qwen3-Embedding-4B Q8_0 with the shared-memory
@@ -58,6 +66,9 @@ public final class SmallBatchCrossover {
 
     /** The integer-dot multi-column matvec row cap of projections without a measured entry: the previous dispatch. */
     private static final int DEFAULT_INT8_MATVEC_N_MAX = LlmKernelConstants.MATVEC_N_DISPATCH_MAX;
+
+    /** Highest row count of the Vulkan NVIDIA tiny-shape Q6_K entry ({@link #tinyDecisions}). */
+    private static final int TINY_Q6_K_VULKAN_NVIDIA = 14;
 
     /**
      * One measured dispatch decision: the fast GEMM lane's first row count, the float multi-column
@@ -75,6 +86,7 @@ public final class SmallBatchCrossover {
         }
     }
 
+    private static final Map<DeviceKind, Map<GGMLType, Decision>> TINY = tinyDecisions();
     private static final Map<DeviceKind, Map<GGMLType, Decision>> SMALL = decisions(true);
     private static final Map<DeviceKind, Map<GGMLType, Decision>> LARGE = decisions(false);
 
@@ -117,8 +129,19 @@ public final class SmallBatchCrossover {
                 : DEFAULT_INT8_MATVEC_N_MAX;
     }
 
-    /** The measured decision for the projection's size class and device kind, or null without one. */
+    /**
+     * The measured decision for the projection's size class and device kind, or null without one: the
+     * tiny-shape entry below {@link #TINY_SHAPE_MAX_ELEMENTS} where the kind has one for the type, otherwise
+     * the small or large side of {@link #SHAPE_MIN_ELEMENTS}.
+     */
     private static Decision decision(DeviceKind device, GGMLType type, long elements) {
+        if (elements < TINY_SHAPE_MAX_ELEMENTS) {
+            Map<GGMLType, Decision> tiny = TINY.get(device);
+            Decision d = tiny == null ? null : tiny.get(type);
+            if (d != null) {
+                return d;
+            }
+        }
         Map<GGMLType, Decision> m = (elements >= SHAPE_MIN_ELEMENTS ? LARGE : SMALL).get(device);
         return m == null ? null : m.get(type);
     }
@@ -128,9 +151,33 @@ public final class SmallBatchCrossover {
      * {@code device} at any projection size (the load-time preparation asks without knowing a size).
      */
     public static boolean hasFloatMatvecN(DeviceKind device, GGMLType type) {
-        Decision small = decision(device, type, 0L);
+        Decision tiny = decision(device, type, 0L);
+        Decision small = decision(device, type, TINY_SHAPE_MAX_ELEMENTS);
         Decision large = decision(device, type, Long.MAX_VALUE);
-        return (small != null && small.floatNMax > 0) || (large != null && large.floatNMax > 0);
+        return (tiny != null && tiny.floatNMax > 0) || (small != null && small.floatNMax > 0)
+                || (large != null && large.floatNMax > 0);
+    }
+
+    /**
+     * The measured decisions of the projections below {@link #TINY_SHAPE_MAX_ELEMENTS}, by device kind and type,
+     * for the kinds whose tiny shapes measured a different crossover than the small side's measured shape.
+     */
+    private static Map<DeviceKind, Map<GGMLType, Decision>> tinyDecisions() {
+        Map<DeviceKind, Map<GGMLType, Decision>> m = new HashMap<>();
+        // Vulkan NVIDIA discrete (RTX 5080 Laptop), the 0.6B-class projections and the 4B K/V against the CM2
+        // lane (CountedMatvecNMeasureTest medians of nine interleaved rounds): the paired counted matvec costs
+        // 13-34us at 4 to 16 rows where the CM2 lane's 64-token tile pays 24-88us. Q8_0 wins every count on
+        // 1024x1024 (18.5 against 23.8us at 16), 1024x2048 (23.7 against 39.3), 1024x2560 and 1024x3072 (26.5
+        // against 54.2), ties 2048x1024 from 15 rows (25.3 against 25.2 at 16) and loses 3072x1024 from 12
+        // (33.4 against 26.1 at 16): summed over a 0.6B layer's seven projections the counted lane is 39us
+        // faster at 16 rows, so it serves the whole counted range. Q4_K wins every shape and count but
+        // 3072x1024 at 16 (36.7 against 35.6). Q6_K wins through 14 rows on every shape and loses 3072x1024
+        // at 15 and 16 (35.4 against 31.8 at 16). The rows below the CM2 lane follow
+        // Int8MatvecTuning.countedLaneIsFaster(DeviceKind, GGMLType, long, int).
+        put(m, nvidiaDiscrete(BackendType.VULKAN), GGMLType.Q8_0, cm(), floatNevers(), int8MaxCounted());
+        put(m, nvidiaDiscrete(BackendType.VULKAN), GGMLType.Q4_K, cm(), floatNevers(), int8MaxCounted());
+        put(m, nvidiaDiscrete(BackendType.VULKAN), GGMLType.Q6_K, cm(), floatNevers(), TINY_Q6_K_VULKAN_NVIDIA);
+        return Collections.unmodifiableMap(m);
     }
 
     /**
@@ -210,12 +257,17 @@ public final class SmallBatchCrossover {
             // 0.050 kernel ms at 2) and the step-validated MMA lane serves 4 rows and up (13.17 ms
             // step against 13.16 tiled at 8), the previous dispatch.
             put(m, nvidiaDiscreteCudaTensor(), GGMLType.F16, mmq(), floatNevers(), int8Never());
-            // Vulkan NVIDIA discrete (RTX 5080 Laptop): the cooperative-matrices lane keeps the
-            // default crossover at four rows, and the integer-dot matvec stays off the rows below
-            // it, where it measured slower than the batched matvec (step medians at 2 rows: 17.4 ms
-            // against 15.1 on the 0.6B Q8_0, 37.5 against 33.2 on the 4B; kernel 4096x1024: 0.090
-            // against 0.086).
-            put(m, nvidiaDiscrete(BackendType.VULKAN), GGMLType.Q8_0, cm(), floatNevers(), int8Never());
+            // Vulkan NVIDIA discrete (RTX 5080 Laptop), against the cooperative-matrix-2 GEMM lane
+            // (staging included; CountedMatvecNMeasureTest medians of nine interleaved rounds): the
+            // paired counted integer-dot matvec serves the rows where it measured faster, the CM2 lane
+            // the rest. Q8_0 4096x1024: paired 20.7-23.7us at 2 to 8 rows against CM2's 33.2-26.2,
+            // a tie at 9 (25.6 against 25.5) and CM2 ahead from 10 (27.8 against 26.4). Q4_K: paired
+            // 18.1-39.2us at 2 to 14 rows against CM2's 35.9-40.5, CM2 ahead at 15 and 16 (36.0
+            // against 42.6 and 44.7). Q6_K: paired 17.8-30.4us at 2 to 10 rows against CM2's 32.0-32.3,
+            // ties at 11 and 12, CM2 ahead from 13 (31.9 against 35.3).
+            put(m, nvidiaDiscrete(BackendType.VULKAN), GGMLType.Q8_0, cm(), floatNevers(), 8);
+            put(m, nvidiaDiscrete(BackendType.VULKAN), GGMLType.Q4_K, cm(), floatNevers(), 14);
+            put(m, nvidiaDiscrete(BackendType.VULKAN), GGMLType.Q6_K, cm(), floatNevers(), 10);
             // The F16 projections: the fp16-MMA lane keeps the default crossover at four rows (step
             // medians 18.9 to 19.8 ms from 4 to 16 rows against the batched matvec's 15.0 at 2 rows)
             // and the float multi-column matvec stays off, having lost at every kernel count (0.114
@@ -305,13 +357,21 @@ public final class SmallBatchCrossover {
             // float and 9.18 int8), so the integer-dot lane stays off; the cooperative-matrices lane
             // keeps its step-validated crossover at 4 rows.
             put(m, intelIntegrated(BackendType.VULKAN), GGMLType.Q8_0, cm(), floatNevers(), int8Never());
-            // The 4B-class projections on Vulkan NVIDIA discrete (RTX 5080 Laptop): the
-            // cooperative-matrices lane keeps the default crossover at four rows (49.6 to 54.5 ms
-            // step medians at 4 to 16 rows) and the integer-dot matvec stays off the rows below it,
-            // where the batched matvec measured faster (33.2 ms step at 2 rows against 37.5); the
-            // matvec's kernel cost grows 0.291 to 1.070 ms from 2 to 16 rows against the lane's
-            // flat 49.6 at 4.
-            put(m, nvidiaDiscrete(BackendType.VULKAN), GGMLType.Q8_0, cm(), floatNevers(), int8Never());
+            // The 4B-class projections on Vulkan NVIDIA discrete (RTX 5080 Laptop), same protocol;
+            // one size class holds the decoder's projections and the output head, so the cap weighs
+            // a step's 36 layers against its one head launch. Q8_0: the paired matvec wins the
+            // layer projections through 14 rows (19456x2560 plus 2560x9728 at 14: 287.8us against
+            // CM2's 318.1; at 16: 323.0 against 323.9) and loses the head from 9 rows (151936x2560 at
+            // 14: 1850 against 1084), a net gain per step through 14 rows (1.09 ms of layers against
+            // 0.77 of head) and a net loss at 15. Q4_K: paired ahead at every count of the 2560-row
+            // and 9728-row projections (2560x9728 at 16: 102.9 against 263.2) and through 14 rows of
+            // 19456x2560 (203.3 against 220.6), 357 against 497us per layer at 16 rows. Q6_K (the
+            // Q4_K_M down projections and head): paired ahead at every count of 2560x9728 (97.2
+            // against 226.2 at 16) and 9728x2560, behind on the head from 10 rows (2404 against 1476
+            // at 16), a net gain at every count over a step of 36 layers.
+            put(m, nvidiaDiscrete(BackendType.VULKAN), GGMLType.Q8_0, cm(), floatNevers(), 14);
+            put(m, nvidiaDiscrete(BackendType.VULKAN), GGMLType.Q4_K, cm(), floatNevers(), int8MaxCounted());
+            put(m, nvidiaDiscrete(BackendType.VULKAN), GGMLType.Q6_K, cm(), floatNevers(), int8MaxCounted());
         }
         return Collections.unmodifiableMap(m);
     }

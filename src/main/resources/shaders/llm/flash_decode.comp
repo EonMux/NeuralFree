@@ -154,6 +154,11 @@ float nf_fd_v1(uint e, int row) {
         : vc_kv_load1(e, NF_FD_V_TYPE);
 }
 
+/* Values e .. e + 3 of a plain V cache row (the fast path's coalesced read; never a vendor row). */
+vec4 nf_fd_v4(uint e, int row) {
+    return vc_kv_load4(e, NF_FD_V_TYPE);
+}
+
 /* norm / |centroids| of a TurboQuant key row, else 1. */
 float nf_fd_tq_score(uint e_head, int row) {
     return nf_kv_is_vendor(NF_FD_K_TYPE)
@@ -164,6 +169,7 @@ float nf_fd_tq_score(uint e_head, int row) {
 #else
 vec4 nf_fd_k4(uint e, int row) { return kc_load4(e); }
 float nf_fd_v1(uint e, int row) { return vc_load1(e); }
+vec4 nf_fd_v4(uint e, int row) { return vc_load4(e); }
 float nf_fd_tq_score(uint e_head, int row) { return 1.0; }
 #endif
 
@@ -186,14 +192,44 @@ bool nf_fd_types_ok() {
 shared float nf_fa_smem[NF_FA_SMEM_FLOATS];
 shared float nf_fd_stats[3 * NF_FD_MAX_G];   /* m[16] | l[16] | ALiBi slope[16] */
 
+/*
+ * The warp fast path's gate (flash_decode.cl nf_fd_fast_ok), in the __sg module on 32-wide subgroups only, where a
+ * subgroup is the .cl warp: one query head's K row is read as one coalesced vec4 per lane (the row spans exactly
+ * one subgroup instruction) and its dot is reduced over the subgroup, so pass 1 needs no shared-memory tree per key;
+ * pass 2 accumulates V the same coalesced way. Plain cache element types only (F32/F16/BF16), no row-relative bias
+ * table, head dims of at most NF_FA_FAST_DIM, the split no longer than the workgroup and at most NF_FA_LG heads per
+ * workgroup. Every other shape, and the plain module, runs the portable scalar body.
+ */
+/* Keys a subgroup of the fast path's pass 1 scores per round: their K rows are loaded before the first is reduced,
+ * so NF_FD_KEYS row reads are in flight per subgroup instead of one dependent read per key. */
+#define NF_FD_KEYS 4
+
+bool nf_fd_plain_type(int t) {
+    return t == NF_KV_F32 || t == NF_KV_F16 || t == NF_KV_BF16;
+}
+
+bool nf_fd_fast_ok() {
+#ifdef USE_SUBGROUPS
+    return gl_SubgroupSize == 32u && gl_NumSubgroups == uint(NF_FA_LG)
+        && pc.d_k <= NF_FA_FAST_DIM && pc.d_v <= NF_FA_FAST_DIM
+        && pc.split_len <= NF_FA_WG && pc.n_buckets == 0 && pc.g_tile <= NF_FA_LG
+        && nf_fd_plain_type(NF_FD_K_TYPE) && nf_fd_plain_type(NF_FD_V_TYPE);
+#else
+    return false;
+#endif
+}
+
+/* Plan constraints of flash_decode.cl nf_fd_plan_ok: the q, score and pass-2 lane-group tiles plus the fast path's
+ * row staging (2 * split_len ints when it runs) fit the shared budget. */
 bool nf_fd_plan_ok() {
+    const int stage_floats = nf_fd_fast_ok() ? 2 * pc.split_len : 0;
     return nf_fd_types_ok()
         && pc.n_head > 0 && pc.n_head_kv > 0 && pc.n_head % pc.n_head_kv == 0
         && pc.g_tile >= 1 && pc.g_tile <= NF_FD_MAX_G
         && pc.d_k > 0 && pc.d_v > 0 && (pc.d_k & 3) == 0 && (pc.d_v & 3) == 0
         && pc.n_split >= 1 && pc.split_len > 0
-        && pc.g_tile * (pc.d_k + pc.split_len) <= NF_FA_SMEM_FLOATS
-        && pc.g_tile * pc.d_v <= NF_FA_WG * NF_FA_ACC_MAX
+        && pc.g_tile * (pc.d_k + pc.split_len) + NF_FA_LG * pc.g_tile * pc.d_v + stage_floats <= NF_FA_SMEM_FLOATS
+        && pc.g_tile * pc.d_v <= (NF_FA_WG / NF_FA_LG) * NF_FA_ACC_MAX
         && ((pc.flags & NF_ATTN_FLAG_DIRECT) == 0 || pc.n_split == 1)
         && gl_WorkGroupSize.x == uint(NF_FA_WG);
 }
@@ -378,53 +414,130 @@ void main() {
     }
     barrier();
 
-    /* 2. pass 1 */
+    /* 1b. stage the fast path's rows: the split's physical rows and their kv_pos, resolved by the whole workgroup
+     * at once (each invocation one key's page id -> row -> position chain) instead of once per serial scan step of
+     * a subgroup below. A masked page stages row -1, which every reader treats as the absent key the page test
+     * gates; the rows ride the shared budget after the pass-2 partials, as int bits. */
+    const bool fast = nf_fd_fast_ok();
+    const int rows_base = s_base + g_tile * split_len + NF_FA_LG * g_tile * d_v;
+    const int pos_base = rows_base + split_len;
+    if (fast) {
+        for (int j = lid; j < n_keys; j += NF_FA_WG) {
+            int row = -1;
+            int p = -1;
+            if (nf_fd_page_ok(seq, k_begin + j)) {
+                row = nf_fd_row(seq, k_begin + j);
+                p = kv_pos[row];
+            }
+            nf_fa_smem[rows_base + j] = intBitsToFloat(row);
+            nf_fa_smem[pos_base + j] = intBitsToFloat(p);
+        }
+        barrier();
+    }
+
+    /* 2. pass 1: scores of the split's keys, per-invocation running max. On the fast path subgroup w scans the
+     * keys w, w + NF_FA_LG, ... of the split, NF_FD_KEYS per round, every lane holding one vec4 of a key's K row and
+     * the per-head dot reduced over the subgroup, so every subgroup has keys even when the split is one subgroup
+     * wide; the scalar body is the portable form (plain modules, other caches, longer splits). */
     float mx[NF_FD_MAX_G];
     [[unroll]] for (int g = 0; g < NF_FD_MAX_G; g++) {
         mx[g] = -NF_INF;
     }
     const uint k_head = uint(kvh * pc.k_head_stride);
-    for (int j = lid; j < split_len; j += NF_FA_WG) {
-        float acc[NF_FD_MAX_G];
-        [[unroll]] for (int g = 0; g < NF_FD_MAX_G; g++) {
-            acc[g] = 0.0;
-        }
-        int p_k = -1;
-        int vis = 0;
-        if (j < n_keys && nf_fd_page_ok(seq, k_begin + j)) {
-            const int t = k_begin + j;
-            /* A masked page's row is not a row, so kv_pos is read only after the page test; an empty cell's
-             * kv_pos stays -1 and is never visible. */
-            const int row = nf_fd_row(seq, t);
-            p_k = kv_pos[row];
-            vis = nf_attn_tree_visible(p_k, t_bits, kv_end, nf_attn_flag_fresh(pc.flags), q_pos,
-                                       (pc.flags & NF_ATTN_FLAG_CAUSAL), pc.swa_type, pc.n_swa) != 0 ? 1 : 0;
-            if (vis != 0) {
-                const uint e0 = uint(row) * uint(pc.k_row_stride) + k_head;
-                float ks = nf_kv_is_per_token_head(NF_FD_K_TYPE)
-                    ? kv_scales[(row * 2u) * uint(pc.n_head_kv) + kvh] : kv_scales[kvh];
-                ks *= nf_fd_tq_score(e0, row);
-                for (int d = 0; d < d_k; d += 4) {
-                    const vec4 k4 = nf_fd_k4(e0 + uint(d), row) * ks;
-                    [[unroll]] for (int g = 0; g < NF_FD_MAX_G; g++) {
-                        if (g < g_tile) {
-                            const int qi = g * d_k + d;
-                            acc[g] += dot(vec4(nf_fa_smem[qi], nf_fa_smem[qi + 1], nf_fa_smem[qi + 2],
-                                               nf_fa_smem[qi + 3]), k4);
+#ifdef USE_SUBGROUPS
+    if (fast) {
+        const int slane = int(gl_SubgroupInvocationID);
+        const int dk4 = d_k >> 2;
+        for (int jb = int(gl_SubgroupID); jb < split_len; jb += NF_FD_KEYS * NF_FA_LG) {
+            /* NF_FD_KEYS keys per round, their K rows loaded before any is reduced */
+            int p_k[NF_FD_KEYS];
+            int vis[NF_FD_KEYS];
+            vec4 k4[NF_FD_KEYS];
+            [[unroll]] for (int u = 0; u < NF_FD_KEYS; u++) {
+                const int j = jb + u * NF_FA_LG;
+                p_k[u] = -1;
+                vis[u] = 0;
+                k4[u] = vec4(0.0);
+                if (j < n_keys && floatBitsToInt(nf_fa_smem[rows_base + j]) >= 0) {
+                    const int row = floatBitsToInt(nf_fa_smem[rows_base + j]);
+                    p_k[u] = floatBitsToInt(nf_fa_smem[pos_base + j]);
+                    vis[u] = nf_attn_tree_visible(p_k[u], t_bits, kv_end, nf_attn_flag_fresh(pc.flags), q_pos,
+                                                  (pc.flags & NF_ATTN_FLAG_CAUSAL), pc.swa_type, pc.n_swa) != 0 ? 1 : 0;
+                    if (vis[u] != 0 && slane < dk4) {
+                        const uint e0 = uint(row) * uint(pc.k_row_stride) + k_head;
+                        k4[u] = nf_fd_k4(e0 + uint(slane * 4), row) * kv_scales[kvh];
+                    }
+                }
+            }
+            [[unroll]] for (int u = 0; u < NF_FD_KEYS; u++) {
+                const int j = jb + u * NF_FA_LG;
+                [[unroll]] for (int g = 0; g < 4; g++) {
+                    if (g < g_tile) {
+                        float part = 0.0;
+                        if (vis[u] != 0 && slane < dk4) {
+                            const int qi = g * d_k + slane * 4;
+                            part = dot(vec4(nf_fa_smem[qi], nf_fa_smem[qi + 1], nf_fa_smem[qi + 2],
+                                            nf_fa_smem[qi + 3]), k4[u]);
                         }
+                        const float dot_qk = subgroupAdd(part);
+                        float sc = -NF_INF;
+                        if (vis[u] != 0 && g < g_cnt) {
+                            sc = nf_attn_score(dot_qk, pc.scale, pc.softcap)
+                               + nf_fd_bias(h0 + g, q_pos, p_k[u], nf_fd_stats[2 * NF_FD_MAX_G + g], max(seq, 0));
+                        }
+                        if (slane == 0 && j < split_len) {
+                            nf_fa_smem[s_base + g * split_len + j] = sc;
+                        }
+                        mx[g] = max(mx[g], sc);
                     }
                 }
             }
         }
-        [[unroll]] for (int g = 0; g < NF_FD_MAX_G; g++) {
-            if (g < g_tile) {
-                float s = -NF_INF;
-                if (vis != 0 && g < g_cnt) {
-                    s = nf_attn_score(acc[g], pc.scale, pc.softcap)
-                      + nf_fd_bias(h0 + g, q_pos, p_k, nf_fd_stats[2 * NF_FD_MAX_G + g], max(seq, 0));
+    } else
+#endif
+    {
+        for (int j = lid; j < split_len; j += NF_FA_WG) {
+            float acc[NF_FD_MAX_G];
+            [[unroll]] for (int g = 0; g < NF_FD_MAX_G; g++) {
+                acc[g] = 0.0;
+            }
+            int p_k = -1;
+            int vis = 0;
+            if (j < n_keys && nf_fd_page_ok(seq, k_begin + j)) {
+                const int t = k_begin + j;
+                /* A masked page's row is not a row, so kv_pos is read only after the page test; an empty cell's
+                 * kv_pos stays -1 and is never visible. */
+                const int row = nf_fd_row(seq, t);
+                p_k = kv_pos[row];
+                vis = nf_attn_tree_visible(p_k, t_bits, kv_end, nf_attn_flag_fresh(pc.flags), q_pos,
+                                           (pc.flags & NF_ATTN_FLAG_CAUSAL), pc.swa_type, pc.n_swa) != 0 ? 1 : 0;
+                if (vis != 0) {
+                    const uint e0 = uint(row) * uint(pc.k_row_stride) + k_head;
+                    float ks = nf_kv_is_per_token_head(NF_FD_K_TYPE)
+                        ? kv_scales[(row * 2u) * uint(pc.n_head_kv) + kvh] : kv_scales[kvh];
+                    ks *= nf_fd_tq_score(e0, row);
+                    for (int d = 0; d < d_k; d += 4) {
+                        const vec4 k4 = nf_fd_k4(e0 + uint(d), row) * ks;
+                        [[unroll]] for (int g = 0; g < NF_FD_MAX_G; g++) {
+                            if (g < g_tile) {
+                                const int qi = g * d_k + d;
+                                acc[g] += dot(vec4(nf_fa_smem[qi], nf_fa_smem[qi + 1], nf_fa_smem[qi + 2],
+                                                   nf_fa_smem[qi + 3]), k4);
+                            }
+                        }
+                    }
                 }
-                nf_fa_smem[s_base + g * split_len + j] = s;
-                mx[g] = max(mx[g], s);
+            }
+            [[unroll]] for (int g = 0; g < NF_FD_MAX_G; g++) {
+                if (g < g_tile) {
+                    float s = -NF_INF;
+                    if (vis != 0 && g < g_cnt) {
+                        s = nf_attn_score(acc[g], pc.scale, pc.softcap)
+                          + nf_fd_bias(h0 + g, q_pos, p_k, nf_fd_stats[2 * NF_FD_MAX_G + g], max(seq, 0));
+                    }
+                    nf_fa_smem[s_base + g * split_len + j] = s;
+                    mx[g] = max(mx[g], s);
+                }
             }
         }
     }
@@ -458,33 +571,118 @@ void main() {
     }
     barrier();
 
-    /* 4. pass 2 over (g, d) pairs */
+    /* 4. pass 2: o[g][d] = sum_t p[g][t] * V[t][d]. The workgroup runs as n_lg lane groups of gs invocations that
+     * own interleaved keys (j = lg, step n_lg), so n_lg key streams run in parallel: every lane group accumulates
+     * every (g, d) pair over its own keys, lane l of a group owning pairs l, l + gs, .... The groups stage their
+     * accumulators in o_s; each invocation then sums the partials of the pairs it writes in step 5 (pairs lid,
+     * lid + NF_FA_WG, ...). On the fast path lane group lg is subgroup lg and each lane holds the vec4 of dims
+     * lane * 4 of every o[g], so one coalesced V row read feeds the group's lane slice per key. */
     const int n_pairs = g_tile * d_v;
+    const int n_lg = n_pairs <= 32 * NF_FA_ACC_MAX ? NF_FA_LG : 1;
+    const int gs = NF_FA_WG / n_lg;
+    const int o_base = s_base + g_tile * split_len;
+    const uint v_head = uint(kvh * pc.v_head_stride);
     float o[NF_FA_ACC_MAX];
     int pg[NF_FA_ACC_MAX];
     int pd[NF_FA_ACC_MAX];
-    [[unroll]] for (int i = 0; i < NF_FA_ACC_MAX; i++) {
-        const int pi = lid + i * NF_FA_WG;
-        const int g = pi < n_pairs ? pi / d_v : 0;
-        o[i] = 0.0;
-        pg[i] = g;
-        pd[i] = pi - g * d_v;
-    }
-    const uint v_head = uint(kvh * pc.v_head_stride);
-    for (int j = 0; j < n_keys; j++) {
-        const int vrow = nf_fd_row(seq, k_begin + j);
-        const uint e0 = uint(vrow) * uint(pc.v_row_stride) + v_head;
-        const float v_scale = nf_kv_is_per_token_head(NF_FD_V_TYPE)
-            ? kv_scales[(vrow * 2u + 1u) * uint(pc.n_head_kv) + kvh]
-            : kv_scales[uint(pc.n_head_kv) + kvh];
-        [[unroll]] for (int i = 0; i < NF_FA_ACC_MAX; i++) {
-            if (lid + i * NF_FA_WG < n_pairs) {
-                const float p = nf_fa_smem[s_base + pg[i] * split_len + j];
-                if (p != 0.0) {
-                    o[i] += p * (nf_fd_v1(e0 + uint(pd[i]), vrow) * v_scale);
+#ifdef USE_SUBGROUPS
+    if (fast && n_pairs <= 32 * NF_FA_ACC_MAX) {
+        const int lg = int(gl_SubgroupID);
+        const int lane = int(gl_SubgroupInvocationID);
+        const int dv4 = d_v >> 2;
+        vec4 acc[4];
+        [[unroll]] for (int g = 0; g < 4; g++) {
+            acc[g] = vec4(0.0);
+        }
+        const float v_scale = kv_scales[uint(pc.n_head_kv) + kvh];
+        for (int jb = lg; jb < n_keys; jb += NF_FD_KEYS * n_lg) {
+            /* NF_FD_KEYS keys per round, their V rows loaded before the first is accumulated (in key order, so the
+             * sums match the one-key loop). A key no head of the tile weights (masked, or on an unmapped page) is
+             * not read: its row is not a row off the page table. The test is uniform across the lane group. */
+            vec4 v4[NF_FD_KEYS];
+            [[unroll]] for (int u = 0; u < NF_FD_KEYS; u++) {
+                const int j = jb + u * n_lg;
+                v4[u] = vec4(0.0);
+                bool live = false;
+                if (j < n_keys) {
+                    [[unroll]] for (int g = 0; g < 4; g++) {
+                        live = live || (g < g_tile && nf_fa_smem[s_base + g * split_len + j] != 0.0);
+                    }
+                }
+                if (live && lane < dv4) {
+                    const int vrow = floatBitsToInt(nf_fa_smem[rows_base + j]);
+                    const uint e0 = uint(vrow) * uint(pc.v_row_stride) + v_head;
+                    v4[u] = nf_fd_v4(e0 + uint(lane * 4), vrow) * v_scale;
+                }
+            }
+            [[unroll]] for (int u = 0; u < NF_FD_KEYS; u++) {
+                const int j = jb + u * n_lg;
+                [[unroll]] for (int g = 0; g < 4; g++) {
+                    if (g < g_tile && j < n_keys) {
+                        const float p = nf_fa_smem[s_base + g * split_len + j];
+                        if (p != 0.0) {
+                            acc[g] += p * v4[u];
+                        }
+                    }
                 }
             }
         }
+        [[unroll]] for (int g = 0; g < 4; g++) {
+            if (g < g_tile && lane < dv4) {
+                const int ob = o_base + lg * n_pairs + g * d_v + lane * 4;
+                nf_fa_smem[ob] = acc[g].x;
+                nf_fa_smem[ob + 1] = acc[g].y;
+                nf_fa_smem[ob + 2] = acc[g].z;
+                nf_fa_smem[ob + 3] = acc[g].w;
+            }
+        }
+    } else
+#endif
+    {
+        const int lg = lid / gs;
+        const int lane = lid - lg * gs;
+        [[unroll]] for (int i = 0; i < NF_FA_ACC_MAX; i++) {
+            const int pi = lane + i * gs;
+            const int g = pi < n_pairs ? pi / d_v : 0;
+            o[i] = 0.0;
+            pg[i] = g;
+            pd[i] = pi - g * d_v;
+        }
+        for (int j = lg; j < n_keys; j += n_lg) {
+            const int vrow = nf_fd_row(seq, k_begin + j);
+            const uint e0 = uint(vrow) * uint(pc.v_row_stride) + v_head;
+            const float v_scale = nf_kv_is_per_token_head(NF_FD_V_TYPE)
+                ? kv_scales[(vrow * 2u + 1u) * uint(pc.n_head_kv) + kvh]
+                : kv_scales[uint(pc.n_head_kv) + kvh];
+            [[unroll]] for (int i = 0; i < NF_FA_ACC_MAX; i++) {
+                if (lane + i * gs < n_pairs) {
+                    const float p = nf_fa_smem[s_base + pg[i] * split_len + j];
+                    if (p != 0.0) {
+                        o[i] += p * (nf_fd_v1(e0 + uint(pd[i]), vrow) * v_scale);
+                    }
+                }
+            }
+        }
+        [[unroll]] for (int i = 0; i < NF_FA_ACC_MAX; i++) {
+            const int pi = lane + i * gs;
+            if (pi < n_pairs) {
+                nf_fa_smem[o_base + lg * n_pairs + pi] = o[i];
+            }
+        }
+    }
+    barrier();
+    [[unroll]] for (int i = 0; i < NF_FA_ACC_MAX; i++) {
+        const int pi = lid + i * NF_FA_WG;
+        const int g = pi < n_pairs ? pi / d_v : 0;
+        float sum = 0.0;
+        if (pi < n_pairs) {
+            for (int w = 0; w < n_lg; w++) {
+                sum += nf_fa_smem[o_base + w * n_pairs + pi];
+            }
+        }
+        o[i] = sum;
+        pg[i] = g;
+        pd[i] = pi - g * d_v;
     }
 
     /* 5. output */

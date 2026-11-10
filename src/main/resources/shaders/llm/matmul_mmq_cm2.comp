@@ -1,0 +1,129 @@
+/* matmul_mmq_cm2.comp - workgroup-scope cooperative-matrix GEMM over the MMQ quant types
+ * (VK_NV_cooperative_matrix2, the llama.cpp coopmat2 design of mul_mm_cm2.comp): the weight tile loads
+ * through per-element decode callbacks of the tensor loads (coopMatLoadTensorNV) and the activation tile
+ * from fp16 rows staged by LLM_Stage_F16_Rows, so the shader stages nothing in shared memory itself; the
+ * driver lays the workgroup's matrices out for the tensor cores. Replaces matmul_mmq_cm.comp (the KHR
+ * subgroup-scope form) on devices that report DeviceFeature.COOPERATIVE_MATRIX_2.
+ * Requires: common/nf_common.glsl, common/quant_blocks.glsl, common/quant_mmq_ref.glsl,
+ * common/matmul_cm2_tile.glsl.
+ *
+ * Variant rows select QTYPE=QT_<T> and, with NF_SPLIT_K=1, the split-K twin; kernel names are the
+ * OpenCL names with a _CM2 suffix, e.g.
+ *     Q4_K_MatMul_CM2	matmul_mmq_cm2.comp	QTYPE=QT_Q4_K	vk13,vulkan
+ *     Q4_K_MatMul_CM2_KSplit	matmul_mmq_cm2.comp	NF_SPLIT_K=1 QTYPE=QT_Q4_K	vk13,vulkan
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   plain:  (i M, i K, i N, i x_stride, i x_off, i y_stride, i y_off, R weight, R half x, W float y)
+ *   ksplit: (i M, i K, i N, i x_stride, i x_off, i k_slice, R weight, R half x, W float partial)
+ *   y[y_off + t*y_stride + r] = sum_{k < K} W[r][k] * x[x_off + t*x_stride + k],  r < M, t < N. x holds
+ *   the fp16 activation rows of LLM_Stage_F16_Rows: offsets and strides in halves, both multiples of 8
+ *   (16-byte aligned rows), and ceil(N / NF_CM2_BN) * NF_CM2_BN rows, the ones past N zero. The split-K
+ *   twin writes partial[(slice * N + t) * M + r] for k in slice * k_slice .. +k_slice (k_slice a
+ *   multiple of NF_CM2_BK), slice taken from the work-group id, and LLM_SplitK_Reduce sums the planes.
+ *
+ * Compute: fp16 x fp16 -> fp16 cooperative matrix products of NF_CM2_BK reduction elements per stage
+ * over an NF_CM2_BM x NF_CM2_BN (rows x tokens) tile. The weight tile decodes through
+ * common/quant_mmq_ref.glsl (the callback's reference points at the element's weight block, the tensor
+ * layout's block size is the type's MMQ_BS); the activation tile and the output use the engine's
+ * row-major [tokens, K] / [tokens, rows] layouts through the transposed tensor view, as llama.cpp's
+ * mul_mm_cm2 reads its B and stores its D matrices. The last token tile of a launch whose tokens end
+ * within its first quarter or half runs at that narrower width (llama.cpp's BNover4 / BNover2
+ * matrices), so a short tail does not pay for the full tile. Products and the accumulation are fp16,
+ * the accumulator saturating at +-65504 before the fp32 store: llama.cpp's coopmat2 contract for quantized
+ * weights (mul_mm_cm2 ACC_TYPE float16_t with ACC_TYPE_MAX), whose tensor cores run fp16 accumulation at twice
+ * the fp32 rate on GeForce parts. Measured on the RTX 5080 Laptop at 512 tokens, the fp32 accumulator of the
+ * same tile reaches 38 TFLOPS on Q8_0 9728x2560 against 66 with fp16, and the driver compiles its pipelines four
+ * to ten times slower. The split-K twin accumulates each slice in fp16 and LLM_SplitK_Reduce sums the slices
+ * in fp32.
+ *
+ * Dispatch: 2-D (never folded), global = {ceil(M / BM) * 256, ceil(N / BN), 1}, local = {256, 1, 1};
+ * the split-K twin multiplies the x groups by the slice count and takes the slice from
+ * group.x / row tiles. Requires VK_NV_cooperative_matrix2 with workgroup scope, flexible dimensions,
+ * tensor addressing and block loads (DeviceFeature.COOPERATIVE_MATRIX_2) next to the KHR
+ * cooperative-matrix feature set, and bufferDeviceAddress for the decode references.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_NV_cooperative_matrix2 : require
+#extension GL_EXT_buffer_reference : require
+
+#include "common/nf_common.glsl"
+
+#ifndef QTYPE
+#error "matmul_mmq_cm2.comp requires QTYPE"
+#endif
+
+NF_BUFFER_VIEWS(0, w)
+#include "common/quant_blocks.glsl"
+#include "common/quant_mmq_ref.glsl"
+
+#define NF_CM2_BM 128                         /* weight rows per workgroup tile */
+#define NF_CM2_BN 256                         /* tokens per workgroup tile */
+#define NF_CM2_BK 64                          /* reduction depth of one stage */
+#define NF_CM2_ACC_MAX float16_t(65504.0)      /* largest finite fp16 value: the accumulator's saturation */
+/* Reduction elements per unrolled group of an interior tile: one K-quant block, or eight stages of the
+ * 32-element types (llama.cpp mul_mm_cm2 UNROLL_K). */
+#define NF_CM2_UNROLL_K (MMQ_BS == 256 ? 256u : 8u * NF_CM2_BK)
+
+layout(std430, binding = 1) readonly buffer NfCm2Input { float16_t x_in[]; };
+#ifdef NF_SPLIT_K
+layout(std430, binding = 2) writeonly buffer NfCm2Partial { float partial_out[]; };
+layout(push_constant) uniform NfCm2Params {
+    int M; int K; int N; int x_stride; int x_off; int k_slice;
+} pc;
+#define NF_CM2_OUT partial_out
+#else
+layout(std430, binding = 2) writeonly buffer NfCm2Output { float y_out[]; };
+layout(push_constant) uniform NfCm2Params {
+    int M; int K; int N; int x_stride; int x_off; int y_stride; int y_off;
+} pc;
+#define NF_CM2_OUT y_out
+#endif
+
+#define NF_CM2_TW NF_CM2_BN
+#define NF_CM2_TILE_FN nf_cm2_tile_full
+#include "common/matmul_cm2_tile.glsl"
+#undef NF_CM2_TW
+#undef NF_CM2_TILE_FN
+#define NF_CM2_TW (NF_CM2_BN / 2)
+#define NF_CM2_TILE_FN nf_cm2_tile_half
+#include "common/matmul_cm2_tile.glsl"
+#undef NF_CM2_TW
+#undef NF_CM2_TILE_FN
+#define NF_CM2_TW (NF_CM2_BN / 4)
+#define NF_CM2_TILE_FN nf_cm2_tile_quarter
+#include "common/matmul_cm2_tile.glsl"
+
+void main() {
+    const uint M = uint(pc.M);
+    const uint N = uint(pc.N);
+#ifdef NF_SPLIT_K
+    const uint rtiles = (M + NF_CM2_BM - 1u) / NF_CM2_BM;
+    const uint slice = gl_WorkGroupID.x / rtiles;
+    const uint m0 = (gl_WorkGroupID.x - slice * rtiles) * NF_CM2_BM;
+    const uint kb = slice * uint(pc.k_slice);
+    const uint ke = min(kb + uint(pc.k_slice), uint(pc.K));
+    const uint pos_d = slice * N * M;
+    const uint stride_d = M;
+#else
+    const uint m0 = gl_WorkGroupID.x * NF_CM2_BM;
+    const uint kb = 0u;
+    const uint ke = uint(pc.K);
+    const uint pos_d = uint(pc.y_off);
+    const uint stride_d = uint(pc.y_stride);
+#endif
+    const uint n0 = gl_WorkGroupID.y * NF_CM2_BN;
+    const bool interior = m0 + NF_CM2_BM <= M && (ke - kb) % NF_CM2_BK == 0u;
+    if (n0 + NF_CM2_BN / 4u >= N) {
+        nf_cm2_tile_quarter(m0, n0, kb, ke, pos_d, stride_d, interior);
+    } else if (n0 + NF_CM2_BN / 2u >= N) {
+        nf_cm2_tile_half(m0, n0, kb, ke, pos_d, stride_d, interior);
+    } else {
+        nf_cm2_tile_full(m0, n0, kb, ke, pos_d, stride_d, interior);
+    }
+}

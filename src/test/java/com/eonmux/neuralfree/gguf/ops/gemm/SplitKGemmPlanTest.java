@@ -31,6 +31,17 @@ public class SplitKGemmPlanTest {
         assertEquals(1, SplitKGemmPlan.splitsFor(4, 3, 1, 4096));
     }
 
+    /** The CM2 launches split only grids that keep their slices in one wave: the 16-tile grid of a 1024-row
+     * projection over 512 tokens on 60 units splits by 3, the 40-tile grid of a 2560-row one stays whole. */
+    @Test
+    public void theCm2HeuristicKeepsOnlyTheSingleWaveBand() {
+        assertEquals(3, SplitKGemmPlan.cm2SplitsFor(60, 8, 2, 3072));
+        assertEquals(1, SplitKGemmPlan.cm2SplitsFor(60, 20, 2, 9728));
+        assertEquals("the general heuristic splits that grid by 3", 3, SplitKGemmPlan.splitsFor(60, 20, 2, 9728));
+        assertEquals("small K never splits", 1, SplitKGemmPlan.cm2SplitsFor(60, 1, 1, 2047));
+        assertEquals(SplitKGemmPlan.MAX_SPLITS, SplitKGemmPlan.cm2SplitsFor(60, 1, 1, 4096));
+    }
+
     /** The 16-token band of the small-token-tile heuristic splits a staged grid up to about 1.3
      * waves to the capped slice count and leaves bigger grids alone (the measured RTX 5080 Laptop
      * twins: the 64-tile 4096x2560 Q4_K twin runs 86-93us whole and 59-60us as 8 slices over 60

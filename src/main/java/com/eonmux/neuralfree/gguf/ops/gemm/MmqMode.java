@@ -6,12 +6,13 @@ import java.util.Locale;
  * Selection mode of the fast quantized-weight GEMM lane, the counterpart of llama.cpp's
  * {@code GGML_CUDA_FORCE_MMQ} / {@code GGML_CUDA_FORCE_CUBLAS} switches. The lane serves the llama.cpp
  * MMQ weight types with the int8 MMQ GEMM ({@code {T}_MatMul_MMQ}; on Vulkan devices with cooperative
- * matrices through the fp16-tile tensor-core form {@code {T}_MatMul_CM}) and differs from the exact
+ * matrices through the fp16-tile tensor-core forms, {@code {T}_MatMul_CM2} where the device reports
+ * {@code VK_NV_cooperative_matrix2} and {@code {T}_MatMul_CM} otherwise) and differs from the exact
  * tiled GEMM by the fast form's rounding.
  *
  * <ul>
  *   <li>{@link #AUTO}: the dispatch picks the fast lane wherever its kernel can run, in the form the
- *       device runs best: the fp16-tile CM form on Vulkan devices with cooperative matrices, the
+ *       device runs best: the fp16-tile CM2 or CM form on Vulkan devices with cooperative matrices, the
  *       int8 MMQ GEMM everywhere else (the default).</li>
  *   <li>{@link #ON}: the int8 MMQ GEMM for every weight type of the lane on every device, also
  *       where {@link #AUTO} would take the CM form ({@code GGML_CUDA_FORCE_MMQ}).</li>

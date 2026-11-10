@@ -690,6 +690,36 @@ public class Int8MatvecLaneTest {
         assertTrue(Int8MatvecTuning.countedLaneNeedsPackedDots(openclIntel, GGMLType.Q8_0));
     }
 
+    /**
+     * The Vulkan NVIDIA kind's measured small projections take the counted lane from
+     * {@link Int8MatvecTuning#COUNTED_SMALL_MIN_TOKENS} rows, where the pair beat the batched matvec and the CM2
+     * lane, and at two rows from {@link Int8MatvecTuning#COUNTED_SMALL_TWO_ROW_MIN_ELEMENTS} (the batched matvec
+     * won two rows on the smaller shapes); the unmeasured types keep the size gate at every count, and the other
+     * kinds' answers do not depend on the row count.
+     */
+    @Test
+    public void vulkanNvidiaSmallProjectionsTakeTheCountedLaneFromThreeRows() {
+        DeviceKind vulkanNvidia = kind(ComputeBackend.BackendType.VULKAN, DeviceKind.Vendor.NVIDIA);
+        DeviceKind vulkanIntel = kind(ComputeBackend.BackendType.VULKAN, DeviceKind.Vendor.INTEL);
+        DeviceKind openclNvidia = kind(ComputeBackend.BackendType.OPENCL, DeviceKind.Vendor.NVIDIA);
+        long small = 2048L * 1024;
+        int three = Int8MatvecTuning.COUNTED_SMALL_MIN_TOKENS;
+        for (GGMLType type : new GGMLType[]{GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K}) {
+            assertFalse(type + " at 2 rows", Int8MatvecTuning.countedLaneIsFaster(vulkanNvidia, type, small, 2));
+            assertTrue(type + " 3072x1024 at 2 rows", Int8MatvecTuning.countedLaneIsFaster(vulkanNvidia, type,
+                    3072L * 1024, 2));
+            assertTrue(type + " at 3 rows", Int8MatvecTuning.countedLaneIsFaster(vulkanNvidia, type, small, three));
+            assertTrue(type + " at 16 rows", Int8MatvecTuning.countedLaneIsFaster(vulkanNvidia, type, small,
+                    LlmKernelConstants.MATVEC_N_COUNTED_MAX));
+            assertTrue(type + " large at 2 rows", Int8MatvecTuning.countedLaneIsFaster(vulkanNvidia, type,
+                    Int8MatvecTuning.LANE_MIN_ELEMENTS, 2));
+        }
+        assertFalse(Int8MatvecTuning.countedLaneIsFaster(vulkanNvidia, GGMLType.Q5_K, small, three));
+        assertFalse(Int8MatvecTuning.countedLaneIsFaster(openclNvidia, GGMLType.Q4_K, small, three));
+        assertEquals(Int8MatvecTuning.countedLaneIsFaster(vulkanIntel, GGMLType.Q8_0, small),
+                Int8MatvecTuning.countedLaneIsFaster(vulkanIntel, GGMLType.Q8_0, small, three));
+    }
+
     @Test
     public void tuningPairsOnlyTheTypesThatMeasuredFasterPaired() {
         DeviceKind cudaTensor = DeviceKind.of(ComputeBackend.BackendType.CUDA, DeviceKind.Vendor.NVIDIA,

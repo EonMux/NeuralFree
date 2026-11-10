@@ -10,6 +10,7 @@ import com.eonmux.neuralfree.gguf.cpu.ops.CpuParallel;
 import com.eonmux.neuralfree.gguf.engine.ContextFullException;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
 import com.eonmux.neuralfree.gguf.engine.EngineModel;
+import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
 import com.eonmux.neuralfree.gguf.engine.ForwardBatch;
 import com.eonmux.neuralfree.gguf.engine.LLMModelFactory;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuForwardBackend;
@@ -626,7 +627,7 @@ final class BenchCommand {
             }
         }
         if (grid.kernels) {
-            KernelTiming timing = gpuTiming(f);
+            KernelTiming timing = gpuTiming(f.model.forwardBackend());
             if (timing != null) {
                 timing.reset();
             }
@@ -671,8 +672,16 @@ final class BenchCommand {
      * retired them. A CPU engine or a device without dispatch timing prints a note instead.
      */
     private static void printKernelTiming(Forwarder f, Appendable err) throws IOException {
-        KernelTiming timing = gpuTiming(f);
-        err.append("nftool bench: per-kernel device time, cumulative over the warmup and repetitions\n");
+        printKernelTiming(gpuTiming(f.model.forwardBackend()),
+                "nftool bench: per-kernel device time, cumulative over the warmup and repetitions", err);
+    }
+
+    /**
+     * Prints {@code header} and the per-kernel device time of {@code timing} on {@code err}, or a note when the
+     * backend timed no dispatch (a CPU engine, or a device without dispatch timing). Shared with batched-bench.
+     */
+    static void printKernelTiming(KernelTiming timing, String header, Appendable err) throws IOException {
+        err.append(header).append('\n');
         if (timing == null || timing.isEmpty()) {
             err.append("  (the backend timed no dispatch; --kernels needs the GPU engine)\n");
             return;
@@ -683,15 +692,15 @@ final class BenchCommand {
     }
 
     /** The GPU engine's dispatch timing, or null for a CPU engine or a queue without timing. */
-    private static KernelTiming gpuTiming(Forwarder f) {
-        if (f.model.forwardBackend() instanceof GpuForwardBackend) {
-            return ((GpuForwardBackend) f.model.forwardBackend()).context().queue().kernelTiming();
+    static KernelTiming gpuTiming(ForwardBackend backend) {
+        if (backend instanceof GpuForwardBackend) {
+            return ((GpuForwardBackend) backend).context().queue().kernelTiming();
         }
         return null;
     }
 
     /** Restores a system property the {@code --kernels} run changed, removing it when unset before. */
-    private static void restoreProperty(String name, String priorValue) {
+    static void restoreProperty(String name, String priorValue) {
         if (priorValue == null) {
             System.clearProperty(name);
         } else {

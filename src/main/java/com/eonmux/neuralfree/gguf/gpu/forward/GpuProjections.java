@@ -163,7 +163,7 @@ final class GpuProjections {
         String fused = fusedGateUpName(k.matvec);
         String q8 = k.matvecQ8 != null ? fusedGateUpName(k.matvecQ8) : null;
         if (q8 != null && GpuOps.cols(gate) % gate.type().getBlockSize() == 0
-                && (int8LaneSelected(gate.type(), (long) gate.rows() * GpuOps.cols(gate), false)
+                && (int8LaneSelected(gate.type(), (long) gate.rows() * GpuOps.cols(gate), 1)
                     || subgroupRowKernel(q8, gate.type(), GpuOps.cols(gate)) != null)
                 && ops.optionalReady(q8, matvecLocal)) {
             return q8;
@@ -195,7 +195,7 @@ final class GpuProjections {
         GpuOps.checkView("accumulator of " + w.name(), accum, accOff, nOut);
         WeightKernels k = projectionFamily(w);
         boolean invariant = BatchInvariance.enabled();
-        boolean q8Add = !invariant && nTokens == 1 && int8LaneUsable(k.matvecAddQ8, w, false);
+        boolean q8Add = !invariant && nTokens == 1 && int8LaneUsable(k.matvecAddQ8, w, 1);
         if (!invariant && nTokens == 1 && w.isSingleShard() && accOff == 0 && !w.hasScale()
                 && !GpuOps.overlaps(in, inOff, nIn, accum, accOff, nOut)
                 && (q8Add || ops.optionalReady(k.matvecAdd, matvecLocal))) {
@@ -291,8 +291,12 @@ final class GpuProjections {
         GpuMatmulTap.dense(queue, w, x.buf, x.off, nTokens, cols);
         if (fastUsable) {
             boolean staged = FastGemmLanes.stagedFast(fast);
+            boolean halfRows = FastGemmLanes.cm2Fast(fast);
             GpuOps.View activations = x;
-            if (staged) {
+            if (halfRows) {
+                ScratchSlot f16 = ops.lanes.stageF16(w.type(), x.buf, x.off, nTokens, cols);
+                activations = new GpuOps.View(f16.buffer(), 0);
+            } else if (staged) {
                 ScratchSlot q8;
                 if (fp8Staging != null) {
                     q8 = ops.lanes.stageFp8(fp8Staging, x.buf, x.off, nTokens, cols);
@@ -320,7 +324,7 @@ final class GpuProjections {
                     ops.lanes.splitKLaunch(split, w.shard(s), activations.buf, out, yOff, rows);
                 } else {
                     int qStride = staged ? ops.lanes.stagedRowRecords(cols) : cols;
-                    int qOff = staged ? activations.off : x.off;
+                    int qOff = staged || halfRows ? activations.off : x.off;
                     if (sgFast != null) {
                         int sgGroup = SubgroupMmqGemm.workGroup(kernels, w.type());
                         ops.launch2d(sgFast, SubgroupMmqGemm.globalRows(m, sgGroup),
@@ -346,7 +350,7 @@ final class GpuProjections {
             requireMatvecLocal(w);
             x = offsetFree(x, nTokens, cols);
             boolean direct = w.isSingleShard() && outOff == 0;
-            boolean q8 = !invariant && nTokens == 1 && int8LaneUsable(k.matvecQ8, w, false);
+            boolean q8 = !invariant && nTokens == 1 && int8LaneUsable(k.matvecQ8, w, 1);
             GpuBuffer xq = q8 ? quantizedRow(x, cols) : q8n ? quantizedRows(x, nTokens, cols) : null;
             for (int s = 0; s < w.shardCount(); s++) {
                 int m = (int) w.shardRows(s);
@@ -411,7 +415,7 @@ final class GpuProjections {
         if (!invariant && nTokens >= LlmKernelConstants.TILED_MIN_TOKENS && tiledUsable(k, w, nTokens)) {
             return false;
         }
-        if (k.matvecQ8 != null && !invariant && nTokens == 1 && int8LaneUsable(k.matvecQ8, w, false)) {
+        if (k.matvecQ8 != null && !invariant && nTokens == 1 && int8LaneUsable(k.matvecQ8, w, 1)) {
             return false;
         }
         return matvecLocal % MATVEC_MAX_TPS == 0;
@@ -655,7 +659,7 @@ final class GpuProjections {
                 && tensorCoreServesShards(w, cols, nTokens)) {
             return true;
         }
-        return nTokens <= int8Max && int8LaneUsable(k.matvecNQ8, w, true);
+        return nTokens <= int8Max && int8LaneUsable(k.matvecNQ8, w, nTokens);
     }
 
     /** Whether the tensor-core multi-column matvec serves {@code nTokens} rows through every shard of {@code w}. */
@@ -806,16 +810,17 @@ final class GpuProjections {
      * weight blocks (the int8 kernels read complete 32/256-element groups), the configured
      * {@link Int8MatvecMode} and device permit it (packed dot products reported, or the mode forces the
      * lane), {@link Int8MatvecTuning} has no decode evidence against the type on this device kind, and
-     * the kernel is prepared at the matvec work-group size. A single-token kernel whose subgroup-row twin
-     * serves ({@link #subgroupRowKernel}) takes the lane whatever that evidence says: the evidence measured
+     * the kernel is prepared at the matvec work-group size. {@code nTokens} is 1 for the single-row
+     * lane and the launch's row count for the counted multi-column lane. A single-token kernel whose subgroup-row
+     * twin serves ({@link #subgroupRowKernel}) takes the lane whatever that evidence says: the evidence measured
      * the family's forms, which the twin replaces.
      */
-    private boolean int8LaneUsable(String kernel, GpuWeight w, boolean counted) {
+    private boolean int8LaneUsable(String kernel, GpuWeight w, int nTokens) {
         if (kernel == null || GpuOps.cols(w) % w.type().getBlockSize() != 0) {
             return false;
         }
-        boolean selected = int8LaneSelected(w.type(), (long) GpuOps.rows(w) * GpuOps.cols(w), counted)
-                || (!counted && subgroupRowKernel(kernel, w.type(), GpuOps.cols(w)) != null);
+        boolean selected = int8LaneSelected(w.type(), (long) GpuOps.rows(w) * GpuOps.cols(w), nTokens)
+                || (nTokens == 1 && subgroupRowKernel(kernel, w.type(), GpuOps.cols(w)) != null);
         return selected && ops.optionalReady(kernel, matvecLocal);
     }
 
@@ -825,19 +830,20 @@ final class GpuProjections {
      * and either it forces the lane or the type measured faster with the lane here at that projection
      * size behind the lane's feature gate — the single-token lane's own evidence
      * ({@link Int8MatvecTuning#laneIsFaster}) behind the device's packed dot product for the
-     * single-row form, the counted multi-column lane's ({@link Int8MatvecTuning#countedLaneIsFaster})
+     * single-row form ({@code nTokens == 1}), the counted multi-column lane's
+     * ({@link Int8MatvecTuning#countedLaneIsFaster(DeviceKind, GGMLType, long, int)} at {@code nTokens} rows)
      * behind the packed dot product or the measured portable-arithmetic exception
      * ({@link Int8MatvecTuning#countedLaneNeedsPackedDots}) for the counted forms.
      */
-    private boolean int8LaneSelected(GGMLType type, long elements, boolean counted) {
+    private boolean int8LaneSelected(GGMLType type, long elements, int nTokens) {
         if (!int8Mode.permitsLane()) {
             return false;
         }
         if (int8Mode.forcesLane()) {
             return true;
         }
-        if (counted) {
-            return Int8MatvecTuning.countedLaneIsFaster(deviceKind, type, elements)
+        if (nTokens > 1) {
+            return Int8MatvecTuning.countedLaneIsFaster(deviceKind, type, elements, nTokens)
                     && (kernels.caps().hasFeature(DeviceFeature.INTEGER_DOT_PRODUCT)
                         || !Int8MatvecTuning.countedLaneNeedsPackedDots(deviceKind, type));
         }
@@ -925,8 +931,8 @@ final class GpuProjections {
             if (k.matvecN != null && SmallBatchCrossover.hasFloatMatvecN(deviceKind, type)) {
                 ops.optionalReady(k.matvecN, matvecLocal);
             }
-            if (k.matvecQ8 != null && (int8LaneSelected(type, Long.MAX_VALUE, false)
-                    || int8LaneSelected(type, Long.MAX_VALUE, true))) {
+            if (k.matvecQ8 != null && (int8LaneSelected(type, Long.MAX_VALUE, 1)
+                    || int8LaneSelected(type, Long.MAX_VALUE, LlmKernelConstants.MATVEC_N_COUNTED_MAX))) {
                 ops.optionalReady(k.matvecQ8, matvecLocal);
                 ops.optionalReady(k.matvecAddQ8, matvecLocal);
                 ops.optionalReady(k.matvecNQ8, matvecLocal);

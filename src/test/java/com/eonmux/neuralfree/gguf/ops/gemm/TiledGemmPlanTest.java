@@ -49,10 +49,12 @@ public class TiledGemmPlanTest {
         List<String> names = GemmKernels.kernelNames();
         // One tiled kernel per TILED_TYPES entry; per MMQ type the plain / KSplit / 16- and 64-token
         // twins / their two split-K planes / CM / CM_KSplit family, per FP8 and per W4A8 type the plain /
-        // KSplit / two twins / two twin split-K planes family, per dense type the MMA pair; then the 11
-        // activation staging kernels and the reduce, top-k, row top-k and logit prefilter.
+        // KSplit / two twins / two twin split-K planes family, per dense type the MMA pair; per CM2 type
+        // the CM2 / CM2_KSplit pair; then the 11 activation staging kernels and the reduce, top-k, row
+        // top-k and logit prefilter.
         assertEquals(41 + GemmKernels.MMQ_TYPES.size() * 8 + GemmKernels.FP8_TYPES.size() * 6
-                + GemmKernels.W4A8_TYPES.size() * 6 + GemmKernels.MMA_TYPES.size() * 2 + 15, names.size());
+                + GemmKernels.W4A8_TYPES.size() * 6 + GemmKernels.MMA_TYPES.size() * 2
+                + GemmKernels.CM2_TYPES.size() * 2 + 15, names.size());
         assertTrue(names.contains(GemmKernels.matmulMmq(GGMLType.Q4_K)));
         assertTrue(names.contains(GemmKernels.matmulMmqKSplit(GGMLType.Q4_K)));
         assertTrue(names.contains(GemmKernels.matmulMmqSmall(GGMLType.Q4_K)));
@@ -61,6 +63,11 @@ public class TiledGemmPlanTest {
         assertTrue(names.contains(GemmKernels.matmulMmqSmallSplit(GGMLType.Q4_K, MmqConfig.TWIN_MAX_TOKENS)));
         assertTrue(names.contains(GemmKernels.matmulCm(GGMLType.Q4_K)));
         assertTrue(names.contains(GemmKernels.matmulCmKSplit(GGMLType.Q4_K)));
+        assertEquals("Q4_K_MatMul_CM2", GemmKernels.matmulCm2(GGMLType.Q4_K));
+        assertEquals("Q4_K_MatMul_CM2_KSplit", GemmKernels.matmulCm2KSplit(GGMLType.Q4_K));
+        assertTrue(GemmKernels.hasCm2(GGMLType.Q4_K));
+        assertFalse(GemmKernels.hasCm2(GGMLType.IQ4_XS));
+        assertFalse(GemmKernels.hasCm2(null));
         assertTrue(names.contains(GemmKernels.matmulMmqSmall(GGMLType.F8_E4M3)));
         assertFalse(names.contains(GGMLType.F8_E4M3.name() + "_MatMul_CM"));
         assertTrue(names.contains(GemmKernels.matmulMma(GGMLType.BF16)));
