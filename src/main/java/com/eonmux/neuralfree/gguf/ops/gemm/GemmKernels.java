@@ -15,8 +15,8 @@ import java.util.Set;
 
 /**
  * Kernel names and argument indices of the GEMM family ({@code kernels/llm/matmul_tiled.cl},
- * {@code kernels/llm/matmul_mmq.cl}, {@code kernels/llm/matmul_mma.cl}, {@code kernels/llm/matmul_cm.cl},
- * {@code kernels/llm/split_k_reduce.cl}, {@code kernels/llm/sampling_topk.cl}; GLSL twins
+ * {@code kernels/llm/matmul_mmq.cl}, {@code kernels/llm/matmul_mmq_stream.cl}, {@code kernels/llm/matmul_mma.cl},
+ * {@code kernels/llm/matmul_cm.cl}, {@code kernels/llm/split_k_reduce.cl}, {@code kernels/llm/sampling_topk.cl}; GLSL twins
  * {@code shaders/llm/matmul_tiled.comp}, {@code shaders/llm/matmul_mmq.comp},
  * {@code shaders/llm/matmul_mma.comp}, {@code shaders/llm/matmul_mmq_cm.comp},
  * {@code shaders/llm/split_k_reduce.comp}, {@code shaders/llm/topk_partial.comp}).
@@ -33,6 +33,12 @@ import java.util.Set;
  *       by {@link #QUANT_MMQ_Q8_1}, or, for the FP8 types, the E4M3 GEMM over the E4M3 records of the
  *       {@code LLM_Quant_MMQ_Fp8*}/{@code Fp4*} stagings; {@code q_stride} / {@code q_off} are in 32-bit
  *       record units; dispatch geometry in {@link MmqGemmPlan}.</li>
+ *   <li>{@code <T>_MatMul_MMQ_StreamK(int M, int K, int N, int q_stride, int q_off, int y_stride,
+ *       int y_off, GpuBuffer weight, GpuBuffer q8, GpuBuffer y, GpuBuffer fixup)} and
+ *       {@code LLM_MMQ_StreamK_Fixup(int M, int K, int N, int y_stride, int y_off, GpuBuffer fixup,
+ *       GpuBuffer y)}: the stream-k form of the int8 MMQ GEMM on the CUDA tensor tile
+ *       ({@code kernels/llm/matmul_mmq_stream.cl}) and the pass that adds its split tiles' partial
+ *       sums; dispatch geometry in {@link StreamKGemmPlan}.</li>
  *   <li>{@code <T>_MatMul_W4A8(int M, int K, int N, int q_stride, int q_off, int y_stride, int y_off,
  *       GpuBuffer weight, GpuBuffer q8, GpuBuffer y)}: the E4M3 GEMM of a 4-bit weight type, same argument
  *       list and staged records as the MMQ form ({@link #MATMUL_W4A8_SUFFIX}).</li>
@@ -75,6 +81,8 @@ public final class GemmKernels {
     public static final String MATMUL_MMQ_SUFFIX = "_MatMul_MMQ";
     /** Name suffix of the split-K twins of the int8 MMQ GEMM kernels, {@code <T>_MatMul_MMQ_KSplit}. */
     public static final String MATMUL_MMQ_KSPLIT_SUFFIX = "_MatMul_MMQ_KSplit";
+    /** Name suffix of the stream-k form of the int8 MMQ GEMM kernels, {@code <T>_MatMul_MMQ_StreamK}. */
+    public static final String MATMUL_MMQ_STREAMK_SUFFIX = "_MatMul_MMQ_StreamK";
     /** Name suffix of the small-token-tile twins of the int8 MMQ GEMM kernels, {@code <T>_MatMul_MMQ_S}. */
     public static final String MATMUL_MMQ_S_SUFFIX = "_MatMul_MMQ_S";
     /** Name suffix of the 64-token small-token-tile twins, {@code <T>_MatMul_MMQ_S64}. */
@@ -151,6 +159,8 @@ public final class GemmKernels {
     public static final String QUANT_MMQ_FP4_NV = "LLM_Quant_MMQ_Fp4Nv";
     /** The split-K slice reduce. */
     public static final String SPLIT_K_REDUCE = "LLM_SplitK_Reduce";
+    /** The stream-k fixup: adds the partial sums of the tiles a stream-k MMQ launch split into their outputs. */
+    public static final String STREAM_K_FIXUP = "LLM_MMQ_StreamK_Fixup";
     /** Partial top-k over vocabulary slices. */
     public static final String TOPK_PARTIAL = "LLM_TopK_Partial";
     /** Row-wise top-k in rank order with the row's softmax denominators. */
@@ -378,6 +388,21 @@ public final class GemmKernels {
                     + "; supported: " + MMQ_TYPES);
         }
         return type.name() + MATMUL_MMQ_KSPLIT_SUFFIX;
+    }
+
+    /**
+     * Name of the stream-k form of the int8 MMQ GEMM kernel of a weight type
+     * ({@code <T>_MatMul_MMQ_StreamK}): CUDA sm_80+ only (the tensor tile), so callers select it through
+     * {@code ops.optionalReady(name, workGroup, 1)}.
+     *
+     * @throws IllegalArgumentException when the type has no int8 MMQ GEMM kernel
+     */
+    public static String matmulMmqStreamK(GGMLType type) {
+        if (!isInt8Mmq(type)) {
+            throw new IllegalArgumentException("no stream-k MMQ GEMM kernel for weight type " + type
+                    + "; supported: " + MMQ_TYPES);
+        }
+        return type.name() + MATMUL_MMQ_STREAMK_SUFFIX;
     }
 
     /**

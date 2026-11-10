@@ -550,6 +550,497 @@ NF_INLINE void nf_mmq_store(NF_GLOBAL float* NF_RESTRICT y, int M, int N,
 #endif
 }
 
+#if NF_MMQ_TENSOR
+/* ---- the tensor-core device tile: T_MatMul_MMQ and T_MatMul_MMQ_KSplit on CUDA sm_80+ ----
+ *
+ * The plain kernels over the NF_MMQ_TM x NF_MMQ_TN device tile stage one NF_MMQ_TK-deep chunk per
+ * barrier into two alternating shared buffers. One step is a single branch-free block: it starts the
+ * asynchronous copy of the next chunk's records into the other buffer (4-byte cp.async, no register
+ * round trip), issues the next chunk's weight and (scale, offset) loads into registers, combines the
+ * current chunk from shared memory, then decodes and commits the next chunk's weights, waits for the
+ * copy and passes the step's one barrier, so the load latency and the type's decode overlap the
+ * combine instead of sitting between barriers. The NF_MMQ_WG / 32 warps form NF_MMQ_TC_RG row groups
+ * of NF_MMQ_TC_NTX = NF_MMQ_RM / 4 m16 minitiles by NF_MMQ_TC_TG token groups of NF_MMQ_TC_NB n8
+ * blocks: on the 128 x 128 tile at eight rows per work-item, eight warps of 32 rows x 64 tokens
+ * (llama.cpp's 256-thread block), so each A fragment read with ldmatrix feeds eight mma and each B
+ * fragment and token scale read from the record tile two.
+ *
+ * The staged weight codes are word-swizzled (word w of row r at r * 8 + (w ^ 4 * ((r >> 2) & 1))) so
+ * the ldmatrix reads of the A fragments and the commit stores are free of bank conflicts without
+ * padding; the record tile keeps the NF_MMQ_RC-unit record layout of the staging pass, whose 12-word
+ * token stride already spreads the B-fragment reads over all banks.
+ *
+ * Every output takes the per-chunk fp32 combine of nf_mmq_tensor_stage in the same order, with the
+ * same operations (only the exact int-to-float conversion is computed on the integer pipe), so the
+ * plain kernels equal the small-token twins bit for bit; types whose OFF is identically zero (the
+ * HAS_OFF trait of the instantiation) skip the zero offset term, which leaves every sum unchanged.
+ * The asymmetric zero-point form is a property of the staging pass (LLM_Quant_MMQ_Int8Asym writes
+ * one static zero point into every record), so the gate the twins read per chunk - token 0's
+ * zero-point unit - is read once per tile and selects the pipe's form.
+ */
+#define NF_MMQ_TC_NTX (NF_MMQ_RM / 4)                  /* m16 row minitiles per warp */
+#define NF_MMQ_TC_WROWS (16 * NF_MMQ_TC_NTX)           /* weight rows per warp */
+#define NF_MMQ_TC_WARPS (NF_MMQ_WG / 32)
+#define NF_MMQ_TC_RG (NF_MMQ_TM / NF_MMQ_TC_WROWS)     /* warp row groups */
+#define NF_MMQ_TC_TG (NF_MMQ_TC_WARPS / NF_MMQ_TC_RG)  /* warp token groups */
+#define NF_MMQ_TC_WTOK (NF_MMQ_TN / NF_MMQ_TC_TG)      /* tokens per warp */
+#define NF_MMQ_TC_NB (NF_MMQ_TC_WTOK / 8)              /* n8 token blocks per warp */
+#define NF_MMQ_TC_ACC (NF_MMQ_TC_NTX * NF_MMQ_TC_NB * 4) /* accumulators per lane */
+#define NF_MMQ_TC_CW (NF_MMQ_TM * NF_MMQ_QS)            /* staged code words of one chunk */
+#define NF_MMQ_TC_CWI (NF_MMQ_TC_CW / NF_MMQ_WG)        /* code words per work-item and chunk */
+#define NF_MMQ_TC_SW (NF_MMQ_TM * NF_MMQ_SH)            /* (scale, offset) slots of one chunk */
+#define NF_MMQ_TC_SWI ((NF_MMQ_TC_SW + NF_MMQ_WG - 1) / NF_MMQ_WG)
+#define NF_MMQ_TC_XU (NF_MMQ_TN * NF_MMQ_RC)            /* record units of one chunk */
+#define NF_MMQ_TC_XUI (NF_MMQ_TC_XU / NF_MMQ_WG)        /* record units per work-item and chunk */
+
+#if NF_MMQ_TK != 32 || NF_MMQ_TC_CW % NF_MMQ_WG != 0 || NF_MMQ_TC_XU % NF_MMQ_WG != 0 \
+    || NF_MMQ_TM % NF_MMQ_TC_WROWS != 0 \
+    || NF_MMQ_TC_WARPS % NF_MMQ_TC_RG != 0 || NF_MMQ_TN % (8 * NF_MMQ_TC_TG) != 0
+#error "the tensor-core MMQ tile needs 32-deep stages and whole warp tiles"
+#endif
+
+/* The staged position of code word w of tile row r (see the swizzle above). */
+#define NF_MMQ_TC_SWZ(r, w) ((r) * NF_MMQ_QS + ((w) ^ ((((r) >> 2) & 1) << 2)))
+
+/* (scale, offset) slots per row and chunk: one per 32-element group, one per half for SG 16. */
+#define NF_MMQ_TC_SC(SG) ((SG) == 16 ? NF_MMQ_SH : 1)
+
+/* Four 8x8 b16 matrices from shared memory: lane l supplies the row address of matrix l >> 3. */
+NF_INLINE void nf_mmq_ldsm_x4(uint a[4], NF_LOCAL_PTR const int* p) {
+    const uint addr = (uint)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+                 : "r"(addr));
+}
+
+/* cp.async of one 4-byte unit from global to shared memory, the closing of the work-item's copy
+ * group, and the wait for all of its groups. */
+NF_INLINE void nf_mmq_cp_async4(NF_LOCAL_PTR uint* dst, const NF_GLOBAL uint* src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                 :: "r"((uint)__cvta_generic_to_shared(dst)), "l"(src) : "memory");
+}
+NF_INLINE void nf_mmq_cp_async_commit(void) {
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+NF_INLINE void nf_mmq_cp_async_wait(void) {
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+}
+/* The wait for all but the work-item's most recent copy group. */
+NF_INLINE void nf_mmq_cp_async_wait_prior(void) {
+    asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+}
+
+/* The integer code sum of half h (16 codes) of staged row r, for the asymmetric zero-point term. */
+NF_INLINE int nf_mmq_tc_half_sum(NF_LOCAL_PTR const int* wq, int r, int h) {
+    int s = 0;
+    for (int u = 0; u < 4; u++) {
+        s = __dp4a(wq[NF_MMQ_TC_SWZ(r, 4 * h + u)], 0x01010101, s);
+    }
+    return s;
+}
+
+/*
+ * One output's chunk term added to its accumulator, rounded step by step as nf_mmq_tensor_stage's
+ * compiled form rounds acc += d_t * (dx * d + dy * s - zp * (dx * W + dy * n)): fma(dx, d, dy * s),
+ * then fma(-(dx * W + dy * n), zp, .) with the code-sum term fma(dy, n, dx * W), then fma(d_t, ., acc).
+ * The explicit roundings keep that order whatever terms a form drops (dy == 0 without offsets, zp == 0
+ * on the symmetric records), so the plain tile and the twins agree bit for bit; a dropped term is an
+ * exact zero there (only the sign of a zero sum can differ, and acc starts at +0).
+ */
+NF_INLINE float nf_mmq_tc_term(float acc, int d, float dx, float dy, float s, float dt, int zp, int wsum,
+                               int n, const int has_off, const int asym) {
+    float sd = has_off ? __fmaf_rn(dx, (float)d, __fmul_rn(dy, s)) : __fmul_rn(dx, (float)d);
+    if (asym) {
+        const float corr = has_off ? __fmaf_rn(dy, (float)n, __fmul_rn(dx, (float)wsum))
+                                   : __fmul_rn(dx, (float)wsum);
+        sd = __fmaf_rn(-corr, (float)zp, sd);
+    }
+    return __fmaf_rn(dt, sd, acc);
+}
+
+/*
+ * One chunk of the tensor-core tile: the lane's NF_MMQ_TC_NTX minitiles against its warp's
+ * NF_MMQ_TC_NB n8 token blocks, combined per output exactly as nf_mmq_tensor_stage does. wq / xr /
+ * wsc / wof are the chunk's staged buffers, wrow0 / wtok0 the warp's first tile row and token; sg
+ * (16 or 32), has_off and asym (the tile's zero-point form) are compile-time constants.
+ */
+NF_INLINE void nf_mmq_tc_combine(NF_LOCAL_PTR const int* wq, NF_LOCAL_PTR const uint* xr,
+                                 NF_LOCAL_PTR const float* wsc, NF_LOCAL_PTR const float* wof,
+                                 int lane, int wrow0, int wtok0, float acc[], const int sg,
+                                 const int has_off, const int asym) {
+    const int g = lane >> 2, q = lane & 3;
+    const int sc = NF_MMQ_TC_SC(sg);
+    /* ldmatrix row of this lane: matrices (rows 0-7 | 8-15) x (words 0-3 | 4-7) of a minitile */
+    const int lrow = (lane & 7) + 8 * ((lane >> 3) & 1);
+    const int lword = (((lane >> 4) & 1) ^ ((lane >> 2) & 1)) * 4;
+    uint a[NF_MMQ_TC_NTX][4];
+    float dmx[NF_MMQ_TC_NTX][2][NF_MMQ_SH], dmy[NF_MMQ_TC_NTX][2][NF_MMQ_SH];
+    int wsu[NF_MMQ_TC_NTX][2][NF_MMQ_SH];
+    for (int m = 0; m < NF_MMQ_TC_NTX; m++) {
+        nf_mmq_ldsm_x4(a[m], wq + (wrow0 + 16 * m + lrow) * NF_MMQ_QS + lword);
+        for (int j = 0; j < 2; j++) {
+            const int r = wrow0 + 16 * m + g + 8 * j;
+            for (int h = 0; h < NF_MMQ_SH; h++) {
+                dmx[m][j][h] = h < sc ? wsc[r * sc + h] : 0.0f;
+                dmy[m][j][h] = has_off && h < sc ? wof[r * sc + h] : 0.0f;
+                /* the weight code sums of the asymmetric correction, reduced only on that form */
+                wsu[m][j][h] = asym ? nf_mmq_tc_half_sum(wq, r, h) : 0;
+            }
+        }
+    }
+    for (int nb = 0; nb < NF_MMQ_TC_NB; nb++) {
+        const int tb = wtok0 + nb * 8;
+        const int rb = (tb + g) * NF_MMQ_RC;
+        const uint b[2] = {xr[rb + q], xr[rb + q + NF_MMQ_TK / 8]};
+        float tds[2];
+        float tsf[2][NF_MMQ_SH];
+        int tzp[2];
+        for (int t = 0; t < 2; t++) {
+            const int tc = (tb + 2 * q + t) * NF_MMQ_RC;
+            tds[t] = nf_mmq_rec_d(xr[tc + NF_MMQ_QS]);
+            for (int h = 0; h < NF_MMQ_SH; h++) {
+                tsf[t][h] = !has_off ? 0.0f : sg == 32
+                    ? (h == 0 ? (float)((int)xr[tc + NF_MMQ_QS + 1] + (int)xr[tc + NF_MMQ_QS + 2]) : 0.0f)
+                    : (float)(int)xr[tc + NF_MMQ_QS + 1 + h];
+            }
+            tzp[t] = asym ? (int)xr[tc + NF_MMQ_QS + 1 + NF_MMQ_SH] : 0;
+        }
+        for (int m = 0; m < NF_MMQ_TC_NTX; m++) {
+            float* ac = acc + (m * NF_MMQ_TC_NB + nb) * 4;
+            if (sg == 32) {
+                int d[4] = {0, 0, 0, 0};
+                nf_mmq_mma_m16n8k32(d, a[m], b);
+                for (int i = 0; i < 4; i++) {
+                    const int j = i >> 1, t = i & 1;
+                    ac[i] = nf_mmq_tc_term(ac[i], d[i], dmx[m][j][0], dmy[m][j][0], tsf[t][0], tds[t],
+                                           tzp[t], wsu[m][j][0] + wsu[m][j][1], NF_MMQ_SH * 16,
+                                           has_off, asym);
+                }
+            } else {
+                for (int h = 0; h < NF_MMQ_SH; h++) {
+                    const uint ah[2] = {a[m][2 * h], a[m][2 * h + 1]};
+                    int d[4] = {0, 0, 0, 0};
+                    nf_mmq_mma_m16n8k16(d, ah, b[h]);
+                    for (int i = 0; i < 4; i++) {
+                        const int j = i >> 1, t = i & 1;
+                        ac[i] = nf_mmq_tc_term(ac[i], d[i], dmx[m][j][h], dmy[m][j][h], tsf[t][h], tds[t],
+                                               tzp[t], wsu[m][j][h], 16, has_off, asym);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/*
+ * Byte offsets of the work-item's weight slots from the tile's first row, and unit offsets of its
+ * record pieces from the tile's first token, fixed for the whole tile: code word slot
+ * s * NF_MMQ_WG + lid holds word slot & 7 of row slot >> 3 (a warp reads four rows' chunk codes as
+ * contiguous spans), (scale, offset) slot i row i / SC, record slot i unit i % NF_MMQ_RC of token
+ * i / NF_MMQ_RC (consecutive units are consecutive in q8). Rows past M read row M - 1 and tokens past N token N - 1: an output depends
+ * only on its own row's codes and scales and its own token's record, and the outputs of those rows
+ * and tokens are never stored, so the loads only need to stay in bounds. The offsets fit int: a tile
+ * spans NF_MMQ_TM rows of at most ~1.07 bytes per element.
+ */
+#define NF_MMQ_TC_SLOTS(SC) \
+    for (int s = 0; s < NF_MMQ_TC_CWI; s++) { \
+        const int slot = s * NF_MMQ_WG + lid; \
+        tc_wo[s] = (int)((min(m0 + (slot >> 3), M - 1) - m0) * row_bytes); \
+        tc_we[s] = 4 * (slot & 7); \
+    } \
+    for (int s = 0; s < NF_MMQ_TC_SWI; s++) { \
+        const int i = min(s * NF_MMQ_WG + lid, NF_MMQ_TM * (SC) - 1); \
+        tc_so[s] = (int)((min(m0 + i / (SC), M - 1) - m0) * row_bytes); \
+        tc_se[s] = (i % (SC)) * 16; \
+    } \
+    for (int s = 0; s < NF_MMQ_TC_XUI; s++) { \
+        const int i = s * NF_MMQ_WG + lid; \
+        tc_xo[s] = (min(n0 + i / NF_MMQ_RC, N - 1) - n0) * q_stride * NF_MMQ_RC + i % NF_MMQ_RC; \
+    }
+
+/*
+ * Starts the asynchronous copy of chunk c's records of the tile's tokens into the record stage at unit
+ * offset xoff (cp.async: the records need no decode, so they go global -> shared without registers)
+ * and closes the copy group. The copy moves 4-byte units, which every record offset aligns to, so the
+ * step needs no alignment branch; consecutive work-items copy consecutive units, coalesced.
+ */
+#define NF_MMQ_TC_XCOPY(c, xoff) \
+    { \
+        const NF_GLOBAL uint* xchunk = xtile + ((c) / NF_MMQ_TK) * NF_MMQ_RC; \
+        for (int s = 0; s < NF_MMQ_TC_XUI; s++) { \
+            nf_mmq_cp_async4(tc_xr + (xoff) + s * NF_MMQ_WG + lid, xchunk + tc_xo[s]); \
+        } \
+        nf_mmq_cp_async_commit(); \
+    }
+
+/*
+ * Loads chunk c's weight codes and (scale, offset) pairs into prefetch register set P (0 or 1)
+ * through the slot offsets of NF_MMQ_TC_SLOTS: the chunk adds one block offset to every slot. Every
+ * load is unconditional, so the step stays one branch-free block.
+ */
+#define NF_MMQ_TC_PREFETCH(c, P, HAS_OFF, BS, BB, CODE, SCALE, OFF) \
+    { \
+        const NF_GLOBAL uchar* wc = wtile + ((c) / (BS)) * (BB); \
+        for (int s = 0; s < NF_MMQ_TC_CWI; s++) { \
+            tc_pw##P[s] = CODE##4(wc + tc_wo[s], ((c) % (BS)) + tc_we[s]); \
+        } \
+        for (int s = 0; s < NF_MMQ_TC_SWI; s++) { \
+            tc_ps##P[s] = SCALE(wc + tc_so[s], (c) + tc_se[s]); \
+            tc_po##P[s] = HAS_OFF ? OFF(wc + tc_so[s], (c) + tc_se[s]) : 0.0f; \
+        } \
+    }
+
+/* Writes prefetch register set P into weight buffer `buf`. */
+#define NF_MMQ_TC_COMMIT(buf, P, SC, HAS_OFF) \
+    for (int s = 0; s < NF_MMQ_TC_CWI; s++) { \
+        const int slot = s * NF_MMQ_WG + lid; \
+        tc_wq[(buf) * NF_MMQ_TC_CW + NF_MMQ_TC_SWZ(slot >> 3, slot & 7)] = (int)tc_pw##P[s]; \
+    } \
+    for (int s = 0; s < NF_MMQ_TC_SWI; s++) { \
+        const int i = s * NF_MMQ_WG + lid; \
+        if (i < NF_MMQ_TM * (SC)) { \
+            tc_wsc[(buf) * NF_MMQ_TC_SW + i] = tc_ps##P[s]; \
+            if (HAS_OFF) { \
+                tc_wof[(buf) * NF_MMQ_TC_SW + i] = tc_po##P[s]; \
+            } \
+        } \
+    }
+
+/* The int8 combine of weight buffer buf and the record stage at unit offset xoff in the tile's form
+ * (the COMBINE argument of NF_MMQ_TC_LOOP). */
+#define NF_MMQ_TC_INT8(buf, xoff, SG, ASYM, HAS_OFF) \
+    nf_mmq_tc_combine(tc_wq + (buf) * NF_MMQ_TC_CW, tc_xr + (xoff), \
+                      tc_wsc + (buf) * NF_MMQ_TC_SW, tc_wof + (buf) * NF_MMQ_TC_SW, \
+                      lane, wrow0, wtok0, acc, (SG), (HAS_OFF), (ASYM));
+
+/*
+ * One step of the chunk held in weight buffer bufA and record stage tc_x0, two chunks ahead of the
+ * loads: start chunk cn2's record copy into stage tc_x2 and its weight loads into register set PL,
+ * combine the current chunk, commit the next chunk's weights (loaded one step earlier into set PC)
+ * into the other weight buffer - which every warp finished reading before the previous barrier -,
+ * wait for the next chunk's record copy (cn2's stays in flight) and pass the step's single barrier,
+ * then rotate the record stages. Near the end cn2 repeats the last chunk; its copies and loads land
+ * in stages and registers nothing reads.
+ */
+#define NF_MMQ_TC_STEP(cn2, bufA, PL, PC, COMBINE, SG, ASYM, HAS_OFF, BS, BB, CODE, SCALE, OFF) \
+    NF_MMQ_TC_XCOPY(cn2, tc_x2) \
+    NF_MMQ_TC_PREFETCH(cn2, PL, HAS_OFF, BS, BB, CODE, SCALE, OFF) \
+    COMBINE(bufA, tc_x0, SG, ASYM, HAS_OFF) \
+    NF_MMQ_TC_COMMIT(1 - (bufA), PC, NF_MMQ_TC_SC(SG), HAS_OFF) \
+    nf_mmq_cp_async_wait_prior(); \
+    barrier(CLK_LOCAL_MEM_FENCE); \
+    { \
+        const int xfree = tc_x0; \
+        tc_x0 = tc_x1; \
+        tc_x1 = tc_x2; \
+        tc_x2 = xfree; \
+    }
+
+/*
+ * The tile's chunks [cstart, cend) through COMBINE in one zero-point form, loaded two chunks ahead of
+ * the combine: the prologue copies the records of the first two chunks, commits the first chunk's
+ * weights and loads the second's into register set 1; two steps per iteration keep the weight buffer
+ * and register set of every step compile-time constants, and the three record stages rotate through
+ * tc_x0 (combined), tc_x1 (landing) and tc_x2 (being issued). The last copy group is drained before
+ * the tile leaves the loop.
+ */
+#define NF_MMQ_TC_LOOP(cstart, cend, COMBINE, SG, ASYM, HAS_OFF, BS, BB, CODE, SCALE, OFF) \
+    if ((cstart) < (cend)) { \
+        const int clast = (cend) - NF_MMQ_TK; \
+        int tc_x0 = 0, tc_x1 = NF_MMQ_TC_XU, tc_x2 = 2 * NF_MMQ_TC_XU; \
+        NF_MMQ_TC_SLOTS(NF_MMQ_TC_SC(SG)) \
+        NF_MMQ_TC_XCOPY((cstart), tc_x0) \
+        NF_MMQ_TC_PREFETCH((cstart), 0, HAS_OFF, BS, BB, CODE, SCALE, OFF) \
+        NF_MMQ_TC_XCOPY(min((cstart) + NF_MMQ_TK, clast), tc_x1) \
+        NF_MMQ_TC_COMMIT(0, 0, NF_MMQ_TC_SC(SG), HAS_OFF) \
+        NF_MMQ_TC_PREFETCH(min((cstart) + NF_MMQ_TK, clast), 1, HAS_OFF, BS, BB, CODE, SCALE, OFF) \
+        nf_mmq_cp_async_wait_prior(); \
+        barrier(CLK_LOCAL_MEM_FENCE); \
+        for (int c = (cstart); c < (cend); c += 2 * NF_MMQ_TK) { \
+            NF_MMQ_TC_STEP(min(c + 2 * NF_MMQ_TK, clast), 0, 0, 1, COMBINE, SG, ASYM, HAS_OFF, BS, BB, \
+                           CODE, SCALE, OFF) \
+            if (c + NF_MMQ_TK >= (cend)) { \
+                break; \
+            } \
+            NF_MMQ_TC_STEP(min(c + 3 * NF_MMQ_TK, clast), 1, 1, 0, COMBINE, SG, ASYM, HAS_OFF, BS, BB, \
+                           CODE, SCALE, OFF) \
+        } \
+        nf_mmq_cp_async_wait(); \
+    }
+
+/* The tile's chunks [cstart, cend) into acc through the int8 combine, in the zero-point form of the
+ * tile's first record: every staging kernel writes one zero point into all records of a launch
+ * (LLM_Quant_MMQ_Int8Asym its static zp, the others 0), so the first record decides the form of the
+ * whole tile. */
+#define NF_MMQ_TC_PIPE(cstart, cend, SG, HAS_OFF, BS, BB, CODE, SCALE, OFF) \
+    if ((cstart) < (cend) \
+        && xtile[((cstart) / NF_MMQ_TK) * NF_MMQ_RC + NF_MMQ_QS + 1 + NF_MMQ_SH] != 0u) { \
+        NF_MMQ_TC_LOOP(cstart, cend, NF_MMQ_TC_INT8, SG, 1, HAS_OFF, BS, BB, CODE, SCALE, OFF) \
+    } else { \
+        NF_MMQ_TC_LOOP(cstart, cend, NF_MMQ_TC_INT8, SG, 0, HAS_OFF, BS, BB, CODE, SCALE, OFF) \
+    }
+
+/* The lane's accumulators to global memory, bounds-checked per element. */
+NF_INLINE void nf_mmq_tc_store(NF_GLOBAL float* NF_RESTRICT y, int M, int N, int y_stride, nf_i64 y_off,
+                               int m0, int n0, int lane, int wrow0, int wtok0, const float acc[]) {
+    const int g = lane >> 2, q = lane & 3;
+    for (int m = 0; m < NF_MMQ_TC_NTX; m++) {
+        for (int nb = 0; nb < NF_MMQ_TC_NB; nb++) {
+            const float* v = acc + (m * NF_MMQ_TC_NB + nb) * 4;
+            const int r = m0 + wrow0 + 16 * m + g;
+            const int c = n0 + wtok0 + nb * 8 + 2 * q;
+            if (r < M && c < N) y[y_off + (nf_i64)c * y_stride + r] = v[0];
+            if (r < M && c + 1 < N) y[y_off + (nf_i64)(c + 1) * y_stride + r] = v[1];
+            if (r + 8 < M && c < N) y[y_off + (nf_i64)c * y_stride + r + 8] = v[2];
+            if (r + 8 < M && c + 1 < N) y[y_off + (nf_i64)(c + 1) * y_stride + r + 8] = v[3];
+        }
+    }
+}
+
+/* The work-item's index and warp geometry, from the work-item index LID. */
+#define NF_MMQ_TC_GEOMETRY(LID) \
+    const int lid = (LID); \
+    const int lane = lid & 31; \
+    const int wrow0 = ((lid >> 5) / NF_MMQ_TC_TG) * NF_MMQ_TC_WROWS; \
+    const int wtok0 = ((lid >> 5) % NF_MMQ_TC_TG) * NF_MMQ_TC_WTOK;
+
+/*
+ * The work-item index read afresh from the special register (volatile, so never hoisted): a kernel that
+ * runs the pipe in a loop over several tiles derives its geometry from it inside the loop, so the
+ * compiler keeps the lane-derived addressing per tile instead of hoisting it out of the loop and
+ * holding it live across the whole pipe (which costs the stream-k kernels some 80 registers and
+ * spills).
+ */
+NF_INLINE int nf_mmq_tc_fresh_lid(void) {
+    int v;
+    asm volatile("mov.u32 %0, %%tid.x;" : "=r"(v));
+    return v;
+}
+
+/* Shared buffers, prefetch registers and accumulators of a tensor-core tile kernel. */
+#define NF_MMQ_TC_TILE_DECLS(BS, BB) \
+    const nf_i64 row_bytes = (nf_i64)(K / (BS)) * (BB); \
+    NF_LOCAL int tc_wq[2 * NF_MMQ_TC_CW]; \
+    NF_LOCAL float tc_wsc[2 * NF_MMQ_TC_SW]; \
+    NF_LOCAL float tc_wof[2 * NF_MMQ_TC_SW]; \
+    NF_LOCAL uint tc_xr[3 * NF_MMQ_TC_XU]; \
+    int tc_wo[NF_MMQ_TC_CWI], tc_we[NF_MMQ_TC_CWI], tc_so[NF_MMQ_TC_SWI], tc_se[NF_MMQ_TC_SWI]; \
+    int tc_xo[NF_MMQ_TC_XUI]; \
+    uint tc_pw0[NF_MMQ_TC_CWI], tc_pw1[NF_MMQ_TC_CWI]; \
+    float tc_ps0[NF_MMQ_TC_SWI], tc_ps1[NF_MMQ_TC_SWI]; \
+    float tc_po0[NF_MMQ_TC_SWI], tc_po1[NF_MMQ_TC_SWI]; \
+    float acc[NF_MMQ_TC_ACC];
+
+/* Declarations and warp geometry of a one-tile tensor-core kernel; GEMM_ARGS is its body. */
+#define NF_MMQ_TC_KERNEL_BODY(BS, BB, GEMM_ARGS) \
+    NF_MMQ_TC_GEOMETRY(get_local_id(0)) \
+    NF_MMQ_TC_TILE_DECLS(BS, BB) \
+    for (int i = 0; i < NF_MMQ_TC_ACC; i++) \
+        acc[i] = 0.0f; \
+    GEMM_ARGS
+
+/* The plain and split-K kernels of the tensor-core tile; PIPE runs the tile's chunks (NF_MMQ_TC_PIPE
+ * for the int8 types, NF_FP8_TC_PIPE for the E4M3 lane). */
+#define NF_MMQ_TC_GEMM_NAMED(NAME, PIPE, BS, BB, SG, HAS_OFF, CODE, SCALE, OFF) \
+NF_KERNEL __launch_bounds__(NF_MMQ_WG) void NAME( \
+    const int M, const int K, const int N, \
+    const int q_stride, const int q_off, const int y_stride, const int y_off, \
+    NF_GLOBAL const uchar* NF_RESTRICT weight, \
+    NF_GLOBAL const uint* NF_RESTRICT q8, \
+    NF_GLOBAL float* NF_RESTRICT y) { \
+    NF_MMQ_TC_KERNEL_BODY((BS), (BB), \
+        const int m0 = (int)get_group_id(0) * NF_MMQ_TM; \
+        const int n0 = (int)get_group_id(1) * NF_MMQ_TN; \
+        const NF_GLOBAL uchar* wtile = weight + (nf_i64)m0 * row_bytes; \
+        const NF_GLOBAL uint* xtile = q8 + (nf_i64)q_off + (nf_i64)n0 * q_stride * NF_MMQ_RC; \
+        PIPE(0, K, (SG), (HAS_OFF), (BS), (BB), CODE, SCALE, OFF) \
+        nf_mmq_tc_store(y, M, N, y_stride, (nf_i64)y_off, m0, n0, lane, wrow0, wtok0, acc); \
+    ) \
+}
+
+#define NF_MMQ_TC_KSPLIT_NAMED(NAME, PIPE, BS, BB, SG, HAS_OFF, CODE, SCALE, OFF) \
+NF_KERNEL __launch_bounds__(NF_MMQ_WG) void NAME( \
+    const int M, const int K, const int N, \
+    const int q_stride, const int q_off, const int k_slice, \
+    NF_GLOBAL const uchar* NF_RESTRICT weight, \
+    NF_GLOBAL const uint* NF_RESTRICT q8, \
+    NF_GLOBAL float* NF_RESTRICT partial) { \
+    NF_MMQ_TC_KERNEL_BODY((BS), (BB), \
+        const int rtiles = (M + NF_MMQ_TM - 1) / NF_MMQ_TM; \
+        const int slice = (int)get_group_id(0) / rtiles; \
+        const int m0 = ((int)get_group_id(0) - slice * rtiles) * NF_MMQ_TM; \
+        const int n0 = (int)get_group_id(1) * NF_MMQ_TN; \
+        const int k0 = slice * k_slice; \
+        const int k1 = k0 + k_slice < K ? k0 + k_slice : K; \
+        const NF_GLOBAL uchar* wtile = weight + (nf_i64)m0 * row_bytes; \
+        const NF_GLOBAL uint* xtile = q8 + (nf_i64)q_off + (nf_i64)n0 * q_stride * NF_MMQ_RC; \
+        PIPE(k0, k1, (SG), (HAS_OFF), (BS), (BB), CODE, SCALE, OFF) \
+        nf_mmq_tc_store(partial, M, N, M, (nf_i64)slice * M * N, m0, n0, lane, wrow0, wtok0, acc); \
+    ) \
+}
+
+/*
+ * Stream-k decomposition of the tile grid (llama.cpp's mul_mat_q stream-k form, ggml-cuda/mmq.cuh):
+ * the launch's output tiles, row tile major with the token tile fastest (the token tiles of one weight
+ * row tile run back to back and share its weight stream in L2), times their K / NF_MMQ_TK chunks form
+ * one sequence, and block b of nb takes chunks [nf_mmq_streamk_start(b), nf_mmq_streamk_start(b + 1)).
+ * Every block then carries the same work whatever the tile count, so the last wave of a grid whose
+ * tiles are not a multiple of the device's resident blocks no longer runs part-empty. A block stores
+ * the tiles whose last chunk it runs straight into y; at most one segment per block - its last, when it
+ * stops inside a tile - goes to the block's TM x TN plane of the fixup buffer, and
+ * LLM_MMQ_StreamK_Fixup adds those planes into the tile afterwards.
+ */
+NF_INLINE int nf_mmq_streamk_start(int b, int nb, int total) {
+    return (int)(((nf_i64)b * total) / nb);
+}
+
+/*
+ * The stream-k kernel of the tensor-core tile: global {nb * NF_MMQ_WG, 1}, local {NF_MMQ_WG, 1} with
+ * nb <= the launch's tile count times its chunk count (the host picks the device's resident blocks).
+ * Arguments as T_MatMul_MMQ plus fixup, nb planes of NF_MMQ_TM x NF_MMQ_TN floats (token-major).
+ * Every segment runs the plain kernel's chunk pipe, so a tile run by one block equals T_MatMul_MMQ's
+ * output bit for bit; a split tile differs by the fp32 rounding of adding its partial sums.
+ */
+#define NF_MMQ_TC_STREAMK_NAMED(NAME, PIPE, BS, BB, SG, HAS_OFF, CODE, SCALE, OFF) \
+NF_KERNEL __launch_bounds__(NF_MMQ_WG) void NAME( \
+    const int M, const int K, const int N, \
+    const int q_stride, const int q_off, const int y_stride, const int y_off, \
+    NF_GLOBAL const uchar* NF_RESTRICT weight, \
+    NF_GLOBAL const uint* NF_RESTRICT q8, \
+    NF_GLOBAL float* NF_RESTRICT y, \
+    NF_GLOBAL float* NF_RESTRICT fixup) { \
+    NF_MMQ_TC_TILE_DECLS((BS), (BB)) \
+    { \
+        const int kc = K / NF_MMQ_TK; \
+        const int ntj = (N + NF_MMQ_TN - 1) / NF_MMQ_TN; \
+        const int total = (M + NF_MMQ_TM - 1) / NF_MMQ_TM * ntj * kc; \
+        const int b = (int)get_group_id(0); \
+        const int nb = (int)get_num_groups(0); \
+        const int kstop = nf_mmq_streamk_start(b + 1, nb, total); \
+        for (int kbc = nf_mmq_streamk_start(b, nb, total); kbc < kstop;) { \
+            NF_MMQ_TC_GEOMETRY(nf_mmq_tc_fresh_lid()) \
+            const int tile = kbc / kc; \
+            const int kb = kbc - tile * kc; \
+            const int ke = min(kc, kb + (kstop - kbc)); \
+            const int m0 = tile / ntj * NF_MMQ_TM; \
+            const int n0 = tile % ntj * NF_MMQ_TN; \
+            const NF_GLOBAL uchar* wtile = weight + (nf_i64)m0 * row_bytes; \
+            const NF_GLOBAL uint* xtile = q8 + (nf_i64)q_off + (nf_i64)n0 * q_stride * NF_MMQ_RC; \
+            for (int i = 0; i < NF_MMQ_TC_ACC; i++) \
+                acc[i] = 0.0f; \
+            PIPE(kb * NF_MMQ_TK, ke * NF_MMQ_TK, (SG), (HAS_OFF), (BS), (BB), CODE, SCALE, OFF) \
+            if (ke == kc) { \
+                nf_mmq_tc_store(y, M, N, y_stride, (nf_i64)y_off, m0, n0, lane, wrow0, wtok0, acc); \
+            } else { \
+                nf_mmq_tc_store(fixup, NF_MMQ_TM, NF_MMQ_TN, NF_MMQ_TM, (nf_i64)b * NF_MMQ_TM * NF_MMQ_TN, 0, 0, \
+                                lane, wrow0, wtok0, acc); \
+            } \
+            kbc += ke - kb; \
+        } \
+    } \
+}
+#endif /* NF_MMQ_TENSOR */
+
 /* ---- kernel generator ---- */
 
 /*
@@ -602,8 +1093,13 @@ NF_KERNEL void NAME( \
     ) \
 }
 
+#if NF_MMQ_TENSOR
+#define NF_MMQ_GEMM(T, BS, BB, SG, CODE, SCALE, OFF) \
+    NF_MMQ_TC_GEMM_NAMED(T##_MatMul_MMQ, NF_MMQ_TC_PIPE, BS, BB, SG, T##_MMQ_HAS_OFF, CODE, SCALE, OFF)
+#else
 #define NF_MMQ_GEMM(T, BS, BB, SG, CODE, SCALE, OFF) \
     NF_MMQ_GEMM_TN(T##_MatMul_MMQ, NF_MMQ_TN, BS, BB, SG, CODE, SCALE, OFF)
+#endif
 
 #define NF_MMQ_GEMM_S(T, BS, BB, SG, CODE, SCALE, OFF) \
     NF_MMQ_GEMM_TN(T##_MatMul_MMQ_S, 16, BS, BB, SG, CODE, SCALE, OFF)
@@ -640,8 +1136,20 @@ NF_KERNEL void NAME( \
     ) \
 }
 
+#if NF_MMQ_TENSOR
+#define NF_MMQ_GEMM_KSPLIT(T, BS, BB, SG, CODE, SCALE, OFF) \
+    NF_MMQ_TC_KSPLIT_NAMED(T##_MatMul_MMQ_KSplit, NF_MMQ_TC_PIPE, BS, BB, SG, T##_MMQ_HAS_OFF, CODE, SCALE, \
+                           OFF)
+#else
 #define NF_MMQ_GEMM_KSPLIT(T, BS, BB, SG, CODE, SCALE, OFF) \
     NF_MMQ_KSPLIT_TN(T##_MatMul_MMQ_KSplit, NF_MMQ_TN, BS, BB, SG, CODE, SCALE, OFF)
+#endif
+
+#if NF_MMQ_TENSOR
+#define NF_MMQ_GEMM_STREAMK(T, BS, BB, SG, CODE, SCALE, OFF) \
+    NF_MMQ_TC_STREAMK_NAMED(T##_MatMul_MMQ_StreamK, NF_MMQ_TC_PIPE, BS, BB, SG, T##_MMQ_HAS_OFF, CODE, SCALE, \
+                            OFF)
+#endif
 
 #define NF_MMQ_GEMM_SKSPLIT(T, BS, BB, SG, CODE, SCALE, OFF) \
     NF_MMQ_KSPLIT_TN(T##_MatMul_MMQ_SKSplit, 16, BS, BB, SG, CODE, SCALE, OFF)
@@ -739,6 +1247,84 @@ NF_INLINE void nf_fp8_combine(NF_LOCAL_PTR const nf_i8* wq, NF_LOCAL_PTR const u
 #endif
 }
 
+#if NF_MMQ_TENSOR
+/*
+ * The E4M3 lane on the tensor-core device tile (T_MatMul_MMQ / T_MatMul_W4A8 and their KSplit forms):
+ * the int8 tile's staging, pipeline and warp layout with the E4M3 combine. Each output adds
+ * d_t * (s_w * dot) - the sm_89+ E4M3 mma dot, or below sm_89 the scalar dot in nf_fp8_stage_dot's
+ * element order - rounded step by step as nf_fp8_combine's compiled form rounds it (fmul, then fma),
+ * so the plain kernels equal the twins bit for bit.
+ */
+
+/* nf_fp8_stage_dot over staged row r of the swizzled code tile. */
+NF_INLINE float nf_fp8_tc_dot(NF_LOCAL_PTR const int* wq, int r, NF_LOCAL_PTR const uint* rec) {
+    float sum = 0.0f;
+    for (int kk = 0; kk < NF_MMQ_TK; kk++) {
+        const uint word = (uint)wq[NF_MMQ_TC_SWZ(r, kk >> 2)];
+        const uint wc = (word >> (8u * (kk & 3u))) & 0xFFu;
+        const uint xc = (rec[kk >> 2] >> (8u * (kk & 3u))) & 0xFFu;
+        sum += F8_E4M3_LUT[wc] * F8_E4M3_LUT[xc];
+    }
+    return sum;
+}
+
+/* One chunk of the E4M3 tile: as nf_mmq_tc_combine over one scale per row and chunk, no offset. */
+NF_INLINE void nf_fp8_tc_combine(NF_LOCAL_PTR const int* wq, NF_LOCAL_PTR const uint* xr,
+                                 NF_LOCAL_PTR const float* wsc, int lane, int wrow0, int wtok0, float acc[]) {
+    const int g = lane >> 2, q = lane & 3;
+    float dmx[NF_MMQ_TC_NTX][2];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+    const int lrow = (lane & 7) + 8 * ((lane >> 3) & 1);
+    const int lword = (((lane >> 4) & 1) ^ ((lane >> 2) & 1)) * 4;
+    uint a[NF_MMQ_TC_NTX][4];
+#endif
+    for (int m = 0; m < NF_MMQ_TC_NTX; m++) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+        nf_mmq_ldsm_x4(a[m], wq + (wrow0 + 16 * m + lrow) * NF_MMQ_QS + lword);
+#endif
+        for (int j = 0; j < 2; j++) {
+            dmx[m][j] = wsc[wrow0 + 16 * m + g + 8 * j];
+        }
+    }
+    for (int nb = 0; nb < NF_MMQ_TC_NB; nb++) {
+        const int tb = wtok0 + nb * 8;
+        float tds[2];
+        for (int t = 0; t < 2; t++) {
+            tds[t] = nf_mmq_rec_d(xr[(tb + 2 * q + t) * NF_MMQ_RC + NF_MMQ_QS]);
+        }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+        const int rb = (tb + g) * NF_MMQ_RC;
+        const uint b[2] = {xr[rb + q], xr[rb + q + NF_MMQ_TK / 8]};
+#endif
+        for (int m = 0; m < NF_MMQ_TC_NTX; m++) {
+            float* ac = acc + (m * NF_MMQ_TC_NB + nb) * 4;
+            float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+            nf_fp8_mma_m16n8k32(d, a[m], b);
+#else
+            for (int i = 0; i < 4; i++) {
+                d[i] = nf_fp8_tc_dot(wq, wrow0 + 16 * m + g + 8 * (i >> 1),
+                                     xr + (tb + 2 * q + (i & 1)) * NF_MMQ_RC);
+            }
+#endif
+            for (int i = 0; i < 4; i++) {
+                ac[i] = __fmaf_rn(tds[i & 1], __fmul_rn(dmx[m][i >> 1], d[i]), ac[i]);
+            }
+        }
+    }
+}
+
+/* The E4M3 combine of weight buffer buf and the record stage at unit offset xoff (the COMBINE argument
+ * of NF_MMQ_TC_LOOP). */
+#define NF_FP8_TC_COMBINE(buf, xoff, SG, ASYM, HAS_OFF) \
+    nf_fp8_tc_combine(tc_wq + (buf) * NF_MMQ_TC_CW, tc_xr + (xoff), \
+                      tc_wsc + (buf) * NF_MMQ_TC_SW, lane, wrow0, wtok0, acc);
+
+/* The E4M3 tile's chunks [cstart, cend): one scale per 32-element chunk, no offset, no zero point. */
+#define NF_FP8_TC_PIPE(cstart, cend, SG, HAS_OFF, BS, BB, CODE, SCALE, OFF) \
+    NF_MMQ_TC_LOOP(cstart, cend, NF_FP8_TC_COMBINE, 32, 0, 0, BS, BB, CODE, SCALE, OFF)
+#endif /* NF_MMQ_TENSOR */
+
 /* The weight offset of the E4M3 lane: every FP8 and 4-bit type it serves is symmetric, and the staged
  * activation records carry a zero zero-point, so no offset term applies. */
 #define NF_FP8Q_NO_OFFSET(bp, k0) 0.0f
@@ -770,8 +1356,14 @@ NF_KERNEL void NAME( \
     ) \
 }
 
+/* The device-tile kernels: the tensor-core tile on the tensor path, the pipelined stage elsewhere. */
+#if NF_MMQ_TENSOR
+#define NF_FP8Q_GEMM_NAMED(NAME, BS, BB, CODE, SCALE) \
+    NF_MMQ_TC_GEMM_NAMED(NAME, NF_FP8_TC_PIPE, BS, BB, 32, 0, CODE, SCALE, NF_FP8Q_NO_OFFSET)
+#else
 #define NF_FP8Q_GEMM_NAMED(NAME, BS, BB, CODE, SCALE) \
     NF_FP8Q_GEMM_TN_NAMED(NAME, NF_MMQ_TN, BS, BB, CODE, SCALE)
+#endif
 
 #define NF_FP8Q_GEMM_S_NAMED(NAME, BS, BB, CODE, SCALE) \
     NF_FP8Q_GEMM_TN_NAMED(NAME, 16, BS, BB, CODE, SCALE)
@@ -798,8 +1390,13 @@ NF_KERNEL void NAME( \
     ) \
 }
 
+#if NF_MMQ_TENSOR
+#define NF_FP8Q_GEMM_KSPLIT_NAMED(NAME, BS, BB, CODE, SCALE) \
+    NF_MMQ_TC_KSPLIT_NAMED(NAME, NF_FP8_TC_PIPE, BS, BB, 32, 0, CODE, SCALE, NF_FP8Q_NO_OFFSET)
+#else
 #define NF_FP8Q_GEMM_KSPLIT_NAMED(NAME, BS, BB, CODE, SCALE) \
     NF_FP8Q_GEMM_KSPLIT_TN_NAMED(NAME, NF_MMQ_TN, BS, BB, CODE, SCALE)
+#endif
 
 #define NF_FP8Q_GEMM(T, BS, BB, CODE, SCALE) \
     NF_FP8Q_GEMM_NAMED(T##_MatMul_MMQ, BS, BB, CODE, SCALE)

@@ -480,7 +480,7 @@ On a CUDA device of compute capability 8.0 or newer, prefill attention (prompts,
 - both head dimensions are multiples of 16, at most 128;
 - the layer uses standard attention (MLA keeps its own path).
 
-Split-K over long contexts, sinks, softcap, ALiBi, the T5 relative bias, sliding windows, causal and bidirectional masks and paged caches behave as in the scalar kernels; the outputs differ only by the F16 rounding of the staged Q, K and V tiles. Single-row decode steps run it too, as a one-row prefill (48 against 65 us per layer on the scalar decode kernel at 256 keys, 32 query and 8 KV heads of 128), except on CUDA and HIP past 128 live keys where a KV head serves at most two query heads: those steps run the split-K decode kernel's warp-shuffle form (128 tokens generated after 512 cached on the RTX 5080 Laptop: 320 against 277 t/s on Qwen3-Embedding-0.6B, 201 against 187 on Qwen3-VL-Embedding-2B; with four query heads per KV head the one-row prefill stays ahead at every depth). The paged kernel's single-row steps keep the paged decode kernel; on CUDA with an F16 or BF16 cache that is the grouped-query `LLM_FlashDecodePagedGqa_F16` / `_BF16`, which reads each K and V row once for all query heads of a KV group (up to four) and splits the keys by the step's sequence count (16 sequences at 129 keys on Qwen3-Embedding-4B: 16 against 143 us per layer). On the RTX 5080 Laptop, a 512-token prefill over 1024 cached keys at head dimension 128 takes 0.38 ms against 1.84 ms on the scalar kernel. OpenCL and Vulkan run the scalar kernels.
+Split-K over long contexts, sinks, softcap, ALiBi, the T5 relative bias, sliding windows, causal and bidirectional masks and paged caches behave as in the scalar kernels; the outputs differ only by the F16 rounding of the staged Q, K and V tiles. Single-row decode steps run it too, as a one-row prefill (48 against 65 us per layer on the scalar decode kernel at 256 keys, 32 query and 8 KV heads of 128), except on CUDA and HIP past 128 live keys where a KV head serves at most two query heads: those steps run the split-K decode kernel's warp-shuffle form (128 tokens generated after 512 cached on the RTX 5080 Laptop: 320 against 277 t/s on Qwen3-Embedding-0.6B, 201 against 187 on Qwen3-VL-Embedding-2B; with four query heads per KV head the one-row prefill stays ahead at every depth). The paged kernel's single-row steps keep the paged decode kernel; on CUDA with an F16 or BF16 cache that is the grouped-query `LLM_FlashDecodePagedGqa_F16` / `_BF16`, which reads each K and V row once for all query heads of a KV group (up to four) and splits the keys by the step's sequence count (16 sequences at 129 keys on Qwen3-Embedding-4B: 16 against 143 us per layer). On the RTX 5080 Laptop, a 512-token prefill over 1024 cached keys with 32 query and 8 KV heads of 128 takes 0.28 ms of kernel time. OpenCL and Vulkan run the scalar kernels.
 
 ### Fast GEMM for prefill and batched decode
 
@@ -523,8 +523,8 @@ planes. On a reduction shorter than the split-K threshold (K below 2048, no spli
 Wider steps run the plain tile. The weight stream is a software pipeline, so the next tile's loads overlap the
 current tile's dot products, and each 4-bit word decodes in two ALU ops. On an RTX 5080 Laptop (CUDA), `nftool batched-bench -c 4096 -npp 1 -ntg 128` decodes Qwen3-Embedding-4B
 at an 8-row step of 11.0 ms in Q8_0 and 7.3 ms in Q4_K_M, and a 16-row step of 13.7 and 10.4 ms
-(`llama-batched-bench -ngl 99 -fa on`: 9.6 and 6.7 ms at 8 rows, 10.3 and 8.1 at 16); a 512-token prefill (`nftool bench -p 512`) runs 2894 t/s in Q8_0 (`llama-bench` 9639) and
-2758 t/s in Q4_K_M (llama.cpp 9140).
+(`llama-batched-bench -ngl 99 -fa on`: 9.6 and 6.7 ms at 8 rows, 10.3 and 8.1 at 16); a 512-token prefill (`nftool bench -p 512`) runs 7290 t/s in Q8_0 (`llama-bench -fa 1` 10230) and
+5880 t/s in Q4_K_M (llama.cpp 9240), and 31700 t/s for Qwen3 0.6B in Q8_0 (llama.cpp 39080).
 
 | Weights | Fast lane | Where | Rounding vs. the exact tiled GEMM |
 |---|---|---|---|
@@ -543,9 +543,16 @@ keep their tiled kernels (llama.cpp's MMQ does not serve them), except the E4M3 
 Before the MMQ GEMM, one `LLM_Quant_MMQ_Q8_1` launch quantizes every token row of the projection
 once (llama.cpp `quantize_mmq_q8_1`), unless the checkpoint's activation scheme stages its own int8 codes
 ([activation quantization](#activation-quantization)), and every row tile reads those 8-bit codes. On CUDA sm_80+
-the tensor tile is 128 rows × 128 tokens over a depth-3 software pipeline of 32-deep stages, so each weight word
-decodes once per 128-token tile (four times at a 512-token projection); other devices use 16 × 16 tiles, following
-llama.cpp's per-architecture MMQ configuration.
+the tensor tile is 128 rows × 128 tokens on 256 work-items: eight warps of 32 rows × 64 tokens, so every
+activation fragment feeds two `mma` and each weight word decodes once per 128-token tile (four times at a
+512-token projection). The staged records arrive by `cp.async` two 32-deep chunks ahead of the `mma`, with one
+barrier per chunk. When a projection's tiles would fill less than 90% of their last wave of one tile per
+multiprocessor (llama.cpp's stream-k rule), `<T>_MatMul_MMQ_StreamK` instead runs one block per multiprocessor
+over an even share of the (tile, 32-deep chunk) sequence; a block that stops inside a tile writes its partial
+sums to a scratch plane, and `LLM_MMQ_StreamK_Fixup` adds those planes into the output. Tiles that no block
+splits match the plain kernel bit for bit; a split tile differs only by the fp32 rounding of the added partial
+sums, so batch-invariant runs keep the plain grid. Other devices use 16 × 16 tiles, following llama.cpp's
+per-architecture MMQ configuration.
 
 When a checkpoint carries an activation quantization scheme (`<base>.input_scale`, `<base>.input_zero_point`, as
 vLLM's W8A8 and W4A8 checkpoints do), a projection no longer fake-quantizes its input to floats before the GEMM: one
@@ -776,10 +783,10 @@ A layer's decode path launches fused kernels in place of kernel pairs that read 
 
 | Kernel | Replaces | Where it is selected |
 |---|---|---|
-| `LLM_RmsNormRope` | `LLM_RowNorm` (RMS) then `LLM_RoPE_Ext` on the same rows | `GpuAttentionMixer` for a layer whose Q/K norms are per-head RMS norms applied before RoPE |
+| `LLM_RmsNormRope` | `LLM_RowNorm` (RMS) then `LLM_RoPE_Ext` on the same rows | `GpuAttentionMixer` for a layer whose Q/K norms are per-head RMS norms applied before RoPE; one workgroup per (token, head) row of at most 4 values per work-item (32 work-items for a 128-value head) |
 | `LLM_GdnNormGate` | `LLM_RowNorm` (RMS) then `LLM_GLU` (SWIGLU) | `GpuGdnMixer` output of every gated DeltaNet layer |
 | `LLM_HcPostNorm` | `LLM_HC_Post` (expand) then the leading `LLM_RowNorm` of the consuming site | `GpuHcExtra.afterMixer`; both norm scopes (per stream row with gamma, per token without) are handled |
-| `LLM_NormRopeStore` | The per-head RMS norm, `LLM_RoPE_Ext` and the K row store into the KV cache (llama.cpp's `rms_norm + mul + rope + view + set_rows`) | `GpuAttentionMixer` for an F32 or F16 device KV cache whose row is the K projection's width, with no K rotation or per-row scales |
+| `LLM_NormRopeStore` | The per-head RMS norm, `LLM_RoPE_Ext` and the K row store into the KV cache (llama.cpp's `rms_norm + mul + rope + view + set_rows`) | `GpuAttentionMixer` for an F32 or F16 device KV cache whose row is the K projection's width, with no K rotation or per-row scales; one workgroup per (token, head) row of at most 4 values per work-item (32 work-items for a 128-value head) |
 | `LLM_RopeStore` | `LLM_RoPE_Ext` then the K row store, for layers without a QK norm (llama.cpp's `rope + view + set_rows`) | `GpuAttentionMixer`; the V row keeps its own store |
 | `{T}_MatVecFusedGateUp[Gelu][_Q8]` | The gate and up matvecs and `LLM_GLU` | `GpuDenseFfn` for single-token decode of a plain parallel-GLU feed-forward |
 | `LLM_ResidualMixNorm` | `LLM_ResidualMix` then `LLM_RowNorm` of the sum | The layer executor, where a layer's feed-forward residual feeds the next layer's attention norm of the same width: no post-norm, residual scale or extra stream operations on either layer, and an ungrouped row norm |

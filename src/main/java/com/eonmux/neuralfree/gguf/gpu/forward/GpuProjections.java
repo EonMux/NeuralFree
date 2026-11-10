@@ -15,6 +15,7 @@ import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.ops.gemm.GemmKernels;
 import com.eonmux.neuralfree.gguf.ops.gemm.MatVecMmaPlan;
 import com.eonmux.neuralfree.gguf.ops.gemm.SplitKGemmPlan;
+import com.eonmux.neuralfree.gguf.ops.gemm.StreamKGemmPlan;
 import com.eonmux.neuralfree.gguf.quant.HadamardSpec;
 import com.eonmux.neuralfree.gguf.quant.InputTransform;
 import com.eonmux.neuralfree.gguf.spec.ActParams;
@@ -306,10 +307,17 @@ final class GpuProjections {
             for (int s = 0; s < w.shardCount(); s++) {
                 int m = (int) w.shardRows(s);
                 int yOff = outOff + (int) w.shardRowStart(s);
-                SplitKGemmPlan split = invariant ? null
+                /* A plain-tile int8 launch whose tile grid would leave the last wave part-empty runs as
+                 * stream-k (an even share of the grid's chunks per resident block); the twins and a
+                 * batch-invariant step keep their grids. */
+                StreamKGemmPlan streamK = invariant || smallFast != null ? null
+                        : ops.lanes.streamK(fast, w, m, cols, nTokens, yOff, activations.off, rows);
+                SplitKGemmPlan split = invariant || streamK != null ? null
                         : ops.lanes.splitK(fast, w, m, cols, nTokens, yOff, activations.off, rows,
                                 smallFast != null);
-                if (split != null) {
+                if (streamK != null) {
+                    ops.lanes.streamKLaunch(streamK, w.shard(s), activations.buf, out);
+                } else if (split != null) {
                     ops.lanes.splitKLaunch(split, w.shard(s), activations.buf, out, yOff, rows);
                 } else {
                     int qStride = staged ? ops.lanes.stagedRowRecords(cols) : cols;

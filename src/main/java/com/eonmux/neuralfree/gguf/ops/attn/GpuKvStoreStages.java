@@ -135,8 +135,8 @@ final class GpuKvStoreStages {
             dstArg = FusedKernels.ROPE_STORE_ARG_DST;
             posStrideArg = FusedKernels.ROPE_STORE_ARG_POS_STRIDE;
         }
-        TokenStep store = mixer.step(kernel, args, FusedKernels.STORE_ARG_N_TOKENS, 1, (long) nHeads * mixer.local(),
-                0, posStrideArg);
+        TokenStep store = mixer.normRope().rowStep(kernel, args, FusedKernels.STORE_ARG_N_TOKENS, nHeads, headDim,
+                posStrideArg);
         storeRebinds.add(new StoreRebind(store, cellArg, cellIdx, dstArg, kv.k(), false));
         return store;
     }

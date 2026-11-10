@@ -22,9 +22,11 @@ import java.util.Objects;
  * work-item holds {@link #rowsPerWorkItem()} weight rows for one of {@link #TOKEN_LANES} token
  * lanes, and the tile tokens are covered in groups of {@link #TOKEN_LANES}. The work-group size is
  * therefore {@code tileRows / rowsPerWorkItem() * TOKEN_LANES}. The packed-dot and RDNA3 tiles keep
- * the four rows per work-item of the original kernel (256 work-items); the CDNA 128-row tile takes
- * eight rows per work-item so its work-group is also 256 work-items, and the CUDA 128 x 128 tensor
- * tile keeps four rows per work-item over 512 work-items.</p>
+ * the four rows per work-item of the original kernel (256 work-items); the CDNA 128-row tile and the
+ * CUDA 128 x 128 tensor tile take eight rows per work-item, so their work-groups are also 256
+ * work-items (on the tensor tile eight warps of two m16 row minitiles by 64 tokens, llama.cpp's
+ * 256-thread block). The small-token twins of a tile take {@link #twinRowsPerWorkItem()} rows per
+ * work-item: four on the tensor tile, whose twins keep the packed-dot family's 64-row tile.</p>
  *
  * <p>Instances are immutable values; {@link #forDevice} and {@link #forHipTarget} select the tile of
  * a device and {@link #of} builds one from validated tile sizes.</p>
@@ -37,8 +39,9 @@ public final class MmqConfig {
      */
     public static final MmqConfig PACKED_DOT = new MmqConfig("packed-dot", 16, 64, 16, 4);
     /** int8 tensor cores ({@code mma.m16n8k32} / {@code m16n8k16} s8), 128 x 128 tile over 32-deep
-     *  stages (llama.cpp's widest I/J table row; 512 work-items per workgroup): CUDA sm_80+. */
-    public static final MmqConfig INT8_TENSOR = new MmqConfig("int8-tensor", 32, 128, 128, 4);
+     *  stages (llama.cpp's widest I/J table row) at eight rows per work-item (256 work-items per
+     *  workgroup), with four-row twins: CUDA sm_80+. */
+    public static final MmqConfig INT8_TENSOR = new MmqConfig("int8-tensor", 32, 128, 128, 8, 4);
     /**
      * RDNA3 (gfx1100&ndash;gfx1103): llama.cpp's {@code mmq-config-rdna3.cuh} widest tile, 64 rows x
      * 128 tokens over 16-deep stages. It is the table's non-fallback J=128 row of every int8 MMQ type
@@ -103,13 +106,20 @@ public final class MmqConfig {
     private final int tileRows;
     private final int tileTokens;
     private final int rowsPerWorkItem;
+    private final int twinRowsPerWorkItem;
 
     private MmqConfig(String name, int stageDepth, int tileRows, int tileTokens, int rowsPerWorkItem) {
+        this(name, stageDepth, tileRows, tileTokens, rowsPerWorkItem, rowsPerWorkItem);
+    }
+
+    private MmqConfig(String name, int stageDepth, int tileRows, int tileTokens, int rowsPerWorkItem,
+                      int twinRowsPerWorkItem) {
         this.name = name;
         this.stageDepth = stageDepth;
         this.tileRows = tileRows;
         this.tileTokens = tileTokens;
         this.rowsPerWorkItem = rowsPerWorkItem;
+        this.twinRowsPerWorkItem = twinRowsPerWorkItem;
     }
 
     /**
@@ -214,8 +224,9 @@ public final class MmqConfig {
 
     /**
      * The tile of the small-token-tile GEMM twins ({@code <T>_MatMul_MMQ_S}): the device config's
-     * stage depth and rows per work-item with a 16-token tile and a row tile that keeps the twin's
-     * workgroup at {@link #TWIN_WORK_GROUP} work-items (the 128-row tiles cap at 64 rows), the tile
+     * stage depth and twin rows per work-item ({@link #twinRowsPerWorkItem()}) with a 16-token tile
+     * and a row tile that keeps the twin's workgroup at {@link #TWIN_WORK_GROUP} work-items (the
+     * tensor tile's twins and the packed-dot family's 64 rows), the tile
      * of the packed-dot path and what llama.cpp picks per launch for small batches
      * (ggml_cuda_mmq_get_J_best). Only a device tile wider than 16 tokens has a twin;
      * {@link MmqGemmPlan} launches the twin with this tile's geometry.
@@ -245,8 +256,8 @@ public final class MmqConfig {
             throw new IllegalArgumentException("MMQ tile " + device.name + " is at most " + tokens
                     + " tokens wide; it has no " + tokens + "-token twin");
         }
-        int twinRows = Math.min(device.tileRows, TWIN_WORK_GROUP / TOKEN_LANES * device.rowsPerWorkItem);
-        return of(device.stageDepth, twinRows, tokens, device.rowsPerWorkItem);
+        int twinRows = Math.min(device.tileRows, TWIN_WORK_GROUP / TOKEN_LANES * device.twinRowsPerWorkItem);
+        return of(device.stageDepth, twinRows, tokens, device.twinRowsPerWorkItem);
     }
 
     /**
@@ -327,6 +338,15 @@ public final class MmqConfig {
         return rowsPerWorkItem;
     }
 
+    /**
+     * Weight rows one work-item of the small-token twins covers ({@code NF_MMQ_TWIN_RM}, or
+     * {@code NF_MMQ_RM} when the tile defines none): four on {@link #INT8_TENSOR}, whose twins keep the
+     * one-minitile-per-warp mma layout of the 64-row tile, {@link #rowsPerWorkItem()} elsewhere.
+     */
+    public int twinRowsPerWorkItem() {
+        return twinRowsPerWorkItem;
+    }
+
     /** Work-items per workgroup ({@code NF_MMQ_WG}): {@code tileRows / rowsPerWorkItem() * TOKEN_LANES}. */
     public int workGroupSize() {
         return tileRows / rowsPerWorkItem * TOKEN_LANES;
@@ -335,33 +355,40 @@ public final class MmqConfig {
     /**
      * The preprocessor defines that compile the MMQ kernels with this tile, or the empty string when
      * they already are the tile of the dialect's default config: {@code NF_MMQ_TM}, {@code NF_MMQ_TN},
-     * {@code NF_MMQ_TK} and {@code NF_MMQ_RM} (when not 4), which
+     * {@code NF_MMQ_TK}, {@code NF_MMQ_RM} (when not the default's) and {@code NF_MMQ_TWIN_RM} (when
+     * the twins take other rows per work-item than the tile), which
      * kernels/llm/common/matmul_mmq_config.h takes when defined.
      *
      * @param tensorPass whether the pass compiles the int8 tensor path (CUDA sm_80+), whose default
      *                   tile is {@link #INT8_TENSOR}; the packed-dot default is {@link #PACKED_DOT}
-     * @throws IllegalArgumentException when a tensor pass is asked for a tile whose rows per
-     *                                  work-item is not {@link #ROWS_PER_WORK_ITEM}: the mma
-     *                                  fragments map the tile rows to warps, not work-items
+     * @throws IllegalArgumentException when a tensor pass is asked for a tile other than
+     *                                  {@link #INT8_TENSOR}'s 32-deep stages, multiple-of-four rows
+     *                                  per work-item and four-row twins: the mma fragments map the
+     *                                  tile rows to warps of {@code rowsPerWorkItem / 4} m16
+     *                                  minitiles, and the twins' to one minitile per warp
      */
     public String kernelDefines(boolean tensorPass) {
-        if (tensorPass && rowsPerWorkItem != ROWS_PER_WORK_ITEM) {
-            throw new IllegalArgumentException("MMQ tile " + name + " covers " + rowsPerWorkItem
-                    + " rows per work-item; the int8 tensor path needs " + ROWS_PER_WORK_ITEM);
+        if (tensorPass && (stageDepth != INT8_TENSOR.stageDepth || rowsPerWorkItem % 4 != 0
+                || twinRowsPerWorkItem != INT8_TENSOR.twinRowsPerWorkItem)) {
+            throw new IllegalArgumentException("MMQ tile " + name + " stages " + stageDepth + " elements over "
+                    + rowsPerWorkItem + " rows per work-item (" + twinRowsPerWorkItem + " on its twins); the"
+                    + " int8 tensor path needs 32-deep stages, a multiple of 4 rows per work-item and "
+                    + INT8_TENSOR.twinRowsPerWorkItem + "-row twins");
         }
-        int defaultDepth = tensorPass ? INT8_TENSOR.stageDepth : PACKED_DOT.stageDepth;
-        int defaultRows = tensorPass ? INT8_TENSOR.tileRows : PACKED_DOT.tileRows;
-        int defaultTokens = tensorPass ? INT8_TENSOR.tileTokens : PACKED_DOT.tileTokens;
-        if (stageDepth == defaultDepth && tileRows == defaultRows && tileTokens == defaultTokens
-                && rowsPerWorkItem == ROWS_PER_WORK_ITEM) {
+        MmqConfig base = tensorPass ? INT8_TENSOR : PACKED_DOT;
+        if (stageDepth == base.stageDepth && tileRows == base.tileRows && tileTokens == base.tileTokens
+                && rowsPerWorkItem == base.rowsPerWorkItem && twinRowsPerWorkItem == base.twinRowsPerWorkItem) {
             return "";
         }
         StringBuilder defines = new StringBuilder()
                 .append("-DNF_MMQ_TM=").append(tileRows)
                 .append(" -DNF_MMQ_TN=").append(tileTokens)
                 .append(" -DNF_MMQ_TK=").append(stageDepth);
-        if (rowsPerWorkItem != ROWS_PER_WORK_ITEM) {
+        if (rowsPerWorkItem != base.rowsPerWorkItem) {
             defines.append(" -DNF_MMQ_RM=").append(rowsPerWorkItem);
+        }
+        if (twinRowsPerWorkItem != rowsPerWorkItem) {
+            defines.append(" -DNF_MMQ_TWIN_RM=").append(twinRowsPerWorkItem);
         }
         return defines.toString();
     }
@@ -397,14 +424,23 @@ public final class MmqConfig {
      * and per-half weight code sums of the asymmetric int8 form &mdash; and one copy of the tokens'
      * {@code TN} staged records ({@code TK/4 + 2 + TK/16} units: the code ints the B fragments
      * read, the chunk scales, the code sums and the zero points); the activations themselves are
-     * read from the staging buffer.
+     * read from the staging buffer. A 32-deep tile also bounds the tensor-core plain kernels of the
+     * CUDA dialect (common/matmul_mmq_family.h, NF_MMQ_TC_KERNEL_BODY): two copies of the weight
+     * codes ({@code TM * TK / 4} ints) and of the scale and offset tiles ({@code TM * TK / 16}
+     * floats each), and three of the record tile ({@code TN} records), whose loads run two chunks
+     * ahead of the combine.
      */
     public long sharedBytes() {
         long halves = stageDepth / 16;
-        long codes = 3L * tileRows * stageDepth / (stageDepth > PACKED_DOT.stageDepth ? 4 : 1);
-        long scales = 9L * tileRows * halves;
-        long records = (long) tileTokens * (stageDepth / 4 + 2 + halves);
-        return 4L * (codes + scales + records);
+        long recordTile = (long) tileTokens * (stageDepth / 4 + 2 + halves);
+        boolean tensor = stageDepth > PACKED_DOT.stageDepth;
+        long codes = 3L * tileRows * stageDepth / (tensor ? 4 : 1);
+        long pipelined = codes + 9L * tileRows * halves + recordTile;
+        if (!tensor) {
+            return 4L * pipelined;
+        }
+        long tensorTile = 2L * tileRows * stageDepth / 4 + 4L * tileRows * halves + 3L * recordTile;
+        return 4L * Math.max(pipelined, tensorTile);
     }
 
     @Override
@@ -417,17 +453,17 @@ public final class MmqConfig {
         }
         MmqConfig that = (MmqConfig) o;
         return stageDepth == that.stageDepth && tileRows == that.tileRows && tileTokens == that.tileTokens
-                && rowsPerWorkItem == that.rowsPerWorkItem;
+                && rowsPerWorkItem == that.rowsPerWorkItem && twinRowsPerWorkItem == that.twinRowsPerWorkItem;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(stageDepth, tileRows, tileTokens, rowsPerWorkItem);
+        return Objects.hash(stageDepth, tileRows, tileTokens, rowsPerWorkItem, twinRowsPerWorkItem);
     }
 
     @Override
     public String toString() {
         return "MmqConfig{" + name + ", TK=" + stageDepth + ", TM=" + tileRows + ", TN=" + tileTokens
-                + ", RM=" + rowsPerWorkItem + ", WG=" + workGroupSize() + '}';
+                + ", RM=" + rowsPerWorkItem + ", twin RM=" + twinRowsPerWorkItem + ", WG=" + workGroupSize() + '}';
     }
 }

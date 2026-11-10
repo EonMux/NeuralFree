@@ -22,6 +22,7 @@ common/matmul_tiled_family.h
 common/matmul_grouped_family.h
 common/matmul_mmq_config.h
 common/matmul_mmq_family.h
+common/matmul_mmq_types.h
 common/matmul_mma_family.h
 common/rope_common.h
 common/kv_types.h
@@ -50,6 +51,7 @@ quantize_q8_1.cl
 matmul_mmq.cl
 [opencl] matmul_mmq_sg.cl
 [cuda] matvec_mma.cl
+[cuda] matmul_mmq_stream.cl
 [cuda] matmul_fp8.cl
 matmul_mma.cl
 matmul_cm.cl

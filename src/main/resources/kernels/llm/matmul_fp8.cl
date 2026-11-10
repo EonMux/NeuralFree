@@ -388,14 +388,17 @@ NF_W4A8_GEMM_KSPLIT(NVFP4, NVFP4_BLOCK_SIZE, NVFP4_BLOCK_BYTES, NVFP4_W4A8_CODE,
  * tiles, and the S64/SKSplit64 forms over 64-token tiles) ---- As in kernels/llm/matmul_mmq.cl:
  * generated when the device tile is wider than 16 tokens, the host serves a staged launch of fewer
  * tokens than the device tile with the twin of its ladder row (16 tokens up to 16, 64 above) and
- * splits it with the matching SKSplit. The twins keep the row tile of the packed-dot family: the
- * tile above is capped at
- * NF_MMQ_RM * 16 rows, whose 256-item workgroups pack two blocks per SM where the device tile's
- * 512-item workgroups cap at one. The file is CUDA-only ([cuda]), so the twins exist on the sm_80+
+ * splits it with the matching SKSplit. The twins keep the row tile of the packed-dot family:
+ * NF_MMQ_TWIN_RM rows per work-item and at most NF_MMQ_RM * 16 rows, whose 256-item workgroups pack
+ * two blocks per SM. The file is CUDA-only ([cuda]), so the twins exist on the sm_80+
  * segments the tensor datapath compiles for and are absent below sm_80, where the packed-dot tile is
  * 16 tokens already. */
 
 #if NF_MMQ_TN > 16
+#if defined(NF_MMQ_TWIN_RM) && NF_MMQ_TWIN_RM != NF_MMQ_RM
+#undef NF_MMQ_RM
+#define NF_MMQ_RM NF_MMQ_TWIN_RM
+#endif
 #if NF_MMQ_TM / NF_MMQ_RM > 16
 #undef NF_MMQ_TM
 #define NF_MMQ_TM (NF_MMQ_RM * 16)

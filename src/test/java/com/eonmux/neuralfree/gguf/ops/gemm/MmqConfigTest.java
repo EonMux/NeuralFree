@@ -104,10 +104,15 @@ public class MmqConfigTest {
         assertEquals(256, MmqConfig.PACKED_DOT.workGroupSize());
         assertEquals(64, MmqConfig.PACKED_DOT.tileRows());
         assertEquals(16, MmqConfig.PACKED_DOT.tileTokens());
-        /* llama.cpp's widest table row: I 128, J 128, four rows per work-item over 512 work-items. */
-        assertEquals(512, MmqConfig.INT8_TENSOR.workGroupSize());
+        /* llama.cpp's widest table row: I 128, J 128 over its 256-thread block, eight rows per
+         * work-item (eight warps of two m16 minitiles); the twins keep four rows per work-item. */
+        assertEquals(256, MmqConfig.INT8_TENSOR.workGroupSize());
         assertEquals(128, MmqConfig.INT8_TENSOR.tileRows());
         assertEquals(128, MmqConfig.INT8_TENSOR.tileTokens());
+        assertEquals(8, MmqConfig.INT8_TENSOR.rowsPerWorkItem());
+        assertEquals(4, MmqConfig.INT8_TENSOR.twinRowsPerWorkItem());
+        assertEquals("a tile's twins take its rows per work-item unless it pins them",
+                MmqConfig.CDNA.rowsPerWorkItem(), MmqConfig.CDNA.twinRowsPerWorkItem());
         assertEquals(4 + 2 + 1, MmqConfig.PACKED_DOT.recordUnits());
         assertEquals(8 + 2 + 2, MmqConfig.INT8_TENSOR.recordUnits());
         assertEquals(4, MmqConfig.PACKED_DOT.rowRecords(64));
@@ -124,7 +129,9 @@ public class MmqConfigTest {
         assertEquals("-DNF_MMQ_TM=64 -DNF_MMQ_TN=128 -DNF_MMQ_TK=16", MmqConfig.RDNA3.kernelDefines(false));
         assertEquals("-DNF_MMQ_TM=128 -DNF_MMQ_TN=64 -DNF_MMQ_TK=16 -DNF_MMQ_RM=8",
                 MmqConfig.CDNA.kernelDefines(false));
-        assertEquals("-DNF_MMQ_TM=128 -DNF_MMQ_TN=128 -DNF_MMQ_TK=32", MmqConfig.INT8_TENSOR.kernelDefines(false));
+        assertEquals("-DNF_MMQ_TM=128 -DNF_MMQ_TN=128 -DNF_MMQ_TK=32 -DNF_MMQ_RM=8 -DNF_MMQ_TWIN_RM=4",
+                MmqConfig.INT8_TENSOR.kernelDefines(false));
+        assertEquals("@int8-tensor", MmqConfig.INT8_TENSOR.kernelKey(false));
         assertEquals("@cdna", MmqConfig.CDNA.kernelKey(false));
     }
 
@@ -169,6 +176,7 @@ public class MmqConfigTest {
         expectInvalid("token tile", () -> MmqConfig.of(16, 64, 17));
         expectInvalid("token tile", () -> MmqConfig.of(16, 64, 256));
         expectInvalid("rows per work-item", () -> MmqConfig.CDNA.kernelDefines(true));
+        expectInvalid("rows per work-item", () -> MmqConfig.of(32, 128, 128, 8).kernelDefines(true));
     }
 
     /** The small-token-tile twin keeps the device tile's stage depth over 16 tokens, with a row tile
@@ -176,7 +184,7 @@ public class MmqConfigTest {
      * the 64-token twin shares the row tile and workgroup. */
     @Test
     public void theSmallTileTwinKeepsTheDeviceRowsAndStageDepthOver16Tokens() {
-        assertEquals("the 128-row tensor tile's twin keeps the 64-row tile",
+        assertEquals("the 128-row tensor tile's twin keeps the 64-row, four-rows-per-work-item tile",
                 MmqConfig.of(32, 64, 16, 4), MmqConfig.smallTile(MmqConfig.INT8_TENSOR));
         assertEquals("the CDNA tile's 8-row work items already fit the twin workgroup",
                 MmqConfig.of(16, 128, 16, 8), MmqConfig.smallTile(MmqConfig.CDNA));

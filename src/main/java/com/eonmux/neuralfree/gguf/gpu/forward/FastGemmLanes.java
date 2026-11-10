@@ -15,6 +15,7 @@ import com.eonmux.neuralfree.gguf.ops.gemm.MmqConfig;
 import com.eonmux.neuralfree.gguf.ops.gemm.MmqGemmPlan;
 import com.eonmux.neuralfree.gguf.ops.gemm.MmqMode;
 import com.eonmux.neuralfree.gguf.ops.gemm.SplitKGemmPlan;
+import com.eonmux.neuralfree.gguf.ops.gemm.StreamKGemmPlan;
 import com.eonmux.neuralfree.gguf.quant.ActQuantScheme;
 import com.eonmux.neuralfree.gguf.quant.InputTransform;
 
@@ -492,6 +493,46 @@ final class FastGemmLanes {
                 plan.partialLocalWorkSize(), plan.partialArgs(shard, x, partial.buffer()));
         queue.enqueueKernelNoEvent(kernels.get(GemmKernels.SPLIT_K_REDUCE), plan.reduceGlobalWorkSize(),
                 plan.reduceLocalWorkSize(), plan.reduceArgs(partial.buffer(), out, yStride, yOff));
+    }
+
+    /**
+     * The stream-k dispatch of one shard of a plain-tile int8 MMQ launch, or null when it keeps the plain grid
+     * ({@link StreamKGemmPlan#of}: the CUDA tensor tile whose waves would run part-empty), or when this device
+     * lacks either kernel (the stream-k kernels exist only on the CUDA sm_80+ segments of the tensor tile).
+     * The caller keeps the plain grid under batch invariance and for the small-token twins.
+     *
+     * @param qOff    staged record offset of the shard's activation view
+     * @param yStride element stride between output rows
+     */
+    StreamKGemmPlan streamK(String fastKernel, GpuWeight w, int m, int cols, int nTokens, int yOff, int qOff,
+                            int yStride) {
+        if (!fastKernel.endsWith(GemmKernels.MATMUL_MMQ_SUFFIX) || !GemmKernels.isInt8Mmq(w.type())) {
+            return null;
+        }
+        MmqGemmPlan base = MmqGemmPlan.of(mmqConfig, w.type(), m, cols, nTokens, mmqConfig.rowRecords(cols), qOff,
+                yStride, yOff);
+        StreamKGemmPlan plan = StreamKGemmPlan.of(base, kernels.caps().getComputeUnits());
+        int workGroup = mmqConfig.workGroupSize();
+        if (plan == null || plan.checkDevice(kernels.caps()) != null
+                || !ops.optionalReady(plan.kernelName(), workGroup, 1)
+                || !ops.optionalReady(GemmKernels.STREAM_K_FIXUP, workGroup, 1)) {
+            return null;
+        }
+        return plan;
+    }
+
+    /**
+     * One stream-k launch: the shard's tiles into the output, the planes of the tiles it splits into their own
+     * staging slot (never a view of the projection's input or output), then the fixup that adds them.
+     */
+    void streamKLaunch(StreamKGemmPlan plan, GpuBuffer shard, GpuBuffer q8, GpuBuffer out) {
+        ScratchSlot fixup = scratch.staging(GpuScratch.Staging.SPLIT_K, plan.fixupElements());
+        queue.enqueueKernelNoEvent(kernels.get(plan.kernelName()), plan.globalWorkSize(), plan.localWorkSize(),
+                plan.args(shard, q8, out, fixup.buffer()));
+        if (plan.fixupNeeded()) {
+            queue.enqueueKernelNoEvent(kernels.get(GemmKernels.STREAM_K_FIXUP), plan.fixupGlobalWorkSize(),
+                    plan.localWorkSize(), plan.fixupArgs(fixup.buffer(), out));
+        }
     }
 
     /**

@@ -6,6 +6,7 @@ import com.eonmux.neuralfree.gguf.arch.NormKind;
 import com.eonmux.neuralfree.gguf.arch.QkNormKind;
 import com.eonmux.neuralfree.gguf.arch.RopeType;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuOps;
+import com.eonmux.neuralfree.gguf.gpu.forward.PreparedDispatch;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.ops.fused.FusedKernels;
 import com.eonmux.neuralfree.gguf.ops.fused.GpuMultiTask;
@@ -27,6 +28,16 @@ import java.util.Objects;
  * shift read. Not thread-safe; driven by the owning mixer's bind.
  */
 final class GpuNormRopeStages implements AutoCloseable {
+
+    /**
+     * Row values one work-item of the per-row norm+rotation kernels ({@link FusedKernels#RMS_NORM_ROPE},
+     * {@link FusedKernels#NORM_ROPE_STORE}) covers. Their workgroups hold one (token, head) row each, so a row of
+     * 128 values takes 32 work-items rather than the mixer's 256, of which half would idle in every row loop while
+     * the group still pays all its barriers; a 512-token prefill of 32 heads launches 16384 such groups.
+     */
+    static final int ROW_VALUES_PER_WORK_ITEM = 4;
+    /** Fewest work-items of a per-row workgroup: one CUDA warp, the multiple the kernels' contract asks for. */
+    static final int ROW_MIN_LOCAL = 32;
 
     private final GpuAttentionMixer mixer;
 
@@ -211,8 +222,33 @@ final class GpuNormRopeStages implements AutoCloseable {
         Object[] args = FusedKernels.rmsNormRopeArgs(rope, mixer.ubatch(), g.nHeads(), mixer.spec().headDimK(),
                 rowStride, g.rowLen(), rope.nOffs(), mixer.ubatch(), 0, 0, op.flags(), op.wRows, g.eps(), hasFf, pos,
                 ff, op.weight != null ? op.weight : none, op.bias != null ? op.bias : none, x, x);
-        mixer.input(mixer.step(FusedKernels.RMS_NORM_ROPE, args, FusedKernels.ROPE_ARG_N_TOKENS, 1,
-                (long) g.nHeads() * mixer.local(), 0, FusedKernels.ROPE_ARG_POS_STRIDE), true);
+        mixer.input(rowStep(FusedKernels.RMS_NORM_ROPE, args, FusedKernels.ROPE_ARG_N_TOKENS, g.nHeads(), g.rowLen(),
+                FusedKernels.ROPE_ARG_POS_STRIDE), true);
+    }
+
+    /**
+     * The workgroup size of a per-row kernel over rows of {@code rowLen} values: the smallest power of two from
+     * {@link #ROW_MIN_LOCAL} that gives each work-item at most {@link #ROW_VALUES_PER_WORK_ITEM} values, capped at
+     * {@code maxLocal} (the mixer's workgroup size, itself a power of two).
+     */
+    static int rowLocal(int rowLen, int maxLocal) {
+        int l = Math.min(ROW_MIN_LOCAL, maxLocal);
+        while (l < maxLocal && (long) l * ROW_VALUES_PER_WORK_ITEM < rowLen) {
+            l <<= 1;
+        }
+        return l;
+    }
+
+    /**
+     * A step of a per-row kernel: one workgroup of {@link #rowLocal} work-items per (token, row), {@code rows} rows
+     * per token, with the step's token count in {@code countArg}.
+     */
+    TokenStep rowStep(String kernel, Object[] args, int countArg, int rows, int rowLen, int posStrideArg) {
+        int l = rowLocal(rowLen, mixer.local());
+        long itemsPerToken = (long) rows * l;
+        PreparedDispatch d = mixer.resources().prepare(kernel, new long[]{Math.max(1, mixer.ubatch() * itemsPerToken)},
+                new long[]{l}, args);
+        return new TokenStep(d, countArg, 1, itemsPerToken, 0, posStrideArg, l);
     }
 
     static boolean perHeadRms(QkNormGeometry g, int nHeads, int headDim) {

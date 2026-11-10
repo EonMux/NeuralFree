@@ -8,7 +8,7 @@
  *   (mma.m16n8k32 / m16n8k16 .s8) over 32-deep stages and a 128 x 128 tile, the widest J row of
  *   llama.cpp's tables (ggml_cuda_mmq_get_J_best picks the widest token tile that minimizes the
  *   token-tile count). With the activations staged once per projection (LLM_Quant_MMQ_Q8_1), the
- *   tile costs only the register accumulators here: 32 float accumulators per lane of a 512
+ *   tile costs only the register accumulators here: 64 float accumulators per lane of a 256
  *   work-item workgroup.
  * - Everything else, MmqConfig.PACKED_DOT: the packed integer dot on __dp4a (CUDA sm_61+) or scalar
  *   int arithmetic (CUDA below sm_61, OpenCL, GLSL) over 16-deep stages and a 64 x 16 tile. The
@@ -21,10 +21,11 @@
  *   mmq-config-cdna.cuh tile, 128 rows x 64 tokens over 16-deep stages (I 128, J 64); eight rows
  *   per work-item keep the work-group at 256 work-items, as on the packed-dot tile.
  *
- * NF_MMQ_TM / NF_MMQ_TN / NF_MMQ_TK / NF_MMQ_RM can also be passed as build defines (the OpenCL
- * library passes them for a tile forced with -Dneuralfree.mmq.tile), so the host can run any tile on
- * a runtime-compiled kernel. NF_MMQ_RM is the number of weight rows one work-item covers; the
- * work-group is NF_MMQ_TM / NF_MMQ_RM row lanes times 16 token lanes.
+ * NF_MMQ_TM / NF_MMQ_TN / NF_MMQ_TK / NF_MMQ_RM / NF_MMQ_TWIN_RM can also be passed as build
+ * defines (the OpenCL library passes them for a tile forced with -Dneuralfree.mmq.tile), so the host
+ * can run any tile on a runtime-compiled kernel. NF_MMQ_RM is the number of weight rows one work-item
+ * covers; the work-group is NF_MMQ_TM / NF_MMQ_RM row lanes times 16 token lanes. NF_MMQ_TWIN_RM,
+ * when defined, is the rows per work-item of the small-token twins (NF_MMQ_RM otherwise).
  */
 #ifndef NF_MATMUL_MMQ_CONFIG_H
 #define NF_MATMUL_MMQ_CONFIG_H
@@ -44,13 +45,19 @@
 #endif
 
 /* Row tile and rows per work-item of every pass: llama.cpp's I is 64 (RDNA3, packed dot) or 128
- * (CDNA); the tensor path takes the table's I=128 row with its J=128 widest tile, whose 16 warps
- * cover the 128 rows as eight 16-row groups. */
+ * (CDNA); the tensor path takes the table's I=128 row with its J=128 widest tile over llama.cpp's
+ * 256-thread block: eight warps, each two m16 row minitiles (32 rows) by 64 tokens, so every A
+ * fragment feeds eight mma and every B fragment two. Its small-token twins keep the 64-row,
+ * 4-rows-per-work-item tile of the packed-dot family (NF_MMQ_TWIN_RM, gguf.ops.gemm.MmqConfig
+ * .smallTile), whose mma warp layout is one 16-row minitile per warp. */
 #if NF_MMQ_TENSOR
 #define NF_MMQ_DEFAULT_TM 128
-#define NF_MMQ_DEFAULT_RM 4
+#define NF_MMQ_DEFAULT_RM 8
 #define NF_MMQ_DEFAULT_TK 32           /* reduction depth of one stage: one m16n8k32 fragment */
-#define NF_MMQ_DEFAULT_TN 128          /* tokens per workgroup tile: eight n8 blocks per warp */
+#define NF_MMQ_DEFAULT_TN 128          /* tokens per workgroup tile: eight n8 blocks per minitile */
+#ifndef NF_MMQ_TWIN_RM
+#define NF_MMQ_TWIN_RM 4
+#endif
 #else
 #define NF_MMQ_DEFAULT_TM 64
 #define NF_MMQ_DEFAULT_RM 4

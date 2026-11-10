@@ -133,7 +133,7 @@ public final class FlashAttnTiling {
     /** Query rows per mma work-group ({@code NF_FM_BM}); {@code bq * g_tile == MMA_ROWS} always. */
     public static final int MMA_ROWS = 64;
     /** Keys per mma tile ({@code NF_FM_BN}). */
-    public static final int MMA_BK = 32;
+    public static final int MMA_BK = 64;
     /** Longest split of the grouped-query paged decode ({@code NF_FDG_MAX_SPLIT}, its staged key rows). */
     public static final int GQA_MAX_SPLIT = 512;
     /** Most query heads per KV head of the grouped-query paged decode ({@code NF_FDG_MAX_G}). */
@@ -323,10 +323,14 @@ public final class FlashAttnTiling {
         }
     }
 
-    /** Shared-memory floats the mma kernel stages for d_k and d_v (kernels/llm/flash_mma.cl nf_fm_smem_floats). */
+    /**
+     * Shared-memory floats the mma kernel stages for d_k and d_v (kernels/llm/flash_mma.cl nf_fm_smem_floats): the
+     * K tile, which first holds the Q tile ({@code MMA_ROWS <= MMA_BK}), and the V tile, {@code MMA_BK} rows of
+     * {@code d + 8} halves each, plus the tile's key positions.
+     */
     public static long mmaSmemFloats(int dK, int dV) {
-        long halves = (long) MMA_ROWS * (dK + 8) + (long) MMA_BK * (dK + 8) + (long) dV * (MMA_BK + 8);
-        return (halves + 2 * MMA_BK + WG) / 2;
+        long halves = (long) MMA_BK * (dK + 8) + (long) MMA_BK * (dV + 8);
+        return halves / 2 + MMA_BK;
     }
 
     /**

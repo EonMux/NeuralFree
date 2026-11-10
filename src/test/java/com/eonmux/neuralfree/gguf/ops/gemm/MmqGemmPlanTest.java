@@ -142,7 +142,7 @@ public class MmqGemmPlanTest {
     public void theTensorConfigTilesOneHundredTwentyEightTokens() {
         MmqGemmPlan p = MmqGemmPlan.contiguous(MmqConfig.INT8_TENSOR, GGMLType.Q4_K, 4096 + 1, 4096, 33);
         assertEquals("33 tokens fit one 128-token tile", 1, p.tokenTiles());
-        assertArrayEquals(new long[]{33L * 512, 1}, p.globalWorkSize());
+        assertArrayEquals(new long[]{33L * 256, 1}, p.globalWorkSize());
         assertEquals(MmqConfig.INT8_TENSOR, p.config());
         MmqGemmPlan wide = MmqGemmPlan.contiguous(MmqConfig.INT8_TENSOR, GGMLType.Q4_K, 4096, 4096, 129);
         assertEquals("129 tokens need two 128-token tiles", 2, wide.tokenTiles());
@@ -206,8 +206,11 @@ public class MmqGemmPlanTest {
         assertEquals("the pipelined stage holds three copies of the weight tiles and one of the "
                 + "tokens' records", 4L * (3 * 64 * 16 + 9 * 64 + 16 * (4 + 2 + 1)),
                 MmqConfig.PACKED_DOT.sharedBytes());
-        assertEquals(4L * (3 * 128 * 32 / 4 + 9 * 128 * 2 + 128 * (8 + 2 + 2)),
-                MmqConfig.INT8_TENSOR.sharedBytes());
+        assertEquals("the tensor tile's plain kernels hold two weight stages and three record stages",
+                4L * (2 * 128 * 32 / 4 + 4 * 128 * 2 + 3 * 128 * (8 + 2 + 2)), MmqConfig.INT8_TENSOR.sharedBytes());
+        assertEquals("its twins keep the pipelined stage's three weight copies and one record tile",
+                4L * (3 * 64 * 32 / 4 + 9 * 64 * 2 + 16 * (8 + 2 + 2)),
+                MmqConfig.smallTile(MmqConfig.INT8_TENSOR).sharedBytes());
     }
 
     @Test

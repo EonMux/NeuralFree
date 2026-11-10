@@ -99,12 +99,12 @@ public class FlashAttnMmaTilingTest {
 
     @Test
     public void sharedMemoryBudgetMatchesTheKernelArrays() {
-        // kernels/llm/flash_mma.cl: q_s 64 x (d_k + 8), k_s 32 x (d_k + 8), v_s d_v x (32 + 8) halves, plus the
-        // per-tile key positions and the skip flag, as floats (the formula rounds the counters up).
+        // kernels/llm/flash_mma.cl: k_s (which first holds the 64-row Q tile) and v_s, 64 x (d + 8) halves each,
+        // plus the 64 key positions of the tile, as floats.
         long worst = FlashAttnTiling.mmaSmemFloats(FlashAttnTiling.MMA_MAX_HEAD_DIM,
                 FlashAttnTiling.MMA_MAX_HEAD_DIM);
-        assertEquals((64L * 136 + 32L * 136 + 128L * 40 + 2 * FlashAttnTiling.MMA_BK + FlashAttnTiling.WG) / 2,
-                worst);
+        assertEquals((64L * 136 + 64L * 136) / 2 + FlashAttnTiling.MMA_BK, worst);
+        assertTrue(FlashAttnTiling.MMA_ROWS <= FlashAttnTiling.MMA_BK);
         assertTrue(worst <= SMEM);
     }
 }

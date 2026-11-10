@@ -34,7 +34,7 @@ import static org.junit.Assert.assertTrue;
  * ({@link #tileOf}, the {@code FastGemmLanes.fastTileRows} / {@code fastTileTokens} / {@code fastWorkGroup}
  * derivation the dispatch itself uses: the device's {@link MmqConfig} for the plain kernel,
  * {@link MmqConfig#smallTile} for the small-token-tile twins), never literals &mdash; the tile the CUDA fatbin
- * builds a kernel with follows the device ({@code MmqConfig.INT8_TENSOR}, 128 rows x 128 tokens over 512
+ * builds a kernel with follows the device ({@code MmqConfig.INT8_TENSOR}, 128 rows x 128 tokens over 256
  * work-items, on sm_80+), and a launch planned for another tile leaves whole row groups unwritten.</p>
  */
 public class W4a8GemmParityTest {

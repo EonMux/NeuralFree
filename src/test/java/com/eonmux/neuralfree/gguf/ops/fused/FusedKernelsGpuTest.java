@@ -139,7 +139,11 @@ public class FusedKernelsGpuTest {
     }
 
     private void run(String kernel, long global, Object[] args) {
-        backend.computeQueue().enqueueKernel(kernels.get(kernel), new long[]{global}, new long[]{local}, args);
+        runAt(kernel, global, local, args);
+    }
+
+    private void runAt(String kernel, long global, int workGroup, Object[] args) {
+        backend.computeQueue().enqueueKernel(kernels.get(kernel), new long[]{global}, new long[]{workGroup}, args);
     }
 
     private static void near(float[] expected, float[] actual, String what) {
@@ -189,6 +193,46 @@ public class FusedKernelsGpuTest {
                         NormKernels.FLAG_HAS_W | NormKernels.FLAG_HAS_B, nHeads, EPS, false, posb, ff, wb, bb, xb, out));
 
         near(read(ref, total), read(out, total), "rms norm + rope");
+    }
+
+    /**
+     * The fused kernel over one-warp workgroups (32 work-items for a 128-value head row, the attention mixer's
+     * per-row workgroup) equals the row norm and rotation at the device's matvec workgroup.
+     */
+    @Test
+    public void rmsNormRopeOverOneWarpRowsMatchesRowNormThenRope() throws Exception {
+        int nTokens = 3;
+        int nHeads = 4;
+        int headDim = 128;
+        int rowLocal = 32;
+        Assume.assumeTrue("workgroup of " + local + " is narrower than one warp row", local >= rowLocal);
+        int rowStride = nHeads * headDim;
+        int total = nTokens * rowStride;
+        RopeSpec rope = neox(headDim);
+        float[] x = random(total, 31);
+        float[] w = random(nHeads * headDim, 32);
+        float[] b = random(nHeads * headDim, 33);
+        GpuBuffer ff = placeholders.readOnlyFloats();
+        GpuBuffer posb = ints(new int[]{0, 7, 511});
+        GpuBuffer xb = buffer(x);
+        GpuBuffer wb = buffer(w);
+        GpuBuffer bb = buffer(b);
+        GpuBuffer ref = buffer(x);
+        GpuBuffer out = backend.allocateBuffer((long) total * Float.BYTES);
+
+        run(NormKernels.ROW_NORM, (long) nTokens * nHeads * local,
+                NormKernels.rowNormArgs(NormKind.RMS, EPS, nTokens * nHeads, headDim, headDim, ref, 0, ref, 0, wb,
+                        bb, nHeads, placeholders.readOnlyFloats()));
+        run(RopeKernels.ROPE_EXT,
+                ActKernels.global1d(RopeKernels.ropeExtWorkItems(rope.type(), nTokens, nHeads, rope.nDims()), local)[0],
+                RopeKernels.ropeExtArgs(rope, nTokens, nHeads, headDim, rowStride, 0, nTokens, 0, false, posb, ff,
+                        ref));
+        runAt(FusedKernels.RMS_NORM_ROPE, FusedKernels.rmsNormRopeGlobal(nTokens, nHeads, rowLocal), rowLocal,
+                FusedKernels.rmsNormRopeArgs(rope, nTokens, nHeads, headDim, rowStride, headDim, 0, nTokens, 0, 0,
+                        NormKernels.FLAG_HAS_W | NormKernels.FLAG_HAS_B, nHeads, EPS, false, posb, ff, wb, bb, xb,
+                        out));
+
+        near(read(ref, total), read(out, total), "rms norm + rope over one-warp rows");
     }
 
     // ------------------------------------------------------------------ GDN norm + gate
