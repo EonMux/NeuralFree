@@ -352,6 +352,19 @@ On an OpenCL device that also accepts a required subgroup size of 16 (the Intel 
 
 They keep their state in registers across 16-lane subgroups instead of staging it in local memory, read the weights and cache rows with 16-byte loads, and share activations through subgroup shuffles. Their float summation order differs from the portable kernels', so `-Dneuralfree.batch.invariant=true` keeps the portable matvec and GEMM forms. The attention forms are chosen per layer for the dense and the paged plans together, so a step's result does not depend on which plan runs it.
 
+The Vulkan backend carries the same forms as GLSL ports in `shaders/llm` (`matvec_sg.comp`, `matmul_mmq_sg.comp`, `flash_decode_sg.comp`, `flash_prefill_sg.comp`), built by the `sg16` rows of `shaders/llm/variants/subgroup16.tsv`. A row flagged `sg16` compiles its module with `USE_SUBGROUPS=1 NF_SG_ROW_SIZE=16`, records `<kernel>.sgsize=16` in the library index, and its pipelines require 16-lane full subgroups (`VK_EXT_subgroup_size_control`). A device whose compute stage cannot pin 16 lanes, or that lacks basic, ballot and arithmetic subgroup operations, refuses those modules, and the dispatcher uses them only on Intel devices whose kernels use subgroups. They use no subgroup shuffles: a token's activation words reach the lanes through `subgroupBroadcast`. The MMQ form splits a work-group's 32 tokens between two halves of 128 invocations for Q8_0 and Q4_K, because Mesa's Intel compiler gives a SIMD16 thread 128 registers. On the Arrow Lake iGPU (Mesa ANV), 512-token prefill and 32-token decode, in tokens/s:
+
+| Model | Test | Portable kernels | Subgroup forms | llama.cpp Vulkan |
+|---|---|---|---|---|
+| Qwen3 0.6B Q8_0 | pp512 | 34-42 | 1338 | 1034 |
+| Qwen3 0.6B Q8_0 | tg32 | 14.9 | 51.0 | 31.0 |
+| Qwen3 4B Q4_K_M | pp512 | 25.6 | 194.6 | 193.4 |
+| Qwen3 4B Q4_K_M | tg32 | 4.4 | 19.5 | 16.1 |
+| Qwen3 4B Q8_0 | pp512 | device lost | 174.2 | 143.2 |
+| Qwen3 4B Q8_0 | tg32 | 4.6 | 12.0 | 11.4 |
+
+The portable kernels' decode figures were measured over 128 tokens. Their 4B Q8_0 prefill ran 88 ms projections at 128 tokens, and the i915 driver reset the GPU during its 512-token pass; the subgroup forms' longest dispatch on these models is about 26 ms.
+
 What each API needs to run a library:
 
 | API | `llm` | `train` |
@@ -3840,6 +3853,7 @@ Every parameter takes a comma-separated list or a range (`first-last`, `first-la
 | `-r`, `--repetitions N` | Timed repetitions per test; rows report `avg ± stddev` | 5 |
 | `-o`, `--output FMT`; `-oe`, `--output-err FMT` | `md`, `csv`, `json`, `jsonl`, `sql` or `none`, on stdout and stderr | `md`, `none` |
 | `--progress`, `--no-warmup`, `--delay S` | Progress lines on stderr; skip the warmup pass; pause before each test | |
+| `--kernels` | Time every GPU dispatch of each test and print the per-kernel device time (count, total, mean, share) on stderr, cumulative over the warmup and the repetitions: OpenCL profiling events, CUDA event pairs around each launch, Vulkan timestamp queries around each dispatch (`-Dneuralfree.gpu.profile=true`; HIP and Metal time nothing). Each timed dispatch waits for the previous one, and decode-step replay is off, so the totals measure the kernels rather than the run's throughput | off |
 
 Rows carry the model facts (file, type, size, parameter count), the run's settings — including `n_threads`, `n_cpu_moe`, `split_mode`, `main_gpu`, `no_kv_offload`, `devices`, `tensor_split`, `tensor_buft_overrides`, `load_mode` and `embeddings` in `csv`, `json`, `jsonl` and `sql`, and as `threads`, `n_cpu_moe`, `sm`, `main_gpu`, `nkvo`, `dev`, `ts`, `ot`, `lm` and `embd` in the Markdown table when they vary — and its statistics; json and jsonl add the raw `samples_ns` and `samples_ts`. A parameter that is not swept takes its value from the `-Dneuralfree.*` properties. Prompt tokens come from a fixed-seed generator, so a sweep is reproducible. `-fa`/`--flash-attn` (attention always runs the fused kernels, so `off` cannot be honored), `-nopo`/`--no-op-offload` (operations follow their tensors, so there is no separate host-operation offload), `-fitt`/`--fit-target` (the load has no per-device reserve margin; `neuralfree.gpu.vram.limit` caps the allocation instead) and `-fitc`/`--fit-ctx` (there is no minimum-context floor for the fit) are refused by name, as is every other llama-bench parameter the bench does not sweep.
 
@@ -8495,7 +8509,7 @@ GGUF files ignore these; Hugging Face checkpoints read them at open. The meaning
 | `neuralfree.opencl.disable` | Skip OpenCL enumeration | false |
 | `neuralfree.opencl.skip.probe` | Skip the subprocess probe for crashing OpenCL platforms | false |
 | `neuralfree.opencl.binaryCache` | OpenCL program binary cache (`~/.cache/neuralfree/opencl`, capped at 1 GiB) | true |
-| `neuralfree.gpu.profile` | Per-command profiling on OpenCL queues | false |
+| `neuralfree.gpu.profile` | Per-command profiling on OpenCL queues, per-launch event pairs on CUDA streams and per-dispatch timestamp queries on Vulkan queues (`nftool bench --kernels` sets it) | false |
 | `neuralfree.gpu.decodeReplay` | Replay the single-token decode trunk as one CUDA graph / HIP graph / Vulkan or OpenCL command-buffer submission ([decode-step command replay](#decode-step-command-replay)) | true |
 | `neuralfree.gpu.chainReplay` | Extend decode replay into speculative rounds: keep the drafter's capture across rollbacks and record the verify step ([decode-step command replay](#decode-step-command-replay)) | true on CUDA, false elsewhere |
 | `neuralfree.gpu.graphWarmupSteps` | Consecutive same-shape decode steps that run directly before the trunk is recorded for replay ([decode-step command replay](#decode-step-command-replay)) | 2 |

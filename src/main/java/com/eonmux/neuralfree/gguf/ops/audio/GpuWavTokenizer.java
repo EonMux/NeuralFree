@@ -290,7 +290,8 @@ public final class GpuWavTokenizer implements WavTokenizerDecoder.Backend {
      */
     public static GpuWavTokenizer bind(WavTokenizerDecoder dec, GpuOps ops, GpuWeights weights, int capacity) {
         Objects.requireNonNull(ops, "ops");
-        return new GpuWavTokenizer(dec, ops, weights, capacity, ops.kernels().caps().getComputeUnits());
+        return new GpuWavTokenizer(dec, ops, weights, capacity,
+                FlashAttnTiling.planningUnits(ops.kernels().caps()));
     }
 
     /** Single-head non-causal flash plan over up to {@code capacity} keys of width {@code c}. */

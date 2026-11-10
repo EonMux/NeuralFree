@@ -1,0 +1,334 @@
+/* flash_prefill_sg.comp - LLM_FlashAttnSg_<KV> and LLM_FlashAttnPagedSg_<KV> subgroup prefill attention for 16-lane
+ * subgroups: the Vulkan form of kernels/llm/flash_prefill_sg.cl, which documents the work mapping in full.
+ * Requires: common/nf_common.glsl, common/act.glsl, common/kv_types.glsl, common/attn_common.glsl,
+ * common/flash_sg.glsl.
+ *
+ * The prefill attention of LLM_FlashAttn_<KV> / LLM_FlashAttnPaged_<KV> (flash_prefill.comp) for plain F32, F16 and
+ * BF16 caches, with their argument lists (bk is not read), layouts, masking, biases, sinks, tree masks and partial
+ * outputs. Variants rows select KV=NF_KV_F32, NF_KV_F16 or NF_KV_BF16, PAGED=1 for the paged entry points; flag
+ * sg16 (the pipeline pins 16-lane full subgroups).
+ *
+ * - A workgroup is NF_FDS_SUBGROUPS subgroups and owns R = bq * g_tile == NF_FAS_WG_ROWS query rows of one KV head
+ *   (r = i * g_tile + g: token t0 + i, head h0 + g); subgroup s serves rows 2s and 2s + 1, which with g_tile >= 2 are
+ *   one token's two heads and share every K and V load and the visibility.
+ * - The subgroup scans its key range in blocks of 16 keys. Lane j scores key j of the block against both rows with
+ *   full dot products of its own (the query rows are uniform reads of shared memory); one subgroup max and sum per
+ *   row and block; lane l accumulates its NF_FDS_DPL output dims of both rows from every visible key's V row, the
+ *   key's probabilities broadcast from its lane. A block no key of which is visible to either row costs its
+ *   visibility test only. No barrier follows the query staging.
+ *
+ * Dispatch: global {ceil(n_tokens / bq) * 64, n_head_kv * ceil(G / g_tile), n_split}, local {64, 1, 1}. Plan
+ * constraints (violations write NaN outputs): g_tile in {1, 2, 4, 8} with bq * g_tile == 8, d_k == d_v a positive
+ * multiple of 8 of at most 128, K and V row and head strides multiples of 8, n_split >= 1, split_len > 0, direct_out
+ * only with n_split == 1, local size 64 with 16-lane subgroups. Results are deterministic (fixed key order).
+ * Shared memory: 8 * 128 floats (4 KiB).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/act.glsl"
+#include "common/kv_types.glsl"
+#include "common/attn_common.glsl"
+#include "common/flash_sg.glsl"
+
+layout(std430, binding = 0) readonly buffer NfFasQ { float q_in[]; };
+NF_FDS_KV_VIEW(1, kc)
+NF_FDS_KV_VIEW(2, vc)
+layout(std430, binding = 3) readonly buffer NfFasQPos { int q_pos[]; };
+layout(std430, binding = 4) readonly buffer NfFasKvPos { int kv_pos[]; };
+layout(std430, binding = 5) readonly buffer NfFasSinks { float sinks[]; };
+layout(std430, binding = 6) readonly buffer NfFasRelBias { float rel_bias[]; };
+layout(std430, binding = 7) writeonly buffer NfFasOut { float dst[]; };
+layout(std430, binding = 8) writeonly buffer NfFasPartial { float partial[]; };
+#if defined(PAGED)
+layout(std430, binding = 9) readonly buffer NfFasPages { int page_table[]; };
+layout(std430, binding = 10) readonly buffer NfFasKvScales { float kv_scales[]; };
+layout(std430, binding = 11) readonly buffer NfFasTreeMask { uvec2 tree_mask[]; };
+#else
+layout(std430, binding = 9) readonly buffer NfFasKvScales { float kv_scales[]; };
+layout(std430, binding = 10) readonly buffer NfFasTreeMask { uvec2 tree_mask[]; };
+#endif
+
+layout(push_constant) uniform NfFasParams {
+    int n_tokens; int n_head; int n_head_kv; int d_k; int d_v;
+    int bq; int bk; int g_tile; int n_split; int split_len;
+    int kv_start; int kv_end;
+    int q_row_stride; int out_row_stride;
+    int k_row_stride; int k_head_stride; int v_row_stride; int v_head_stride;
+    float scale; float softcap; float max_bias;
+    int flags; int swa_type; int n_swa;
+    int bias_mode; int n_buckets; int max_distance;
+    int q_off; int out_off;
+#if defined(PAGED)
+    int page_shift; int pt_off;
+#endif
+} pc;
+
+/* Query rows per subgroup and per workgroup (SubgroupFlashAttention mirrors both). */
+#define NF_FAS_ROWS 2
+#define NF_FAS_WG_ROWS (NF_FDS_SUBGROUPS * NF_FAS_ROWS)
+
+/* The workgroup's query rows, staged for the uniform reads of the score loop. */
+shared float nf_fas_q[NF_FAS_WG_ROWS * NF_FDS_MAX_D];
+
+bool nf_fas_plan_ok() {
+    const int d = pc.d_k;
+    const int g = pc.g_tile;
+    return nf_fds_strides_ok(pc.k_row_stride, pc.k_head_stride, pc.v_row_stride, pc.v_head_stride)
+        && pc.n_head > 0 && pc.n_head_kv > 0 && pc.n_head % pc.n_head_kv == 0
+        && (g == 1 || g == 2 || g == 4 || g == 8) && pc.bq * g == NF_FAS_WG_ROWS
+        && d == pc.d_v && d > 0 && d % NF_FDS_DPL == 0 && d <= NF_FDS_MAX_D
+        && pc.n_split >= 1 && pc.split_len > 0
+        && ((pc.flags & NF_ATTN_FLAG_DIRECT) == 0 || pc.n_split == 1)
+#if defined(PAGED)
+        && pc.page_shift >= 0 && pc.page_shift <= 20 && pc.pt_off >= 0
+#endif
+        && nf_fds_shape_ok();
+}
+
+/* NaN over the outputs of a call that violates the plan (workgroup (0, 0, 0) only), as flash_prefill.comp. */
+void nf_fas_poison() {
+    if (gl_WorkGroupID.x != 0u || gl_WorkGroupID.y != 0u || gl_WorkGroupID.z != 0u
+        || pc.n_tokens <= 0 || pc.n_head <= 0 || pc.d_v <= 0 || pc.n_split <= 0) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    if ((pc.flags & NF_ATTN_FLAG_DIRECT) != 0) {
+        const uint n = uint(pc.n_head * pc.d_v);
+        for (int t = 0; t < pc.n_tokens; t++) {
+            for (uint i = lid; i < n; i += gl_WorkGroupSize.x) {
+                dst[uint(pc.out_off + t * pc.out_row_stride) + i] = NF_NAN;
+            }
+        }
+    } else {
+        const uint n = uint(pc.n_tokens * pc.n_head * pc.n_split * (pc.d_v + 2));
+        for (uint i = lid; i < n; i += gl_WorkGroupSize.x) {
+            partial[i] = NF_NAN;
+        }
+    }
+}
+
+/* Position bias of head h (flash_prefill.comp nf_fa_bias); q_row = the query token's row in the step. */
+float nf_fas_bias(int h, int p_q, int p_k, float slope, int q_row) {
+    if (pc.bias_mode == NF_ATTN_BIAS_ALIBI) {
+        return slope * (-float(abs(p_q - p_k)));
+    }
+    if (pc.bias_mode == NF_ATTN_BIAS_ALIBI_SQRT) {
+        return p_k <= p_q ? slope * (-sqrt(float(p_q - p_k))) : 0.0;
+    }
+    if (pc.bias_mode == NF_ATTN_BIAS_T5_CAUSAL || pc.bias_mode == NF_ATTN_BIAS_T5_BIDIR) {
+        const int bucket = nf_t5_bucket(p_k, p_q, pc.n_buckets, pc.max_distance,
+                                        pc.bias_mode == NF_ATTN_BIAS_T5_BIDIR ? 1 : 0);
+        return rel_bias[bucket * pc.n_head + h];
+    }
+    if (pc.bias_mode == NF_ATTN_BIAS_INKLING) {
+        const int dist = p_q - p_k;
+        if (dist < 0 || dist >= pc.n_buckets) {
+            return 0.0;
+        }
+        return rel_bias[(q_row * pc.n_head + h) * pc.n_buckets + dist];
+    }
+    return 0.0;
+}
+
+#if defined(PAGED)
+/* The page id of a key slot; a negative id masks the slot (host-validated table, slot < kv_end in bounds). */
+int nf_fas_page_id(int slot) {
+    return page_table[uint(pc.pt_off + (slot >> pc.page_shift))];
+}
+#endif
+
+/* Whether the lane's key, at position p_k, is visible to a valid query row at position p_q with tree bits tm. */
+bool nf_fas_visible(bool valid, int p_k, uvec2 tm, int p_q) {
+    return valid && nf_attn_tree_visible(p_k, tm, pc.kv_end, nf_attn_flag_fresh(pc.flags), p_q,
+                                         pc.flags & NF_ATTN_FLAG_CAUSAL, pc.swa_type, pc.n_swa) != 0;
+}
+
+/* Writes one row's normalized output (direct_out) or its (o, m, l) partial. */
+void nf_fas_store(int t, int h, int split, float m, float l, vec4 olo, vec4 ohi, bool live, uint lane) {
+    const int d = pc.d_v;
+    const int dim0 = int(lane) * NF_FDS_DPL;
+    if ((pc.flags & NF_ATTN_FLAG_DIRECT) != 0) {
+        const vec2 fl = (pc.flags & NF_ATTN_FLAG_SINKS) != 0 ? nf_attn_sink(m, l, sinks[h]) : vec2(1.0, l);
+        if (live) {
+            const float f = fl.y > 0.0 ? fl.x / fl.y : 0.0;
+            const vec4 lo = fl.y > 0.0 ? olo * f : vec4(0.0);
+            const vec4 hi = fl.y > 0.0 ? ohi * f : vec4(0.0);
+            const uint b = uint(pc.out_off + t * pc.out_row_stride + h * d + dim0);
+            dst[b] = lo.x; dst[b + 1u] = lo.y; dst[b + 2u] = lo.z; dst[b + 3u] = lo.w;
+            dst[b + 4u] = hi.x; dst[b + 5u] = hi.y; dst[b + 6u] = hi.z; dst[b + 7u] = hi.w;
+        }
+    } else {
+        const uint pp = uint(((t * pc.n_head + h) * pc.n_split + split) * (d + 2));
+        if (live) {
+            const uint b = pp + uint(dim0);
+            partial[b] = olo.x; partial[b + 1u] = olo.y; partial[b + 2u] = olo.z; partial[b + 3u] = olo.w;
+            partial[b + 4u] = ohi.x; partial[b + 5u] = ohi.y; partial[b + 6u] = ohi.z; partial[b + 7u] = ohi.w;
+        }
+        if (lane == 0u) {
+            partial[pp + uint(d)] = m;
+            partial[pp + uint(d + 1)] = l;
+        }
+    }
+}
+
+void main() {
+    if (!nf_fas_plan_ok()) {
+        nf_fas_poison();
+        return;   /* uniform across the workgroup: no barrier has been reached */
+    }
+    const uint lane = gl_SubgroupInvocationID;
+    const int sg = int(gl_SubgroupID);
+    const int lid = int(gl_LocalInvocationID.x);
+    const int split = int(gl_WorkGroupID.z);
+    const int d = pc.d_k;
+    const int g_tile = pc.g_tile;
+    const int G = pc.n_head / pc.n_head_kv;
+    const int n_gt = (G + g_tile - 1) / g_tile;
+    const int kvh = int(gl_WorkGroupID.y) / n_gt;
+    const int gt = int(gl_WorkGroupID.y) - kvh * n_gt;
+    const int h0 = kvh * G + gt * g_tile;
+    const int g_cnt = min(g_tile, G - gt * g_tile);
+    const int t0 = int(gl_WorkGroupID.x) * pc.bq;
+    const int k_begin = pc.kv_start + split * pc.split_len;
+    const int k_stop = min(k_begin + pc.split_len, pc.kv_end);
+
+    /* Stage the workgroup's query rows (zeros for rows past the tokens or the head tile). */
+    for (int idx = lid; idx < NF_FAS_WG_ROWS * d; idx += NF_FDS_WG) {
+        const int r = idx / d;
+        const int c = idx - r * d;
+        const int i = r / g_tile;
+        const int g = r - i * g_tile;
+        const int t = t0 + i;
+        nf_fas_q[r * NF_FDS_MAX_D + c] = t < pc.n_tokens && g < g_cnt
+            ? q_in[uint(pc.q_off + t * pc.q_row_stride + (h0 + g) * d + c)] : 0.0;
+    }
+    barrier();
+
+    /* This subgroup's two rows. */
+    const int ra = sg * NF_FAS_ROWS;
+    const int rb = ra + 1;
+    const int ia = ra / g_tile;
+    const int ga = ra - ia * g_tile;
+    const int ib = rb / g_tile;
+    const int gb = rb - ib * g_tile;
+    const int ta = t0 + ia;
+    const int tb = t0 + ib;
+    const bool va = ta < pc.n_tokens && ga < g_cnt;
+    const bool vb = tb < pc.n_tokens && gb < g_cnt;
+    if (!va && !vb) {
+        return;   /* no barrier follows */
+    }
+    const int ha = h0 + ga;
+    const int hb = h0 + gb;
+    const int pqa = va ? q_pos[ta] : 0;
+    const int pqb = vb ? q_pos[tb] : 0;
+    const bool tree = (pc.flags & NF_ATTN_FLAG_TREE) != 0;
+    const uvec2 tma = tree && va ? tree_mask[ta] : uvec2(0u);
+    const uvec2 tmb = tree && vb ? tree_mask[tb] : uvec2(0u);
+    const bool alibi = pc.bias_mode == NF_ATTN_BIAS_ALIBI || pc.bias_mode == NF_ATTN_BIAS_ALIBI_SQRT;
+    const float slope_a = alibi ? nf_alibi_slope(ha, pc.n_head, pc.max_bias) : 1.0;
+    const float slope_b = alibi ? nf_alibi_slope(hb, pc.n_head, pc.max_bias) : 1.0;
+    /* Plain caches carry one scale per KV head and side (1.0 unless a checkpoint scale was set). */
+    const float ks = kv_scales[kvh];
+    const float vs = kv_scales[pc.n_head_kv + kvh];
+    const uint k_head = uint(kvh * pc.k_head_stride);
+    const uint v_head = uint(kvh * pc.v_head_stride);
+    const int qa = ra * NF_FDS_MAX_D;
+    const int qb = rb * NF_FDS_MAX_D;
+    const int dim0 = int(lane) * NF_FDS_DPL;
+    const bool live = dim0 < d;
+
+    float m_a = -NF_INF, l_a = 0.0, m_b = -NF_INF, l_b = 0.0;
+    vec4 acc_alo = vec4(0.0), acc_ahi = vec4(0.0), acc_blo = vec4(0.0), acc_bhi = vec4(0.0);
+
+    for (int blk = k_begin; blk < k_stop; blk += NF_SG_ROW_SIZE) {
+        /* Lane j: key blk + j, its row, position and visibility to both rows. */
+        const int slot = blk + int(lane);
+        int row_l = 0;
+        bool vis_a = false;
+        bool vis_b = false;
+        int p_k = -1;
+#if defined(PAGED)
+        const int page = slot < k_stop ? nf_fas_page_id(slot) : -1;
+        if (page >= 0) {
+            row_l = nf_kv_row(slot, pc.page_shift, page);
+#else
+        if (slot < k_stop) {
+            row_l = slot;
+#endif
+            p_k = kv_pos[row_l];
+            vis_a = nf_fas_visible(va, p_k, tma, pqa);
+            vis_b = nf_fas_visible(vb, p_k, tmb, pqb);
+        }
+        const uint vis_mask = subgroupBallot(vis_a || vis_b).x;
+        if (vis_mask == 0u) {
+            continue;
+        }
+
+        /* Scores: the lane's key against both rows, full dot products in the lane. */
+        float sa = 0.0;
+        float sb = 0.0;
+        if (vis_a || vis_b) {
+            const uint krow = uint(row_l) * uint(pc.k_row_stride) + k_head;
+            for (int c = 0; c < d; c += NF_FDS_DPL) {
+                vec4 klo, khi;
+                kc_load8(krow + uint(c), klo, khi);
+                const vec4 qalo = vec4(nf_fas_q[qa + c], nf_fas_q[qa + c + 1],
+                                       nf_fas_q[qa + c + 2], nf_fas_q[qa + c + 3]);
+                const vec4 qahi = vec4(nf_fas_q[qa + c + 4], nf_fas_q[qa + c + 5],
+                                       nf_fas_q[qa + c + 6], nf_fas_q[qa + c + 7]);
+                const vec4 qblo = vec4(nf_fas_q[qb + c], nf_fas_q[qb + c + 1],
+                                       nf_fas_q[qb + c + 2], nf_fas_q[qb + c + 3]);
+                const vec4 qbhi = vec4(nf_fas_q[qb + c + 4], nf_fas_q[qb + c + 5],
+                                       nf_fas_q[qb + c + 6], nf_fas_q[qb + c + 7]);
+                sa += nf_fds_dot(qalo, qahi, klo, khi);
+                sb += nf_fds_dot(qblo, qbhi, klo, khi);
+            }
+        }
+        sa = vis_a ? nf_attn_score(sa * ks, pc.scale, pc.softcap) + nf_fas_bias(ha, pqa, p_k, slope_a, ta) : -NF_INF;
+        sb = vis_b ? nf_attn_score(sb * ks, pc.scale, pc.softcap) + nf_fas_bias(hb, pqb, p_k, slope_b, tb) : -NF_INF;
+
+        /* Online softmax per row over the block. */
+        const float mn_a = max(m_a, subgroupMax(sa));
+        const float mn_b = max(m_b, subgroupMax(sb));
+        const float al_a = nf_attn_rescale(m_a, mn_a);
+        const float al_b = nf_attn_rescale(m_b, mn_b);
+        const float pa = nf_attn_rescale(sa, mn_a);
+        const float pb = nf_attn_rescale(sb, mn_b);
+        l_a = l_a * al_a + subgroupAdd(pa);
+        l_b = l_b * al_b + subgroupAdd(pb);
+        m_a = mn_a;
+        m_b = mn_b;
+        acc_alo *= al_a;
+        acc_ahi *= al_a;
+        acc_blo *= al_b;
+        acc_bhi *= al_b;
+
+        /* Values: every visible key's V row, weighted by its broadcast probabilities. */
+        uint todo = vis_mask;
+        while (todo != 0u) {
+            const uint j = uint(findLSB(todo));
+            todo &= todo - 1u;
+            const int row = subgroupBroadcast(row_l, j);
+            const float wa = subgroupBroadcast(pa, j) * vs;
+            const float wb = subgroupBroadcast(pb, j) * vs;
+            if (live) {
+                vec4 vlo, vhi;
+                vc_load8(uint(row) * uint(pc.v_row_stride) + v_head + uint(dim0), vlo, vhi);
+                acc_alo += wa * vlo;
+                acc_ahi += wa * vhi;
+                acc_blo += wb * vlo;
+                acc_bhi += wb * vhi;
+            }
+        }
+    }
+
+    if (va) {
+        nf_fas_store(ta, ha, split, m_a, l_a, acc_alo, acc_ahi, live, lane);
+    }
+    if (vb) {
+        nf_fas_store(tb, hb, split, m_b, l_b, acc_blo, acc_bhi, live, lane);
+    }
+}

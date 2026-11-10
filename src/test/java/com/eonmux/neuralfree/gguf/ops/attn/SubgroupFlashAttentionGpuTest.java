@@ -1,12 +1,11 @@
 package com.eonmux.neuralfree.gguf.ops.attn;
 
-import com.eonmux.neuralfree.acceleration.GpuTestUtil;
-import com.eonmux.neuralfree.acceleration.HWAcceleration;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
+import com.eonmux.neuralfree.acceleration.backend.ComputeBackend.BackendType;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
-import com.eonmux.neuralfree.acceleration.ocl.CLDevice;
 import com.eonmux.neuralfree.gguf.arch.SwaType;
+import com.eonmux.neuralfree.gguf.gpu.forward.SubgroupFormBackends;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.memory.KvWindow;
@@ -19,7 +18,6 @@ import org.junit.runners.Parameterized;
 
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.EnumSet;
 import java.util.List;
 import java.util.Random;
 
@@ -28,7 +26,9 @@ import static org.junit.Assert.assertTrue;
 /**
  * The subgroup flash-attention kernels ({@link SubgroupFlashAttention}: {@code LLM_FlashDecodeSg_<KV>},
  * {@code LLM_FlashDecodePagedSg_<KV>}, {@code LLM_FlashAttnSg_<KV>} and {@code LLM_FlashAttnPagedSg_<KV>}) against
- * {@link CpuAttentionCore} on every OpenCL device whose program builds them (the Intel GPUs; other devices skip): F32,
+ * {@link CpuAttentionCore} on every device whose kernels include them ({@link SubgroupFormBackends}: the OpenCL kernels
+ * of kernels/llm/flash_*_sg.cl and their Vulkan ports shaders/llm/flash_*_sg.comp, the Intel GPUs; other devices
+ * skip): F32,
  * F16 and BF16 caches at head dims 64 (half the subgroup's lanes idle), 80 and 128 (every lane), GQA groups of 1 to 4
  * (3 leaves a partial head tile), empty cache cells, sinks, softcap, the sliding window and bidirectional attention.
  * Each decode case runs the plan's split of the step (split-K merged by {@code LLM_FlashAttn_Combine}, or direct) and
@@ -42,41 +42,44 @@ public class SubgroupFlashAttentionGpuTest {
     private static final int PAGE_SHIFT = 4;
     private static final int PAGE = 1 << PAGE_SHIFT;
     private static final float TOL = 1e-4f;
+    /**
+     * The fewest compute units the decode plans of this test assume: more than any tested device reports (the Arrow
+     * Lake iGPU reports 64 through OpenCL, none through Mesa ANV) or {@code FlashAttnTiling.planningUnits} assumes, so
+     * the decode runs split and merged on every device.
+     */
+    private static final int PLAN_COMPUTE_UNITS = 128;
 
-    @Parameterized.Parameters(name = "{0}")
+    @Parameterized.Parameters(name = "{0} {1}")
     public static List<Object[]> types() {
         List<Object[]> rows = new ArrayList<>();
-        for (KvDType t : new KvDType[]{KvDType.F32, KvDType.F16, KvDType.BF16}) {
-            rows.add(new Object[]{t});
+        for (BackendType api : new BackendType[]{BackendType.OPENCL, BackendType.VULKAN}) {
+            for (KvDType t : new KvDType[]{KvDType.F32, KvDType.F16, KvDType.BF16}) {
+                rows.add(new Object[]{api, t});
+            }
         }
         return rows;
     }
 
+    private final BackendType api;
     private final KvDType type;
-    private final List<ComputeBackend> backends = new ArrayList<>();
-    private HWAcceleration hw;
+    private SubgroupFormBackends devices;
+    private List<ComputeBackend> backends;
 
-    public SubgroupFlashAttentionGpuTest(KvDType type) {
+    public SubgroupFlashAttentionGpuTest(BackendType api, KvDType type) {
+        this.api = api;
         this.type = type;
     }
 
     @Before
     public void open() {
-        GpuTestUtil.assumeOpenCLAvailable();
-        hw = new HWAcceleration(EnumSet.of(ComputeBackend.BackendType.OPENCL));
-        for (CLDevice device : hw.getCLDevices()) {
-            backends.add(hw.createBackend(device));
-        }
-        Assume.assumeFalse("no OpenCL device enumerated", backends.isEmpty());
+        devices = SubgroupFormBackends.open(api);
+        backends = devices.backends();
     }
 
     @After
     public void close() {
-        for (ComputeBackend b : backends) {
-            b.close();
-        }
-        if (hw != null) {
-            hw.shutdown();
+        if (devices != null) {
+            devices.close();
         }
     }
 
@@ -101,7 +104,7 @@ public class SubgroupFlashAttentionGpuTest {
                     .window(KvWindow.of(SwaType.STANDARD, 70, true)).build(), false);
             runDense(backend, kernels, dev + " empty cells", 8, 8, 128, causal, true);
         }
-        Assume.assumeTrue("no OpenCL device builds the subgroup decode kernels", served > 0);
+        Assume.assumeTrue("no " + api + " device builds the subgroup decode kernels", served > 0);
     }
 
     @Test
@@ -115,7 +118,7 @@ public class SubgroupFlashAttentionGpuTest {
             served++;
             runPaged(backend, kernels, backend.capabilities().getDeviceName(), 8, 2, 128, new int[]{37, 300, 900});
         }
-        Assume.assumeTrue("no OpenCL device builds the subgroup decode kernels", served > 0);
+        Assume.assumeTrue("no " + api + " device builds the subgroup decode kernels", served > 0);
     }
 
     @Test
@@ -141,7 +144,7 @@ public class SubgroupFlashAttentionGpuTest {
                     CpuAttentionCore.Params.builder(4).scale(0.125f).window(KvWindow.FULL_BIDIRECTIONAL).build(),
                     null);
         }
-        Assume.assumeTrue("no OpenCL device builds the subgroup attention kernels", served > 0);
+        Assume.assumeTrue("no " + api + " device builds the subgroup attention kernels", served > 0);
     }
 
     @Test
@@ -160,7 +163,7 @@ public class SubgroupFlashAttentionGpuTest {
             runPrefill(backend, kernels, dev + " paged tree", true, 8, 2, 64, 120, 5, causal(8),
                     new int[]{-1, 0, 0, 1, 3});
         }
-        Assume.assumeTrue("no OpenCL device builds the subgroup attention kernels", served > 0);
+        Assume.assumeTrue("no " + api + " device builds the subgroup attention kernels", served > 0);
     }
 
     /** The device's kernels when its program builds this type's subgroup kernels, else null. */
@@ -192,7 +195,7 @@ public class SubgroupFlashAttentionGpuTest {
         float[] sinks = randomFloats(rnd, nHead);
         CpuAttentionCore.Params params = withSinks(base, sinks);
         FlashAttnTiling plan = FlashAttnTiling.decodeSubgroup(nHead, nHeadKv, d, d, nKvMax, kernels.faSmemFloats(),
-                Math.max(1, backend.capabilities().getComputeUnits()));
+                planUnits(backend));
         assertTrue(plan.toString(), plan.subgroup() && plan.gTile() == 1);
         try (Bufs bufs = new Bufs(backend)) {
             GpuBuffer dq = bufs.upload(q);
@@ -287,7 +290,7 @@ public class SubgroupFlashAttentionGpuTest {
                     0, len, want, s * nHead * d, nHead * d);
         }
         FlashAttnTiling plan = FlashAttnTiling.decodePagedSubgroup(nSeq, nHead, nHeadKv, d, d,
-                maxPages << PAGE_SHIFT, kernels.faSmemFloats(), Math.max(1, backend.capabilities().getComputeUnits()));
+                maxPages << PAGE_SHIFT, kernels.faSmemFloats(), planUnits(backend));
         FlashAttnTiling.Split split = plan.decodeSplit(maxLen);
         assertTrue("the paged launch needs several splits: " + split, !split.direct());
         try (Bufs bufs = new Bufs(backend)) {
@@ -403,7 +406,7 @@ public class SubgroupFlashAttentionGpuTest {
         }
 
         FlashAttnTiling plan = FlashAttnTiling.prefillSubgroup(nHead, nHeadKv, d, d, nKv, kernels.faSmemFloats(),
-                Math.max(1, backend.capabilities().getComputeUnits()));
+                planUnits(backend));
         assertTrue(plan.toString(), plan.subgroup() && plan.rows() == SubgroupFlashAttention.PREFILL_ROWS);
         int splitLen = 48;
         int nSplit = (nKv + splitLen - 1) / splitLen;
@@ -629,6 +632,11 @@ public class SubgroupFlashAttentionGpuTest {
     }
 
     /** The buffers of one case, released together. */
+    /** The compute-unit count the plans use: the device's, but at least {@link #PLAN_COMPUTE_UNITS}. */
+    private static int planUnits(ComputeBackend backend) {
+        return Math.max(PLAN_COMPUTE_UNITS, backend.capabilities().getComputeUnits());
+    }
+
     private static final class Bufs implements AutoCloseable {
         private final ComputeBackend backend;
         private final List<GpuBuffer> all = new ArrayList<>();

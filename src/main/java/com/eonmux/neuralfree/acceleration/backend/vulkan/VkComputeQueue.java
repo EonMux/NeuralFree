@@ -10,6 +10,7 @@ import com.eonmux.neuralfree.acceleration.backend.GpuGraph;
 import com.eonmux.neuralfree.acceleration.backend.GpuGraphMismatchException;
 import com.eonmux.neuralfree.acceleration.backend.GpuUncapturableCommandException;
 import com.eonmux.neuralfree.acceleration.backend.KernelHandle;
+import com.eonmux.neuralfree.acceleration.backend.KernelTiming;
 import com.eonmux.neuralfree.utils.LoggingUtil;
 import org.apache.logging.log4j.Logger;
 import org.lwjgl.system.MemoryStack;
@@ -112,6 +113,8 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
     private final VkDescriptorStrategy strategy;
     private final long[] maxGroups;
     private final VkSubmitPolicy submitPolicy;
+    /** Dispatch timing under {@code -Dneuralfree.gpu.profile=true}, or null. */
+    private final VkDispatchTimer timer;
     private final long commandPool;
     private final long timeline;
     private final VkHazardTracker tracker = new VkHazardTracker();
@@ -164,6 +167,8 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         this.strategy = backend.descriptorStrategy();
         this.maxGroups = backend.info().maxComputeWorkGroupCount();
         this.submitPolicy = new VkSubmitPolicy(backend.dispatchesPerSubmit());
+        this.timer = dispatchCapable
+                ? VkDispatchTimer.create(device, backend.info(), context.family(), submitPolicy.cap()) : null;
         this.commandPool = VkQueueResources.createCommandPool(device, context.family());
         long semaphore;
         try {
@@ -798,6 +803,15 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
     }
 
     /**
+     * The dispatch timing of this queue ({@link VkDispatchTimer}), or null when
+     * {@code -Dneuralfree.gpu.profile=true} is unset or the queue family writes no timestamps.
+     */
+    @Override
+    public KernelTiming kernelTiming() {
+        return timer != null ? timer.timing() : null;
+    }
+
+    /**
      * The backend's own queues only finish (nothing once the backend is closed); a caller-owned queue
      * is released ({@link #closeInternal()}).
      */
@@ -921,6 +935,9 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
             replaySignals.clear();
             pendingReplaySignal = 0;
             current = null;
+            if (timer != null) {
+                failure = step(timer::close, failure);
+            }
             failure = step(() -> vkDestroyCommandPool(device, commandPool, null), failure);
             failure = step(() -> vkDestroySemaphore(device, timeline, null), failure);
             if (uploadRing != null) {
@@ -999,7 +1016,10 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
             state.materialize();
 
             VkCommandBatch b = batch();
-            if (tracker.needsBarrier(state.readIds(), state.writeIds())) {
+            boolean timed = timer != null && timer.open(b, timingKey(handle.kernelName(), global, local3));
+            if (timed) {
+                tracker.reset();
+            } else if (tracker.needsBarrier(state.readIds(), state.writeIds())) {
                 b.barrier();
                 tracker.reset();
             }
@@ -1007,6 +1027,9 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
             b.bindDescriptors(variant.program(), state);
             variant.program().pushConstants(b.commandBuffer(), state);
             b.dispatch((int) groups[0], (int) groups[1], (int) groups[2]);
+            if (timed) {
+                timer.close(b);
+            }
             tracker.record(state.readIds(), state.writeIds());
             long value = pendingValue();
             if (submitPolicy.submitAfterDispatch(b.dispatchCount())) {
@@ -1014,6 +1037,11 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
             }
             return wantEvent ? new VkGpuEvent(this, value) : null;
         }
+    }
+
+    /** The timing report key of a dispatch: its kernel name and grid, the OpenCL queue's key. */
+    private static String timingKey(String name, long[] global, int[] local3) {
+        return name + "#" + global[0] + "x" + local3[0];
     }
 
     private GpuEvent write(GpuBuffer dst, long dstOffset, long size, HostSource source, GpuEvent[] waits) {
@@ -1228,17 +1256,32 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
 
     /** Returns a batch whose submission failed to the free list; its readbacks never complete. */
     private void recycleUnsubmitted(VkCommandBatch b, RuntimeException cause) {
+        if (timer != null) {
+            timer.discard(b);
+        }
         try {
             strategy.reset(b.descriptorFrame());
             b.reset();
             freeBatches.addLast(b);
         } catch (RuntimeException e) {
             cause.addSuppressed(e);
-            allBatches.remove(b);
-            step(() -> strategy.destroy(b.descriptorFrame()), null);
-            b.close();
-            VkQueueResources.freeCommandBuffer(device, commandPool, b.commandBuffer());
+            destroyFailedBatch(b, cause);
         }
+    }
+
+    /**
+     * Destroys a batch that cannot return to the free list after {@code cause}: its timing queries, descriptor
+     * frame and command buffer. The batch is not executing (it completed, or its submission failed); failures of
+     * the release steps are added to {@code cause}.
+     */
+    private void destroyFailedBatch(VkCommandBatch b, RuntimeException cause) {
+        allBatches.remove(b);
+        if (timer != null) {
+            step(() -> timer.release(b), cause);
+        }
+        step(() -> strategy.destroy(b.descriptorFrame()), cause);
+        b.close();
+        VkQueueResources.freeCommandBuffer(device, commandPool, b.commandBuffer());
     }
 
     /**
@@ -1254,14 +1297,14 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
                 for (VkCommandBatch.PendingRead read : b.pendingReads()) {
                     read.copyOut();
                 }
+                if (timer != null) {
+                    timer.collect(b);
+                }
                 strategy.reset(b.descriptorFrame());
                 b.reset();
                 freeBatches.addLast(b);
             } catch (RuntimeException e) {
-                allBatches.remove(b);
-                step(() -> strategy.destroy(b.descriptorFrame()), null);
-                b.close();
-                VkQueueResources.freeCommandBuffer(device, commandPool, b.commandBuffer());
+                destroyFailedBatch(b, e);
                 throw e;
             }
         }

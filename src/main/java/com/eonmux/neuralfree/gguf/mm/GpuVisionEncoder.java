@@ -83,7 +83,7 @@ public final class GpuVisionEncoder implements VisionEncoder {
         this.ops = Objects.requireNonNull(ops, "ops");
         this.device = Objects.requireNonNull(device, "device");
         int smem = ops.kernels().faSmemFloats();
-        int units = Math.max(1, ops.kernels().caps().getComputeUnits());
+        int units = FlashAttnTiling.planningUnits(ops.kernels().caps());
         String reason = unsupportedReason(model, smem, units);
         if (reason != null) {
             throw new UnsupportedOperationException(reason);
@@ -234,7 +234,7 @@ public final class GpuVisionEncoder implements VisionEncoder {
     /** Whether the GPU encoder can run {@code model} with these kernels ({@link #unsupportedReason}). */
     public static String unsupportedReason(ClipVisionModel model, LlmKernels kernels) {
         Objects.requireNonNull(kernels, "kernels");
-        return unsupportedReason(model, kernels.faSmemFloats(), Math.max(1, kernels.caps().getComputeUnits()));
+        return unsupportedReason(model, kernels.faSmemFloats(), FlashAttnTiling.planningUnits(kernels.caps()));
     }
 
     /** Why the blocks of {@code model} cannot run on the GPU tower, or null. */

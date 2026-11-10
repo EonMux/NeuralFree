@@ -9,6 +9,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -16,6 +17,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.regex.Pattern;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
@@ -43,21 +45,26 @@ public final class KernelInventoryChecks {
     /** Address-space keywords of work-group local memory. */
     private static final Set<String> LOCAL_QUALIFIERS = new HashSet<>(Arrays.asList(
             "NF_LOCAL", "NF_LOCAL_PTR", "__local", "local"));
+    /** The variant-row flag that pins a module's subgroup width ({@code sg<N>}). */
+    private static final Pattern PINNED_FLAG = Pattern.compile("sg(8|16|32|64)");
 
     private final Path kernelRoot;
     private final Path variantsDir;
     private final KernelManifest manifest;
     private final List<KernelSig> kernels;
     private final Map<String, List<String>> variantRows;
+    private final Map<String, List<String>> pinnedRows;
     private final List<String> variantFormatErrors;
 
     private KernelInventoryChecks(Path kernelRoot, Path variantsDir, KernelManifest manifest, List<KernelSig> kernels,
-                                  Map<String, List<String>> variantRows, List<String> variantFormatErrors) {
+                                  Map<String, List<String>> variantRows, Map<String, List<String>> pinnedRows,
+                                  List<String> variantFormatErrors) {
         this.kernelRoot = kernelRoot;
         this.variantsDir = variantsDir;
         this.manifest = manifest;
         this.kernels = Collections.unmodifiableList(kernels);
         this.variantRows = Collections.unmodifiableMap(variantRows);
+        this.pinnedRows = Collections.unmodifiableMap(pinnedRows);
         this.variantFormatErrors = Collections.unmodifiableList(variantFormatErrors);
     }
 
@@ -73,6 +80,7 @@ public final class KernelInventoryChecks {
             files.put(e.path(), read(RESOURCES.resolve(e.resourcePath(config.sourceRoot()))));
         }
         Map<String, List<String>> rows = new TreeMap<>();
+        Map<String, List<String>> pinned = new TreeMap<>();
         List<String> errors = new ArrayList<>();
         if (Files.isDirectory(variantsDir)) {
             List<Path> tsvs = new ArrayList<>();
@@ -93,11 +101,14 @@ public final class KernelInventoryChecks {
                         errors.add(where + ": expected kernel_name<TAB>source.comp[<TAB>defines[<TAB>flags]]");
                         continue;
                     }
-                    rows.computeIfAbsent(cols[0].trim(), n -> new ArrayList<>()).add(where);
+                    boolean pins = cols.length == 4 && Arrays.stream(cols[3].split(","))
+                            .anyMatch(f -> PINNED_FLAG.matcher(f.trim()).matches());
+                    (pins ? pinned : rows).computeIfAbsent(cols[0].trim(), n -> new ArrayList<>()).add(where);
                 }
             }
         }
-        return new KernelInventoryChecks(kernelRoot, variantsDir, manifest, new Scanner(files).scan(), rows, errors);
+        return new KernelInventoryChecks(kernelRoot, variantsDir, manifest, new Scanner(files).scan(), rows, pinned,
+                errors);
     }
 
     /** The parsed manifest of the library. */
@@ -186,6 +197,37 @@ public final class KernelInventoryChecks {
         }
         violations.addAll(variantFormatErrors);
         return violations;
+    }
+
+    /**
+     * Pinned variant rows ({@code sg<N>} flag) that do not name exactly one kernel of a file in {@code openClOnly}:
+     * a pinned module is the Vulkan twin of an OpenCL kernel written for one subgroup width, so it must share that
+     * kernel's name and must never shadow a portable kernel.
+     */
+    public List<String> pinnedVariantRowViolations(Set<String> openClOnly) {
+        Map<String, String> openClKernels = new HashMap<>();
+        for (KernelSig k : kernels) {
+            if (openClOnly.contains(k.file)) {
+                openClKernels.put(k.name, k.file);
+            }
+        }
+        List<String> violations = new ArrayList<>();
+        for (Map.Entry<String, List<String>> e : pinnedRows.entrySet()) {
+            if (!openClKernels.containsKey(e.getKey())) {
+                violations.add(e.getKey() + " (" + e.getValue() + ") pins a subgroup width but names no kernel of "
+                        + openClOnly);
+            }
+            if (e.getValue().size() != 1 || variantRows.containsKey(e.getKey())) {
+                violations.add(e.getKey() + " has more than one variant row: " + e.getValue()
+                        + (variantRows.containsKey(e.getKey()) ? " and " + variantRows.get(e.getKey()) : ""));
+            }
+        }
+        return violations;
+    }
+
+    /** The kernel names of the pinned variant rows, sorted. */
+    public Set<String> pinnedVariantNames() {
+        return pinnedRows.keySet();
     }
 
     /**

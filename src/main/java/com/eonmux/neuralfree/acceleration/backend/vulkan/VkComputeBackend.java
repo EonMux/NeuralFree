@@ -303,7 +303,8 @@ public final class VkComputeBackend implements ComputeBackend {
         }
         CacheKey key = new CacheKey(artifact.kernelName(),
                 SPIRV_KEY_PREFIX + artifact.programKey() + artifact.specConstants(), "");
-        return cached(key, () -> new VkKernelHandle(programs, programs.get(artifact.resourcePath()),
+        return cached(key, () -> new VkKernelHandle(programs,
+                programs.get(artifact.resourcePath(), artifact.requiredSubgroupSize()),
                 artifact.kernelName(), artifact.specConstants(), artifact.signature()));
     }
 

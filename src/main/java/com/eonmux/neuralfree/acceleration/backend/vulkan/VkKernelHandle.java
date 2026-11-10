@@ -26,6 +26,10 @@ import java.util.TreeMap;
  * runs the plain module {@code <name>.spv}, loaded on first need. Both modules must have the same
  * argument interface, because they share this handle's argument state.</p>
  *
+ * <p>A handle of a pinned program ({@link VkProgram#requiredSubgroupSize()} {@code N > 0}) has one module and always
+ * runs it with {@code REQUIRE_FULL_SUBGROUPS} and subgroups of {@code N} lanes, so its local size must be a multiple
+ * of {@code N} within {@code N * maxComputeWorkgroupSubgroups} invocations.</p>
+ *
  * <p><b>Local size.</b> {@link #resolveLocalSize} takes the caller's local size for the
  * specialisable dimensions ({@link WorkSizes#defaultLocal} when the caller passes none) and the
  * module's value for fixed dimensions, warning once per handle when a caller's request differs
@@ -236,7 +240,10 @@ public final class VkKernelHandle implements KernelHandle {
             return last;
         }
         Variant v;
-        if (runsSubgroupModule(local3)) {
+        if (program.requiredSubgroupSize() > 0) {
+            requirePinnedLocalSize(local3);
+            v = new Variant(program, program.pipeline(local3, specs, true), true, true);
+        } else if (runsSubgroupModule(local3)) {
             boolean full = cache.fullSubgroupsEnabled();
             v = new Variant(program, program.pipeline(local3, specs, full), true, full);
         } else {
@@ -265,12 +272,16 @@ public final class VkKernelHandle implements KernelHandle {
         if (last != null && local3[0] == lastX && local3[1] == lastY && local3[2] == lastZ) {
             return last;
         }
-        boolean subgroups = runsSubgroupModule(local3);
+        boolean pinned = program.requiredSubgroupSize() > 0;
+        if (pinned) {
+            requirePinnedLocalSize(local3);
+        }
+        boolean subgroups = pinned || runsSubgroupModule(local3);
         VkProgram target = subgroups || !subgroupModule ? program : plainProgram;
         if (target == null) {
             return null;
         }
-        boolean full = subgroups && cache.fullSubgroupsEnabled();
+        boolean full = pinned || subgroups && cache.fullSubgroupsEnabled();
         Long pipeline = target.existingPipeline(local3, specs, full);
         return pipeline == null ? null : remember(local3, new Variant(target, pipeline, subgroups, full));
     }
@@ -282,6 +293,20 @@ public final class VkKernelHandle implements KernelHandle {
         lastZ = local3[2];
         lastVariant = v;
         return v;
+    }
+
+    /**
+     * The local-size rule of a pinned program ({@link VkPinnedSubgroups#localSizeRefusal}): full subgroups of
+     * {@code N} lanes need {@code local_x % N == 0}, and the work-group may hold at most
+     * {@code maxComputeWorkgroupSubgroups} of them.
+     *
+     * @throws IllegalArgumentException when the local size breaks the rule
+     */
+    private void requirePinnedLocalSize(int[] local3) {
+        String reason = cache.pinnedSubgroups().localSizeRefusal(program.requiredSubgroupSize(), local3);
+        if (reason != null) {
+            throw new IllegalArgumentException(name + ": " + reason);
+        }
     }
 
     /** The local-size rule of the subgroup module: loaded, and {@code local_x % maxSubgroupSize == 0}. */

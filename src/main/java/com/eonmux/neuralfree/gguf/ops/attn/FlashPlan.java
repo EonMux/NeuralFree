@@ -64,7 +64,7 @@ final class FlashPlan {
      */
     static FlashPlan of(LlmKernels kernels, AttentionSpec a, FlashKeys keys, PagedFlashGeometry pg, int ubatch) {
         int smem = kernels.faSmemFloats();
-        int cu = Math.max(1, kernels.caps().getComputeUnits());
+        int cu = FlashAttnTiling.planningUnits(kernels.caps());
         int rows = keys.rows();
         boolean fast = FlashAttnTiling.decodeFastPath(kernels.caps().hasFeature(DeviceFeature.SUBGROUP_SHUFFLE),
                 keys.typeK(), keys.typeV(), a.headDimK(), a.headDimV());

@@ -1,0 +1,364 @@
+/* matmul_mmq_sg.comp - subgroup-row int8 MMQ GEMM of Q8_0, Q4_K and Q6_K weights for 16-lane subgroups: the Vulkan
+ * form of kernels/llm/matmul_mmq_sg.cl. Requires: common/nf_common.glsl.
+ *
+ * Q8_0_MatMulSg_MMQ, Q4_K_MatMulSg_MMQ and Q6_K_MatMulSg_MMQ compute what Q8_0_MatMul_MMQ, Q4_K_MatMul_MMQ and
+ * Q6_K_MatMul_MMQ (matmul_mmq.comp) compute, with their argument list and staged Q8_1 records (quant_mmq.comp,
+ * tk = 16: codes at units 0..3, d at 4, code sum at 5, zero point at 6), under the work mapping of the OpenCL
+ * source, which that file documents in full:
+ *
+ * - A workgroup owns NF_SGM_TM = 128 weight rows by NF_SGM_TN = 32 tokens in NF_SGM_SPLIT token halves of 128
+ *   invocations (subgroups of 16 lanes; the variants row's sg16 flag pins the size and full subgroups): work-item
+ *   l = 16 * subgroup + lane owns row m0 + l % 128 and keeps the token sums of its half, 32 / NF_SGM_SPLIT, in
+ *   registers. Q8_0 and Q4_K split in two: Mesa's Intel compiler gives a SIMD16 thread 128 registers, which the
+ *   32 sums of the OpenCL tile overflow; Q6_K keeps one half, its block decode costing more when repeated
+ *   (SubgroupMmqGemm.VULKAN_TOKEN_SPLIT has the measurements).
+ * - A stage is 64 deep (a Q8_0 block pair, or a quarter of a K-quant super-block). Each work-item of the first half
+ *   copies one 16-deep record of one token into shared memory (double-buffered, the next stage's copy issued
+ *   between the two halves of the stage), one barrier per stage.
+ * - Each token's 16-unit record pair is one shared load across the subgroup (lane i reads unit i) and its words
+ *   reach every lane through subgroupBroadcast with constant lane ids, which the Intel compiler lowers to scalar
+ *   register regions; the codes meet them in dotPacked4x8EXT (dp4a), 8 per 32-deep half and token.
+ * - The subgroup operations are basic and ballot ones (subgroupBroadcast) only.
+ *
+ * Variant rows select NF_SGM_Q8_0, NF_SGM_Q4_K or NF_SGM_Q6_K.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i M, i K, i N, i q_stride, i q_off, i y_stride, i y_off, R weight, R uint q8, W float y)
+ *   y[y_off + t*y_stride + r] = sum_{k < K} W[r][k] * x[t][k],  r < M, t < N.
+ * Each output is one invocation's fixed-order float sum over K, independent of N and of the tile position.
+ *
+ * Preconditions the host checks (SubgroupMmqGemm): K a multiple of 64 (of 256 for the K-quants), symmetric
+ * 16-deep records, a device that pins 16-lane subgroups for compute shaders.
+ *
+ * Dispatch: 2-D, global = {ceil(M / 128) * 128 * NF_SGM_SPLIT, ceil(N / 32), 1}, local = {128 * NF_SGM_SPLIT, 1, 1}.
+ * Shared memory: 2 * 32 * 32 uints (8 KiB).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+#include "common/nf_common.glsl"
+
+#if !defined(USE_SUBGROUPS) || !defined(NF_SG_ROW_SIZE) || NF_SG_ROW_SIZE != 16
+#error "matmul_mmq_sg.comp is built only by an sg16 variants row"
+#endif
+#if defined(NF_SGM_Q8_0) + defined(NF_SGM_Q4_K) + defined(NF_SGM_Q6_K) != 1
+#error "matmul_mmq_sg.comp requires exactly one of NF_SGM_Q8_0, NF_SGM_Q4_K, NF_SGM_Q6_K"
+#endif
+
+NF_BUFFER_VIEWS(0, w)
+layout(std430, binding = 1) readonly buffer NfMmqStaged { uint q8_in[]; };
+layout(std430, binding = 2) writeonly buffer NfMmqOutput { float y_out[]; };
+layout(push_constant) uniform NfMmqParams {
+    int M; int K; int N; int q_stride; int q_off; int y_stride; int y_off;
+} pc;
+
+/* Weight rows and tokens per workgroup, token halves, tokens per invocation, subgroups and invocations per
+ * workgroup (SubgroupMmqGemm). */
+#define NF_SGM_TM 128
+#define NF_SGM_TN 32
+#ifdef NF_SGM_Q6_K
+#define NF_SGM_SPLIT 1
+#else
+#define NF_SGM_SPLIT 2
+#endif
+#define NF_SGM_TH (NF_SGM_TN / NF_SGM_SPLIT)
+#define NF_SGM_WG (NF_SGM_TM * NF_SGM_SPLIT)
+#define NF_SGM_SUBGROUPS (NF_SGM_WG / NF_SG_ROW_SIZE)
+/* Stage depth: one Q8_0 block pair, four 16-deep records. */
+#define NF_SGM_TK 64
+/* Units of one 16-deep record. */
+#define NF_SGM_RC 7
+/* Shared units per token: two 16-unit segments, each holding two records at units 0 and 7. */
+#define NF_SGM_XT 32
+#define NF_SGM_XBUF (NF_SGM_TN * NF_SGM_XT)
+
+shared uint nf_sgm_xs[2 * NF_SGM_XBUF];
+
+/* Unit k of the token segment xv held across the subgroup. */
+#define NF_SGM_X(k) subgroupBroadcast(xv, k)
+#define NF_SGM_XI(k) int(NF_SGM_X(k))
+#define NF_SGM_XF(k) uintBitsToFloat(NF_SGM_X(k))
+
+/* Gather state of this invocation: whether it gathers (the first NF_SGM_TM invocations), token gt, record gc of the
+ * stage, destination unit gdst. */
+bool nf_sgm_gon;
+uint nf_sgm_gaddr;
+bool nf_sgm_glive;
+int nf_sgm_gpartner;
+int nf_sgm_gdst;
+
+/* Unit u of stage st of this invocation's gather record (0..6; the Q4_K partner record at u -/+ 7), 0 past N. */
+uint nf_sgm_rec(int st, int u) {
+    return nf_sgm_glive ? q8_in[uint(int(nf_sgm_gaddr) + st * (4 * NF_SGM_RC) + u)] : 0u;
+}
+
+/* Stores record units g0..g6 at buffer offset dst + gdst. */
+void nf_sgm_put(uint dst, uvec4 g0, uvec3 g1) {
+    const uint d = dst + uint(nf_sgm_gdst);
+    nf_sgm_xs[d] = g0.x;
+    nf_sgm_xs[d + 1u] = g0.y;
+    nf_sgm_xs[d + 2u] = g0.z;
+    nf_sgm_xs[d + 3u] = g0.w;
+    nf_sgm_xs[d + 4u] = g1.x;
+    nf_sgm_xs[d + 5u] = g1.y;
+    nf_sgm_xs[d + 6u] = g1.z;
+}
+
+uvec4 nf_sgm_rec_codes(int st) {
+    return uvec4(nf_sgm_rec(st, 0), nf_sgm_rec(st, 1), nf_sgm_rec(st, 2), nf_sgm_rec(st, 3));
+}
+
+uvec3 nf_sgm_rec_tail(int st) {
+    return uvec3(nf_sgm_rec(st, 4), nf_sgm_rec(st, 5), nf_sgm_rec(st, 6));
+}
+
+/* The two 8-word integer dots of one token against codes c (record r at units 0..3, r + 1 at 7..10), each
+ * started at i0 / i1. */
+#define NF_SGM_DOTS(c, i0, i1) \
+    i0 = dotPacked4x8EXT(int(c[0]), NF_SGM_XI(0)) + i0; \
+    i0 = dotPacked4x8EXT(int(c[1]), NF_SGM_XI(1)) + i0; \
+    i0 = dotPacked4x8EXT(int(c[2]), NF_SGM_XI(2)) + i0; \
+    i0 = dotPacked4x8EXT(int(c[3]), NF_SGM_XI(3)) + i0; \
+    i1 = dotPacked4x8EXT(int(c[4]), NF_SGM_XI(7)) + i1; \
+    i1 = dotPacked4x8EXT(int(c[5]), NF_SGM_XI(8)) + i1; \
+    i1 = dotPacked4x8EXT(int(c[6]), NF_SGM_XI(9)) + i1; \
+    i1 = dotPacked4x8EXT(int(c[7]), NF_SGM_XI(10)) + i1;
+
+/* The first workgroup token of this invocation's half. */
+int nf_sgm_t0;
+/* The segment of token t of the stage buffer at xb, one unit per lane. */
+#define NF_SGM_SEGMENT(xb, t) nf_sgm_xs[(xb) + uint(t) * NF_SGM_XT + gl_SubgroupInvocationID]
+
+#ifdef NF_SGM_Q8_0
+/* One 32-deep block of the stage: codes c[0..7] with block scale dw against each token's segment at xb. */
+#define NF_SGM_BLOCK(xb, c, dw) \
+    [[unroll]] for (int t = 0; t < NF_SGM_TH; t++) { \
+        const uint xv = NF_SGM_SEGMENT(xb, nf_sgm_t0 + t); \
+        int i0 = 0, i1 = 0; \
+        NF_SGM_DOTS(c, i0, i1) \
+        acc[t] = fma(dw, fma(float(i1), NF_SGM_XF(11), float(i0) * NF_SGM_XF(4)), acc[t]); \
+    }
+#endif
+
+#ifdef NF_SGM_Q4_K
+/* One Q4_K sub-block: codes c[0..7] with d * sc (dsc) and -dmin * m (nmm), unit 6 holding the pair's dx * sum. */
+#define NF_SGM_BLOCK_Q4K(xb, c, dsc, nmm) \
+    [[unroll]] for (int t = 0; t < NF_SGM_TH; t++) { \
+        const uint xv = NF_SGM_SEGMENT(xb, nf_sgm_t0 + t); \
+        int i0 = 0, i1 = 0; \
+        NF_SGM_DOTS(c, i0, i1) \
+        acc[t] = fma(dsc, fma(float(i1), NF_SGM_XF(11), float(i0) * NF_SGM_XF(4)), acc[t]); \
+        acc[t] = fma(nmm, NF_SGM_XF(6), acc[t]); \
+    }
+
+/* Q4_K unit 6: dx * sum of this record plus that of its sub-block partner (record gc ^ 1 of the same token, whose d
+ * and code sum this invocation reads itself, so the gather needs no lane shuffle). */
+uint nf_sgm_fix(int st, uvec3 g1) {
+    const int partner = nf_sgm_gpartner;
+    const float ds = uintBitsToFloat(g1.x) * float(int(g1.y));
+    const float dp = uintBitsToFloat(nf_sgm_rec(st, partner + 4)) * float(int(nf_sgm_rec(st, partner + 5)));
+    return floatBitsToUint(ds + dp);
+}
+
+/* d * sc (x) and -dmin * m (y) of sub-block 2q + i of the Q4_K block whose header words are h (ggml's
+ * get_scale_min_k4). */
+vec2 nf_sgm_q4k_scales(uvec4 h, int q, int i) {
+    const uint sh = uint(8 * (2 * (q & 1) + i));
+    const uint lo = (h.y >> sh) & 0xFFu, lm = (h.z >> sh) & 0xFFu, hw = (h.w >> sh) & 0xFFu;
+    const uint sc = q < 2 ? lo & 63u : (hw & 0xFu) | ((lo >> 6) << 4);
+    const uint mn = q < 2 ? lm & 63u : (hw >> 4) | ((lm >> 6) << 4);
+    return vec2(nf_half(h.x) * float(sc), -(nf_half(h.x >> 16) * float(mn)));
+}
+#endif
+
+#ifdef NF_SGM_Q6_K
+/* One Q6_K pass: codes c[0..3] of record A (units 0..6) and c[4..7] of record B (units 7..13) with d * sc of
+ * each (ea, eb); each integer dot starts at its record's -32 * sum (units 6 and 13). */
+#define NF_SGM_BLOCK_Q6K(xb, c, ea, eb) \
+    [[unroll]] for (int t = 0; t < NF_SGM_TH; t++) { \
+        const uint xv = NF_SGM_SEGMENT(xb, nf_sgm_t0 + t); \
+        int i0 = NF_SGM_XI(6), i1 = NF_SGM_XI(13); \
+        NF_SGM_DOTS(c, i0, i1) \
+        acc[t] = fma(eb, float(i1) * NF_SGM_XF(11), fma(ea, float(i0) * NF_SGM_XF(4), acc[t])); \
+    }
+
+/* Q6_K unit 6: -32 * sum, the code offset of the record's integer dot. */
+uint nf_sgm_fix(int st, uvec3 g1) {
+    return uint(-32 * int(g1.y));
+}
+
+/* A word of a byte run sh / 8 bytes (0 or 2) past its covering aligned word a, b the next one. */
+uint nf_sgm_funnel(uint a, uint b, uint sh) {
+    return (a >> sh) | ((b << 16) << (16u - sh));
+}
+
+/* The 16-byte run whose covering aligned words start at word pw, shifted by sh bits. */
+uvec4 nf_sgm_run16(uint pw, uint sh) {
+    const uint v0 = w_u32[pw], v1 = w_u32[pw + 1u], v2 = w_u32[pw + 2u], v3 = w_u32[pw + 3u], e = w_u32[pw + 4u];
+    return uvec4(nf_sgm_funnel(v0, v1, sh), nf_sgm_funnel(v1, v2, sh), nf_sgm_funnel(v2, v3, sh),
+                 nf_sgm_funnel(v3, e, sh));
+}
+
+/* The 6-bit codes of 4 bytes: the nibble of each ql byte selected by nsh and the two qh bits selected by hsh. */
+uint nf_sgm_q6k_code(uint ql, uint qh, uint nsh, uint hsh) {
+    return ((ql >> nsh) & 0x0F0F0F0Fu) | (((qh >> hsh) & 0x03030303u) << 4);
+}
+
+/* Pass pss of a Q6_K quarter (records pss and 2 + pss) against the segment at xseg; see the OpenCL source. */
+#define NF_SGM_Q6K_PASS(pss, xseg) \
+    { \
+        const uvec4 qh = nf_sgm_run16(pa + 32u + 8u * hf + 4u * (pss), sh); \
+        const uvec4 la = nf_sgm_run16(pa + 16u * hf + 4u * (pss), sh); \
+        const uvec4 lb = nf_sgm_run16(pa + 16u * hf + 8u + 4u * (pss), sh); \
+        const uint c[8] = uint[8]( \
+            nf_sgm_q6k_code(la.x, qh.x, nsh, nsh), nf_sgm_q6k_code(la.y, qh.y, nsh, nsh), \
+            nf_sgm_q6k_code(la.z, qh.z, nsh, nsh), nf_sgm_q6k_code(la.w, qh.w, nsh, nsh), \
+            nf_sgm_q6k_code(lb.x, qh.x, nsh, nsh + 2u), nf_sgm_q6k_code(lb.y, qh.y, nsh, nsh + 2u), \
+            nf_sgm_q6k_code(lb.z, qh.z, nsh, nsh + 2u), nf_sgm_q6k_code(lb.w, qh.w, nsh, nsh + 2u)); \
+        const float ea = d * float(nf_i8(scw >> (8u * (pss)))); \
+        const float eb = d * float(nf_i8(scw >> (8u * (2u + (pss))))); \
+        NF_SGM_BLOCK_Q6K(xseg, c, ea, eb) \
+    }
+#endif
+
+/* Copies stage st's record of this invocation into the stage buffer at dst; the K-quants rewrite unit 6 with
+ * nf_sgm_fix, a record past N staying all zero. */
+void nf_sgm_gather(uint dst, int st) {
+    if (!nf_sgm_gon) {
+        return;
+    }
+    const uvec4 g0 = nf_sgm_rec_codes(st);
+    uvec3 g1 = nf_sgm_rec_tail(st);
+#ifndef NF_SGM_Q8_0
+    g1.z = nf_sgm_fix(st, g1);
+#endif
+    nf_sgm_put(dst, g0, g1);
+}
+
+void main() {
+    /* Work-item index by subgroup, so a subgroup's lanes are 16 consecutive rows of one token half whatever order
+     * the device numbers the workgroup's invocations in. */
+    const int lid = int(gl_SubgroupID) * NF_SG_ROW_SIZE + int(gl_SubgroupInvocationID);
+    const int M = pc.M;
+    const int K = pc.K;
+    const int N = pc.N;
+    const int m0 = int(gl_WorkGroupID.x) * NF_SGM_TM;
+    const int n0 = int(gl_WorkGroupID.y) * NF_SGM_TN;
+    const int gt = lid >> 2, gc = lid & 3;
+    const int lr = lid & (NF_SGM_TM - 1);
+    /* The token half and whether a lane gathers depend on its subgroup alone, so both stay uniform values. */
+    nf_sgm_t0 = int(gl_SubgroupID) / (NF_SGM_TM / NF_SG_ROW_SIZE) * NF_SGM_TH;
+    nf_sgm_gon = int(gl_SubgroupID) < NF_SGM_TM / NF_SG_ROW_SIZE;
+    nf_sgm_glive = n0 + gt < N;
+    nf_sgm_gpartner = ((gc ^ 1) - gc) * NF_SGM_RC;
+    nf_sgm_gaddr = uint(pc.q_off) + (uint(n0 + gt) * uint(pc.q_stride) + uint(gc)) * NF_SGM_RC;
+#ifdef NF_SGM_Q6_K
+    /* Records 0 and 2 (pass 0) at units 0 and 7, records 1 and 3 (pass 1) at 16 and 23. */
+    nf_sgm_gdst = gt * NF_SGM_XT + (gc & 1) * 16 + (gc >> 1) * NF_SGM_RC;
+#else
+    /* Records 0 and 1 (block A) at units 0 and 7, records 2 and 3 (block B) at 16 and 23. */
+    nf_sgm_gdst = gt * NF_SGM_XT + (gc >> 1) * 16 + (gc & 1) * NF_SGM_RC;
+#endif
+    /* Rows past M repeat row M - 1 and drop their stores. */
+    const uint lrow = uint(min(m0 + lr, M - 1));
+    float acc[NF_SGM_TH];
+    [[unroll]] for (int t = 0; t < NF_SGM_TH; t++) {
+        acc[t] = 0.0;
+    }
+    const int stages = K / NF_SGM_TK;
+    nf_sgm_gather(0u, 0);
+    barrier();
+#ifdef NF_SGM_Q8_0
+    /* A row is K / 64 block pairs of 17 words; the pair is 4-byte aligned. */
+    uint p = lrow * uint(stages) * 17u;
+    for (int s = 0; s < stages; s++, p += 17u) {
+        const uint xb = uint(s & 1) * NF_SGM_XBUF;
+        const uint w0 = w_u32[p], w1 = w_u32[p + 1u], w2 = w_u32[p + 2u], w3 = w_u32[p + 3u];
+        const uint w4 = w_u32[p + 4u], w5 = w_u32[p + 5u], w6 = w_u32[p + 6u], w7 = w_u32[p + 7u];
+        const uint w8 = w_u32[p + 8u];
+        {
+            /* Block A: d is the low half of word 0, code word i is (w_i >> 16) | (w_{i+1} << 16). */
+            const uint c[8] = uint[8]((w0 >> 16) | (w1 << 16), (w1 >> 16) | (w2 << 16),
+                                      (w2 >> 16) | (w3 << 16), (w3 >> 16) | (w4 << 16),
+                                      (w4 >> 16) | (w5 << 16), (w5 >> 16) | (w6 << 16),
+                                      (w6 >> 16) | (w7 << 16), (w7 >> 16) | (w8 << 16));
+            const float dw = nf_half(w0);
+            NF_SGM_BLOCK(xb, c, dw)
+        }
+        if (s + 1 < stages) {
+            nf_sgm_gather(uint((s + 1) & 1) * NF_SGM_XBUF, s + 1);
+        }
+        {
+            /* Block B: d is the high half of word 8, its code words are words 9..16. */
+            const uint c[8] = uint[8](w_u32[p + 9u], w_u32[p + 10u], w_u32[p + 11u], w_u32[p + 12u],
+                                      w_u32[p + 13u], w_u32[p + 14u], w_u32[p + 15u], w_u32[p + 16u]);
+            const float dw = nf_half(w8 >> 16);
+            NF_SGM_BLOCK(xb + 16u, c, dw)
+        }
+        barrier();
+    }
+#elif defined(NF_SGM_Q4_K)
+    /* A row is K / 256 blocks of 36 words: d, dmin, scales[12], 128 code bytes. */
+    const uint rbase = lrow * uint(K / 256) * 36u;
+    for (int s = 0; s < stages; s++) {
+        const uint xb = uint(s & 1) * NF_SGM_XBUF;
+        const int q = s & 3;
+        const uint p = rbase + uint(s >> 2) * 36u;
+        const uint pq = p + 4u + 8u * uint(q);
+        {
+            const uint c[8] = uint[8](w_u32[pq] & 0x0F0F0F0Fu, w_u32[pq + 1u] & 0x0F0F0F0Fu,
+                                      w_u32[pq + 2u] & 0x0F0F0F0Fu, w_u32[pq + 3u] & 0x0F0F0F0Fu,
+                                      w_u32[pq + 4u] & 0x0F0F0F0Fu, w_u32[pq + 5u] & 0x0F0F0F0Fu,
+                                      w_u32[pq + 6u] & 0x0F0F0F0Fu, w_u32[pq + 7u] & 0x0F0F0F0Fu);
+            const vec2 sm = nf_sgm_q4k_scales(uvec4(w_u32[p], w_u32[p + 1u], w_u32[p + 2u], w_u32[p + 3u]), q, 0);
+            NF_SGM_BLOCK_Q4K(xb, c, sm.x, sm.y)
+        }
+        if (s + 1 < stages) {
+            nf_sgm_gather(uint((s + 1) & 1) * NF_SGM_XBUF, s + 1);
+        }
+        {
+            /* Each half loads its own codes and header: holding them across the gather spills the tile. */
+            const uint c[8] = uint[8]((w_u32[pq] >> 4) & 0x0F0F0F0Fu, (w_u32[pq + 1u] >> 4) & 0x0F0F0F0Fu,
+                                      (w_u32[pq + 2u] >> 4) & 0x0F0F0F0Fu, (w_u32[pq + 3u] >> 4) & 0x0F0F0F0Fu,
+                                      (w_u32[pq + 4u] >> 4) & 0x0F0F0F0Fu, (w_u32[pq + 5u] >> 4) & 0x0F0F0F0Fu,
+                                      (w_u32[pq + 6u] >> 4) & 0x0F0F0F0Fu, (w_u32[pq + 7u] >> 4) & 0x0F0F0F0Fu);
+            const vec2 sm = nf_sgm_q4k_scales(uvec4(w_u32[p], w_u32[p + 1u], w_u32[p + 2u], w_u32[p + 3u]), q, 1);
+            NF_SGM_BLOCK_Q4K(xb + 16u, c, sm.x, sm.y)
+        }
+        barrier();
+    }
+#else
+    /* A row is K / 256 blocks of 210 bytes (ql[128], qh[64], scales[16], d), so a block starts 0 or 2 bytes past a
+     * word: every run is read from its covering aligned words and funnel-shifted. The lane's block byte offset is
+     * carried through the loop. */
+    uint bo = lrow * uint(K / 256) * 210u;
+    for (int s = 0; s < stages; s++) {
+        const uint xb = uint(s & 1) * NF_SGM_XBUF;
+        const uint q = uint(s & 3), hf = q >> 1;
+        const uint nsh = 4u * (q & 1u);
+        const uint al = bo & 2u, sh = al << 3;
+        const uint pa = (bo - al) >> 2;
+        /* Scales 192 + 4q .. 195 + 4q: an aligned block loads the same word twice. */
+        const uint scw = nf_sgm_funnel(w_u32[pa + 48u + q], w_u32[pa + 48u + q + (al >> 1)], sh);
+        const float d = nf_half(uint(w_u16[(bo + 208u) >> 1]));
+        NF_SGM_Q6K_PASS(0u, xb)
+        if (s + 1 < stages) {
+            nf_sgm_gather(uint((s + 1) & 1) * NF_SGM_XBUF, s + 1);
+        }
+        NF_SGM_Q6K_PASS(1u, xb + 16u)
+        bo += q == 3u ? 210u : 0u;
+        barrier();
+    }
+#endif
+    const int row = m0 + lr;
+    if (row < M) {
+        const uint yr = uint(pc.y_off) + uint(n0 + nf_sgm_t0) * uint(pc.y_stride) + uint(row);
+        [[unroll]] for (int t = 0; t < NF_SGM_TH; t++) {
+            if (n0 + nf_sgm_t0 + t < N) {
+                y_out[yr + uint(t) * uint(pc.y_stride)] = acc[t];
+            }
+        }
+    }
+}

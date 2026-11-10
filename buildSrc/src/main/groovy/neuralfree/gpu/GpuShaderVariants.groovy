@@ -9,10 +9,16 @@ class GpuShaderVariants {
     private static final Pattern NAME = Pattern.compile('[A-Za-z_][A-Za-z0-9_]*')
     private static final Pattern DEFINE = Pattern.compile('[A-Za-z_][A-Za-z0-9_]*(?:=\\S+)?')
     private static final Set<String> FLAGS = ['sg'] as Set
+    /**
+     * The pinned-subgroup flags sg<N>: the row is a device twin of an [opencl] subgroup form, built as its only module
+     * with USE_SUBGROUPS=1 and NF_SG_ROW_SIZE=N, whose pipelines require subgroups of exactly N lanes.
+     */
+    private static final Pattern PINNED = Pattern.compile('sg(8|16|32|64)')
 
     /**
-     * All rows as [name, source, defines, sg, location], in file-name then line order; any malformed row throws,
-     * and so does an sg flag when the library builds no subgroup variants (allowSubgroups false).
+     * All rows as [name, source, defines, sg, sgSize, location], in file-name then line order (sgSize is the N of an
+     * sg<N> flag, 0 without one); any malformed row throws, and so does an sg or sg<N> flag when the library builds
+     * no subgroup variants (allowSubgroups false) or a row that carries both.
      */
     static List<Map> read(File variantsDir, File shaderRoot, boolean allowSubgroups) {
         List<Map> rows = []
@@ -49,17 +55,32 @@ class GpuShaderVariants {
                     if (d == 'USE_SUBGROUPS' || d.startsWith('USE_SUBGROUPS=')) {
                         throw new GradleException("${loc}: USE_SUBGROUPS is set by the sg flag, not by a define")
                     }
+                    if (d == 'NF_SG_ROW_SIZE' || d.startsWith('NF_SG_ROW_SIZE=')) {
+                        throw new GradleException("${loc}: NF_SG_ROW_SIZE is set by an sg<N> flag, not by a define")
+                    }
                 }
                 List<String> flags = cols.length > 3 ? cols[3].split(',').collect { it.trim() }.findAll { !it.isEmpty() } : []
+                int sgSize = 0
                 for (String f : flags) {
-                    if (!FLAGS.contains(f)) {
-                        throw new GradleException("${loc}: unknown flag '${f}' (known: ${FLAGS.join(', ')})")
+                    boolean pinned = PINNED.matcher(f).matches()
+                    if (!FLAGS.contains(f) && !pinned) {
+                        throw new GradleException("${loc}: unknown flag '${f}' (known: ${FLAGS.join(', ')}, sg8, sg16, sg32, sg64)")
                     }
-                    if (f == 'sg' && !allowSubgroups) {
-                        throw new GradleException("${loc}: flag sg on ${name}, but this library builds no subgroup variants")
+                    if (!allowSubgroups) {
+                        throw new GradleException("${loc}: flag ${f} on ${name}, but this library builds no subgroup variants")
+                    }
+                    if (pinned) {
+                        if (sgSize != 0) {
+                            throw new GradleException("${loc}: ${name} pins more than one subgroup size")
+                        }
+                        sgSize = Integer.parseInt(f.substring(2))
                     }
                 }
-                rows.add([name: name, source: source, defines: defines, sg: flags.contains('sg'), location: loc])
+                if (sgSize != 0 && flags.contains('sg')) {
+                    throw new GradleException("${loc}: ${name} carries sg and sg${sgSize}; a pinned row has no __sg twin")
+                }
+                rows.add([name: name, source: source, defines: defines, sg: flags.contains('sg'), sgSize: sgSize,
+                          location: loc])
                 where[name] = loc
             }
         }

@@ -18,7 +18,8 @@ import java.util.function.Supplier;
  *   <li>{@link Kind#CUDA_IMAGE}: a classpath fatbin, cubin or PTX resource.</li>
  *   <li>{@link Kind#HIP_IMAGE}: a classpath HIP code object (hipcc-built, per gfx target).</li>
  *   <li>{@link Kind#SPIRV}: a classpath SPIR-V module with specialisation
- *       constants and the build-time {@link KernelSignature}.</li>
+ *       constants, the build-time {@link KernelSignature} and, for a module written for one subgroup width,
+ *       the {@link #requiredSubgroupSize()} its pipelines must pin.</li>
  *   <li>{@link Kind#METAL_SOURCE}: a classpath Metal Shading Language file
  *       (supplied lazily and memoised) plus the build-time {@link KernelSignature}.
  *       The Metal backend compiles it with the Metal framework.</li>
@@ -45,10 +46,17 @@ public final class KernelArtifact {
     private final String resourcePath;
     private final SortedMap<Integer, Integer> specConstants;
     private final KernelSignature signature;
+    private final int requiredSubgroupSize;
 
     private KernelArtifact(Kind kind, String kernelName, String programKey, Supplier<String> source,
                            String buildOptions, String resourcePath, SortedMap<Integer, Integer> specConstants,
                            KernelSignature signature) {
+        this(kind, kernelName, programKey, source, buildOptions, resourcePath, specConstants, signature, 0);
+    }
+
+    private KernelArtifact(Kind kind, String kernelName, String programKey, Supplier<String> source,
+                           String buildOptions, String resourcePath, SortedMap<Integer, Integer> specConstants,
+                           KernelSignature signature, int requiredSubgroupSize) {
         this.kind = kind;
         this.kernelName = requireText(kernelName, "kernelName");
         this.programKey = requireText(programKey, "programKey");
@@ -57,6 +65,7 @@ public final class KernelArtifact {
         this.resourcePath = resourcePath;
         this.specConstants = specConstants;
         this.signature = signature;
+        this.requiredSubgroupSize = requiredSubgroupSize;
     }
 
     /**
@@ -108,7 +117,25 @@ public final class KernelArtifact {
      */
     public static KernelArtifact spirv(String kernelName, String resourcePath,
                                        SortedMap<Integer, Integer> specConstants, KernelSignature signature) {
+        return spirv(kernelName, resourcePath, specConstants, signature, 0);
+    }
+
+    /**
+     * A Vulkan kernel in a SPIR-V module written for one subgroup width: its pipelines pin subgroups of exactly
+     * {@code requiredSubgroupSize} lanes ({@code VkPipelineShaderStageRequiredSubgroupSizeCreateInfo}) and require
+     * full subgroups.
+     *
+     * @param requiredSubgroupSize the pinned width, a power of two; 0 means the module runs at any width
+     * @see #spirv(String, String, SortedMap, KernelSignature)
+     */
+    public static KernelArtifact spirv(String kernelName, String resourcePath,
+                                       SortedMap<Integer, Integer> specConstants, KernelSignature signature,
+                                       int requiredSubgroupSize) {
         requireText(resourcePath, "resourcePath");
+        if (requiredSubgroupSize < 0 || Integer.bitCount(requiredSubgroupSize) > 1) {
+            throw new IllegalArgumentException("required subgroup size of " + kernelName
+                    + " must be 0 or a power of two, got " + requiredSubgroupSize);
+        }
         if (signature == null) {
             throw new IllegalArgumentException("SPIR-V artifact " + kernelName + " requires a kernel signature");
         }
@@ -123,7 +150,7 @@ public final class KernelArtifact {
             }
         }
         return new KernelArtifact(Kind.SPIRV, kernelName, resourcePath, null, "", resourcePath,
-                Collections.unmodifiableSortedMap(specs), signature);
+                Collections.unmodifiableSortedMap(specs), signature, requiredSubgroupSize);
     }
 
     /**
@@ -193,6 +220,11 @@ public final class KernelArtifact {
         return signature;
     }
 
+    /** The subgroup width a SPIR-V module's pipelines must pin, or 0 when the module runs at any width. */
+    public int requiredSubgroupSize() {
+        return requiredSubgroupSize;
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) {
@@ -206,18 +238,20 @@ public final class KernelArtifact {
                 && kernelName.equals(that.kernelName)
                 && programKey.equals(that.programKey)
                 && Objects.equals(resourcePath, that.resourcePath)
-                && specConstants.equals(that.specConstants);
+                && specConstants.equals(that.specConstants)
+                && requiredSubgroupSize == that.requiredSubgroupSize;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(kind, kernelName, programKey, resourcePath, specConstants);
+        return Objects.hash(kind, kernelName, programKey, resourcePath, specConstants, requiredSubgroupSize);
     }
 
     @Override
     public String toString() {
         return "KernelArtifact{" + kind + " " + kernelName + " @ " + programKey
-                + (specConstants.isEmpty() ? "" : " spec=" + specConstants) + "}";
+                + (specConstants.isEmpty() ? "" : " spec=" + specConstants)
+                + (requiredSubgroupSize == 0 ? "" : " subgroup=" + requiredSubgroupSize) + "}";
     }
 
     private static SortedMap<Integer, Integer> emptySpecs() {

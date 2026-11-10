@@ -525,7 +525,7 @@ public final class GpuMlaMixer implements GpuMixer {
     private void prepareAttention(GpuForwardContext ctx, LayerSpec layer, GpuWeights ws, GpuBuffer ph) {
         FlashBindGuard.requireServable(ctx.kernels(), "MLA layer " + il, g.nHead, g.nHeadKv, g.dQ, g.dV);
         int smem = ctx.kernels().faSmemFloats();
-        int cus = Math.max(1, ctx.kernels().caps().getComputeUnits());
+        int cus = FlashAttnTiling.planningUnits(ctx.kernels().caps());
         boolean fast = FlashAttnTiling.decodeFastPath(ctx.kernels().caps().hasFeature(DeviceFeature.SUBGROUP_SHUFFLE),
                 layout.dtypeK(), layout.dtypeV(), g.dQ, g.dV);
         decodeTiling = FlashAttnTiling.decode(g.nHead, g.nHeadKv, g.dQ, g.dV, layout.rows(), smem, cus, fast);

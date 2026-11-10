@@ -1,13 +1,10 @@
 package com.eonmux.neuralfree.gguf.gpu.forward;
 
-import com.eonmux.neuralfree.acceleration.GpuTestUtil;
-import com.eonmux.neuralfree.acceleration.HWAcceleration;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
+import com.eonmux.neuralfree.acceleration.backend.ComputeBackend.BackendType;
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
-import com.eonmux.neuralfree.acceleration.kernels.OpenClKernelLibrary;
-import com.eonmux.neuralfree.acceleration.ocl.CLDevice;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.ops.gemm.MmqConfig;
@@ -22,7 +19,6 @@ import org.junit.runners.Parameterized;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.EnumSet;
 import java.util.List;
 import java.util.Random;
 
@@ -30,9 +26,10 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The subgroup-row MMQ GEMM ({@code {T}_MatMulSg_MMQ} of kernels/llm/matmul_mmq_sg.cl, {@link SubgroupMmqGemm}) of
- * every weight type in {@link SubgroupMmqGemm#TYPES}, on every OpenCL device whose program builds it (the Intel GPUs;
- * other devices skip). Each case hand-builds weight rows of the type (Q8_0: codes over the full -128..127 range and
+ * The subgroup-row MMQ GEMM ({@code {T}_MatMulSg_MMQ}, {@link SubgroupMmqGemm}) of every weight type in
+ * {@link SubgroupMmqGemm#TYPES}, on every device whose kernels include it ({@link SubgroupFormBackends}): the OpenCL
+ * kernel of kernels/llm/matmul_mmq_sg.cl and its Vulkan port shaders/llm/matmul_mmq_sg.comp (the Intel GPUs; other
+ * devices skip). Each case hand-builds weight rows of the type (Q8_0: codes over the full -128..127 range and
  * f16 scales; Q4_K: random 6-bit scales and minimums in the packed 12-byte table, f16 d and dmin, every nibble;
  * Q6_K: every 6-bit code, int8 sub-block scales over -128..127, f16 d, and 210-byte blocks that leave rows and odd
  * blocks 2 bytes off a word) and staged 16-deep Q8_1 records (codes, scale, code sum, zero point 0) at a record
@@ -63,47 +60,37 @@ public class SubgroupMmqGemmGpuTest {
     /** Unit roundoff of fp32. */
     private static final double FP32_U = 0x1.0p-24;
 
+    private final BackendType api;
     private final GGMLType type;
-    private final List<ComputeBackend> backends = new ArrayList<>();
-    private HWAcceleration hw;
+    private SubgroupFormBackends devices;
+    private List<ComputeBackend> backends;
 
-    public SubgroupMmqGemmGpuTest(GGMLType type) {
+    public SubgroupMmqGemmGpuTest(BackendType api, GGMLType type) {
+        this.api = api;
         this.type = type;
     }
 
-    @Parameterized.Parameters(name = "{0}")
+    @Parameterized.Parameters(name = "{0} {1}")
     public static Collection<Object[]> types() {
         List<Object[]> types = new ArrayList<>();
-        for (GGMLType t : SubgroupMmqGemm.TYPES) {
-            types.add(new Object[]{t});
+        for (BackendType api : new BackendType[]{BackendType.OPENCL, BackendType.VULKAN}) {
+            for (GGMLType t : SubgroupMmqGemm.TYPES) {
+                types.add(new Object[]{api, t});
+            }
         }
         return types;
     }
 
     @Before
     public void open() {
-        GpuTestUtil.assumeOpenCLAvailable();
-        hw = new HWAcceleration(EnumSet.of(ComputeBackend.BackendType.OPENCL));
-        for (CLDevice device : hw.getCLDevices()) {
-            ComputeBackend backend = hw.createBackend(device);
-            // only a device that takes the 16-lane required subgroup can build the forms: skip building the LLM
-            // program anywhere else
-            if (OpenClKernelLibrary.subgroupRowSize(backend.capabilities(), true) > 0) {
-                backends.add(backend);
-            } else {
-                backend.close();
-            }
-        }
-        Assume.assumeFalse("no OpenCL device takes a 16-lane required subgroup", backends.isEmpty());
+        devices = SubgroupFormBackends.open(api);
+        backends = devices.backends();
     }
 
     @After
     public void close() {
-        for (ComputeBackend b : backends) {
-            b.close();
-        }
-        if (hw != null) {
-            hw.shutdown();
+        if (devices != null) {
+            devices.close();
         }
     }
 
@@ -125,7 +112,7 @@ public class SubgroupMmqGemmGpuTest {
             run(backend, kernels, dev, 70, k, 33, k / TK + 3, 5 * RC, 70 + 9, 11);
             run(backend, kernels, dev, 77, k, 40, k / TK + 1, 3 * RC, 77 + 2, 5);
         }
-        Assume.assumeTrue("no OpenCL device builds " + SubgroupMmqGemm.kernel(type), served > 0);
+        Assume.assumeTrue("no " + api + " device builds " + SubgroupMmqGemm.kernel(type), served > 0);
     }
 
     /** {M, K, N} of the reference cases: ragged rows and tokens around the tiles, one to many stages. */
@@ -166,7 +153,7 @@ public class SubgroupMmqGemmGpuTest {
                         Float.floatToRawIntBits(alone[r]));
             }
         }
-        Assume.assumeTrue("no OpenCL device builds " + SubgroupMmqGemm.kernel(type), served > 0);
+        Assume.assumeTrue("no " + api + " device builds " + SubgroupMmqGemm.kernel(type), served > 0);
     }
 
     @Test
@@ -302,8 +289,10 @@ public class SubgroupMmqGemmGpuTest {
     private float[] launchSg(ComputeBackend backend, LlmKernels kernels, byte[] weight, int[] records, int m, int k,
                              int n, int qStride, int qOff, int yStride, int yOff) {
         return launch(backend, kernels, SubgroupMmqGemm.kernel(type),
-                new long[]{SubgroupMmqGemm.globalRows(m), SubgroupMmqGemm.tokenGroups(n)},
-                new long[]{SubgroupMmqGemm.WORK_GROUP, 1}, weight, records, m, k, n, qStride, qOff, yStride, yOff);
+                new long[]{SubgroupMmqGemm.globalRows(m, SubgroupMmqGemm.workGroup(kernels, type)),
+                        SubgroupMmqGemm.tokenGroups(n)},
+                new long[]{SubgroupMmqGemm.workGroup(kernels, type), 1}, weight, records, m, k, n, qStride, qOff,
+                yStride, yOff);
     }
 
     private static float[] launch(ComputeBackend backend, LlmKernels kernels, String kernel, long[] global,
@@ -349,8 +338,9 @@ public class SubgroupMmqGemmGpuTest {
             double portable = time(queue, kernels, plan.kernelName(), plan.globalWorkSize(), plan.localWorkSize(),
                     args);
             double sg = time(queue, kernels, SubgroupMmqGemm.kernel(type),
-                    new long[]{SubgroupMmqGemm.globalRows(m), SubgroupMmqGemm.tokenGroups(n)},
-                    new long[]{SubgroupMmqGemm.WORK_GROUP, 1}, args);
+                    new long[]{SubgroupMmqGemm.globalRows(m, SubgroupMmqGemm.workGroup(kernels, type)),
+                            SubgroupMmqGemm.tokenGroups(n)},
+                    new long[]{SubgroupMmqGemm.workGroup(kernels, type), 1}, args);
             double flop = 2.0 * m * k * n;
             System.out.printf("SGMMQ %s %s M=%d K=%d N=%d portable %.1f us (%.0f GFLOPS) sg %.1f us (%.0f GFLOPS)"
                             + " speedup %.2fx%n", backend.capabilities().getDeviceName(), type, m, k, n, portable,

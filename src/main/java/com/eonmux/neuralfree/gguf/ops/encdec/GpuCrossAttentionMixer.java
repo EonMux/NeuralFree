@@ -201,7 +201,7 @@ public final class GpuCrossAttentionMixer implements GpuMixer {
         FlashBindGuard.requireServable(ctx.kernels(), "T5 decoder layer " + EncDecBlocks.describe(layer)
                         + " (cross attention)", cross.nHead(), cross.nHeadKv(), cross.headDimK(), cross.headDimV());
         int smem = ctx.kernels().faSmemFloats();
-        int cus = Math.max(1, ctx.kernels().caps().getComputeUnits());
+        int cus = FlashAttnTiling.planningUnits(ctx.kernels().caps());
         KvLayout l = crossKv[0].layout();
         KvDType typeK = l.dtypeK();
         KvDType typeV = l.dtypeV();

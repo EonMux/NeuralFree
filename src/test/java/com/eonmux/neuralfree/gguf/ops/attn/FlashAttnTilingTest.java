@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.ops.attn;
 
+import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import org.junit.Test;
 
@@ -319,5 +320,24 @@ public class FlashAttnTilingTest {
         assertTrue(t.toString(), t.bk() >= 16 && t.bq() >= 1);
         assertTrue(t.toString(), rows * 64L + t.bk() * 64L + (long) rows * t.bk() + 3L * rows <= t.smemFloats());
         assertTrue(t.toString(), (long) rows * t.dV() <= FlashAttnTiling.ACC_PER_GROUP);
+    }
+
+    /**
+     * A device that reports no compute units plans for {@link FlashAttnTiling#UNREPORTED_COMPUTE_UNITS}, so a
+     * 4096-key subgroup decode step of a 32-head layer splits instead of running 32 work-groups; a reported count is
+     * kept as it is.
+     */
+    @Test
+    public void aDeviceWithoutAComputeUnitCountPlansForTheAssumedUnits() {
+        DeviceCapabilities reported = new DeviceCapabilities.Builder().deviceName("reported").computeUnits(84).build();
+        DeviceCapabilities unreported = new DeviceCapabilities.Builder().deviceName("unreported").build();
+        assertEquals(84, FlashAttnTiling.planningUnits(reported));
+        assertEquals(FlashAttnTiling.UNREPORTED_COMPUTE_UNITS, FlashAttnTiling.planningUnits(unreported));
+
+        int units = FlashAttnTiling.planningUnits(unreported);
+        FlashAttnTiling planned = FlashAttnTiling.decodeSubgroup(32, 8, 128, 128, N_KV, SMEM_48K, units);
+        FlashAttnTiling single = FlashAttnTiling.decodeSubgroup(32, 8, 128, 128, N_KV, SMEM_48K, 1);
+        assertEquals(1, single.decodeSplit(N_KV).count());
+        assertEquals(units * 2 / 32, planned.decodeSplit(N_KV).count());
     }
 }

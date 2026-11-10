@@ -38,8 +38,9 @@ public class LlmKernelInventoryTest {
      * {@code [opencl]} entries. {@code matvec_sg.cl} holds the subgroup-row matvec forms,
      * {@code matmul_mmq_sg.cl} the subgroup-row MMQ GEMM, {@code flash_decode_sg.cl} and {@code flash_prefill_sg.cl}
      * the subgroup flash attention; all four pin an Intel required subgroup size and are
-     * compiled only when the host defines {@code NF_SG_ROW_SIZE}, so they have no CUDA build, no Vulkan variant
-     * and no inventory row. Every other LLM kernel is portable.
+     * compiled only when the host defines {@code NF_SG_ROW_SIZE}, so they have no CUDA build and no inventory row.
+     * Their Vulkan twins are pinned variant rows ({@code sg16}), which only devices that can pin 16-lane subgroups
+     * load. Every other LLM kernel is portable.
      */
     private static final Set<String> OPENCL_ONLY =
             Collections.unmodifiableSet(new LinkedHashSet<>(Arrays.asList("matvec_sg.cl", "matmul_mmq_sg.cl",
@@ -77,6 +78,12 @@ public class LlmKernelInventoryTest {
     @Test
     public void everyVariantRowNamesAnInventoryKernel() throws IOException {
         assertNoViolations("variant rows without a kernel", inventory().orphanVariantRowViolations(OPENCL_ONLY));
+    }
+
+    /** Every pinned row ({@code sg<N>}) is the single Vulkan twin of a kernel of an {@code [opencl]} file. */
+    @Test
+    public void everyPinnedVariantRowTwinsAnOpenClOnlyKernel() throws IOException {
+        assertNoViolations("pinned variant rows", inventory().pinnedVariantRowViolations(OPENCL_ONLY));
     }
 
     /**

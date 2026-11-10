@@ -1,0 +1,285 @@
+/* matvec_sg.comp - subgroup-row integer-dot matvecs of Q8_0, Q4_K and Q6_K weights for 16-lane subgroups: the Vulkan
+ * form of kernels/llm/matvec_sg.cl, which documents the work mapping in full.
+ * Requires: common/nf_common.glsl, common/act.glsl, GL_EXT_integer_dot_product.
+ *
+ * {T}_MatVecSg_Q8, {T}_MatVecAddSg_Q8 and {T}_MatVecFusedGateUpSg_Q8 compute what {T}_MatVec_Q8, {T}_MatVecAdd_Q8 and
+ * {T}_MatVecFusedGateUp_Q8 (matvec_q8.comp) compute, with their argument lists, over one Q8_1 activation row (36-byte
+ * blocks: f16 d, f16 s, 32 int8 codes). Variants rows select the weight type (NF_SGR_Q8_0, NF_SGR_Q4_K or
+ * NF_SGR_Q6_K) and the form (OP=OP_MATVEC, OP_MATVEC_ADD or OP_GATEUP_SILU); flag sg16 (the pipeline pins 16-lane
+ * full subgroups).
+ *
+ * - One subgroup owns NF_SGR_ROWS consecutive output rows; a workgroup holds NF_SGR_SUBGROUPS subgroups.
+ * - The input row is cut into 64-element units; lane l takes units l, l + 16, ... . A unit's Q8_1 codes, scales and
+ *   code sums are loaded once per lane and dotted (dotPacked4x8EXT) with every row of the subgroup; each row is
+ *   reduced by one subgroupAdd: no shared memory, no barrier. Rows past the end repeat the last row's weights and
+ *   drop their stores.
+ * Every product is the exact integer dot of the weight codes with the Q8_1 codes, scaled in float as the family
+ * decoders do; results are deterministic (fixed lane assignment and reduction).
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   OP_MATVEC:      (i out_dim, i in_dim, R weight, R input, W output)
+ *   OP_MATVEC_ADD:  (i out_dim, i in_dim, R weight, R input, RW addend_output)
+ *   OP_GATEUP_SILU: (i out_dim, i in_dim, R gate_weight, R up_weight, R input, W output = silu(gate) * up)
+ * Preconditions the host checks (SubgroupRowMatvec): in_dim a multiple of 64 (of 256 for the K-quants).
+ *
+ * Dispatch: global = {ceil(out_dim / 8) * 64}, local = {64}: one-dimensional, so the backend folds a group count above
+ * maxComputeWorkGroupCount[0] into y and nf_wg_id() recovers the group; groups past the last row return at once.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_integer_dot_product : require
+
+#include "common/nf_common.glsl"
+#include "common/act.glsl"
+
+#if !defined(USE_SUBGROUPS) || !defined(NF_SG_ROW_SIZE) || NF_SG_ROW_SIZE != 16
+#error "matvec_sg.comp is built only by an sg16 variants row"
+#endif
+#if defined(NF_SGR_Q8_0) + defined(NF_SGR_Q4_K) + defined(NF_SGR_Q6_K) != 1
+#error "matvec_sg.comp requires exactly one of NF_SGR_Q8_0, NF_SGR_Q4_K, NF_SGR_Q6_K"
+#endif
+#if !defined(OP) || (OP != OP_MATVEC && OP != OP_MATVEC_ADD && OP != OP_GATEUP_SILU)
+#error "matvec_sg.comp requires OP=OP_MATVEC, OP_MATVEC_ADD or OP_GATEUP_SILU"
+#endif
+
+#if OP == OP_GATEUP_SILU
+NF_BUFFER_VIEWS(0, w)
+NF_BUFFER_VIEWS(1, u)
+NF_BUFFER_VIEWS(2, xq)
+layout(std430, binding = 3) writeonly buffer NfSgrOutput { float y_out[]; };
+#else
+NF_BUFFER_VIEWS(0, w)
+NF_BUFFER_VIEWS(1, xq)
+#if OP == OP_MATVEC_ADD
+layout(std430, binding = 2) buffer NfSgrOutput { float y_out[]; };
+#else
+layout(std430, binding = 2) writeonly buffer NfSgrOutput { float y_out[]; };
+#endif
+#endif
+layout(push_constant) uniform NfSgrParams { int out_dim; int in_dim; } pc;
+
+/* Output rows per subgroup and subgroups per workgroup (SubgroupRowMatvec mirrors both). */
+#define NF_SGR_ROWS 2
+#define NF_SGR_SUBGROUPS 4
+/* Input elements per lane unit. */
+#define NF_SGR_UNIT 64
+/* Bytes of one Q8_1 activation block. */
+#define NF_SGR_Q81_BYTES 36
+
+#if defined(NF_SGR_Q8_0)
+#define NF_SGR_BS 32
+#define NF_SGR_BB 34
+#elif defined(NF_SGR_Q4_K)
+#define NF_SGR_BS 256
+#define NF_SGR_BB 144
+#else
+#define NF_SGR_BS 256
+#define NF_SGR_BB 210
+#endif
+
+/* The Q8_1 activation of one lane unit: up to four block scales, the exact code sums of the unit's part of each
+ * block, and sixteen code words. */
+float nf_sgr_d[4];
+int nf_sgr_s[4];
+uint nf_sgr_c[16];
+
+/* Signed-byte sum of a code word. */
+int nf_sgr_sum4(uint w) {
+    return dotPacked4x8EXT(int(0x01010101), int(w));
+}
+
+/* Scale of Q8_1 block b and its code word i. */
+float nf_sgr_xd(uint b) {
+    return nf_half(uint(xq_u16[b * (NF_SGR_Q81_BYTES / 2)]));
+}
+uint nf_sgr_xc(uint b, uint i) {
+    return xq_u32[b * (NF_SGR_Q81_BYTES / 4) + 1u + i];
+}
+
+#if defined(NF_SGR_Q8_0) || defined(NF_SGR_Q4_K)
+/* Q8_1 blocks 2u and 2u + 1: scales d[0..1], codes c[0..7] and c[8..15] (and, for Q4_K, their code sums). */
+void nf_sgr_act(uint u) {
+    nf_sgr_d[0] = nf_sgr_xd(2u * u);
+    nf_sgr_d[1] = nf_sgr_xd(2u * u + 1u);
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        nf_sgr_c[i] = nf_sgr_xc(2u * u, i);
+        nf_sgr_c[8u + i] = nf_sgr_xc(2u * u + 1u, i);
+    }
+#if defined(NF_SGR_Q4_K)
+    int s0 = 0, s1 = 0;
+    [[unroll]] for (int i = 0; i < 8; i++) {
+        s0 += nf_sgr_sum4(nf_sgr_c[i]);
+        s1 += nf_sgr_sum4(nf_sgr_c[8 + i]);
+    }
+    nf_sgr_s[0] = s0;
+    nf_sgr_s[1] = s1;
+#endif
+}
+#endif
+
+/*
+ * NF_SGR_DECODER(V) defines nf_sgr_dot_V(rb, u): the float dot of unit u of the weight row at byte rb of the views
+ * V_u32 / V_u16 with the lane's activation unit (nf_sgr_act). The gate/up form instantiates it for both streams.
+ */
+#if defined(NF_SGR_Q8_0)
+/* The 68-byte block pair of unit u (4-byte aligned): block 2u's d is the low half of w0 and its code word i is
+ * (w_i >> 16) | (w_{i+1} << 16); block 2u + 1's d is the high half of w8 and its code words are w9..w16. */
+#define NF_SGR_DECODER(V) \
+float nf_sgr_dot_##V(uint rb, uint u) { \
+    const uint p = (rb + u * (2u * NF_SGR_BB)) >> 2; \
+    uint w[17]; \
+    [[unroll]] for (uint i = 0u; i < 17u; i++) { \
+        w[i] = V##_u32[p + i]; \
+    } \
+    int s0 = 0, s1 = 0; \
+    [[unroll]] for (int i = 0; i < 8; i++) { \
+        s0 = dotPacked4x8EXT(int((w[i] >> 16) | (w[i + 1] << 16)), int(nf_sgr_c[i])) + s0; \
+        s1 = dotPacked4x8EXT(int(w[9 + i]), int(nf_sgr_c[8 + i])) + s1; \
+    } \
+    return nf_sgr_d[0] * nf_half(w[0]) * float(s0) + nf_sgr_d[1] * nf_half(w[8] >> 16) * float(s1); \
+}
+#elif defined(NF_SGR_Q4_K)
+/* Byte k (0..11) of the 6-bit scale table held in words h.y..h.w of the block header. */
+uint nf_sgr_q4k_byte(uvec4 h, int k) {
+    const uint w = k < 4 ? h.y : (k < 8 ? h.z : h.w);
+    return (w >> ((k & 3) * 8)) & 0xFFu;
+}
+
+/* Scale (x) and minimum (y) of sub-block j, as ggml's get_scale_min_k4. */
+vec2 nf_sgr_q4k_sm(uvec4 h, int j) {
+    if (j < 4) {
+        return vec2(float(nf_sgr_q4k_byte(h, j) & 63u), float(nf_sgr_q4k_byte(h, j + 4) & 63u));
+    }
+    const uint hi = nf_sgr_q4k_byte(h, j + 4);
+    return vec2(float((hi & 0xFu) | ((nf_sgr_q4k_byte(h, j - 4) >> 6) << 4)),
+                float((hi >> 4) | ((nf_sgr_q4k_byte(h, j) >> 6) << 4)));
+}
+
+/* Unit u: quarter c = u % 4 of block u / 4, sub-blocks 2c (low nibbles of the 32 code bytes at 16 + 32c) and 2c + 1
+ * (high nibbles), with the block's 16-byte header d, dmin, scales[12]. */
+#define NF_SGR_DECODER(V) \
+float nf_sgr_dot_##V(uint rb, uint u) { \
+    const int c = int(u & 3u); \
+    const uint bp = (rb + (u >> 2) * NF_SGR_BB) >> 2; \
+    const uvec4 h = uvec4(V##_u32[bp], V##_u32[bp + 1u], V##_u32[bp + 2u], V##_u32[bp + 3u]); \
+    const uint qa = bp + 4u + 8u * uint(c); \
+    int i0 = 0, i1 = 0; \
+    [[unroll]] for (uint i = 0u; i < 8u; i++) { \
+        const uint q = V##_u32[qa + i]; \
+        i0 = dotPacked4x8EXT(int(q & 0x0F0F0F0Fu), int(nf_sgr_c[i])) + i0; \
+        i1 = dotPacked4x8EXT(int((q >> 4) & 0x0F0F0F0Fu), int(nf_sgr_c[8u + i])) + i1; \
+    } \
+    const float d = nf_half(h.x), dmin = nf_half(h.x >> 16); \
+    const vec2 sm0 = nf_sgr_q4k_sm(h, 2 * c), sm1 = nf_sgr_q4k_sm(h, 2 * c + 1); \
+    return nf_sgr_d[0] * (d * sm0.x * float(i0) - dmin * sm0.y * float(nf_sgr_s[0])) \
+         + nf_sgr_d[1] * (d * sm1.x * float(i1) - dmin * sm1.y * float(nf_sgr_s[1])); \
+}
+#else
+/* The Q8_1 blocks 8b + 4hf + t (t = 0..3) of Q6_K unit u (quarter r = u % 4 of block b = u / 4, half hf = r / 2,
+ * positions [16 lh, 16 lh + 16) with lh = r % 2): the 16 codes at byte 16 lh of each, their scales and sums. */
+void nf_sgr_act(uint u) {
+    const uint r = u & 3u;
+    const uint qb0 = (u >> 2) * 8u + (r >> 1) * 4u;
+    [[unroll]] for (uint t = 0u; t < 4u; t++) {
+        const uint b = qb0 + t;
+        int s = 0;
+        [[unroll]] for (uint i = 0u; i < 4u; i++) {
+            const uint x = nf_sgr_xc(b, 4u * (r & 1u) + i);
+            nf_sgr_c[4u * t + i] = x;
+            s += nf_sgr_sum4(x);
+        }
+        nf_sgr_d[t] = nf_sgr_xd(b);
+        nf_sgr_s[t] = s;
+    }
+}
+
+/* Sixteen bytes at byte offset b (2-byte aligned) as four words: the aligned words below b, funnel-shifted by 16
+ * bits when b is 2 bytes off a word (210-byte blocks leave every odd block of a row so). */
+uvec4 nf_sgr_funnel16(uvec4 v, uint e, uint odd) {
+    return odd == 0u ? v : uvec4((v.x >> 16) | (v.y << 16), (v.y >> 16) | (v.z << 16), (v.z >> 16) | (v.w << 16),
+                                 (v.w >> 16) | (e << 16));
+}
+
+/* Unit u: groups t = 0..3 of quarter r = u % 4 of block u / 4 (ql low or high nibbles, two qh bits, an int8 scale
+ * per group), the Q6_K layout walk of kernels/llm/matvec_sg.cl. */
+#define NF_SGR_DECODER(V) \
+uvec4 nf_sgr_load16_##V(uint b) { \
+    const uint odd = b & 2u; \
+    const uint a = (b - odd) >> 2; \
+    const uvec4 v = uvec4(V##_u32[a], V##_u32[a + 1u], V##_u32[a + 2u], V##_u32[a + 3u]); \
+    return nf_sgr_funnel16(v, odd == 0u ? 0u : V##_u32[a + 4u], odd); \
+} \
+float nf_sgr_dot_##V(uint rb, uint u) { \
+    const uint r = u & 3u, hf = r >> 1, lh = r & 1u; \
+    const uint bp = rb + (u >> 2) * NF_SGR_BB; \
+    const uvec4 lo4 = nf_sgr_load16_##V(bp + 64u * hf + 16u * lh); \
+    const uvec4 hi4 = nf_sgr_load16_##V(bp + 64u * hf + 32u + 16u * lh); \
+    const uvec4 qh4 = nf_sgr_load16_##V(bp + 128u + 32u * hf + 16u * lh); \
+    const uint sb = (bp + 192u + 8u * hf) >> 1; \
+    const uint shs = lh * 8u; \
+    float acc = 0.0; \
+    [[unroll]] for (uint t = 0u; t < 4u; t++) { \
+        const uint qlsh = (t >> 1) * 4u, qhsh = t * 2u; \
+        const uvec4 ql = (t & 1u) != 0u ? hi4 : lo4; \
+        int idot = 0; \
+        [[unroll]] for (uint i = 0u; i < 4u; i++) { \
+            const int code = int(((ql[i] >> qlsh) & 0x0F0F0F0Fu) | (((qh4[i] >> qhsh) & 0x03030303u) << 4)); \
+            idot = dotPacked4x8EXT(code, int(nf_sgr_c[4u * t + i])) + idot; \
+        } \
+        const float scl = float(nf_i8(uint(V##_u16[sb + t]) >> shs)); \
+        acc += nf_sgr_d[t] * scl * float(idot - 32 * nf_sgr_s[t]); \
+    } \
+    return nf_half(uint(V##_u16[(bp + 208u) >> 1])) * acc; \
+}
+#endif
+
+NF_SGR_DECODER(w)
+#if OP == OP_GATEUP_SILU
+NF_SGR_DECODER(u)
+#endif
+
+void main() {
+    const int row0 = (int(nf_wg_id()) * NF_SGR_SUBGROUPS + int(gl_SubgroupID)) * NF_SGR_ROWS;
+    if (row0 >= pc.out_dim) {
+        return;
+    }
+    const uint lane = gl_SubgroupInvocationID;
+    const uint rb = uint(pc.in_dim / NF_SGR_BS) * NF_SGR_BB;
+    uint ro[NF_SGR_ROWS];
+    float acc[NF_SGR_ROWS];
+#if OP == OP_GATEUP_SILU
+    float up[NF_SGR_ROWS];
+#endif
+    [[unroll]] for (int r = 0; r < NF_SGR_ROWS; r++) {
+        ro[r] = uint(min(row0 + r, pc.out_dim - 1)) * rb;
+        acc[r] = 0.0;
+#if OP == OP_GATEUP_SILU
+        up[r] = 0.0;
+#endif
+    }
+    const uint units = uint(pc.in_dim / NF_SGR_UNIT);
+    for (uint u = lane; u < units; u += uint(NF_SG_ROW_SIZE)) {
+        nf_sgr_act(u);
+        [[unroll]] for (int r = 0; r < NF_SGR_ROWS; r++) {
+            acc[r] += nf_sgr_dot_w(ro[r], u);
+#if OP == OP_GATEUP_SILU
+            up[r] += nf_sgr_dot_u(ro[r], u);
+#endif
+        }
+    }
+    [[unroll]] for (int r = 0; r < NF_SGR_ROWS; r++) {
+        const float v = subgroupAdd(acc[r]);
+#if OP == OP_GATEUP_SILU
+        const float vu = subgroupAdd(up[r]);
+#endif
+        if (lane == 0u && row0 + r < pc.out_dim) {
+#if OP == OP_GATEUP_SILU
+            y_out[uint(row0 + r)] = nf_silu(v) * vu;
+#elif OP == OP_MATVEC_ADD
+            y_out[uint(row0 + r)] += v;
+#else
+            y_out[uint(row0 + r)] = v;
+#endif
+        }
+    }
+}

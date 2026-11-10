@@ -11,6 +11,7 @@ import org.lwjgl.vulkan.VkDescriptorSetLayoutCreateInfo;
 import org.lwjgl.vulkan.VkDevice;
 import org.lwjgl.vulkan.VkPipelineLayoutCreateInfo;
 import org.lwjgl.vulkan.VkPipelineShaderStageCreateInfo;
+import org.lwjgl.vulkan.VkPipelineShaderStageRequiredSubgroupSizeCreateInfo;
 import org.lwjgl.vulkan.VkPushConstantRange;
 import org.lwjgl.vulkan.VkShaderModuleCreateInfo;
 import org.lwjgl.vulkan.VkSpecializationInfo;
@@ -55,6 +56,10 @@ import static org.lwjgl.vulkan.VK13.VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL
  * one set and, when the module has a push-constant block, one compute range
  * {@code [0, pushConstantSize)}. Pipelines are cached by local size, applied specialisation constants
  * and the full-subgroups flag; lookups are lock-free and creation is serialised per program.</p>
+ *
+ * <p>A program loaded with a {@link #requiredSubgroupSize()} (a module written for one subgroup width) chains
+ * {@code VkPipelineShaderStageRequiredSubgroupSizeCreateInfo} with that width into every pipeline it creates; its
+ * cache validated that the device may pin that width for compute shaders.</p>
  */
 public final class VkProgram implements AutoCloseable {
 
@@ -66,20 +71,23 @@ public final class VkProgram implements AutoCloseable {
     private final long shaderModule;
     private final long descriptorSetLayout;
     private final long pipelineLayout;
+    private final int requiredSubgroupSize;
     private final ConcurrentHashMap<PipelineKey, Long> pipelines = new ConcurrentHashMap<>();
     private volatile boolean closed;
 
     /**
      * Creates the shader module and layouts; the caller has validated the module against the device.
      *
-     * @param code SPIR-V words in native memory, position 0 and limit the code size
+     * @param code                 SPIR-V words in native memory, position 0 and limit the code size
+     * @param requiredSubgroupSize the subgroup width every pipeline pins, or 0 for the device's choice
      * @throws GpuBackendException     when a Vulkan object cannot be created
      * @throws GpuOutOfMemoryException when the driver runs out of memory
      */
     VkProgram(VkDevice device, String resourcePath, ByteBuffer code, SpirvModuleInfo info,
-              VkDescriptorStrategy descriptorStrategy, VkPipelineCache pipelineCache) {
+              VkDescriptorStrategy descriptorStrategy, VkPipelineCache pipelineCache, int requiredSubgroupSize) {
         this.device = device;
         this.resourcePath = resourcePath;
+        this.requiredSubgroupSize = requiredSubgroupSize;
         this.info = info;
         this.descriptorStrategy = descriptorStrategy;
         this.pipelineCache = pipelineCache;
@@ -135,6 +143,11 @@ public final class VkProgram implements AutoCloseable {
     /** Classpath resource the module was loaded from. */
     public String resourcePath() {
         return resourcePath;
+    }
+
+    /** The subgroup width every pipeline of this program pins, or 0 when the device chooses it. */
+    public int requiredSubgroupSize() {
+        return requiredSubgroupSize;
     }
 
     public SpirvModuleInfo info() {
@@ -310,6 +323,10 @@ public final class VkProgram implements AutoCloseable {
                     .module(shaderModule)
                     .pName(stack.UTF8(info.entryPoint()))
                     .pSpecializationInfo(specInfo);
+            if (requiredSubgroupSize > 0) {
+                stage.pNext(VkPipelineShaderStageRequiredSubgroupSizeCreateInfo.calloc(stack).sType$Default()
+                        .requiredSubgroupSize(requiredSubgroupSize));
+            }
             VkComputePipelineCreateInfo.Buffer create = VkComputePipelineCreateInfo.calloc(1, stack);
             create.get(0)
                     .sType(VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO)

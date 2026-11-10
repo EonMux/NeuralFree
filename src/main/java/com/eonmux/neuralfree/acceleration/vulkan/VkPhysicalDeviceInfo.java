@@ -201,6 +201,9 @@ public final class VkPhysicalDeviceInfo {
     private final int subgroupSupportedOperations;
     private final int minSubgroupSize;
     private final int maxSubgroupSize;
+    private final int requiredSubgroupSizeStages;
+    private final int maxComputeWorkgroupSubgroups;
+    private final float timestampPeriod;
     private final int maxPushDescriptors;
     private final int shaderCoreCount;
 
@@ -244,6 +247,9 @@ public final class VkPhysicalDeviceInfo {
         this.subgroupSupportedOperations = s.subgroupSupportedOperations;
         this.minSubgroupSize = s.minSubgroupSize;
         this.maxSubgroupSize = s.maxSubgroupSize;
+        this.requiredSubgroupSizeStages = s.requiredSubgroupSizeStages;
+        this.maxComputeWorkgroupSubgroups = s.maxComputeWorkgroupSubgroups;
+        this.timestampPeriod = s.timestampPeriod;
         this.maxPushDescriptors = s.maxPushDescriptors;
         this.shaderCoreCount = s.shaderCoreCount;
     }
@@ -492,6 +498,27 @@ public final class VkPhysicalDeviceInfo {
         return maxSubgroupSize;
     }
 
+    /**
+     * {@code requiredSubgroupSizeStages}: the {@code VkShaderStageFlags} whose pipelines may pin a subgroup size
+     * through {@code VkPipelineShaderStageRequiredSubgroupSizeCreateInfo}; 0 without subgroup size control.
+     */
+    public int requiredSubgroupSizeStages() {
+        return requiredSubgroupSizeStages;
+    }
+
+    /**
+     * {@code maxComputeWorkgroupSubgroups}: the most subgroups one work-group may hold, which bounds a pipeline that
+     * pins subgroups of size N to N times this many invocations; 0 without subgroup size control.
+     */
+    public int maxComputeWorkgroupSubgroups() {
+        return maxComputeWorkgroupSubgroups;
+    }
+
+    /** {@code timestampPeriod}: nanoseconds per timestamp-query tick. */
+    public float timestampPeriod() {
+        return timestampPeriod;
+    }
+
     /** {@code maxPushDescriptors}, or 0 when {@code VK_KHR_push_descriptor} is absent. */
     public int maxPushDescriptors() {
         return maxPushDescriptors;
@@ -599,6 +626,7 @@ public final class VkPhysicalDeviceInfo {
         s.maxMemoryAllocationCount = clampU32(limits.maxMemoryAllocationCount());
         s.minStorageBufferOffsetAlignment = limits.minStorageBufferOffsetAlignment();
         s.nonCoherentAtomSize = limits.nonCoherentAtomSize();
+        s.timestampPeriod = limits.timestampPeriod();
         for (int d = 0; d < 3; d++) {
             s.maxComputeWorkGroupCount[d] = u32(limits.maxComputeWorkGroupCount(d));
             s.maxComputeWorkGroupSize[d] = u32(limits.maxComputeWorkGroupSize(d));
@@ -703,6 +731,8 @@ public final class VkPhysicalDeviceInfo {
         s.subgroupSupportedOperations = subgroup.supportedOperations();
         s.minSubgroupSize = sizeControl ? sizeProps.minSubgroupSize() : s.subgroupSize;
         s.maxSubgroupSize = sizeControl ? sizeProps.maxSubgroupSize() : s.subgroupSize;
+        s.requiredSubgroupSizeStages = sizeControl ? sizeProps.requiredSubgroupSizeStages() : 0;
+        s.maxComputeWorkgroupSubgroups = sizeControl ? sizeProps.maxComputeWorkgroupSubgroups() : 0;
         s.maxMemoryAllocationSize = maint3.maxMemoryAllocationSize();
         s.driverId = driver.driverID();
         s.driverName = driver.driverNameString().trim();
@@ -939,6 +969,9 @@ public final class VkPhysicalDeviceInfo {
         int subgroupSupportedOperations;
         int minSubgroupSize;
         int maxSubgroupSize;
+        int requiredSubgroupSizeStages;
+        int maxComputeWorkgroupSubgroups;
+        float timestampPeriod;
         int maxPushDescriptors;
         int shaderCoreCount;
     }

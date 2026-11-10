@@ -1,0 +1,29 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg, sg<N>)
+# Pinned 16-lane subgroup forms (flag sg16): the Vulkan twins of the [opencl] Intel subgroup kernels, named like them
+# and taking their arguments. The int8 MMQ GEMM of kernels/llm/matmul_mmq_sg.cl:
+Q8_0_MatMulSg_MMQ	matmul_mmq_sg.comp	NF_SGM_Q8_0	sg16
+Q4_K_MatMulSg_MMQ	matmul_mmq_sg.comp	NF_SGM_Q4_K	sg16
+Q6_K_MatMulSg_MMQ	matmul_mmq_sg.comp	NF_SGM_Q6_K	sg16
+# The subgroup-row integer-dot matvecs of kernels/llm/matvec_sg.cl:
+Q8_0_MatVecSg_Q8	matvec_sg.comp	NF_SGR_Q8_0 OP=OP_MATVEC	sg16
+Q8_0_MatVecAddSg_Q8	matvec_sg.comp	NF_SGR_Q8_0 OP=OP_MATVEC_ADD	sg16
+Q8_0_MatVecFusedGateUpSg_Q8	matvec_sg.comp	NF_SGR_Q8_0 OP=OP_GATEUP_SILU	sg16
+Q4_K_MatVecSg_Q8	matvec_sg.comp	NF_SGR_Q4_K OP=OP_MATVEC	sg16
+Q4_K_MatVecAddSg_Q8	matvec_sg.comp	NF_SGR_Q4_K OP=OP_MATVEC_ADD	sg16
+Q4_K_MatVecFusedGateUpSg_Q8	matvec_sg.comp	NF_SGR_Q4_K OP=OP_GATEUP_SILU	sg16
+Q6_K_MatVecSg_Q8	matvec_sg.comp	NF_SGR_Q6_K OP=OP_MATVEC	sg16
+Q6_K_MatVecAddSg_Q8	matvec_sg.comp	NF_SGR_Q6_K OP=OP_MATVEC_ADD	sg16
+Q6_K_MatVecFusedGateUpSg_Q8	matvec_sg.comp	NF_SGR_Q6_K OP=OP_GATEUP_SILU	sg16
+# The subgroup flash attention of kernels/llm/flash_decode_sg.cl and kernels/llm/flash_prefill_sg.cl:
+LLM_FlashDecodeSg_F32	flash_decode_sg.comp	KV=NF_KV_F32	sg16
+LLM_FlashDecodeSg_F16	flash_decode_sg.comp	KV=NF_KV_F16	sg16
+LLM_FlashDecodeSg_BF16	flash_decode_sg.comp	KV=NF_KV_BF16	sg16
+LLM_FlashDecodePagedSg_F32	flash_decode_sg.comp	KV=NF_KV_F32 PAGED=1	sg16
+LLM_FlashDecodePagedSg_F16	flash_decode_sg.comp	KV=NF_KV_F16 PAGED=1	sg16
+LLM_FlashDecodePagedSg_BF16	flash_decode_sg.comp	KV=NF_KV_BF16 PAGED=1	sg16
+LLM_FlashAttnSg_F32	flash_prefill_sg.comp	KV=NF_KV_F32	sg16
+LLM_FlashAttnSg_F16	flash_prefill_sg.comp	KV=NF_KV_F16	sg16
+LLM_FlashAttnSg_BF16	flash_prefill_sg.comp	KV=NF_KV_BF16	sg16
+LLM_FlashAttnPagedSg_F32	flash_prefill_sg.comp	KV=NF_KV_F32 PAGED=1	sg16
+LLM_FlashAttnPagedSg_F16	flash_prefill_sg.comp	KV=NF_KV_F16 PAGED=1	sg16
+LLM_FlashAttnPagedSg_BF16	flash_prefill_sg.comp	KV=NF_KV_BF16 PAGED=1	sg16

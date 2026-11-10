@@ -59,7 +59,8 @@
  *   metal-shim/                   libmetalshim.dylib, the JNI shim of native/metal/metalshim.m (buildMetalShim;
  *                                 macOS only; run with -Dneuralfree.metal.shim.path=...)
  *   spv/shaders/<lib>/            <Kernel>.spv, <Kernel>__sg.spv for rows flagged sg, and index.properties
- *                                 (<Kernel>.buffers, .ro, .push, .sg; read by KernelSignature.parse)
+ *                                 (<Kernel>.buffers, .ro, .push, .sg, and .sgsize for rows flagged sg<N>;
+ *                                 read by KernelSignature.parse)
  *   spv-test/shaders/test/        backend test shaders
  *   metal/shaders/<lib>/metal/    <Kernel>.metal plus index.properties, generated from the same SPIR-V modules by
  *                                 SPIRV-Cross (compileMetalShaders, via the build-only org.lwjgl:lwjgl-spvc
@@ -309,14 +310,18 @@ def gpuCompileShaderTree = { Map tools, List<File> sources, File out, String wha
 /**
  * Builds one library variant (or its __sg twin): compile without -O with the include directories
  * [shaders/<lib>, shaders], record the signature from the unoptimized module, optimize with bindings and spec
- * constants preserved, validate.
+ * constants preserved, validate. A pinned row (sg<N>, row.sgSize > 0) builds its only module <name>.spv with
+ * USE_SUBGROUPS=1 and NF_SG_ROW_SIZE=<N>.
  */
 def gpuBuildVariant = { Map tools, GpuKernelLibrary lib, Map row, boolean sg, File tmp, File libOut ->
     String name = row.name + (sg ? '__sg' : '')
-    String what = "${lib.shaderRootPath}/variants/${row.location} ${name} (${row.source} ${(row.defines + (sg ? ['USE_SUBGROUPS=1'] : [])).join(' ')})"
+    int pinned = (int) (row.sgSize ?: 0)
+    List<String> defines = row.defines + (sg || pinned > 0 ? ['USE_SUBGROUPS=1'] : []) +
+            (pinned > 0 ? ['NF_SG_ROW_SIZE=' + pinned] : [])
+    String what = "${lib.shaderRootPath}/variants/${row.location} ${name} (${row.source} ${defines.join(' ')})"
     File unoptimized = new File(tmp, name + '.spv')
     gpuCompileGlsl(tools, new File(lib.shaderRoot, (String) row.source), unoptimized, [lib.shaderRoot, gpuShaderRoot],
-            row.defines + (sg ? ['USE_SUBGROUPS=1'] : []), what)
+            defines, what)
     String dis = GpuBuildTools.runChecked([tools.dis, '--raw-id', unoptimized], null, "spirv-dis of ${what}")
     Map signature = GpuSpirvSignature.parse(dis, what)
     File spv = new File(libOut, name + '.spv')
@@ -728,7 +733,7 @@ tasks.register('compileShaders') {
                             throw new GradleException("${lib.shaderRootPath}/variants/${row.location} ${row.name}: the __sg variant's arguments ${sgSignature} differ from the plain variant's ${signature}")
                         }
                     }
-                    [library: lib, name: row.name, sg: row.sg, signature: signature]
+                    [library: lib, name: row.name, sg: row.sg, sgSize: row.sgSize, signature: signature]
                 }) as Callable<Map>)
             }
         }
@@ -736,15 +741,18 @@ tasks.register('compileShaders') {
         List<String> summary = []
         rowsByLibrary.keySet().each { GpuKernelLibrary lib ->
             List<Map> libBuilt = built.findAll { it.library.is(lib) }.sort { it.name }
-            StringBuilder index = new StringBuilder("# ${lib.label} kernel signatures: buffers, read-only flag per binding, push-constant scalar kinds, __sg variant\n")
+            StringBuilder index = new StringBuilder("# ${lib.label} kernel signatures: buffers, read-only flag per binding, push-constant scalar kinds, __sg variant, pinned subgroup size\n")
             libBuilt.each { Map b ->
                 index.append("${b.name}.buffers=${b.signature.buffers}\n")
                 index.append("${b.name}.ro=${b.signature.ro}\n")
                 index.append("${b.name}.push=${b.signature.push}\n")
                 index.append("${b.name}.sg=${b.sg ? 1 : 0}\n")
+                if (b.sgSize > 0) {
+                    index.append("${b.name}.sgsize=${b.sgSize}\n")
+                }
             }
             GpuBuildTools.writeText(new File(new File(out, lib.shaderRootPath), 'index.properties'), index.toString())
-            summary.add("${lib.id} ${libBuilt.size()} kernels (${libBuilt.count { it.sg }} with __sg variants)")
+            summary.add("${lib.id} ${libBuilt.size()} kernels (${libBuilt.count { it.sg }} with __sg variants, ${libBuilt.count { it.sgSize > 0 }} pinned)")
         }
         task.logger.lifecycle("compileShaders: ${summary.join(', ')}")
     }
@@ -1056,6 +1064,30 @@ tasks.register('inventoryCheck') {
     }
 }
 
+/**
+ * The [opencl] kernels of a library as a program built for pinned subgroups of sgSize lanes defines them, the twins
+ * of its pinned variant rows (sg<N>): the clang preprocessor's output of the manifest with USE_SUBGROUPS=1,
+ * NF_SG_ROW_SIZE=<sgSize> and the Intel subgroup extensions those sources require, scanned like the inventory.
+ * Returns name -> [buffers, kinds, ...], or null when clang is absent.
+ */
+def gpuPinnedTwinKernels = { Task task, GpuKernelLibrary lib, int sgSize ->
+    File clang = gpuFindClang()
+    if (clang == null) {
+        return null
+    }
+    List<Map> manifest = lib.manifest(gpuSharedKernelRoot)
+    Set<String> openClOnly = manifest.findAll { it.openClOnly }.collect { (String) it.path } as Set
+    File cl = new File(task.temporaryDir, "${lib.id}_sg${sgSize}_kernels.cl")
+    File ii = new File(task.temporaryDir, "${lib.id}_sg${sgSize}_kernels.i")
+    GpuBuildTools.writeText(cl, GpuKernelSources.concatenate(manifest.findAll { !it.cudaOnly }))
+    GpuBuildTools.runChecked([clang, '-x', 'cl', '-cl-std=CL1.2', '-Xclang', '-finclude-default-header',
+            '-DUSE_SUBGROUPS=1', "-DNF_SG_ROW_SIZE=${sgSize}", '-Dcl_intel_subgroups=1',
+            '-Dcl_intel_required_subgroup_size=1', '-Dcl_intel_subgroup_local_block_io=1', '-E', cl, '-o', ii],
+            task.temporaryDir, "preprocessing the ${lib.id} OpenCL kernel sources for ${sgSize}-lane subgroups")
+    return GpuKernelSources.scanKernels(ii.getText('UTF-8')).findAll { it.file in openClOnly }
+            .collectEntries { [((String) it.name): it] }
+}
+
 tasks.register('verifyGpuKernels') {
     group = 'verification'
     description = 'Builds every GPU kernel artifact and checks that CUDA, HIP, Vulkan and Metal cover every kernel library\'s inventory'
@@ -1104,7 +1136,13 @@ tasks.register('verifyGpuKernels') {
                 spvProperties = p
                 Set<String> spv = p.stringPropertyNames().findAll { it.endsWith('.buffers') }
                         .collect { it.substring(0, it.length() - '.buffers'.length()) } as Set
-                coverage('SPIR-V', spv)
+                // Pinned modules (.sgsize) are the Vulkan twins of [opencl] kernels, outside the portable inventory.
+                Set<String> pinned = spv.findAll { p.getProperty(it + '.sgsize') != null } as Set
+                List<String> pinnedPortable = pinned.intersect(inventory.keySet()).sort()
+                if (!pinnedPortable.isEmpty()) {
+                    problems.add("${lib.id}: SPIR-V pins the subgroup width of portable kernels: ${pinnedPortable.join(', ')}")
+                }
+                coverage('SPIR-V', spv - pinned)
                 // 'i' and 'u' are both 32-bit integers on the Java side; without compareKinds only the count matters.
                 Closure<String> kindClass = { String kind -> lib.compareKinds ? (kind == 'f' ? 'f' : 'i') : 's' }
                 (inventory.keySet().intersect(spv)).sort().each { String name ->
@@ -1115,6 +1153,27 @@ tasks.register('verifyGpuKernels') {
                     if (buffers != k.buffers || ((List<String>) k.kinds).collect(kindClass) != kinds.collect(kindClass)) {
                         problems.add("${lib.id}: ${name}: GLSL has ${buffers} buffers and scalars (${push}), the .cl kernel ${k.buffers} buffers and scalars (${((List) k.kinds).join(',')})")
                     }
+                }
+                // A pinned module takes the argument list of its [opencl] twin, defined only in a subgroup program.
+                Map<Integer, List<String>> pinnedByWidth = pinned.groupBy { Integer.parseInt(p.getProperty(it + '.sgsize').trim()) }
+                pinnedByWidth.keySet().sort().each { Integer width ->
+                    Map<String, Map> twins = gpuPinnedTwinKernels(task, lib, width)
+                    if (twins == null) {
+                        task.logger.warn("WARNING: clang not found: ${lib.id} pinned ${width}-lane modules were not compared with their OpenCL twins")
+                        return
+                    }
+                    pinnedByWidth[width].sort().each { String name ->
+                        Map k = twins[name]
+                        int buffers = Integer.parseInt(p.getProperty(name + '.buffers'))
+                        String push = p.getProperty(name + '.push', '')
+                        List<String> kinds = push.isEmpty() ? [] : push.split(',').toList()
+                        if (k == null) {
+                            problems.add("${lib.id}: ${name}: pinned to ${width} lanes, but no [opencl] source defines it for ${width}-lane subgroups")
+                        } else if (buffers != k.buffers || ((List<String>) k.kinds).collect(kindClass) != kinds.collect(kindClass)) {
+                            problems.add("${lib.id}: ${name}: the pinned GLSL module has ${buffers} buffers and scalars (${push}), its .cl twin ${k.buffers} buffers and scalars (${((List) k.kinds).join(',')})")
+                        }
+                    }
+                    covered.add("${pinnedByWidth[width].size()} sg${width} twins ok")
                 }
             } else {
                 task.logger.warn("WARNING: ${lib.id} SPIR-V was not built: Vulkan coverage not checked")

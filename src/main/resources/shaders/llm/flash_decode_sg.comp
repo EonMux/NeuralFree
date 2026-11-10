@@ -1,0 +1,296 @@
+/* flash_decode_sg.comp - LLM_FlashDecodeSg_<KV> and LLM_FlashDecodePagedSg_<KV> subgroup decode attention for 16-lane
+ * subgroups: the Vulkan form of kernels/llm/flash_decode_sg.cl, which documents the work mapping in full.
+ * Requires: common/nf_common.glsl, common/act.glsl, common/kv_types.glsl, common/attn_common.glsl,
+ * common/flash_sg.glsl.
+ *
+ * The decode attention of LLM_FlashDecode_<KV> / LLM_FlashDecodePaged_<KV> (flash_decode.comp) for plain F32, F16
+ * and BF16 caches, with their argument lists, layouts, masking, biases, sinks and partial outputs. Variants rows
+ * select KV=NF_KV_F32, NF_KV_F16 or NF_KV_BF16, PAGED=1 for the paged entry point; flag sg16 (the pipeline pins
+ * 16-lane full subgroups).
+ *
+ * - A workgroup is NF_FDS_SUBGROUPS subgroups and serves one query head over one key split; lane l holds the head
+ *   dims [l * NF_FDS_DPL, +NF_FDS_DPL) of q, of one key's K and V rows and of the output accumulator.
+ * - Subgroup s scans keys s, s + NF_FDS_SUBGROUPS, ... of the split with an online softmax in registers. Each lane
+ *   first resolves the page row, kv_pos and visibility of one of the subgroup's next 16 keys, and the scan broadcasts
+ *   them and visits only the visible keys: a key costs one subgroup sum and no shared memory.
+ * - The subgroups' states merge through NF_FDS_SUBGROUPS * (NF_FDS_MAX_D + 2) floats of shared memory with one
+ *   barrier; subgroup 0 writes the head's normalized output (direct_out) or its (o, m, l) partial.
+ *
+ * Dispatch: global {n_split * 64, [n_seq *] n_head}, local {64, 1, 1}. Plan constraints (violations write NaN
+ * outputs): g_tile == 1, d_k == d_v a positive multiple of 8 of at most 128, K and V row and head strides multiples
+ * of 8, n_split >= 1, split_len > 0, direct_out only with n_split == 1, local size 64 with 16-lane subgroups. Results
+ * are deterministic (fixed key interleave and merge order). Shared memory: 4 * 130 floats.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/act.glsl"
+#include "common/kv_types.glsl"
+#include "common/attn_common.glsl"
+#include "common/flash_sg.glsl"
+
+layout(std430, binding = 0) readonly buffer NfFdsQ { float q_in[]; };
+NF_FDS_KV_VIEW(1, kc)
+NF_FDS_KV_VIEW(2, vc)
+layout(std430, binding = 3) readonly buffer NfFdsKvPos { int kv_pos[]; };
+layout(std430, binding = 4) readonly buffer NfFdsSinks { float sinks[]; };
+layout(std430, binding = 5) readonly buffer NfFdsRelBias { float rel_bias[]; };
+layout(std430, binding = 6) writeonly buffer NfFdsOut { float dst[]; };
+layout(std430, binding = 7) writeonly buffer NfFdsPartial { float partial[]; };
+#if defined(PAGED)
+layout(std430, binding = 8) readonly buffer NfFdsPages { int page_table[]; };
+layout(std430, binding = 9) readonly buffer NfFdsSeqKvLen { int seq_kv_len[]; };
+layout(std430, binding = 10) readonly buffer NfFdsQPosSeq { int q_pos_seq[]; };
+layout(std430, binding = 11) readonly buffer NfFdsKvScales { float kv_scales[]; };
+layout(std430, binding = 12) readonly buffer NfFdsTreeMask { uvec2 tree_mask[]; };
+#else
+layout(std430, binding = 8) readonly buffer NfFdsKvScales { float kv_scales[]; };
+layout(std430, binding = 9) readonly buffer NfFdsTreeMask { uvec2 tree_mask[]; };
+#endif
+
+layout(push_constant) uniform NfFdsParams {
+    int n_head; int n_head_kv; int d_k; int d_v; int g_tile;
+    int n_split; int split_len; int kv_start; int kv_end; int q_pos;
+    int k_row_stride; int k_head_stride; int v_row_stride; int v_head_stride;
+    float scale; float softcap; float max_bias;
+    int flags; int swa_type; int n_swa;
+    int bias_mode; int n_buckets; int max_distance;
+    int q_off; int out_off;
+#if defined(PAGED)
+    int page_shift; int max_pages; int n_seq; int q_seq_stride; int out_seq_stride;
+#endif
+} pc;
+
+/* Per subgroup: the output dims, then m and l. */
+#define NF_FDS_STATE (NF_FDS_MAX_D + 2)
+
+shared float nf_fds_merge[NF_FDS_SUBGROUPS * NF_FDS_STATE];
+
+bool nf_fds_plan_ok() {
+    const int d = pc.d_k;
+    return nf_fds_strides_ok(pc.k_row_stride, pc.k_head_stride, pc.v_row_stride, pc.v_head_stride)
+        && pc.n_head > 0 && pc.n_head_kv > 0 && pc.n_head % pc.n_head_kv == 0
+        && pc.g_tile == 1
+        && d == pc.d_v && d > 0 && d % NF_FDS_DPL == 0 && d <= NF_FDS_MAX_D
+        && pc.n_split >= 1 && pc.split_len > 0
+        && ((pc.flags & NF_ATTN_FLAG_DIRECT) == 0 || pc.n_split == 1)
+#if defined(PAGED)
+        && pc.page_shift >= 0 && pc.page_shift <= 20 && pc.max_pages >= 1 && pc.n_seq >= 1
+        && pc.q_seq_stride >= 0 && pc.out_seq_stride >= 0
+#endif
+        && nf_fds_shape_ok();
+}
+
+/* NaN over the outputs of a call that violates the plan (workgroup (0, 0) only), as flash_decode.comp. */
+void nf_fds_poison() {
+#if defined(PAGED)
+    const int n_seq = pc.n_seq;
+#else
+    const int n_seq = 1;
+#endif
+    if (gl_WorkGroupID.x != 0u || gl_WorkGroupID.y != 0u
+        || n_seq <= 0 || pc.n_head <= 0 || pc.d_v <= 0 || pc.n_split <= 0) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    if ((pc.flags & NF_ATTN_FLAG_DIRECT) != 0) {
+        const uint n = uint(pc.n_head * pc.d_v);
+        for (int s = 0; s < n_seq; s++) {
+            for (uint i = lid; i < n; i += gl_WorkGroupSize.x) {
+                dst[uint(pc.out_off) + uint(s) * n + i] = NF_NAN;
+            }
+        }
+    } else {
+        const uint n = uint(n_seq * pc.n_head * pc.n_split * (pc.d_v + 2));
+        for (uint i = lid; i < n; i += gl_WorkGroupSize.x) {
+            partial[i] = NF_NAN;
+        }
+    }
+}
+
+/* Position bias of head h (flash_decode.comp nf_fd_bias); q_row = the sequence index on a paged decode, else 0. */
+float nf_fds_bias(int h, int p_q, int p_k, float slope, int q_row) {
+    if (pc.bias_mode == NF_ATTN_BIAS_ALIBI) {
+        return slope * (-float(abs(p_q - p_k)));
+    }
+    if (pc.bias_mode == NF_ATTN_BIAS_ALIBI_SQRT) {
+        return p_k <= p_q ? slope * (-sqrt(float(p_q - p_k))) : 0.0;
+    }
+    if (pc.bias_mode == NF_ATTN_BIAS_T5_CAUSAL || pc.bias_mode == NF_ATTN_BIAS_T5_BIDIR) {
+        const int bucket = nf_t5_bucket(p_k, p_q, pc.n_buckets, pc.max_distance,
+                                        pc.bias_mode == NF_ATTN_BIAS_T5_BIDIR ? 1 : 0);
+        return rel_bias[bucket * pc.n_head + h];
+    }
+    if (pc.bias_mode == NF_ATTN_BIAS_INKLING) {
+        const int dist = p_q - p_k;
+        if (dist < 0 || dist >= pc.n_buckets) {
+            return 0.0;
+        }
+        return rel_bias[(q_row * pc.n_head + h) * pc.n_buckets + dist];
+    }
+    return 0.0;
+}
+
+void main() {
+    if (!nf_fds_plan_ok()) {
+        nf_fds_poison();
+        return;   /* uniform across the workgroup: no barrier has been reached */
+    }
+    const uint lane = gl_SubgroupInvocationID;
+    const int sg = int(gl_SubgroupID);
+    const int split = int(gl_WorkGroupID.x);
+    const int d = pc.d_k;
+#if defined(PAGED)
+    /* g_tile 1: one workgroup row per head, the sequence folded in front of the head. */
+    const int seq = int(gl_WorkGroupID.y) / pc.n_head;
+    const int h = int(gl_WorkGroupID.y) - seq * pc.n_head;
+    /* The sequence's slots [0, kv_len), kv_len clamped to the page table's slots so every table read is in bounds. */
+    const int kv_cap = pc.max_pages << pc.page_shift;
+    const int kv_end = seq_kv_len[seq] < 0 ? 0 : min(seq_kv_len[seq], kv_cap);
+    const int kv_start = 0;
+    const int q_pos = q_pos_seq[seq];
+    const int q_off = pc.q_off + seq * pc.q_seq_stride;
+    const int out_off = pc.out_off + seq * pc.out_seq_stride;
+    const int q_row = seq;
+    const uvec2 t_bits = (pc.flags & NF_ATTN_FLAG_TREE) != 0 ? tree_mask[seq] : uvec2(0u);
+#else
+    const int seq = 0;
+    const int h = int(gl_WorkGroupID.y);
+    const int kv_end = pc.kv_end;
+    const int kv_start = pc.kv_start;
+    const int q_pos = pc.q_pos;
+    const int q_off = pc.q_off;
+    const int out_off = pc.out_off;
+    const int q_row = 0;
+    const uvec2 t_bits = (pc.flags & NF_ATTN_FLAG_TREE) != 0 ? tree_mask[0] : uvec2(0u);
+#endif
+    const int kvh = h / (pc.n_head / pc.n_head_kv);
+    const int k_begin = kv_start + split * pc.split_len;
+    const int n_keys = max(0, min(k_begin + pc.split_len, kv_end) - k_begin);
+    const int dim0 = int(lane) * NF_FDS_DPL;
+    const bool live = dim0 < d;   /* lanes past d hold zeros (a 64-dim head uses 8 of 16 lanes) */
+
+    vec4 qlo = vec4(0.0), qhi = vec4(0.0);
+    if (live) {
+        const uint qb = uint(q_off + h * d + dim0);
+        qlo = vec4(q_in[qb], q_in[qb + 1u], q_in[qb + 2u], q_in[qb + 3u]);
+        qhi = vec4(q_in[qb + 4u], q_in[qb + 5u], q_in[qb + 6u], q_in[qb + 7u]);
+    }
+    const float slope = pc.bias_mode == NF_ATTN_BIAS_ALIBI || pc.bias_mode == NF_ATTN_BIAS_ALIBI_SQRT
+                        ? nf_alibi_slope(h, pc.n_head, pc.max_bias) : 1.0;
+    /* Plain caches carry one scale per KV head and side (1.0 unless a checkpoint scale was set). */
+    const float ks = kv_scales[kvh];
+    const float vs = kv_scales[pc.n_head_kv + kvh];
+    const uint k_head = uint(kvh * pc.k_head_stride);
+    const uint v_head = uint(kvh * pc.v_head_stride);
+    const int fresh = nf_attn_flag_fresh(pc.flags);
+    const int causal = pc.flags & NF_ATTN_FLAG_CAUSAL;
+
+    float m = -NF_INF;
+    float l = 0.0;
+    vec4 acc_lo = vec4(0.0), acc_hi = vec4(0.0);
+
+    /* Keys of this subgroup: j = sg + NF_FDS_SUBGROUPS * i. A batch is the subgroup's next 16 of them; lane i
+     * resolves key i of the batch (row, position, visibility) and the scan broadcasts them. */
+    const int batch_keys = NF_FDS_SUBGROUPS * NF_SG_ROW_SIZE;
+    for (int base = 0; base < n_keys; base += batch_keys) {
+        const int jl = base + sg + NF_FDS_SUBGROUPS * int(lane);
+        int row_l = 0;
+        int pos_l = -1;
+        bool vis_l = false;
+        if (jl < n_keys) {
+            const int slot = k_begin + jl;
+#if defined(PAGED)
+            const int page = page_table[uint(seq * pc.max_pages + (slot >> pc.page_shift))];
+            if (page >= 0) {
+                row_l = nf_kv_row(slot, pc.page_shift, page);
+#else
+            {
+                row_l = slot;
+#endif
+                pos_l = kv_pos[row_l];
+                vis_l = nf_attn_tree_visible(pos_l, t_bits, kv_end, fresh, q_pos, causal, pc.swa_type,
+                                             pc.n_swa) != 0;
+            }
+        }
+        /* Visible keys of the batch as a lane mask (uniform), so the scan visits only them. */
+        uint vis_mask = subgroupBallot(vis_l).x;
+        while (vis_mask != 0u) {
+            const uint i = uint(findLSB(vis_mask));
+            vis_mask &= vis_mask - 1u;
+            const int row = subgroupBroadcast(row_l, i);
+            const int p_k = subgroupBroadcast(pos_l, i);
+            vec4 klo = vec4(0.0), khi = vec4(0.0), vlo = vec4(0.0), vhi = vec4(0.0);
+            if (live) {
+                kc_load8(uint(row) * uint(pc.k_row_stride) + k_head + uint(dim0), klo, khi);
+                vc_load8(uint(row) * uint(pc.v_row_stride) + v_head + uint(dim0), vlo, vhi);
+            }
+            const float s = nf_attn_score(subgroupAdd(nf_fds_dot(qlo, qhi, klo, khi)) * ks, pc.scale, pc.softcap)
+                          + nf_fds_bias(h, q_pos, p_k, slope, q_row);
+            const float mn = max(m, s);
+            const float a = nf_attn_rescale(m, mn);
+            const float p = nf_attn_rescale(s, mn);
+            l = l * a + p;
+            acc_lo = acc_lo * a + (p * vs) * vlo;
+            acc_hi = acc_hi * a + (p * vs) * vhi;
+            m = mn;
+        }
+    }
+
+    /* Merge the subgroups' states: each writes (acc, m, l), subgroup 0 folds them in subgroup order. */
+    const int own = sg * NF_FDS_STATE;
+    if (live) {
+        for (int i = 0; i < 4; i++) {
+            nf_fds_merge[own + dim0 + i] = acc_lo[i];
+            nf_fds_merge[own + dim0 + 4 + i] = acc_hi[i];
+        }
+    }
+    if (lane == 0u) {
+        nf_fds_merge[own + NF_FDS_MAX_D] = m;
+        nf_fds_merge[own + NF_FDS_MAX_D + 1] = l;
+    }
+    barrier();
+    if (sg != 0) {
+        return;
+    }
+    m = -NF_INF;
+    for (int s = 0; s < NF_FDS_SUBGROUPS; s++) {
+        m = max(m, nf_fds_merge[s * NF_FDS_STATE + NF_FDS_MAX_D]);
+    }
+    l = 0.0;
+    vec4 olo = vec4(0.0), ohi = vec4(0.0);
+    for (int s = 0; s < NF_FDS_SUBGROUPS; s++) {
+        const int st = s * NF_FDS_STATE;
+        const float w = nf_attn_rescale(nf_fds_merge[st + NF_FDS_MAX_D], m);
+        l += nf_fds_merge[st + NF_FDS_MAX_D + 1] * w;
+        if (live) {
+            olo += vec4(nf_fds_merge[st + dim0], nf_fds_merge[st + dim0 + 1], nf_fds_merge[st + dim0 + 2],
+                        nf_fds_merge[st + dim0 + 3]) * w;
+            ohi += vec4(nf_fds_merge[st + dim0 + 4], nf_fds_merge[st + dim0 + 5], nf_fds_merge[st + dim0 + 6],
+                        nf_fds_merge[st + dim0 + 7]) * w;
+        }
+    }
+    if ((pc.flags & NF_ATTN_FLAG_DIRECT) != 0) {
+        const vec2 fl = (pc.flags & NF_ATTN_FLAG_SINKS) != 0 ? nf_attn_sink(m, l, sinks[h]) : vec2(1.0, l);
+        if (live) {
+            const float f = fl.y > 0.0 ? fl.x / fl.y : 0.0;
+            const vec4 lo = fl.y > 0.0 ? olo * f : vec4(0.0);
+            const vec4 hi = fl.y > 0.0 ? ohi * f : vec4(0.0);
+            const uint b = uint(out_off + h * d + dim0);
+            dst[b] = lo.x; dst[b + 1u] = lo.y; dst[b + 2u] = lo.z; dst[b + 3u] = lo.w;
+            dst[b + 4u] = hi.x; dst[b + 5u] = hi.y; dst[b + 6u] = hi.z; dst[b + 7u] = hi.w;
+        }
+    } else {
+        const uint pr = uint(((seq * pc.n_head + h) * pc.n_split + split) * (d + 2));
+        if (live) {
+            const uint b = pr + uint(dim0);
+            partial[b] = olo.x; partial[b + 1u] = olo.y; partial[b + 2u] = olo.z; partial[b + 3u] = olo.w;
+            partial[b + 4u] = ohi.x; partial[b + 5u] = ohi.y; partial[b + 6u] = ohi.z; partial[b + 7u] = ohi.w;
+        }
+        if (lane == 0u) {
+            partial[pr + uint(d)] = m;
+            partial[pr + uint(d + 1)] = l;
+        }
+    }
+}

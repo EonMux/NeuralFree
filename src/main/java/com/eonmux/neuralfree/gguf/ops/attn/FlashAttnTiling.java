@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.ops.attn;
 
+import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 
@@ -124,6 +125,12 @@ public final class FlashAttnTiling {
      * over the same keys alike.
      */
     static final int SUBGROUP_MAX_SPLIT = 1 << 16;
+    /**
+     * Compute units the attention plans assume on a device that reports none
+     * ({@link DeviceCapabilities#UNKNOWN_COMPUTE_UNITS}: Mesa ANV and other Vulkan drivers without a shader-core
+     * property); see {@link #planningUnits}.
+     */
+    public static final int UNREPORTED_COMPUTE_UNITS = 32;
     /** Upper bound of prefill splits per call. */
     static final int MAX_PREFILL_SPLITS = 16;
     /** A prefill split covers at least this many key tiles. */
@@ -312,6 +319,23 @@ public final class FlashAttnTiling {
         return new FlashAttnTiling(Plan.TILED, nHead, nHeadKv, dK, dV, smemFloats, computeUnits,
                 gTile, nKvMax, 0, 0, 0, 0, SubgroupFlashAttention.PREFILL_ROWS / gTile,
                 SubgroupFlashAttention.PREFILL_BLOCK, false, true);
+    }
+
+    /**
+     * The compute units the attention plans of a device split for: the count it reports, or
+     * {@link #UNREPORTED_COMPUTE_UNITS} when it reports none. Planned for one unit, such a device never splits a
+     * decode step, since a step aims at {@code ceil(2 * units / n_head)} splits: a 4096-key step of a 32-head layer
+     * then runs 32 work-groups of four 16-lane subgroups on the Arrow-Lake iGPU under Mesa ANV, whose 64 EUs (8
+     * Xe-cores) hold 512 such subgroup threads. llama.cpp's Vulkan backend assumes 16 shader cores in that case, which
+     * under this formula still leaves a 32-head layer unsplit. Measured on that device (Vulkan, 32-token decode at
+     * a depth of 4096, tokens/s), planning for 1, 16, 32 and 64 units: Qwen3 4B Q8_0 (32 heads) 8.03, 7.95, 9.43 and
+     * 9.35 (llama.cpp Vulkan 9.34); Qwen3 0.6B Q8_0 (16 heads) 18.9 at 1, 37.5 at 32 and 34.8 at 64 units. 32 units
+     * fill 256 subgroup threads with one step of either model; 64, the count the device reports through OpenCL (its
+     * EUs), adds partials to merge without a faster step.
+     */
+    public static int planningUnits(DeviceCapabilities caps) {
+        int units = caps.getComputeUnits();
+        return units > DeviceCapabilities.UNKNOWN_COMPUTE_UNITS ? units : UNREPORTED_COMPUTE_UNITS;
     }
 
     /** The head-dim conditions of the subgroup kernels ({@link SubgroupFlashAttention#shapeServes}). */

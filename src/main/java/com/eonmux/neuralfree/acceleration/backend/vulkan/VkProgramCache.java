@@ -53,6 +53,7 @@ public final class VkProgramCache implements AutoCloseable {
     private final VkDevice device;
     private final VkPhysicalDeviceInfo info;
     private final VkDeviceFeatures.Enabled enabled;
+    private final VkPinnedSubgroups pinnedSubgroups;
     private final VkPipelineCache pipelineCache;
     private final VkDescriptorStrategy descriptorStrategy;
     private final ConcurrentHashMap<String, VkProgram> programs = new ConcurrentHashMap<>();
@@ -68,6 +69,7 @@ public final class VkProgramCache implements AutoCloseable {
         this.device = device;
         this.info = info;
         this.enabled = enabled;
+        this.pinnedSubgroups = VkPinnedSubgroups.of(info, enabled);
         this.pipelineCache = pipelineCache;
         this.descriptorStrategy = descriptorStrategy;
         this.classLoader = VkProgramCache.class.getClassLoader();
@@ -80,24 +82,51 @@ public final class VkProgramCache implements AutoCloseable {
      *                                    capability or limit the device does not provide
      */
     public VkProgram get(String resourcePath) {
+        return get(resourcePath, 0);
+    }
+
+    /**
+     * The program of a classpath {@code .spv} resource whose pipelines pin subgroups of
+     * {@code requiredSubgroupSize} lanes (0: the device chooses), loaded and reflected on first use.
+     *
+     * @throws UnsupportedKernelException when the resource cannot be loaded (see {@link #get(String)}) or the device
+     *                                    cannot pin that subgroup width for compute shaders
+     * @throws IllegalArgumentException   when the resource was already loaded with another width
+     */
+    public VkProgram get(String resourcePath, int requiredSubgroupSize) {
         if (resourcePath == null || resourcePath.isEmpty()) {
             throw new IllegalArgumentException("SPIR-V resource path must not be empty");
         }
         VkProgram program = programs.get(resourcePath);
-        if (program != null) {
-            return program;
-        }
-        synchronized (this) {
-            if (closed) {
-                throw new IllegalStateException("program cache is closed");
+        if (program == null) {
+            synchronized (this) {
+                if (closed) {
+                    throw new IllegalStateException("program cache is closed");
+                }
+                program = programs.get(resourcePath);
+                if (program == null) {
+                    String refusal = requiredSubgroupSize != 0
+                            ? pinnedSubgroups.refusal(requiredSubgroupSize) : null;
+                    if (refusal != null) {
+                        throw new UnsupportedKernelException("SPIR-V module classpath:" + resourcePath
+                                + " pins subgroups of " + requiredSubgroupSize + " lanes, which Vulkan device "
+                                + info.name() + " cannot: " + refusal);
+                    }
+                    program = load(resourcePath, requiredSubgroupSize);
+                    programs.put(resourcePath, program);
+                }
             }
-            program = programs.get(resourcePath);
-            if (program == null) {
-                program = load(resourcePath);
-                programs.put(resourcePath, program);
-            }
-            return program;
         }
+        if (program.requiredSubgroupSize() != requiredSubgroupSize) {
+            throw new IllegalArgumentException("SPIR-V module classpath:" + resourcePath + " is loaded with subgroup"
+                    + " width " + program.requiredSubgroupSize() + ", not " + requiredSubgroupSize);
+        }
+        return program;
+    }
+
+    /** The device facts that decide whether a pipeline may pin its subgroup width. */
+    VkPinnedSubgroups pinnedSubgroups() {
+        return pinnedSubgroups;
     }
 
     public int size() {
@@ -162,7 +191,7 @@ public final class VkProgramCache implements AutoCloseable {
         }
     }
 
-    private VkProgram load(String resourcePath) {
+    private VkProgram load(String resourcePath, int requiredSubgroupSize) {
         byte[] bytes = readResource(resourcePath);
         SpirvModuleInfo module;
         try {
@@ -181,7 +210,8 @@ public final class VkProgramCache implements AutoCloseable {
         ByteBuffer code = MemoryUtil.memAlloc(bytes.length);
         try {
             code.put(bytes).flip();
-            VkProgram program = new VkProgram(device, resourcePath, code, module, descriptorStrategy, pipelineCache);
+            VkProgram program = new VkProgram(device, resourcePath, code, module, descriptorStrategy, pipelineCache,
+                    requiredSubgroupSize);
             LOGGER.debug("Vulkan program {}: {}", resourcePath, module);
             return program;
         } finally {

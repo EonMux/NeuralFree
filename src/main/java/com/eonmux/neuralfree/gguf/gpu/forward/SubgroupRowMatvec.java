@@ -13,13 +13,18 @@ import java.util.Set;
  * Q8_1-activation products of {@link #TYPES} with one 16-lane subgroup per {@link #ROWS_PER_SUBGROUP} output rows,
  * 16-byte weight loads and a subgroup reduction instead of the family's one work-group per row.
  *
- * <p>The forms exist only in OpenCL programs built with {@code NF_SG_ROW_SIZE}
+ * <p>The forms exist in OpenCL programs built with {@code NF_SG_ROW_SIZE}
  * ({@link OpenClKernelLibrary#subgroupRowSize}: a device that accepts a required 16-lane subgroup, the Intel
- * GPUs). The dispatcher gates on that same build condition before it looks the kernel up, so every other
- * backend and device keeps the family's forms. On the Arrow-Lake iGPU the forms stream the weights at
+ * GPUs) and, as the pinned 16-lane modules of {@code shaders/llm/matvec_sg.comp}, on Intel Vulkan devices. The
+ * dispatcher gates on {@link SubgroupRowForms#served} before it looks the kernel up, so every other backend and
+ * device keeps the family's forms. On the Arrow-Lake iGPU the OpenCL forms stream the weights at
  * 41-61 GB/s (Q8_0, Q4_K and Q6_K alike) against the 5-12 GB/s of the one-work-group-per-row family (its
  * streaming-read ceiling is 55-68 GB/s), because that device's loads are limited by load messages (2-byte
  * loads of 34-byte Q8_0 blocks) rather than by DRAM.</p>
+ *
+ * <p>Under Vulkan (Mesa ANV) on the same device, a Qwen3 4B Q4_K_M decode step's fused Q4_K gate/up product
+ * (2 x 9728 x 2560) takes 417 us against the portable form's 1442 (67 against 19 GB/s) and its Q6_K down product
+ * (2560 x 9728) 414 us against 959.</p>
  *
  * <p>The constants mirror {@code NF_SGR_ROWS}, {@code NF_SGR_SUBGROUPS} and {@code NF_SGR_UNIT} of the kernel
  * source.</p>
@@ -30,8 +35,8 @@ final class SubgroupRowMatvec {
     static final int ROWS_PER_SUBGROUP = 2;
     /** Subgroups per work-group ({@code NF_SGR_SUBGROUPS}). */
     static final int SUBGROUPS = 4;
-    /** Work-group size: {@link #SUBGROUPS} subgroups of {@link OpenClKernelLibrary#SUBGROUP_ROW_SIZE} lanes. */
-    static final int WORK_GROUP = SUBGROUPS * OpenClKernelLibrary.SUBGROUP_ROW_SIZE;
+    /** Work-group size: {@link #SUBGROUPS} subgroups of {@link SubgroupRowForms#SIZE} lanes. */
+    static final int WORK_GROUP = SUBGROUPS * SubgroupRowForms.SIZE;
     /** Output rows per work-group. */
     static final int ROWS_PER_GROUP = SUBGROUPS * ROWS_PER_SUBGROUP;
     /** Input elements per lane unit ({@code NF_SGR_UNIT}): a Q8_0 block pair, a K-quant quarter block. */

@@ -241,7 +241,9 @@ void main() {
         }
         y_out[yb + i] = v;
     }
-    memoryBarrierBuffer();
+    /* The rotation reads values other invocations of this workgroup wrote, so only the workgroup must see them; a
+     * device-scope fence (memoryBarrierBuffer) made the kernel 3x slower on the Arrow Lake iGPU (Mesa ANV). */
+    groupMemoryBarrier();
     barrier();
 
     const int n_pairs = nf_rope_pairs(pc.mode, pc.n_dims);

@@ -37,4 +37,14 @@ public interface KernelLibrary {
 
     /** Unmodifiable set of every kernel name this library provides. */
     Set<String> kernelNames();
+
+    /**
+     * The kernels every device the library is {@link #availability available} on can load, which
+     * {@link KernelSet#open} draws its probe kernel from: all of {@link #kernelNames()}, unless the library also
+     * provides kernels that only some devices can load (the Vulkan modules pinned to one subgroup width), which a
+     * probe must never pick, because a refusal of the probe marks the whole library unusable.
+     */
+    default Set<String> universalKernelNames() {
+        return kernelNames();
+    }
 }

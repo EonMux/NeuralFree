@@ -31,7 +31,10 @@ import java.util.regex.Pattern;
  * {@code <name>.metal} for each kernel and writes the Metal {@code index.properties} in the format
  * {@code MetalKernelLibrary} reads. The subgroup module {@code <name>__sg.spv} is translated when
  * the Vulkan index lists one; Metal SIMD groups are always available on Apple GPUs, so the kernel
- * keeps its subgroup reductions as {@code simd_*} calls.</p>
+ * keeps its subgroup reductions as {@code simd_*} calls. A kernel the index pins to one subgroup width
+ * ({@code <name>.sgsize}, the Vulkan twin of an OpenCL kernel written for Intel's 16-lane subgroups) is skipped:
+ * Apple SIMD groups have a fixed width of 32 lanes, so the module's lane arithmetic cannot run there, and such a
+ * kernel is outside the portable inventory the Metal library must cover.</p>
  *
  * <p>Usage: {@code MetalShaderGenerator --spv <spirvDir> --out <metalDir>}.</p>
  */
@@ -185,6 +188,9 @@ public final class MetalShaderGenerator {
                 continue;
             }
             String name = key.substring(0, key.length() - ".buffers".length());
+            if (props.getProperty(name + ".sgsize") != null) {
+                continue;
+            }
             String buffers = props.getProperty(key);
             String readOnly = props.getProperty(name + ".ro");
             String push = props.getProperty(name + ".push");

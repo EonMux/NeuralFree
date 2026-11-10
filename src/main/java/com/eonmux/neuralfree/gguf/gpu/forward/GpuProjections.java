@@ -5,7 +5,6 @@ import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
-import com.eonmux.neuralfree.acceleration.kernels.OpenClKernelLibrary;
 import com.eonmux.neuralfree.gguf.BatchInvariance;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.arch.GluOp;
@@ -65,7 +64,7 @@ final class GpuProjections {
     private final long maxWorkGroupSize;
     private final Int8MatvecMode int8Mode;
     private final FusedMode fusedMode;
-    /** Whether this backend's program builds the subgroup-row forms ({@link #subgroupRowKernel}). */
+    /** Whether this backend holds the subgroup-row forms ({@link #subgroupRowKernel}). */
     private final boolean subgroupRows;
 
     /** Binds the projections to the queue, kernels and scratch of the owning GpuOps. */
@@ -81,8 +80,7 @@ final class GpuProjections {
         this.maxWorkGroupSize = kernels.caps().getMaxWorkGroupSize();
         this.int8Mode = ops.int8Mode;
         this.fusedMode = ops.fusedMode;
-        this.subgroupRows = backend.backendType() == ComputeBackend.BackendType.OPENCL
-                && OpenClKernelLibrary.subgroupRowSize(kernels.caps(), kernels.subgroups()) > 0;
+        this.subgroupRows = SubgroupRowForms.served(kernels);
     }
 
     void matvec(GpuWeight w, GpuBuffer in, int inOff, GpuBuffer out, int outOff, int nTokens) {
@@ -282,8 +280,9 @@ final class GpuProjections {
         int launchWorkGroup = smallFast == null ? fastWorkGroup : ops.lanes.fastWorkGroup(smallFast);
         Int8ActStaging int8Staging = fastUsable && fast.endsWith(GemmKernels.MATMUL_MMQ_SUFFIX)
                 ? ops.lanes.int8Staging(w, cols) : null;
-        /* A plain MMQ launch on an OpenCL program with the subgroup forms runs the subgroup-row GEMM instead
-         * (SubgroupMmqGemm, same arguments and staging); its split-K launches keep the portable KSplit. */
+        /* A plain MMQ launch on a backend with the subgroup forms (SubgroupRowForms.served: OpenCL or Intel Vulkan)
+         * runs the subgroup-row GEMM instead (SubgroupMmqGemm, same arguments and staging); its split-K launches keep
+         * the portable KSplit. */
         String sgFast = fastUsable && smallFast == null && !invariant
                 ? ops.lanes.subgroupMmqKernel(fast, w, cols, nTokens, int8Staging) : null;
         Fp8ActStaging fp8Staging = fastUsable && FastGemmLanes.fp8Fast(w, fast)
@@ -323,9 +322,10 @@ final class GpuProjections {
                     int qStride = staged ? ops.lanes.stagedRowRecords(cols) : cols;
                     int qOff = staged ? activations.off : x.off;
                     if (sgFast != null) {
-                        ops.launch2d(sgFast, SubgroupMmqGemm.globalRows(m), SubgroupMmqGemm.tokenGroups(nTokens),
-                                SubgroupMmqGemm.WORK_GROUP, m, cols, nTokens, qStride, qOff, rows, yOff, w.shard(s),
-                                activations.buf, out);
+                        int sgGroup = SubgroupMmqGemm.workGroup(kernels, w.type());
+                        ops.launch2d(sgFast, SubgroupMmqGemm.globalRows(m, sgGroup),
+                                SubgroupMmqGemm.tokenGroups(nTokens), sgGroup, m, cols, nTokens, qStride, qOff, rows,
+                                yOff, w.shard(s), activations.buf, out);
                     } else {
                         ops.launch2d(smallFast == null ? fast : smallFast,
                                 GpuOps.ceilDiv(m, launchTileRows) * launchWorkGroup,
@@ -756,10 +756,10 @@ final class GpuProjections {
      * The subgroup-row twin ({@link SubgroupRowMatvec}) of the integer-dot single-token kernel {@code kernel} for
      * rows of {@code cols} elements of {@code type}, or null when it does not serve: the configured
      * {@link Int8MatvecMode} keeps the lane, batch invariance is off (the twin's float summation order differs
-     * from the multi-column forms'), the type and shape meet the twin's preconditions, this backend's OpenCL
-     * program defines the forms ({@link OpenClKernelLibrary#subgroupRowSize}, the condition of the build define
-     * itself, not the kernel lookup) and the kernel is prepared. Where it serves it replaces the single-row and
-     * paired forms, which it outruns on every measured shape.
+     * from the multi-column forms'), the type and shape meet the twin's preconditions, this backend holds the
+     * pinned subgroup forms ({@link SubgroupRowForms#served}: an OpenCL program built with them, or an Intel Vulkan
+     * device that pins their 16-lane subgroups) and the kernel is prepared. Where it serves it replaces the
+     * single-row and paired forms, which it outruns on every measured shape.
      */
     private String subgroupRowKernel(String kernel, GGMLType type, int cols) {
         if (!subgroupRows || !int8Mode.permitsLane() || BatchInvariance.enabled()
@@ -770,13 +770,18 @@ final class GpuProjections {
         return twin != null && ops.optionalReady(twin, SubgroupRowMatvec.WORK_GROUP, 1) ? twin : null;
     }
 
-    /** Launches a subgroup-row form over {@code rows} output rows with the form's own work-group. */
+    /**
+     * Launches a subgroup-row form over {@code rows} output rows with the form's own work-group, one-dimensional
+     * like the family it replaces, so a head of more rows than {@code maxComputeWorkGroupCount[0]} work-groups
+     * hold folds instead of failing.
+     */
     private void launchSubgroupRows(String kernel, int rows, int cols, Object... buffers) {
         Object[] args = new Object[buffers.length + 2];
         args[0] = rows;
         args[1] = cols;
         System.arraycopy(buffers, 0, args, 2, buffers.length);
-        ops.launch2d(kernel, SubgroupRowMatvec.globalSize(rows), 1, SubgroupRowMatvec.WORK_GROUP, args);
+        queue.enqueueKernelNoEvent(kernels.get(kernel), new long[]{SubgroupRowMatvec.globalSize(rows)},
+                new long[]{SubgroupRowMatvec.WORK_GROUP}, args);
     }
 
     /**

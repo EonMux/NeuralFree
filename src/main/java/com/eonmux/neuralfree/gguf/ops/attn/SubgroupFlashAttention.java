@@ -1,7 +1,7 @@
 package com.eonmux.neuralfree.gguf.ops.attn;
 
-import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.kernels.OpenClKernelLibrary;
+import com.eonmux.neuralfree.gguf.gpu.forward.SubgroupRowForms;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 
@@ -21,13 +21,19 @@ import com.eonmux.neuralfree.gguf.memory.KvDType;
  *       rows.</li>
  * </ul>
  *
- * <p>The kernels exist only in OpenCL programs built with {@code NF_SG_ROW_SIZE}
- * ({@link OpenClKernelLibrary#subgroupRowSize}: a device that accepts a required 16-lane subgroup, the Intel GPUs).
- * There the portable kernels' {@code NF_FA_SMEM_FLOATS}-float staging holds about one work-group per Xe-core, and
+ * <p>The kernels exist in OpenCL programs built with {@code NF_SG_ROW_SIZE}
+ * ({@link OpenClKernelLibrary#subgroupRowSize}: a device that accepts a required 16-lane subgroup, the Intel GPUs)
+ * and, as the pinned 16-lane modules of {@code shaders/llm/flash_decode_sg.comp} and
+ * {@code shaders/llm/flash_prefill_sg.comp}, on Intel Vulkan devices ({@link SubgroupRowForms}). On OpenCL the
+ * portable kernels' {@code NF_FA_SMEM_FLOATS}-float staging holds about one work-group per Xe-core, and
  * their 128-item work-groups compile at SIMD8 and spill: on the Arrow-Lake iGPU the decode attention took 106-252 us
  * per layer against llama.cpp Vulkan's 56-149 us, and the 512-token prefill attention of a 16-head layer 417 ms
  * against its 10.7 ms. {@link FlashPlan} picks the forms for a layer ({@link #serves}) and its dense and paged plans
  * then all use them, so a single-row step and a paged batch row over the same keys keep one summation order.</p>
+ *
+ * <p>Under Vulkan (Mesa ANV) on the same device, the 512-token prefill attention of a Qwen3 0.6B layer takes
+ * 2.4-2.8 ms against the portable GLSL kernel's 210 ms, and of a Qwen3 4B layer (32 heads) 4.3-4.5 ms against
+ * llama.cpp Vulkan's 8.3 ms; a Qwen3 4B decode step's attention takes 16 us per layer against 990.</p>
  *
  * <p>The constants mirror {@code NF_FDS_SUBGROUPS}, {@code NF_FDS_DPL} and {@code NF_FAS_ROWS} of the kernel
  * sources.</p>
@@ -38,16 +44,16 @@ final class SubgroupFlashAttention {
     static final int SUBGROUPS = 4;
     /** Head dims each lane holds ({@code NF_FDS_DPL}). */
     static final int DIMS_PER_LANE = 8;
-    /** Work-group size: {@link #SUBGROUPS} subgroups of {@link OpenClKernelLibrary#SUBGROUP_ROW_SIZE} lanes. */
-    static final int WORK_GROUP = SUBGROUPS * OpenClKernelLibrary.SUBGROUP_ROW_SIZE;
+    /** Work-group size: {@link #SUBGROUPS} subgroups of {@link SubgroupRowForms#SIZE} lanes. */
+    static final int WORK_GROUP = SUBGROUPS * SubgroupRowForms.SIZE;
     /** Largest head dim: one subgroup's lanes hold the whole row ({@code NF_FDS_MAX_D}). */
-    static final int MAX_HEAD_DIM = DIMS_PER_LANE * OpenClKernelLibrary.SUBGROUP_ROW_SIZE;
+    static final int MAX_HEAD_DIM = DIMS_PER_LANE * SubgroupRowForms.SIZE;
     /** Query rows per prefill subgroup ({@code NF_FAS_ROWS}). */
     static final int ROWS_PER_SUBGROUP = 2;
     /** Query rows per prefill work-group ({@code NF_FAS_WG_ROWS}): {@code bq * g_tile} of the prefill plan. */
     static final int PREFILL_ROWS = SUBGROUPS * ROWS_PER_SUBGROUP;
     /** Keys per prefill block: one per lane ({@code NF_SG_ROW_SIZE}); the prefill plan's {@code bk}. */
-    static final int PREFILL_BLOCK = OpenClKernelLibrary.SUBGROUP_ROW_SIZE;
+    static final int PREFILL_BLOCK = SubgroupRowForms.SIZE;
 
     /** Name prefix of the {@code LLM_FlashDecodeSg_<KV>} variants. */
     static final String PREFIX = "LLM_FlashDecodeSg_";
@@ -62,14 +68,13 @@ final class SubgroupFlashAttention {
     }
 
     /**
-     * Whether the subgroup kernels serve a layer with these caches and head dims on {@code kernels}' device: an
-     * OpenCL program built with the subgroup-row forms, equal plain F32, F16 or BF16 K and V caches, equal head
-     * dims that are positive multiples of {@link #DIMS_PER_LANE} of at most {@link #MAX_HEAD_DIM}, and the four
-     * kernels of the type (dense and paged decode and prefill) present in the program.
+     * Whether the subgroup kernels serve a layer with these caches and head dims on {@code kernels}' device: a
+     * backend with the pinned subgroup forms ({@link SubgroupRowForms#served}), equal plain F32, F16 or BF16 K and V
+     * caches, equal head dims that are positive multiples of {@link #DIMS_PER_LANE} of at most {@link #MAX_HEAD_DIM},
+     * and the four kernels of the type (dense and paged decode and prefill) present.
      */
     static boolean serves(LlmKernels kernels, KvDType typeK, KvDType typeV, int dK, int dV) {
-        return kernels.backend().backendType() == ComputeBackend.BackendType.OPENCL
-                && OpenClKernelLibrary.subgroupRowSize(kernels.caps(), kernels.subgroups()) > 0
+        return SubgroupRowForms.served(kernels)
                 && shapeServes(typeK, typeV, dK, dV)
                 && kernels.has(kernel(typeK))
                 && kernels.has(pagedKernel(typeK))

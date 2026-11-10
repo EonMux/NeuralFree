@@ -2,12 +2,16 @@ package com.eonmux.neuralfree.gguf.gpu.forward;
 
 import com.eonmux.neuralfree.acceleration.HWAcceleration;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
+import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.cuda.CudaComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.ocl.OclComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.vulkan.VkComputeBackend;
+import com.eonmux.neuralfree.acceleration.backend.vulkan.VkPinnedSubgroups;
 import com.eonmux.neuralfree.acceleration.kernels.Availability;
 import com.eonmux.neuralfree.acceleration.kernels.OpenClKernelLibrary;
+import com.eonmux.neuralfree.acceleration.kernels.VulkanKernelLibrary;
+import com.eonmux.neuralfree.acceleration.vulkan.VkDevice;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuActivationQuantizer;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
@@ -29,17 +33,22 @@ import java.util.List;
 import java.util.Random;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 /**
  * The subgroup-row integer-dot matvec forms ({@code {T}_MatVecSg_Q8}, {@code {T}_MatVecAddSg_Q8},
  * {@code {T}_MatVecFusedGateUpSg_Q8}, {@link SubgroupRowMatvec}) against a float reference over the CPU-decoded
  * weights and the CPU Q8_1 quantizer's dequantized activations, on every OpenCL device whose program builds
- * them ({@link OpenClKernelLibrary#subgroupRowSize} positive). Shapes cover a single row, row counts that end
+ * them ({@link OpenClKernelLibrary#subgroupRowSize} positive) and every Vulkan device that loads their pinned
+ * 16-lane modules (the GLSL port shaders/llm/matvec_sg.comp, refused by {@link VulkanKernelLibrary#pinnedRefusal}
+ * and {@link VkPinnedSubgroups#refusal}). Shapes cover a single row, row counts that end
  * inside a subgroup and inside a work-group, rows of an odd Q6_K block count (whose odd rows and odd blocks start
- * 2 bytes off a word) and the 2560-column rows of a 4B decoder. Every other device and backend must lack the forms,
- * so the projections keep the family there. The tolerance derives from the L1 magnitude of each row's terms,
- * which bounds the float summation-order error.
+ * 2 bytes off a word) and the 2560-column rows of a 4B decoder; on a Vulkan device a launch of more work-groups than
+ * {@code maxComputeWorkGroupCount[0]} checks the folded one-dimensional dispatch. Every other device and backend must
+ * lack the forms, and Vulkan serves them only on Intel devices ({@link SubgroupRowForms#served}), so the projections
+ * keep the family there. The tolerance derives from the L1 magnitude of each row's terms, which bounds the float
+ * summation-order error.
  */
 @RunWith(Parameterized.class)
 public class SubgroupRowMatvecGpuTest {
@@ -48,6 +57,10 @@ public class SubgroupRowMatvecGpuTest {
     private static final int[] COL_COUNTS = {256, 1280, 2560};
     private static final GGMLType[] TYPES = {GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K};
     private static final String OPENCL_PREFIX = "opencl:";
+    private static final int PCI_VENDOR_INTEL = 0x8086;
+    /** Largest work-group limit the folding test still exceeds with a launch it can afford. */
+    private static final long FOLD_TEST_MAX_GROUPS = 1L << 20;
+    private static final String VULKAN_PREFIX = "vulkan:";
 
     @Parameterized.Parameters(name = "{0}")
     public static List<Object[]> backends() {
@@ -57,7 +70,11 @@ public class SubgroupRowMatvecGpuTest {
             apis.add(new Object[]{OPENCL_PREFIX + i});
         }
         apis.add(new Object[]{"cuda"});
-        apis.add(new Object[]{"vulkan"});
+        List<String> vulkanDevices = vulkanDeviceNames();
+        for (int i = 0; i < Math.max(1, vulkanDevices.size()); i++) {
+            // the device name in the label lets a run select one GPU (e.g. --tests '*vulkan*Intel*')
+            apis.add(new Object[]{VULKAN_PREFIX + i + (i < vulkanDevices.size() ? " " + vulkanDevices.get(i) : "")});
+        }
         return apis;
     }
 
@@ -72,12 +89,31 @@ public class SubgroupRowMatvecGpuTest {
         }
     }
 
+    /** The enumerated Vulkan devices' names, read from their physical properties (no logical device). */
+    private static List<String> vulkanDeviceNames() {
+        List<String> names = new ArrayList<>();
+        try {
+            HWAcceleration hw = new HWAcceleration(EnumSet.of(ComputeBackend.BackendType.VULKAN));
+            try {
+                for (VkDevice device : hw.getVkDevices()) {
+                    names.add(device.getInfo().name());
+                }
+            } finally {
+                hw.shutdown();
+            }
+        } catch (RuntimeException | LinkageError e) {
+            names.clear();
+        }
+        return names;
+    }
+
     private final String api;
     private HWAcceleration hwAccel;
     private ComputeBackend backend;
     private LlmKernels kernels;
     private int local;
     private boolean previousCuda;
+    private VkDevice vulkanDevice;
 
     public SubgroupRowMatvecGpuTest(String api) {
         this.api = api;
@@ -100,8 +136,15 @@ public class SubgroupRowMatvecGpuTest {
     }
 
     private ComputeBackend openBackend() {
-        if (api.equals("vulkan")) {
-            return new VkComputeBackend();
+        if (api.startsWith(VULKAN_PREFIX)) {
+            String label = api.substring(VULKAN_PREFIX.length());
+            int space = label.indexOf(' ');
+            int index = Integer.parseInt(space < 0 ? label : label.substring(0, space));
+            HWAcceleration accel = new HWAcceleration(EnumSet.of(ComputeBackend.BackendType.VULKAN));
+            hwAccel = accel;
+            Assume.assumeTrue("no Vulkan device " + index, index < accel.getVkDevices().size());
+            vulkanDevice = accel.getVkDevices().get(index);
+            return accel.createBackend(vulkanDevice);
         }
         if (api.equals("cuda")) {
             HWAcceleration.enableCuda = true;
@@ -131,20 +174,74 @@ public class SubgroupRowMatvecGpuTest {
             hwAccel = null;
         }
         HWAcceleration.enableCuda = previousCuda;
+        vulkanDevice = null;
     }
 
-    /** The forms exist exactly where the OpenCL program defines NF_SG_ROW_SIZE. */
+    /**
+     * The forms exist exactly where the OpenCL program defines NF_SG_ROW_SIZE, and on the Vulkan devices that load
+     * the pinned 16-lane modules: the device capabilities hold 16 lanes with subgroup arithmetic
+     * ({@link VulkanKernelLibrary#pinnedRefusal}) and the device can pin them for compute shaders with full
+     * subgroups ({@link VkPinnedSubgroups#refusal}), whatever its vendor.
+     */
     @Test
     public void formsExistOnlyWhereTheProgramBuildsThem() {
-        boolean expected = backend.backendType() == ComputeBackend.BackendType.OPENCL
-                && OpenClKernelLibrary.subgroupRowSize(backend.capabilities(),
-                        OpenClKernelLibrary.useSubgroups(backend.capabilities())) > 0;
+        boolean expected;
+        if (backend.backendType() == ComputeBackend.BackendType.OPENCL) {
+            expected = OpenClKernelLibrary.subgroupRowSize(backend.capabilities(),
+                    OpenClKernelLibrary.useSubgroups(backend.capabilities())) > 0;
+        } else if (backend instanceof VkComputeBackend) {
+            VkComputeBackend vk = (VkComputeBackend) backend;
+            expected = VulkanKernelLibrary.pinnedRefusal(SubgroupRowForms.SIZE, backend.capabilities()) == null
+                    && VkPinnedSubgroups.of(vk.info(), vk.enabledFeatures()).refusal(SubgroupRowForms.SIZE) == null
+                    && backend.capabilities().hasFeature(DeviceFeature.INTEGER_DOT_PRODUCT);
+        } else {
+            expected = false;
+        }
         for (GGMLType type : TYPES) {
             for (String form : new String[]{"MatVec", "MatVecAdd", "MatVecFusedGateUp"}) {
                 String name = SubgroupRowMatvec.twinName(type.name() + "_" + form + "_Q8", type);
                 assertEquals(api + ": " + name, expected, kernels.has(name));
             }
         }
+    }
+
+    /**
+     * Vulkan serves the forms only on Intel devices whose subgroup range holds 16 lanes: the forms were tuned for
+     * the Intel register file, so another vendor's device that could load the modules keeps the family.
+     */
+    @Test
+    public void vulkanServesTheFormsOnlyOnIntelDevices() {
+        Assume.assumeTrue(api + " is not a Vulkan device", vulkanDevice != null);
+        boolean served = SubgroupRowForms.served(kernels);
+        if (vulkanDevice.getInfo().vendorId() != PCI_VENDOR_INTEL) {
+            assertFalse(api + " serves the subgroup forms", served);
+        } else {
+            boolean holdsSixteen = backend.capabilities().getMinSubgroupSize() <= SubgroupRowForms.SIZE
+                    && SubgroupRowForms.SIZE <= backend.capabilities().getMaxSubgroupSize();
+            assertEquals(api, kernels.subgroups() && holdsSixteen, served);
+        }
+    }
+
+    /**
+     * A launch of more work-groups than {@code maxComputeWorkGroupCount[0]} (a vocabulary head above 524,280 rows on
+     * a 65,535-group device) folds into a second dimension and still writes every row.
+     */
+    @Test
+    public void aLaunchBeyondTheGroupCountLimitFolds() throws Exception {
+        assumeForms();
+        Assume.assumeTrue(api + " is not a Vulkan device", vulkanDevice != null);
+        long maxGroups = backend.capabilities().getMaxWorkGroupCount()[0];
+        Assume.assumeTrue(api + " allows " + maxGroups + " work-groups, more than a test launch exceeds",
+                maxGroups < FOLD_TEST_MAX_GROUPS);
+        int rows = (int) ((maxGroups + 1) * SubgroupRowMatvec.ROWS_PER_GROUP);
+        int cols = SubgroupRowMatvec.UNIT;
+        GGMLType type = GGMLType.Q8_0;
+        byte[] w = randomWeights(type, rows, cols, 977L);
+        float[] x = randomActivations(cols, 979L);
+        float[] termAbs = new float[rows];
+        float[] want = reference(type, w, rows, cols, x, termAbs);
+        float[] got = run(type.name() + "_MatVecSg_Q8", rows, cols, x, new float[rows], w);
+        assertClose(type + " " + rows + "x" + cols + " folded MatVecSg", want, got, termAbs);
     }
 
     @Test
@@ -237,8 +334,8 @@ public class SubgroupRowMatvecGpuTest {
             args[2 + weights.length] = xq;
             args[3 + weights.length] = y;
             backend.computeQueue().enqueueKernel(kernels.get(kernel),
-                    new long[]{SubgroupRowMatvec.globalSize(rows), 1},
-                    new long[]{SubgroupRowMatvec.WORK_GROUP, 1}, args);
+                    new long[]{SubgroupRowMatvec.globalSize(rows)},
+                    new long[]{SubgroupRowMatvec.WORK_GROUP}, args);
             backend.computeQueue().finish();
             float[] out = new float[rows];
             backend.computeQueue().enqueueReadBuffer(y, 0, (long) rows * 4, out).awaitCompletion();

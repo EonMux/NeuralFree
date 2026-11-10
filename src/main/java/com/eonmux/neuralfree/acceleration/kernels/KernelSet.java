@@ -354,18 +354,27 @@ public final class KernelSet {
     }
 
     private void probe() {
-        Set<String> names = library.kernelNames();
-        if (names.isEmpty()) {
+        String name = probeKernel(library);
+        if (name == null) {
             LOGGER.debug("{} kernels on {}: no kernel list to probe", library.libraryId(), describe(backend));
             return;
         }
-        String name = Collections.min(names);
         try {
             get(name);
         } catch (UnsupportedKernelException e) {
             throw new UnsupportedKernelException(describe(backend) + ": " + library.libraryId()
                     + " kernels unusable: probe load of " + name + " failed: " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * The kernel {@link #open} probe-loads: the first in name order of the library's
+     * {@link KernelLibrary#universalKernelNames() universal kernels}, so the probe never depends on a device-specific
+     * form; null when the library lists none.
+     */
+    static String probeKernel(KernelLibrary library) {
+        Set<String> names = library.universalKernelNames();
+        return names.isEmpty() ? null : Collections.min(names);
     }
 
     private static Optional<KernelLibrary> lookup(ComputeBackend backend, String libraryId) {
