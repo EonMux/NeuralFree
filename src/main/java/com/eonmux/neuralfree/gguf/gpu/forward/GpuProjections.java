@@ -134,6 +134,110 @@ final class GpuProjections {
     }
 
     /**
+     * Whether {@link #stackedQkv} serves these single-token projections: see {@link #stackedQkvKernel}.
+     */
+    boolean stackedQkvUsable(GpuWeight wq, GpuWeight wk, GpuWeight wv, int nTokens) {
+        ops.ensureOpen();
+        GpuOps.checkTokens(nTokens);
+        return nTokens == 1 && stackedQkvKernel(wq, wk, wv) != null;
+    }
+
+    /**
+     * The three single-token projections of one input row {@code in[inOff ..)} in one launch of the stacked
+     * {@code {T}_MatVecQKV} kernel ({@link #stackedQkvKernel}) into element 0 of {@code q}, {@code k} and {@code v}:
+     * every output row takes its single-weight form's arithmetic, so the outputs equal three
+     * {@code {T}_MatVec} (or {@code {T}_MatVec_Q8}) launches bit for bit.
+     *
+     * @throws UnsupportedOperationException when {@link #stackedQkvUsable} does not hold
+     * @throws IllegalArgumentException      when a view is out of range or the input overlaps an output
+     */
+    void stackedQkv(GpuWeight wq, GpuWeight wk, GpuWeight wv, GpuBuffer in, int inOff, GpuBuffer q, GpuBuffer k,
+                    GpuBuffer v) {
+        ops.ensureOpen();
+        String kernel = stackedQkvKernel(wq, wk, wv);
+        if (kernel == null) {
+            throw new UnsupportedOperationException("no stacked Q/K/V kernel serves " + wq + ", " + wk + " and " + wv
+                    + " on the " + backend.backendType() + " backend");
+        }
+        int cols = GpuOps.cols(wq);
+        int qRows = GpuOps.rows(wq);
+        int kRows = GpuOps.rows(wk);
+        int vRows = GpuOps.rows(wv);
+        GpuOps.checkView("stacked Q/K/V input", in, inOff, cols);
+        GpuOps.checkView("stacked Q output", q, 0, qRows);
+        GpuOps.checkView("stacked K output", k, 0, kRows);
+        GpuOps.checkView("stacked V output", v, 0, vRows);
+        if (GpuOps.overlaps(in, inOff, cols, q, 0, qRows) || GpuOps.overlaps(in, inOff, cols, k, 0, kRows)
+                || GpuOps.overlaps(in, inOff, cols, v, 0, vRows)) {
+            throw new IllegalArgumentException("stacked Q/K/V: the input overlaps an output");
+        }
+        if (GpuOps.overlaps(q, 0, qRows, k, 0, kRows) || GpuOps.overlaps(q, 0, qRows, v, 0, vRows)
+                || GpuOps.overlaps(k, 0, kRows, v, 0, vRows)) {
+            throw new IllegalArgumentException("stacked Q/K/V: the outputs overlap");
+        }
+        GpuOps.View x = offsetFree(new GpuOps.View(in, inOff), 1, cols);
+        GpuMatmulTap.dense(queue, wq, x.buf, x.off, 1, cols);
+        GpuMatmulTap.dense(queue, wk, x.buf, x.off, 1, cols);
+        GpuMatmulTap.dense(queue, wv, x.buf, x.off, 1, cols);
+        GpuBuffer row = kernel.endsWith("_Q8") ? quantizedRow(x, cols) : x.buf;
+        ops.launchMatvec(kernel, (long) (qRows + kRows + vRows) * matvecLocal, qRows, cols, kRows, vRows,
+                wq.shard(0), wk.shard(0), wv.shard(0), row, q, k, v);
+    }
+
+    /**
+     * The stacked Q/K/V kernel for these weights, or null. It serves three single-shard weights of one type and
+     * column count without scale, input transform or Hadamard rotation, outside batch invariance and with fusion
+     * permitted ({@link FusedMode}), on a backend that holds the form (Vulkan) and whose matvec work-group size the
+     * family takes. The launch is one projection of the three weights' elements together, so it takes the lane
+     * {@link #int8LaneSelected} picks for that size: the integer-dot {@code {T}_MatVecQKV_Q8} over the Q8_1 row, or
+     * the float {@code {T}_MatVecQKV}. The integer-dot stack runs one row per work-group, also where the separate
+     * products pair their rows ({@link Int8MatvecTuning#pairedIsFaster}).
+     * Where a single-token twin would serve one of the projections
+     * ({@link #rowTwinKernel}: the pinned subgroup and warp-row forms) the separate products keep it.
+     */
+    private String stackedQkvKernel(GpuWeight wq, GpuWeight wk, GpuWeight wv) {
+        if (backend.backendType() != ComputeBackend.BackendType.VULKAN || BatchInvariance.enabled()
+                || !fusedMode.permitsFusion() || matvecLocal % MATVEC_MAX_TPS != 0) {
+            return null;
+        }
+        if (wq == null || wk == null || wv == null || wq.type() != wk.type() || wq.type() != wv.type()
+                || wq.cols() != wk.cols() || wq.cols() != wv.cols()) {
+            return null;
+        }
+        for (GpuWeight w : new GpuWeight[]{wq, wk, wv}) {
+            if (!w.isSingleShard() || w.hasScale() || w.hasInputTransform() || w.hadamard() != null
+                    || w.type() == GGMLType.W12) {
+                return null;
+            }
+        }
+        GGMLType type = wq.type();
+        int cols = GpuOps.cols(wq);
+        if (cols % type.getBlockSize() != 0) {
+            return null;
+        }
+        WeightKernels k = ops.family(wq);
+        if (k.matvecQ8 != null) {
+            for (GpuWeight w : new GpuWeight[]{wq, wk, wv}) {
+                if (rowTwinKernel(k.matvecQ8, type, GpuOps.rows(w), cols) != null) {
+                    return null;
+                }
+            }
+        }
+        long elements = ((long) GpuOps.rows(wq) + GpuOps.rows(wk) + GpuOps.rows(wv)) * cols;
+        if (k.matvecQ8 != null && int8LaneSelected(type, elements, 1)) {
+            String q8 = stackedQkvName(k.matvecQ8);
+            return ops.optionalReady(q8, matvecLocal) ? q8 : null;
+        }
+        String stacked = stackedQkvName(k.matvec);
+        return ops.optionalReady(stacked, matvecLocal) ? stacked : null;
+    }
+
+    /** {@code {T}_MatVec} to {@code {T}_MatVecQKV} and {@code {T}_MatVec_Q8} to {@code {T}_MatVecQKV_Q8}. */
+    static String stackedQkvName(String matvec) {
+        return matvec.replace("MatVec", "MatVecQKV");
+    }
+
+    /**
      * The fused gate/up SwiGLU GEMM over {@code nTokens > 1} rows at element 0 of {@code in} into the rows at element
      * 0 of {@code out}: the staged records of the rows (shared with an open {@link GpuOps.SharedQ8} scope over them)
      * through {@link StreamKGemmPlan#ofGateUp}'s single launch, in place of the gate and up GEMMs and the GLU pass.
@@ -385,7 +489,7 @@ final class GpuProjections {
             boolean halfRows = FastGemmLanes.cm2Fast(fast);
             GpuOps.View activations = x;
             if (halfRows) {
-                ScratchSlot f16 = ops.lanes.stageF16(w.type(), x.buf, x.off, nTokens, cols);
+                ScratchSlot f16 = stagedHalfRows(w.type(), x, nTokens, cols);
                 activations = new GpuOps.View(f16.buffer(), 0);
             } else if (staged) {
                 ScratchSlot q8;
@@ -984,6 +1088,15 @@ final class GpuProjections {
         return ops.lanes.stageQ8(x.buf, x.off, nTokens, cols);
     }
 
+    /** {@link FastGemmLanes#stageF16} through the open {@link GpuOps.SharedQ8} when it covers these rows. */
+    private ScratchSlot stagedHalfRows(GGMLType type, GpuOps.View x, int nTokens, int cols) {
+        GpuOps.SharedQ8 share = ops.activeShare;
+        if (share != null && share.matches(x, cols, nTokens)) {
+            return share.halfRows(type);
+        }
+        return ops.lanes.stageF16(type, x.buf, x.off, nTokens, cols);
+    }
+
     /** {@link #quantizeQ8N} through the open {@link GpuOps.SharedQ8} when it covers these rows. */
     private GpuBuffer quantizedRows(GpuOps.View x, int nTokens, int cols) {
         GpuOps.SharedQ8 share = ops.activeShare;
@@ -1034,6 +1147,21 @@ final class GpuProjections {
             }
         }
         return ops.optionalReady(k.tiled, TILED_WG, 1);
+    }
+
+    /** Runs the preparation described on {@link GpuOps#prewarmStackedQkv}. */
+    void prewarmStackedQkv(GGMLType type) {
+        ops.ensureOpen();
+        Objects.requireNonNull(type, "type");
+        if (backend.backendType() != ComputeBackend.BackendType.VULKAN || !fusedMode.permitsFusion()
+                || matvecLocal % MATVEC_MAX_TPS != 0) {
+            return;
+        }
+        WeightKernels k = ops.family(type);
+        ops.optionalReady(stackedQkvName(k.matvec), matvecLocal);
+        if (k.matvecQ8 != null && int8LaneSelected(type, Long.MAX_VALUE, 1)) {
+            ops.optionalReady(stackedQkvName(k.matvecQ8), matvecLocal);
+        }
     }
 
     /** Runs the preparation described on {@link GpuOps#prewarmWeightKernels}. */

@@ -268,10 +268,14 @@ public final class SmallBatchCrossover {
             put(m, nvidiaDiscrete(BackendType.VULKAN), GGMLType.Q8_0, cm(), floatNevers(), 8);
             put(m, nvidiaDiscrete(BackendType.VULKAN), GGMLType.Q4_K, cm(), floatNevers(), 14);
             put(m, nvidiaDiscrete(BackendType.VULKAN), GGMLType.Q6_K, cm(), floatNevers(), 10);
-            // The F16 projections: the fp16-MMA lane keeps the default crossover at four rows (step
-            // medians 18.9 to 19.8 ms from 4 to 16 rows against the batched matvec's 15.0 at 2 rows)
-            // and the float multi-column matvec stays off, having lost at every kernel count (0.114
-            // ms against 0.077 batched at 4 rows, 0.211 against 0.114 at 16).
+            // The F16 projections: the fast lane keeps the default crossover at four rows and the float
+            // multi-column matvec stays off, having lost at every kernel count (0.114 ms against 0.077
+            // batched at 4 rows, 0.211 against 0.114 at 16). The crossover was measured on the fp16-MMA
+            // lane (step medians 18.9 to 19.8 ms from 4 to 16 rows against the batched matvec's 15.0 at
+            // 2 rows); the workgroup-scope F16_MatMul_CM2 that serves these rows on cooperative-matrix2
+            // devices kept those steps (pplx-embed-context 0.6B F16 step medians against the MMA lane:
+            // 8.20 against 7.90 ms at 4 rows, 8.33 against 8.10 at 9, 8.62 against 8.29 at 16, 8.51
+            // against 8.69 at 32) and is faster from 64 rows (8.63 against 12.37 ms).
             put(m, nvidiaDiscrete(BackendType.VULKAN), GGMLType.F16, cm(), floatNevers(), int8Never());
             // OpenCL Intel Arrow-Lake iGPU: the integer-dot matvec keeps the rows below the MMQ
             // lane, where it measured faster than the batched matvec (step medians at 2 rows: 504.8

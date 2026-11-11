@@ -503,6 +503,27 @@ public final class GpuOps implements AutoCloseable {
         projections.gateUpGlu(gate, up, op, params, in, out, nTokens);
     }
 
+    /**
+     * Whether {@link #stackedQkv} serves the single-token Q, K and V projections of {@code wq}, {@code wk} and
+     * {@code wv} in one launch: one type and column count, single-shard weights without scale or input transform,
+     * a backend with the stacked form (Vulkan), and the fused selection mode permitting it.
+     */
+    public boolean stackedQkvUsable(GpuWeight wq, GpuWeight wk, GpuWeight wv, int nTokens) {
+        return projections.stackedQkvUsable(wq, wk, wv, nTokens);
+    }
+
+    /**
+     * Runs {@link #stackedQkvUsable}'s stacked projection of the row at {@code in[inOff ..)} into element 0 of
+     * {@code q}, {@code k} and {@code v}: every output row takes the single-row arithmetic of the lane the stacked
+     * launch takes (the float or the integer-dot matvec, picked for the three weights' elements together).
+     *
+     * @throws UnsupportedOperationException when the form cannot serve the weights
+     */
+    public void stackedQkv(GpuWeight wq, GpuWeight wk, GpuWeight wv, GpuBuffer in, int inOff, GpuBuffer q,
+                           GpuBuffer k, GpuBuffer v) {
+        projections.stackedQkv(wq, wk, wv, in, inOff, q, k, v);
+    }
+
     /** {@code accum[accOff + t*rows + r] += scale * W[r] . in[inOff + t*cols ...]}. */
     public void matvecAdd(GpuWeight w, GpuBuffer in, int inOff, GpuBuffer accum, int accOff, int nTokens) {
         projections.matvecAdd(w, in, inOff, accum, accOff, nTokens);
@@ -534,9 +555,9 @@ public final class GpuOps implements AutoCloseable {
      * projection of the scope whose view is exactly the shared rows (element 0 of their buffer, the same token count)
      * reuses its lane's form, each bit for bit the per-projection staging and each in its own staging slot: the Q8_1
      * blocks of an integer-dot lane ({@link #blocks}: the blocks the rows' norm wrote when the scope opens right after
-     * it, {@link Q8Activations#claim}, else quantized on first use) or the int8 MMQ GEMM's records ({@link #records},
-     * staged on first use). Any other projection quantizes its own rows. The caller keeps the rows unchanged until the
-     * scope closes. Closing enqueues nothing and is idempotent; it reports norm-written blocks that no projection read
+     * it, {@link Q8Activations#claim}, else quantized on first use), the int8 MMQ GEMM's records ({@link #records},
+     * staged on first use) or the cooperative-matrix2 GEMM's fp16 rows ({@link #halfRows}, staged on first use).
+     * Any other projection quantizes its own rows. The caller keeps the rows unchanged until the scope closes. Closing enqueues nothing and is idempotent; it reports norm-written blocks that no projection read
      * ({@link Q8Activations#unused}), so that norm stops writing them.
      */
     public final class SharedQ8 implements AutoCloseable {
@@ -547,6 +568,7 @@ public final class GpuOps implements AutoCloseable {
         private final Q8Activations.Claim claim;
         private GpuBuffer blocks;
         private ScratchSlot records;
+        private ScratchSlot halfRows;
         private boolean blocksRead;
         private boolean closed;
 
@@ -582,6 +604,19 @@ public final class GpuOps implements AutoCloseable {
                 records = lanes.stageQ8(GpuScratch.Staging.SHARED_MMQ, source, 0, rows, cols);
             }
             return records;
+        }
+
+        /**
+         * The cooperative-matrix2 GEMM's fp16 rows of the shared rows in the {@code SHARED_F16} slot, staged on first
+         * use ({@link FastGemmLanes#stageF16(GpuScratch.Staging, GGMLType, GpuBuffer, int, int, int)}) for the first
+         * projection's weight type, as llama.cpp converts the input of Q/K/V, and of gate/up, to fp16 once.
+         */
+        ScratchSlot halfRows(GGMLType type) {
+            ensureShareOpen();
+            if (halfRows == null) {
+                halfRows = lanes.stageF16(GpuScratch.Staging.SHARED_F16, type, source, 0, rows, cols);
+            }
+            return halfRows;
         }
 
         private void ensureShareOpen() {
@@ -730,6 +765,16 @@ public final class GpuOps implements AutoCloseable {
      */
     public void prewarmWeightKernels(GGMLType type, boolean matmul, boolean lookup) {
         projections.prewarmWeightKernels(type, matmul, lookup);
+    }
+
+    /**
+     * Prepares both lanes' stacked Q/K/V matvecs ({@link #stackedQkv}) of attention weights stored as {@code type},
+     * where the backend holds the form and fusion is permitted, so the first decode step does not build them.
+     *
+     * @throws UnsupportedOperationException when GpuOps has no kernels for {@code type}
+     */
+    public void prewarmStackedQkv(GGMLType type) {
+        projections.prewarmStackedQkv(type);
     }
 
     // ================================================================== embeddings

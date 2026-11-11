@@ -266,17 +266,29 @@ final class GpuQkvProjections implements AutoCloseable {
         mixer.addDeltas(vSite, n, x, off, cols, qkvTemp, mixer.proj().vOffset(), fw);
     }
 
+    /**
+     * The separate Q, K and V products and their deltas. A single token whose three weights the stacked matvec
+     * serves ({@link GpuOps#stackedQkvUsable}) takes the three base products
+     * in one launch; each delta then adds into its own product as after the separate launches.
+     */
     private void projectSeparate(int n, GpuBuffer x, int off) {
         int cols = (int) wq.cols();
-        mixer.ops().matmul(wq, x, off, qProjBuf, 0, n);
-        mixer.addDeltas(qSite, n, x, off, cols, qProjBuf, 0, mixer.proj().qProjWidth());
-        if (wk != null) {
-            mixer.ops().matmul(wk, x, off, mixer.kBuf(), 0, n);
+        if (n == 1 && mixer.ops().stackedQkvUsable(wq, wk, wv, n)) {
+            mixer.ops().stackedQkv(wq, wk, wv, x, off, qProjBuf, mixer.kBuf(), mixer.vBuf());
+            mixer.addDeltas(qSite, n, x, off, cols, qProjBuf, 0, mixer.proj().qProjWidth());
             mixer.addDeltas(kSite, n, x, off, cols, mixer.kBuf(), 0, mixer.spec().kDim());
-        }
-        if (wv != null) {
-            mixer.ops().matmul(wv, x, off, mixer.vBuf(), 0, n);
             mixer.addDeltas(vSite, n, x, off, cols, mixer.vBuf(), 0, mixer.spec().vDim());
+        } else {
+            mixer.ops().matmul(wq, x, off, qProjBuf, 0, n);
+            mixer.addDeltas(qSite, n, x, off, cols, qProjBuf, 0, mixer.proj().qProjWidth());
+            if (wk != null) {
+                mixer.ops().matmul(wk, x, off, mixer.kBuf(), 0, n);
+                mixer.addDeltas(kSite, n, x, off, cols, mixer.kBuf(), 0, mixer.spec().kDim());
+            }
+            if (wv != null) {
+                mixer.ops().matmul(wv, x, off, mixer.vBuf(), 0, n);
+                mixer.addDeltas(vSite, n, x, off, cols, mixer.vBuf(), 0, mixer.spec().vDim());
+            }
         }
         if (valueExperts != null) {
             valueExperts.run(n, x, off);

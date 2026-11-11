@@ -102,6 +102,15 @@ public final class VkPhysicalDeviceInfo {
 
     private static final Logger LOGGER = LoggingUtil.getLogger(VkPhysicalDeviceInfo.class);
 
+    /**
+     * System property that turns the {@code VK_NV_cooperative_matrix2} kernels off: {@code off} reports no
+     * {@link Feature#COOPERATIVE_MATRIX_2} (nor {@link Feature#COOPERATIVE_MATRIX_2_ATTENTION}) on any device, so
+     * the GEMM lanes take their KHR cooperative-matrix forms and the prefill attention its tiled kernel, as
+     * llama.cpp's {@code GGML_VK_DISABLE_COOPMAT2}; {@code auto}, the default, reports them wherever the device
+     * supports them. Read when the devices are enumerated.
+     */
+    public static final String COOPMAT2_PROPERTY = "neuralfree.vulkan.coopmat2";
+
     /** Mask that removes the patch number from a packed Vulkan version. */
     private static final int VERSION_NO_PATCH_MASK = 0xFFFFF000;
     private static final int UUID_BYTES = 16;
@@ -877,10 +886,12 @@ public final class VkPhysicalDeviceInfo {
          * per-element operations and reductions for the attention softmax, over buffer references; they
          * keep the KHR cooperative-matrix requirements (fp16 arithmetic, full subgroups, memory model). */
         put(s, Feature.COOPERATIVE_MATRIX_2, coopMat2Ext
+                && coopMat2Allowed(System.getProperty(COOPMAT2_PROPERTY))
                 && v12.bufferDeviceAddress()
                 && coopMat2.cooperativeMatrixWorkgroupScope()
                 && coopMat2.cooperativeMatrixFlexibleDimensions()
                 && hasCoopMat2Tile(device, stack, VK_COMPONENT_TYPE_FLOAT16_KHR, 256, 128, 64, 64)
+                && hasCoopMat2Tile(device, stack, VK_COMPONENT_TYPE_FLOAT32_KHR, 256, 128, 64, 64)
                 && coopMat2.cooperativeMatrixTensorAddressing()
                 && coopMat2.cooperativeMatrixBlockLoads()
                 && coopMat2.cooperativeMatrixPerElementOperations()
@@ -934,12 +945,29 @@ public final class VkPhysicalDeviceInfo {
     }
 
     /**
+     * Whether {@value #COOPMAT2_PROPERTY} lets a device report the cooperative-matrix2 features: unset, blank or
+     * {@code auto} (any case) lets it, {@code off} does not.
+     *
+     * @throws IllegalArgumentException naming the property and its values for any other value
+     */
+    static boolean coopMat2Allowed(String value) {
+        if (value == null || value.trim().isEmpty() || value.trim().equalsIgnoreCase("auto")) {
+            return true;
+        }
+        if (value.trim().equalsIgnoreCase("off")) {
+            return false;
+        }
+        throw new IllegalArgumentException(COOPMAT2_PROPERTY + " must be auto or off, got '" + value + "'");
+    }
+
+    /**
      * Whether NV flexible dimensions advertise a workgroup tile of {@code invocations} invocations multiplying fp16
      * operands into an {@code accType} accumulator and result, not saturating, whose granularities divide
      * {@code m}, {@code n} and {@code k}: every matrix of the kernel then has a matching tuple, since its dimensions
-     * are multiples of those. The CM2 GEMM (matmul_mmq_cm2.comp) asks for fp16 accumulation at 256 invocations over
-     * 128 rows, 64-token tails and 64-deep stages; the prefill attention (flash_mma_cm2.comp) for fp32 accumulation
-     * at 128 invocations over 64 query rows and 64-key tiles. The extension requires a matching property tuple when
+     * are multiples of those. The CM2 GEMM (matmul_mmq_cm2.comp) asks for fp16 accumulation (quantized weights) and
+     * fp32 accumulation (dense F16 weights) at 256 invocations over 128 rows, 64-token tails and 64-deep stages, as
+     * llama.cpp's coopmat2 check asks for both accumulators at 256 invocations; the prefill attention
+     * (flash_mma_cm2.comp) for fp32 accumulation at 128 invocations over 64 query rows and 64-key tiles. The extension requires a matching property tuple when
      * flexible dimensions are enabled; the KHR subgroup property list does not describe workgroup-scope matrices.
      */
     private static boolean hasCoopMat2Tile(VkPhysicalDevice device, MemoryStack stack, int accType, int invocations,

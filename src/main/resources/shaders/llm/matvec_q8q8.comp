@@ -30,6 +30,12 @@
  *                  row's weights and drops its store), so the Q8_1 row is read once per two rows
  *   OP_MATVEC_ADD  (i out_dim, i in_dim, R uchar weight, R uchar input, float addend_output)
  *                  addend_output[row] += dot(weight row, input)
+ *   OP_MATVEC3     (i q_rows, i in_dim, i k_rows, i v_rows, R q_weight, R k_weight, R v_weight,
+ *                   R uchar input, W float q_output, W float k_output, W float v_output)
+ *                  the three OP_MATVEC products of one Q8_1 row in one launch (the stacked Q/K/V
+ *                  projection): global = (q_rows + k_rows + v_rows) * L, workgroup r computing row r of
+ *                  the weight its index falls in (Q rows first, then K, then V) with OP_MATVEC's exact
+ *                  arithmetic, so every output equals the single-weight launch's bit for bit
  *   OP_GATEUP_SILU (i out_dim, i in_dim, R uchar gate_weight, R uchar up_weight, R uchar input,
  *                  W float output); output[row] = silu(dot(gate row, input)) * dot(up row, input)
  *   OP_GATEUP_GELU same arguments and result as OP_GATEUP_SILU with the tanh GELU in place of silu
@@ -72,13 +78,24 @@ layout(std430, binding = 2) buffer NfQqOutput { float y_out[]; };
 #else
 layout(std430, binding = 2) writeonly buffer NfQqOutput { float y_out[]; };
 #endif
+#elif OP == OP_MATVEC3
+#define NF_WEIGHT_STREAMS 3
+NF_BUFFER_VIEWS(0, w)
+NF_BUFFER_VIEWS(1, u)
+NF_BUFFER_VIEWS(2, v)
+NF_BUFFER_VIEWS(3, xq)
+layout(std430, binding = 4) writeonly buffer NfQqOutput { float y_out[]; };
+layout(std430, binding = 5) writeonly buffer NfQqOutputK { float y_k[]; };
+layout(std430, binding = 6) writeonly buffer NfQqOutputV { float y_v[]; };
 #else
-#error "matvec_q8q8.comp: OP must be OP_MATVEC, OP_MATVECN, OP_MATVEC2, OP_MATVEC_ADD, OP_GATEUP_SILU, OP_GATEUP_GELU or OP_GATEUP2_Q8"
+#error "matvec_q8q8.comp: OP must be OP_MATVEC, OP_MATVECN, OP_MATVEC2, OP_MATVEC_ADD, OP_MATVEC3, OP_GATEUP_SILU, OP_GATEUP_GELU or OP_GATEUP2_Q8"
 #endif
 /* OP_MATVECN takes the token count as a third scalar (the NC-exact variants fold it into the code
  * and keep the two-scalar block); the other ops keep the two-scalar block. */
 #if OP == OP_MATVECN && !defined(NC)
 layout(push_constant) uniform NfQqParams { int out_dim; int in_dim; int n_tokens; } pc;
+#elif OP == OP_MATVEC3
+layout(push_constant) uniform NfQqParams { int out_dim; int in_dim; int k_rows; int v_rows; } pc;
 #else
 layout(push_constant) uniform NfQqParams { int out_dim; int in_dim; } pc;
 #endif
@@ -174,10 +191,6 @@ float nf_qq_glu(float gate, float up) {
  * first nf_qqn writes otherwise. */
 void nf_qq_tree_n(const uint lid, const uint lsize, float ps[NF_MVQN_MAX], const uint row,
                   const uint out_dim) {
-    [[unroll]] for (uint j = 0u; j < NF_MVQN_MAX; ++j) {
-        nf_qqn[j * lsize + lid] = ps[j];
-    }
-    barrier();
 #if defined(USE_SUBGROUPS)
     [[unroll]] for (uint j = 0u; j < NF_MVQN_MAX; ++j) {
         ps[j] = subgroupAdd(ps[j]);
@@ -198,6 +211,10 @@ void nf_qq_tree_n(const uint lid, const uint lsize, float ps[NF_MVQN_MAX], const
         }
     }
 #else
+    [[unroll]] for (uint j = 0u; j < NF_MVQN_MAX; ++j) {
+        nf_qqn[j * lsize + lid] = ps[j];
+    }
+    barrier();
     const uint span = lsize <= 1u ? 1u : (1u << (uint(findMSB(lsize - 1u)) + 1u));
     for (uint s = span >> 1; s > 0u; s >>= 1) {
         if (lid < s && lid + s < lsize) {
@@ -267,12 +284,11 @@ void main() {
         ps0 += nf_qq_dot_q8(NF_WS_A, rbase0 + b * uint(NF_Q8_0_BB), b, ltid);
         ps1 += nf_qq_dot_q8(NF_WS_A, rbase1 + b * uint(NF_Q8_0_BB), b, ltid);
     }
-    const float o0 = nf_wg_sum(ps0);
-    const float o1 = nf_wg_sum(ps1);
+    const vec2 o = nf_wg_sum2(ps0, ps1);
     if (lid == 0u) {
-        y_out[row0] = o0;
+        y_out[row0] = o.x;
         if (row0 + 1u < out_dim) {
-            y_out[row1] = o1;
+            y_out[row1] = o.y;
         }
     }
 #else
@@ -290,32 +306,34 @@ void main() {
         gs1 += nf_qq_dot_q8(NF_WS_A, b1, b, ltid);
         us1 += nf_qq_dot_q8(NF_WS_B, b1, b, ltid);
     }
-    const float gv0 = nf_wg_sum(gs0);
-    const float uv0 = nf_wg_sum(us0);
-    const float gv1 = nf_wg_sum(gs1);
-    const float uv1 = nf_wg_sum(us1);
+    const vec4 v = nf_wg_sum4(gs0, us0, gs1, us1);
     if (lid == 0u) {
-        y_out[row0] = nf_qq_glu(gv0, uv0);
+        y_out[row0] = nf_qq_glu(v.x, v.y);
         if (row0 + 1u < out_dim) {
-            y_out[row1] = nf_qq_glu(gv1, uv1);
+            y_out[row1] = nf_qq_glu(v.z, v.w);
         }
     }
 #endif
 #else
     /* The row depends only on the workgroup id, so this return is uniform per workgroup. */
     const uint row = nf_wg_id();
+#if OP == OP_MATVEC3
+    if (row >= out_dim + uint(pc.k_rows) + uint(pc.v_rows)) {
+        return;
+    }
+#else
     if (row >= out_dim) {
         return;
     }
+#endif
     const uint rbase = row * nblk * uint(NF_Q8_0_BB);
 #if OP == OP_GATEUP_SILU || OP == OP_GATEUP_GELU
     float gs = 0.0;
     float us = 0.0;
     nf_qq_gateup_partial(rbase, nblk, gs, us);
-    const float g = nf_wg_sum(gs);
-    const float up = nf_wg_sum(us);
+    const vec2 gu = nf_wg_sum2(gs, us);
     if (lid == 0u) {
-        y_out[row] = nf_qq_glu(g, up);
+        y_out[row] = nf_qq_glu(gu.x, gu.y);
     }
 #else
 #if OP == OP_MATVECN
@@ -342,12 +360,6 @@ void main() {
             }
         }
     }
-    [[unroll]] for (uint j = 0u; j < NF_MVQN_MAX; ++j) {
-        if (j < ntok) {
-            nf_qqn[j * gl_WorkGroupSize.x + lid] = ps[j];
-        }
-    }
-    barrier();
     /* The nf_wg_sum steps applied to every token in lockstep (the twin of the single-row
      * Q8_0_MatVec_Q8's per-token nf_wg_sum, so token j's result is that exact reduction):
      * USE_SUBGROUPS reduces inside each subgroup and combines the leader slots linearly as
@@ -375,6 +387,12 @@ void main() {
         }
     }
 #else
+    [[unroll]] for (uint j = 0u; j < NF_MVQN_MAX; ++j) {
+        if (j < ntok) {
+            nf_qqn[j * lsize + lid] = ps[j];
+        }
+    }
+    barrier();
     const uint span = lsize <= 1u ? 1u : (1u << (uint(findMSB(lsize - 1u)) + 1u));
     for (uint s = span >> 1; s > 0u; s >>= 1) {
         if (lid < s && lid + s < lsize) {
@@ -394,6 +412,30 @@ void main() {
         }
     }
 #endif
+#elif OP == OP_MATVEC3
+    /* Workgroup `row` belongs to K or V past the Q rows (out_dim); each branch calls the single-row partial
+     * with a constant stream, so the reads fold to that weight's views and the row takes OP_MATVEC's
+     * partial and reduction unchanged. */
+    const uint k_rows = uint(pc.k_rows);
+    const uint row_bytes = nblk * uint(NF_Q8_0_BB);
+    float ps;
+    if (row < out_dim) {
+        ps = nf_qq_row_partial(NF_WS_A, rbase, nblk);
+    } else if (row < out_dim + k_rows) {
+        ps = nf_qq_row_partial(NF_WS_B, (row - out_dim) * row_bytes, nblk);
+    } else {
+        ps = nf_qq_row_partial(NF_WS_C, (row - out_dim - k_rows) * row_bytes, nblk);
+    }
+    const float acc = nf_wg_sum(ps);
+    if (lid == 0u) {
+        if (row < out_dim) {
+            y_out[row] = acc;
+        } else if (row < out_dim + k_rows) {
+            y_k[row - out_dim] = acc;
+        } else {
+            y_v[row - out_dim - k_rows] = acc;
+        }
+    }
 #else
     const float acc = nf_wg_sum(nf_qq_row_partial(NF_WS_A, rbase, nblk));
     if (lid == 0u) {

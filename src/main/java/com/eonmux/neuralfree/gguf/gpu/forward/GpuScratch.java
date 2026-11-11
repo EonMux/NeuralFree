@@ -69,6 +69,11 @@ public final class GpuScratch implements AutoCloseable {
         /** The fp16 activation rows of the cooperative-matrix2 GEMM lane (LLM_Stage_F16_Rows' output). */
         F16("gpuops.stage.f16"),
         /**
+         * The cooperative-matrix2 GEMM's fp16 rows of token rows shared by several projections
+         * (GpuOps.SharedQ8#halfRows), apart from the per-projection {@link #F16} staging.
+         */
+        SHARED_F16("gpuops.stage.shared_f16"),
+        /**
          * The int8 MMQ GEMM's staged records of token rows shared by several projections
          * (GpuOps.SharedQ8#records), apart from the per-projection {@link #Q8_1} staging and the shared matvec
          * blocks.

@@ -9,6 +9,8 @@
  *     #define NF_WEIGHT_STREAMS 2                         only for two weight streams
  *     NF_BUFFER_VIEWS(<binding>, u)                      weight stream B (NF_WS_B), e.g. the up
  *                                                        projection of a fused gate/up matvec
+ * and, for three streams (#define NF_WEIGHT_STREAMS 3, e.g. the stacked Q/K/V matvec), the third:
+ *     NF_BUFFER_VIEWS(<binding>, v)                      weight stream C (NF_WS_C)
  * QTYPE (one of the QT_* ids, normally from a variants row: QTYPE=QT_Q4_K) selects the decoder;
  * it may be left undefined by shaders that only need the readers.
  *
@@ -175,16 +177,19 @@
 #ifndef NF_WEIGHT_STREAMS
 #define NF_WEIGHT_STREAMS 1
 #endif
-#if NF_WEIGHT_STREAMS != 1 && NF_WEIGHT_STREAMS != 2
-#error "NF_WEIGHT_STREAMS must be 1 or 2"
+#if NF_WEIGHT_STREAMS != 1 && NF_WEIGHT_STREAMS != 2 && NF_WEIGHT_STREAMS != 3
+#error "NF_WEIGHT_STREAMS must be 1, 2 or 3"
 #endif
 
 const uint NF_WS_A = 0u;   /* views w_* (weight, or gate of a fused gate/up) */
 const uint NF_WS_B = 1u;   /* views u_* (up of a fused gate/up); aliases stream A with one stream */
+const uint NF_WS_C = 2u;   /* views v_* (third weight of a stacked matvec); only with three streams */
 
 /* Byte at any offset. */
 uint nf_w_u8(uint ws, uint off) {
-#if NF_WEIGHT_STREAMS == 2
+#if NF_WEIGHT_STREAMS == 3
+    return ws == NF_WS_A ? uint(w_u8[off]) : ws == NF_WS_B ? uint(u_u8[off]) : uint(v_u8[off]);
+#elif NF_WEIGHT_STREAMS == 2
     return ws == NF_WS_A ? uint(w_u8[off]) : uint(u_u8[off]);
 #else
     return uint(w_u8[off]);
@@ -193,7 +198,9 @@ uint nf_w_u8(uint ws, uint off) {
 
 /* Little-endian 16-bit value at an even offset. */
 uint nf_w_u16(uint ws, uint off) {
-#if NF_WEIGHT_STREAMS == 2
+#if NF_WEIGHT_STREAMS == 3
+    return ws == NF_WS_A ? uint(w_u16[off >> 1]) : ws == NF_WS_B ? uint(u_u16[off >> 1]) : uint(v_u16[off >> 1]);
+#elif NF_WEIGHT_STREAMS == 2
     return ws == NF_WS_A ? uint(w_u16[off >> 1]) : uint(u_u16[off >> 1]);
 #else
     return uint(w_u16[off >> 1]);
@@ -202,7 +209,9 @@ uint nf_w_u16(uint ws, uint off) {
 
 /* Little-endian 32-bit value at an offset divisible by 4. */
 uint nf_w_u32(uint ws, uint off) {
-#if NF_WEIGHT_STREAMS == 2
+#if NF_WEIGHT_STREAMS == 3
+    return ws == NF_WS_A ? w_u32[off >> 2] : ws == NF_WS_B ? u_u32[off >> 2] : v_u32[off >> 2];
+#elif NF_WEIGHT_STREAMS == 2
     return ws == NF_WS_A ? w_u32[off >> 2] : u_u32[off >> 2];
 #else
     return w_u32[off >> 2];

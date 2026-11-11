@@ -1,0 +1,16 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg, vulkan)
+# Stacked Q/K/V matvec (OP_MATVEC3): the three single-token projections of one attention input in one launch,
+# each row with its single-weight form's arithmetic, over the float row (matvec_quant.comp, the {T}_MatVec lane)
+# and over the Q8_1 row (matvec_q8.comp and matvec_q8q8.comp, the {T}_MatVec_Q8 lane). Vulkan-only (flag
+# vulkan: no OpenCL twin, no Metal translation, exempt from the inventory and coverage checks), for the weight
+# types of the common checkpoints.
+Q4_0_MatVecQKV	matvec_quant.comp	QTYPE=QT_Q4_0 OP=OP_MATVEC3	sg,vulkan
+Q8_0_MatVecQKV	matvec_quant.comp	QTYPE=QT_Q8_0 OP=OP_MATVEC3	sg,vulkan
+Q4_K_MatVecQKV	matvec_quant.comp	QTYPE=QT_Q4_K OP=OP_MATVEC3	sg,vulkan
+Q5_K_MatVecQKV	matvec_quant.comp	QTYPE=QT_Q5_K OP=OP_MATVEC3	sg,vulkan
+Q6_K_MatVecQKV	matvec_quant.comp	QTYPE=QT_Q6_K OP=OP_MATVEC3	sg,vulkan
+Q4_0_MatVecQKV_Q8	matvec_q8.comp	QTYPE=QT_Q4_0 OP=OP_MATVEC3	sg,vulkan
+Q8_0_MatVecQKV_Q8	matvec_q8q8.comp	OP=OP_MATVEC3	sg,vulkan
+Q4_K_MatVecQKV_Q8	matvec_q8.comp	QTYPE=QT_Q4_K OP=OP_MATVEC3	sg,vulkan
+Q5_K_MatVecQKV_Q8	matvec_q8.comp	QTYPE=QT_Q5_K OP=OP_MATVEC3	sg,vulkan
+Q6_K_MatVecQKV_Q8	matvec_q8.comp	QTYPE=QT_Q6_K OP=OP_MATVEC3	sg,vulkan

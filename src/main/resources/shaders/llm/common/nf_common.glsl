@@ -48,6 +48,8 @@ layout(constant_id = 3) const int NF_FA_SMEM_FLOATS = 3072;
 #define OP_MATVEC2_Q8   12   /* matvec_q8.comp: two rows per workgroup over a Q8_1 activation row */
 #define OP_GATEUP2_Q8   13   /* matvec_q8.comp: two gate/up rows per workgroup over a Q8_1 activation row */
 #define OP_MATVECN      14   /* multi-column matvec, one workgroup per output row */
+#define OP_MATVEC3      15   /* stacked matvec: three weights over one activation row into three outputs */
+#define OP_MATVEC2N     17   /* counted two-row matvec over nc activation rows */
 
 /* Declares three read-only aliased views of one storage-buffer binding, for byte-addressed data
  * such as quantized weights: name_u8[] (uint8_t), name_u16[] (uint16_t) and name_u32[] (uint).

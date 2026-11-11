@@ -27,14 +27,20 @@
  *   OP_GATEUP2     same arguments and result as OP_GATEUP_SILU, two rows per workgroup:
  *                  global = ceil(out_dim / 2) * L, pair p covers rows 2p and 2p+1 of both weights
  *                  (the tail pair of an odd out_dim repeats the last row and drops its store)
+ *   OP_MATVEC3     (i q_rows, i in_dim, i k_rows, i v_rows, R q_weight, R k_weight, R v_weight,
+ *                   R float input, W float q_output, W float k_output, W float v_output)
+ *                  the three OP_MATVEC products of one activation row in one launch (the stacked Q/K/V
+ *                  projection): global = (q_rows + k_rows + v_rows) * L, workgroup r computing row r of
+ *                  the weight its index falls in (Q rows first, then K, then V) with OP_MATVEC's exact
+ *                  arithmetic, so every output equals the single-weight launch's bit for bit
  *   OP_BATCH       (i out_dim, i in_dim, i seq_len, R weight, R float input, W float output)
  *                  output[s * out_dim + row] = dot(weight row, input row s), s in [0, seq_len)
  *   OP_BATCH_2D    same arguments and result, one token per workgroup row
  * A weight row holds in_dim / QT_BS blocks of QT_BB bytes; input row s starts at s * in_dim.
  *
  * Dispatch: every op except OP_BATCH_2D is 1-D with global = rows * L and local = {L, 1, 1}, one
- * workgroup per output row (folded group counts are recovered by nf_wg_id()); OP_MATVEC2 and
- * OP_GATEUP2 use global = ceil(rows / 2) * L, one workgroup per row pair. OP_BATCH_2D uses
+ * workgroup per output row (folded group counts are recovered by nf_wg_id(); OP_MATVEC3 counts the rows of
+ * all three weights); OP_MATVEC2 and OP_GATEUP2 use global = ceil(rows / 2) * L, one workgroup per row pair. OP_BATCH_2D uses
  * global = {out_dim * L, seq_len, 1} and local = {L, 1, 1}. Any L is reduced exactly; the engine
  * passes multiples of 32, for which the block/invocation mapping equals the OpenCL kernels'.
  */
@@ -55,6 +61,16 @@ NF_BUFFER_VIEWS(1, u)
 layout(std430, binding = 2) readonly buffer NfMvInput { float x_in[]; };
 layout(std430, binding = 3) writeonly buffer NfMvOutput { float y_out[]; };
 layout(push_constant) uniform NfMvParams { int out_dim; int in_dim; } pc;
+#elif OP == OP_MATVEC3
+#define NF_WEIGHT_STREAMS 3
+NF_BUFFER_VIEWS(0, w)
+NF_BUFFER_VIEWS(1, u)
+NF_BUFFER_VIEWS(2, v)
+layout(std430, binding = 3) readonly buffer NfMvInput { float x_in[]; };
+layout(std430, binding = 4) writeonly buffer NfMvOutput { float y_out[]; };
+layout(std430, binding = 5) writeonly buffer NfMvOutputK { float y_k[]; };
+layout(std430, binding = 6) writeonly buffer NfMvOutputV { float y_v[]; };
+layout(push_constant) uniform NfMvParams { int out_dim; int in_dim; int k_rows; int v_rows; } pc;
 #elif OP == OP_MATVECN
 NF_BUFFER_VIEWS(0, w)
 layout(std430, binding = 1) readonly buffer NfMvInput { float x_in[]; };
@@ -239,9 +255,15 @@ void main() {
 #else
     /* The row depends only on the workgroup id, so this return is uniform per workgroup. */
     const uint row = nf_wg_id();
+#if OP == OP_MATVEC3
+    if (row >= out_dim + uint(pc.k_rows) + uint(pc.v_rows)) {
+        return;
+    }
+#else
     if (row >= out_dim) {
         return;
     }
+#endif
     const uint rbase = row * row_bytes;
 #if OP == OP_BATCH
     const uint seq_len = uint(pc.seq_len);
@@ -287,12 +309,11 @@ void main() {
         ps1 += qt_dot(NF_WS_A, bp1, 0u, b, ltid);
 #endif
     }
-    const float o0 = nf_wg_sum(ps0);
-    const float o1 = nf_wg_sum(ps1);
+    const vec2 o = nf_wg_sum2(ps0, ps1);
     if (lid == 0u) {
-        y_out[row0] = o0;
+        y_out[row0] = o.x;
         if (row0 + 1u < out_dim) {
-            y_out[row1] = o1;
+            y_out[row1] = o.y;
         }
     }
 #elif OP == OP_GATEUP2
@@ -321,27 +342,46 @@ void main() {
         qt_dot_dual(b0, b0, 0u, b, ltid, gs0, us0);
         qt_dot_dual(b1, b1, 0u, b, ltid, gs1, us1);
     }
-    const float gv0 = nf_wg_sum(gs0);
-    const float uv0 = nf_wg_sum(us0);
-    const float gv1 = nf_wg_sum(gs1);
-    const float uv1 = nf_wg_sum(us1);
+    const vec4 v = nf_wg_sum4(gs0, us0, gs1, us1);
     if (lid == 0u) {
-        y_out[row0] = nf_silu(gv0) * uv0;
+        y_out[row0] = nf_silu(v.x) * v.y;
         if (row0 + 1u < out_dim) {
-            y_out[row1] = nf_silu(gv1) * uv1;
+            y_out[row1] = nf_silu(v.z) * v.w;
+        }
+    }
+#elif OP == OP_MATVEC3
+    /* Workgroup `row` (checked against out_dim, the Q rows, above) belongs to K or V past the Q rows; each
+     * branch calls the single-row partial with a constant stream, so the reads fold to that weight's views
+     * and the row takes OP_MATVEC's partial and reduction unchanged. */
+    const uint k_rows = uint(pc.k_rows);
+    float ps;
+    if (row < out_dim) {
+        ps = nf_mv_row_partial(NF_WS_A, rbase, 0u, nblk);
+    } else if (row < out_dim + k_rows) {
+        ps = nf_mv_row_partial(NF_WS_B, (row - out_dim) * row_bytes, 0u, nblk);
+    } else {
+        ps = nf_mv_row_partial(NF_WS_C, (row - out_dim - k_rows) * row_bytes, 0u, nblk);
+    }
+    const float acc = nf_wg_sum(ps);
+    if (lid == 0u) {
+        if (row < out_dim) {
+            y_out[row] = acc;
+        } else if (row < out_dim + k_rows) {
+            y_k[row - out_dim] = acc;
+        } else {
+            y_v[row - out_dim - k_rows] = acc;
         }
     }
 #elif defined(NF_MV_GATEUP)
     float gs = 0.0;
     float us = 0.0;
     nf_mv_gateup_partial(rbase, nblk, gs, us);
-    const float g = nf_wg_sum(gs);
-    const float up = nf_wg_sum(us);
+    const vec2 gu = nf_wg_sum2(gs, us);
     if (lid == 0u) {
 #if OP == OP_GATEUP_SILU
-        y_out[row] = nf_silu(g) * up;
+        y_out[row] = nf_silu(gu.x) * gu.y;
 #else
-        y_out[row] = nf_gelu_tanh(g) * up;
+        y_out[row] = nf_gelu_tanh(gu.x) * gu.y;
 #endif
     }
 #else

@@ -560,7 +560,7 @@ for Qwen3 0.6B in Q8_0 (llama.cpp 34100).
 |---|---|---|---|
 | Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, I8_B128 | int8 MMQ GEMM (`<T>_MatMul_MMQ`) | every backend: int8 tensor cores (`mma.m16n8k32` / `m16n8k16` s8) on CUDA sm_80+, dp4a or scalar int dots elsewhere | activations are rounded to 8-bit codes per 32-element (tensor) or 16-element chunk, as in llama.cpp `mmq.cuh`; with an `--act-quant checkpoint` int8 scheme they are the checkpoint's own codes |
 | same types | cooperative-matrix GEMM: `<T>_MatMul_CM2` (workgroup-scope `VK_NV_cooperative_matrix2`, 128x256 tiles, fp16 accumulation saturated at +-65504, as llama.cpp `mul_mm_cm2.comp`; Q4_K and Q5_K decode each tile's block scales into shared memory once per block, fetched a block ahead, as its `fetch_scales` / `store_scales`), otherwise `<T>_MatMul_CM` (`VK_KHR_cooperative_matrix`) | Vulkan devices with the extension (default `auto` mode) | activations staged as fp16 rows; the weights decode to fp16 in the tensor loads |
-| F16 | tensor-core GEMM (`F16_MatMul_MMA`) | CUDA sm_80+, Vulkan with cooperative matrices | activations rounded to fp16; fp32 accumulation |
+| F16 | tensor-core GEMM (`F16_MatMul_MMA`); on Vulkan devices with `VK_NV_cooperative_matrix2` the workgroup-scope `F16_MatMul_CM2` (128x256 tiles over the fp16 weights as stored, for a reduction length that is a multiple of 8; any other keeps the MMA GEMM) | CUDA sm_80+, Vulkan with cooperative matrices | activations rounded to fp16; fp32 accumulation (`F16_MatMul_CM2` too: unlike the quantized CM2 GEMM it stores sums past the fp16 range unclipped, which F16 checkpoints such as pplx-embed-v1 0.6B reach) |
 | BF16 | tensor-core GEMM (`BF16_MatMul_MMA`, bf16 `mma`) | CUDA sm_80+ (Vulkan keeps the tiled GEMM for BF16) | activations rounded to bf16; fp32 accumulation |
 | F8_E4M3, F8_E4M3_B32, F8_E4M3_B128, MXFP8 | E4M3 GEMM over the checkpoint's own activation codes (`<T>_MatMul_MMQ`) | CUDA sm_89+ (`mma.sync` `e4m3.e4m3.f32`); elsewhere the exact tiled GEMM | activations staged as E4M3 codes with one scale per 32-element chunk; fp32 accumulation |
 | MXFP4, NVFP4, IQ4_NL, IQ4_XS | E4M3 GEMM over E4M3-mapped 4-bit weight codes (`<T>_MatMul_W4A8`) | CUDA sm_89+ | weight codes are E4M3 (exact for the E2M1 codebooks, one E4M3 rounding for the IQ4 codebooks and the NVFP4 per-16 weight scales); activations staged as E4M3 |
@@ -573,7 +573,8 @@ keep their tiled kernels (llama.cpp's MMQ does not serve them), except the E4M3 
 Before the MMQ GEMM, one staging launch quantizes every token row of the projection once (llama.cpp
 `quantize_mmq_q8_1`), unless the checkpoint's activation scheme stages its own int8 codes
 ([activation quantization](#activation-quantization)), and every row tile reads those 8-bit codes. Projections
-that read the same input (Q, K and V; gate and up) share one staging. On CUDA, rows that start on a
+that read the same input (Q, K and V; gate and up) share one staging, and so do their fp16 rows on the Vulkan
+cooperative-matrix2 lane. On CUDA, rows that start on a
 16-byte boundary stage through `LLM_Quant_MMQ_Q8_1_Warp`, whose lanes share each record so that a warp reads its
 rows and writes its records contiguously; its records equal `LLM_Quant_MMQ_Q8_1`'s bit for bit. Other rows, and
 the other backends, run `LLM_Quant_MMQ_Q8_1`. On CUDA sm_80+
@@ -641,7 +642,8 @@ skip is logged once at info. The dispatch geometry is in `MmqGemmPlan`, `Cm2Gemm
 | `off` | the exact tiled GEMM for these weight types, for workloads that do not accept the 8-bit activation rounding (llama.cpp `GGML_CUDA_FORCE_CUBLAS`) |
 
 Any other value fails at model load with an error naming `neuralfree.gemm.mmq`, the value and the
-allowed values. The switch does not affect F16/BF16 weights.
+allowed values. The switch does not affect F16/BF16 weights; `-Dneuralfree.vulkan.coopmat2=off` keeps the F16
+weights off `F16_MatMul_CM2`, on the `F16_MatMul_MMA` GEMM.
 
 #### Split-K for tall-skinny projections
 
@@ -909,6 +911,7 @@ A layer's decode path launches fused kernels in place of kernel pairs that read 
 | `LLM_NormRopeStore` | The per-head RMS norm, `LLM_RoPE_Ext` and the K row store into the KV cache (llama.cpp's `rms_norm + mul + rope + view + set_rows`) | `GpuAttentionMixer` for an F32 or F16 device KV cache whose row is the K projection's width, with no K rotation or per-row scales; one workgroup per (token, head) row of at most 4 values per work-item (32 work-items for a 128-value head) |
 | `LLM_RopeStore` | `LLM_RoPE_Ext` then the K row store, for layers without a QK norm (llama.cpp's `rope + view + set_rows`) | `GpuAttentionMixer`; the V row keeps its own store |
 | `{T}_MatVecFusedGateUp[Gelu][_Q8]` | The gate and up matvecs and `LLM_GLU` | `GpuDenseFfn` for single-token decode of a plain parallel-GLU feed-forward |
+| `{T}_MatVecQKV[_Q8]` | The Q, K and V matvecs of one input row (Q4_0, Q8_0, Q4_K, Q5_K, Q6_K) | `GpuAttentionMixer` for single-token decode on Vulkan when the three weights share a type and width; each output row takes its single-weight matvec's arithmetic, the lane (float row or Q8_1 row) picked for the three weights' elements together, so weights each below the integer-dot lane's size but together at it (Qwen3 0.6B: 4.19M elements) decode over the Q8_1 row where separate products take the float row (Qwen3-Embedding-0.6B Q8_0, 256 decode steps against the CPU engine: mean KL divergence 4.77e-3 against 5.11e-3 for the separate products) |
 | `LLM_ResidualMixNorm` | `LLM_ResidualMix` then `LLM_RowNorm` of the sum | The layer executor, where a layer's feed-forward residual feeds the next layer's attention norm of the same width: no post-norm, residual scale or extra stream operations on either layer, and an ungrouped row norm |
 
 One persistent multi-task kernel (`LLM_MultiTask`) also runs up to four small tasks of a layer in one launch: a gated DeltaNet layer's four input projections on a single-token step, its L2 norm with the gate preparation, and an attention layer's Q norm and rotation, K norm and rotation, and V norm. Its launches go through the same prepared-dispatch path as every other kernel, so decode-step replay captures them.
@@ -8676,6 +8679,7 @@ GGUF files ignore these; Hugging Face checkpoints read them at open. The meaning
 | `neuralfree.gpu.stagingMb` | CUDA and Vulkan staging ring size in MiB (CUDA 1-1024, Vulkan 1-2047) | upload 64, readback 16 |
 | `neuralfree.vulkan.pipelineCache` | On-disk Vulkan pipeline cache (`~/.cache/neuralfree/vulkan/`) | true |
 | `neuralfree.vulkan.validation` | Enable `VK_LAYER_KHRONOS_validation` | false |
+| `neuralfree.vulkan.coopmat2` | `off` keeps every device's `VK_NV_cooperative_matrix2` kernels off, as llama.cpp `GGML_VK_DISABLE_COOPMAT2`: the GEMMs take their `VK_KHR_cooperative_matrix` forms (`<T>_MatMul_CM`, `F16_MatMul_MMA`) and the prefill attention its tiled kernel; `auto` uses them where the device supports them | `auto` |
 | `neuralfree.vulkan.blockMb` | Vulkan device-memory block size in MiB | 256 |
 | `neuralfree.hip.shim.path` | Absolute path of `libhipshim.so`, the HIP backend's JNI shim; unset loads `hipshim` from the library path | none |
 | `neuralfree.vulkan.dispatchesPerSubmit` | Dispatches recorded per Vulkan command buffer | 256 |

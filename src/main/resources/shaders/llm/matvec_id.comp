@@ -304,8 +304,9 @@ void main() {
     float gs = 0.0;
     float us = 0.0;
     nf_mi_gateup_partial(gbase, ubase, xoff, nblk, gs, us);
-    const float g = nf_wg_sum(gs);
-    const float up = nf_wg_sum(us);
+    const vec2 gu = nf_wg_sum2(gs, us);
+    const float g = gu.x;
+    const float up = gu.y;
     if (lid == 0u) {
         float sg = 1.0;
         float su = 1.0;

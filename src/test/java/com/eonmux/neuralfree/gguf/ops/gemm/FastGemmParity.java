@@ -228,6 +228,123 @@ final class FastGemmParity {
     }
 
     /**
+     * The dense F16 CM2 GEMM against the tiled GEMM: the weights and activations are exact in fp16 and both
+     * accumulate in fp32, so they agree within the MMA GEMM's fp32 bound ({@code 1e-5} of the absolute product
+     * sum, {@link #mmaMatchesTiled}).
+     */
+    void cm2DenseMatchesTiled(byte[] weight, float[] wValues, float[] x, int m, int k, int n)
+            throws InterruptedException {
+        Cm2GemmPlan plan = Cm2GemmPlan.contiguous(GGMLType.F16, m, k, n);
+        float[] fast = launchCm2(plan, null, weight, x);
+        float[] tiled = tiled(GGMLType.F16, m, k, n, weight, x);
+        assertWithinRelative(plan.kernelName(), fast, tiled, wValues, x, m, k, n, 1e-5);
+    }
+
+    /**
+     * The split-K pair of the dense F16 CM2 GEMM against its plain kernel: fp32 slices summed in fp32 against one
+     * fp32 sum, within the fp32 plane-sum bound of the MMA pair ({@link #splitKMatchesPlain}).
+     */
+    void cm2DenseSplitKMatchesPlain(byte[] weight, float[] wValues, float[] x, int m, int k, int n, int splits)
+            throws InterruptedException {
+        Cm2GemmPlan base = Cm2GemmPlan.contiguous(GGMLType.F16, m, k, n);
+        float[] plain = launchCm2(base, null, weight, x);
+        float[] splitOut = launchCm2(base, denseSplit(m, k, n, splits), weight, x);
+        assertWithinRelative(GemmKernels.matmulCm2KSplit(GGMLType.F16), splitOut, plain, wValues, x, m, k, n, 1e-5);
+    }
+
+    /**
+     * The dense F16 CM2 GEMM, plain and split into {@code splits} slices, and the F16 MMA GEMM it replaces, each
+     * against the exact double-precision product, within the MMA GEMM's fp32 bound ({@code 1e-5} of the absolute
+     * product sum). The operands are exact in fp16, so the bound measures the accumulation alone: an fp16
+     * accumulator misses it on every row, and a sum past the fp16 range (the fixtures of
+     * {@link #outlierActivations}) must store unclipped.
+     */
+    void cm2DenseMatchesExactProducts(byte[] weight, float[] wValues, float[] x, int m, int k, int n, int splits)
+            throws InterruptedException {
+        double[] exact = exactProducts(wValues, x, m, k, n);
+        Cm2GemmPlan plan = Cm2GemmPlan.contiguous(GGMLType.F16, m, k, n);
+        MmaGemmPlan mma = MmaGemmPlan.contiguous(GGMLType.F16, m, k, n);
+        assertWithinExact(mma.kernelName(), launch(mma.kernelName(), mma.globalWorkSize(), mma.localWorkSize(), m, k,
+                n, weight, x), exact, wValues, x, m, k, n);
+        assertWithinExact(plan.kernelName(), launchCm2(plan, null, weight, x), exact, wValues, x, m, k, n);
+        assertWithinExact(GemmKernels.matmulCm2KSplit(GGMLType.F16),
+                launchCm2(plan, denseSplit(m, k, n, splits), weight, x), exact, wValues, x, m, k, n);
+    }
+
+    private static SplitKGemmPlan denseSplit(int m, int k, int n, int splits) {
+        return SplitKGemmPlan.of(SplitKGemmPlan.Family.CM2, GGMLType.F16, m, k, n, k, 0, splits,
+                SplitKGemmPlan.sliceLength(k, splits, Cm2GemmPlan.TILE_DEPTH), Cm2GemmPlan.TILE_TOKENS, 256);
+    }
+
+    private static double[] exactProducts(float[] w, float[] x, int m, int k, int n) {
+        double[] y = new double[n * m];
+        for (int t = 0; t < n; t++) {
+            for (int r = 0; r < m; r++) {
+                double acc = 0.0;
+                for (int i = 0; i < k; i++) {
+                    acc += (double) w[r * k + i] * x[t * k + i];
+                }
+                y[t * m + r] = acc;
+            }
+        }
+        return y;
+    }
+
+    private static void assertWithinExact(String kernel, float[] got, double[] exact, float[] w, float[] x, int m,
+                                          int k, int n) {
+        for (int t = 0; t < n; t++) {
+            for (int r = 0; r < m; r++) {
+                double terms = 0.0;
+                for (int i = 0; i < k; i++) {
+                    terms += Math.abs((double) w[r * k + i] * x[t * k + i]);
+                }
+                double tol = 1e-5 * terms + 1e-3;
+                assertTrue(kernel + " token " + t + " row " + r + ": " + got[t * m + r] + " exact " + exact[t * m + r]
+                        + " (|terms| " + terms + ")", Math.abs(got[t * m + r] - exact[t * m + r]) <= tol);
+            }
+        }
+    }
+
+    /**
+     * fp16-exact activations of {@code n} tokens of {@code k} channels with the massive-activation pattern of an F16
+     * checkpoint's feed-forward input: {@link #denseValues} everywhere except {@link #OUTLIER_CHANNELS}, which carry
+     * positive values of 1024 to 2032 that grow with the token. Through {@link #outlierWeights}' row
+     * {@link #OUTLIER_ROW} they sum to 8.6e4 .. 1.7e5, past the fp16 range: the magnitude of pplx-embed-v1 0.6B's
+     * layer-19 feed-forward output, whose channel 35 reaches 1.5e5 and 1.7e5 through the fp32-accumulating MMA GEMM.
+     */
+    static float[] outlierActivations(int n, int k, int seed) {
+        float[] x = denseValues(n * k, seed);
+        for (int t = 0; t < n; t++) {
+            for (int c : OUTLIER_CHANNELS) {
+                x[t * k + c] = 1024.0f + 16.0f * (t % 64);
+            }
+        }
+        return x;
+    }
+
+    /**
+     * fp16-exact weights for {@link #outlierActivations}: {@link #denseValues} scaled by 1/32 (2^-6 .. 2^-4), with
+     * {@link #OUTLIER_ROW} weighting the outlier channels by 18 to 24.
+     */
+    static float[] outlierWeights(int m, int k, int seed) {
+        float[] w = denseValues(m * k, seed);
+        for (int i = 0; i < w.length; i++) {
+            w[i] = w[i] / 32.0f;
+        }
+        float[] gains = {20.0f, 24.0f, 18.0f, 22.0f};
+        for (int j = 0; j < OUTLIER_CHANNELS.length; j++) {
+            w[OUTLIER_ROW * k + OUTLIER_CHANNELS[j]] = gains[j];
+        }
+        return w;
+    }
+
+    /** The outlier channels of {@link #outlierActivations} (below 3072, one of them in the last 64-deep stage). */
+    static final int[] OUTLIER_CHANNELS = {7, 911, 1500, 3050};
+
+    /** The output row of {@link #outlierWeights} whose sums pass the fp16 range. */
+    static final int OUTLIER_ROW = 35;
+
+    /**
      * The MMA GEMM of a dense 16-bit type against the tiled GEMM of the same type: the activations
      * round to the tile format (fp16, or bf16 on the bf16 instruction) before exact products.
      */

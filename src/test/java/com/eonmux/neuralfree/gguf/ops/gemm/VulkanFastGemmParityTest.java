@@ -16,7 +16,8 @@ import org.junit.Test;
  * weight type ({@link FastGemmParity}): every int8 MMQ kernel on any device, and on devices with
  * {@link DeviceFeature#COOPERATIVE_MATRIX} every fp16-tile CM kernel, the F16 and BF16 MMA rows and
  * the split-K pair of both dense 16-bit types, and on devices with
- * {@link DeviceFeature#COOPERATIVE_MATRIX_2} every workgroup-scope CM2 kernel and its split-K twin.
+ * {@link DeviceFeature#COOPERATIVE_MATRIX_2} every workgroup-scope CM2 kernel and its split-K twin, the dense
+ * F16 one included.
  * Skips without a Vulkan GPU.
  */
 public class VulkanFastGemmParityTest {
@@ -119,7 +120,7 @@ public class VulkanFastGemmParityTest {
     @Test
     public void everyCm2KernelMatchesTheTiledGemmWithinFp16Rounding() throws Exception {
         assumeCooperativeMatrix2();
-        for (GGMLType type : GemmKernels.CM2_TYPES) {
+        for (GGMLType type : quantizedCm2Types()) {
             parity.cm2OneHotColumnsMatchCpu(type);
             parity.cm2MatchesTiled(type, M, K, N);
             parity.cm2MatchesTiled(type, M2, 256, N2);
@@ -134,11 +135,59 @@ public class VulkanFastGemmParityTest {
     @Test
     public void cm2SplitKTwinsMatchTheirPlainKernels() throws Exception {
         assumeCooperativeMatrix2();
-        for (GGMLType type : GemmKernels.CM2_TYPES) {
+        for (GGMLType type : quantizedCm2Types()) {
             parity.cm2SplitKMatchesPlain(type, M, 768, N, 3);
             parity.cm2SplitKMatchesPlain(type, M3, 768, N3, 3);
             parity.cm2SplitKMatchesPlain(type, M3, 768, N3, 4);
         }
+    }
+
+    /**
+     * The dense F16 CM2 kernel over fp16-exact operands, within the fp32 accumulation bound: one tile with
+     * partial rows through the clamped layouts and a quarter-width token tile, a full token tile plus a tail over a
+     * reduction that ends inside a stage (clamped K), whole row tiles through the unrolled interior path at half
+     * width, and the split-K twin on clamped and interior tiles.
+     */
+    @Test
+    public void denseF16Cm2MatchesTheTiledGemmAndItsSplitKTwin() throws Exception {
+        assumeCooperativeMatrix2();
+        int[][] shapes = {{M, K, N}, {M2, 520, N2}, {M3, 1024, N3}};
+        for (int[] s : shapes) {
+            float[] w = FastGemmParity.denseValues(s[0] * s[1], 0x51ED);
+            float[] x = FastGemmParity.denseValues(s[2] * s[1], 0xC0DE);
+            parity.cm2DenseMatchesTiled(FastGemmParity.f16Bytes(w), w, x, s[0], s[1], s[2]);
+        }
+        float[] w = FastGemmParity.denseValues(M3 * 1536, 0x51ED);
+        float[] x = FastGemmParity.denseValues(N * 1536, 0xC0DE);
+        parity.cm2DenseSplitKMatchesPlain(FastGemmParity.f16Bytes(w), w, x, M3, 1536, N, 3);
+        float[] w2 = FastGemmParity.denseValues(M * 1536, 0x51ED);
+        parity.cm2DenseSplitKMatchesPlain(FastGemmParity.f16Bytes(w2), w2, x, M, 1536, N, 4);
+    }
+
+    /**
+     * The dense F16 CM2 kernel, plain and split-K, and the F16 MMA GEMM against the exact products of a
+     * feed-forward down projection's shape (K = 3072, two whole row tiles, a full token tile and a quarter-width
+     * tail) whose outlier activations drive one row's sums to 8.6e4 .. 1.7e5: every sum, in range or past the fp16
+     * range, matches within the fp32 accumulation bound.
+     */
+    @Test
+    public void denseF16Cm2KeepsSumsPastTheFp16RangeWithinTheFp32Bound() throws Exception {
+        assumeCooperativeMatrix2();
+        int k = 3072;
+        float[] w = FastGemmParity.outlierWeights(M3, k, 0x51ED);
+        float[] x = FastGemmParity.outlierActivations(N2, k, 0xC0DE);
+        parity.cm2DenseMatchesExactProducts(FastGemmParity.f16Bytes(w), w, x, M3, k, N2, 3);
+    }
+
+    /** The CM2 types whose weights are quantized blocks (every one but the dense F16). */
+    private static java.util.List<GGMLType> quantizedCm2Types() {
+        java.util.List<GGMLType> types = new java.util.ArrayList<>();
+        for (GGMLType type : GemmKernels.CM2_TYPES) {
+            if (GemmKernels.hasMmq(type)) {
+                types.add(type);
+            }
+        }
+        return types;
     }
 
     @Test

@@ -303,13 +303,12 @@ void main() {
     float gs = 0.0;
     float us = 0.0;
     nf_md_gateup_partial(wbase, in_dim, gs, us);
-    const float g = nf_wg_sum(gs);
-    const float up = nf_wg_sum(us);
+    const vec2 gu = nf_wg_sum2(gs, us);
     if (lid == 0u) {
 #if OP == OP_GATEUP_SILU
-        y_out[row] = nf_silu(g) * up;
+        y_out[row] = nf_silu(gu.x) * gu.y;
 #else
-        y_out[row] = nf_gelu_tanh(g) * up;
+        y_out[row] = nf_gelu_tanh(gu.x) * gu.y;
 #endif
     }
 #else

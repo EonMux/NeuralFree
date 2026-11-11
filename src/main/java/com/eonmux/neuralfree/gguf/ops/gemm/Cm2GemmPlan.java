@@ -8,8 +8,8 @@ import com.eonmux.neuralfree.gguf.GGMLType;
 import java.util.Objects;
 
 /**
- * Immutable dispatch plan of one {@code <T>_MatMul_CM2} launch over a llama.cpp MMQ weight type: the
- * validated shape and view arguments, the 2-D work sizes, the activation staging launch and the argument
+ * Immutable dispatch plan of one {@code <T>_MatMul_CM2} launch over a llama.cpp MMQ weight type or dense F16:
+ * the validated shape and view arguments, the 2-D work sizes, the activation staging launch and the argument
  * arrays.
  *
  * <p>The launch computes {@code y[yOff + t*yStride + r] = sum_{k < K} W[r][k] * x[xOff + t*xStride + k]}
@@ -27,6 +27,15 @@ import java.util.Objects;
  * sum. The split-K twin accumulates each slice in fp16 and sums the slices in fp32. The dispatch prefers this
  * family on Vulkan devices that report {@link DeviceFeature#COOPERATIVE_MATRIX_2}, and only when the
  * fast quantized-weight lane is enabled ({@link MmqMode}).</p>
+ *
+ * <p>{@code F16_MatMul_CM2} reads a dense fp16 weight through the tensor layout without a decode and
+ * accumulates in fp32 (each split-K slice too) without the quantized kernels' saturation at +-65504, the accuracy
+ * of the MMA GEMM it replaces ({@link MmaGemmPlan}) and of llama.cpp's f32acc coopmat2 pipelines: F16 checkpoints
+ * reach sums past the fp16 range. Its rows must be 16-byte aligned, so {@code K} is a multiple of
+ * {@link #DENSE_K_MULTIPLE}; the dispatch keeps the MMA GEMM for any other F16 shape ({@link #denseShapeServes}).
+ * It is independent of {@link MmqMode}, like the MMA lane; the device switch
+ * {@value com.eonmux.neuralfree.acceleration.vulkan.VkPhysicalDeviceInfo#COOPMAT2_PROPERTY}{@code =off} turns every
+ * CM2 GEMM off.</p>
  *
  * <p>Geometry: {@code global = {ceil(M / 128) * 256, ceil(N / 256)}}, {@code local = {256, 1}} — the
  * dispatch is 2-D and therefore never folded on Vulkan, so {@link #checkDevice} verifies the group
@@ -51,6 +60,8 @@ public final class Cm2GemmPlan {
     public static final String STAGE_KERNEL = "LLM_Stage_F16_Rows";
     /** Work-group size of the staging launch. */
     public static final int STAGE_LOCAL = 256;
+    /** Reduction lengths of a dense F16 weight are multiples of this many halves: 16-byte aligned rows. */
+    public static final int DENSE_K_MULTIPLE = 8;
 
     private final GGMLType type;
     private final String kernelName;
@@ -112,6 +123,10 @@ public final class Cm2GemmPlan {
             throw new IllegalArgumentException("CM2 GEMM tile indices would overflow int for M=" + m + ", K=" + k
                     + ", N=" + n);
         }
+        if (type == GGMLType.F16 && !denseShapeServes(k)) {
+            throw new IllegalArgumentException("CM2 GEMM over F16 needs K to be a multiple of " + DENSE_K_MULTIPLE
+                    + " (16-byte aligned rows), got K=" + k);
+        }
         int blockSize = type.getBlockSize();
         if (k % blockSize != 0) {
             throw new IllegalArgumentException("CM2 GEMM over " + type + " needs K to be a multiple of the block size "
@@ -128,6 +143,11 @@ public final class Cm2GemmPlan {
                     + ", yOff=" + yOff);
         }
         return new Cm2GemmPlan(type, m, k, n, xStride, xOff, yStride, yOff);
+    }
+
+    /** Whether the dense F16 kernel serves a reduction of {@code k} elements: rows of 16-byte aligned halves. */
+    public static boolean denseShapeServes(int k) {
+        return k > 0 && k % DENSE_K_MULTIPLE == 0;
     }
 
     /** The weight type of the planned launch (a CM2 type). */

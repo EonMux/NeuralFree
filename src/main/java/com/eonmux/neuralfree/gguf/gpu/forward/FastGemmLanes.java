@@ -79,7 +79,10 @@ final class FastGemmLanes {
      * types and the int8 checkpoint type I8_B128 take the fast quantized-weight lane unless {@link MmqMode#OFF}: the
      * fp16-tile CM form under {@link MmqMode#AUTO} on Vulkan devices with cooperative matrices, the int8 MMQ GEMM
      * everywhere else and whenever {@link MmqMode#ON} forces it. F16 takes the tensor-core MMA GEMM on CUDA sm_80+ and Vulkan cooperative-matrix
-     * devices; BF16 only on CUDA sm_80+, whose {@code mma} has a bfloat16 form &mdash; the Vulkan module of
+     * devices, in the workgroup-scope form {@code F16_MatMul_CM2} on Vulkan devices with VK_NV_cooperative_matrix2
+     * (whose 128 x 256 fp32-accumulating tile replaces the 64 x 32 KHR tile, as llama.cpp's coopmat2 mul_mm serves
+     * its F16 weights; {@link #fastGemm(GpuWeight, int)} keeps the MMA GEMM for a reduction length the CM2 rows
+     * cannot align); BF16 only on CUDA sm_80+, whose {@code mma} has a bfloat16 form &mdash; the Vulkan module of
      * {@code BF16_MatMul_MMA} stages fp16 tiles (a native bf16 cooperative-matrix twin needs
      * {@code VK_KHR_shader_bfloat16}, whose GLSL module the build's shader compiler cannot produce yet, although the
      * devices report {@link DeviceFeature#BF16_COOPERATIVE_MATRIX}), whose range is narrower than bf16, so Vulkan keeps
@@ -103,7 +106,7 @@ final class FastGemmLanes {
         }
         if (GemmKernels.hasMma(type) && tensorCores()
                 && (type != GGMLType.BF16 || isBf16MmaBackend())) {
-            return GemmKernels.matmulMma(type);
+            return cm2Form() && GemmKernels.hasCm2(type) ? GemmKernels.matmulCm2(type) : GemmKernels.matmulMma(type);
         }
         return null;
     }
@@ -125,7 +128,11 @@ final class FastGemmLanes {
                 && fp8StagingReady(scheme)) {
             return GemmKernels.matmulW4a8(w.type());
         }
-        return fastGemm(w.type());
+        String lane = fastGemm(w.type());
+        if (lane != null && GemmKernels.hasMma(w.type()) && cm2Fast(lane) && !Cm2GemmPlan.denseShapeServes(cols)) {
+            return GemmKernels.matmulMma(w.type());
+        }
+        return lane;
     }
 
     /**
@@ -652,8 +659,18 @@ final class FastGemmLanes {
      * (llama.cpp converts src1 to fp16 once before its coopmat2 mul_mm).
      */
     ScratchSlot stageF16(GGMLType type, GpuBuffer x, int xOff, int nTokens, int cols) {
+        return stageF16(GpuScratch.Staging.F16, type, x, xOff, nTokens, cols);
+    }
+
+    /**
+     * {@link #stageF16(GGMLType, GpuBuffer, int, int, int)} into staging slot {@code which}: the per-projection
+     * {@code F16} slot, or the {@code SHARED_F16} slot of the rows of a {@link GpuOps.SharedQ8} scope
+     * ({@code SharedQ8.halfRows}). The staged rows depend on the rows alone, not on the weight type, which only
+     * validates the reduction length.
+     */
+    ScratchSlot stageF16(GpuScratch.Staging which, GGMLType type, GpuBuffer x, int xOff, int nTokens, int cols) {
         Cm2GemmPlan plan = Cm2GemmPlan.of(type, 1, cols, nTokens, cols, xOff, 1, 0);
-        ScratchSlot slot = scratch.staging(GpuScratch.Staging.F16, (plan.stagedHalves() + 1) / 2);
+        ScratchSlot slot = scratch.staging(which, (plan.stagedHalves() + 1) / 2);
         enqueue(Cm2GemmPlan.STAGE_KERNEL, plan.stageGlobalWorkSize(), Cm2GemmPlan.stageLocalWorkSize(),
                 plan.stageArgs(x, slot.buffer()));
         return slot;
@@ -791,6 +808,13 @@ final class FastGemmLanes {
         } else if (cm2Fast(fast)) {
             ops.optionalReady(GemmKernels.matmulCm2KSplit(type), workGroup, 1);
             ops.optionalReady(Cm2GemmPlan.STAGE_KERNEL, Cm2GemmPlan.STAGE_LOCAL);
+            if (GemmKernels.hasMma(type)) {
+                // The MMA pair still serves the dense reductions the CM2 rows cannot align (fastGemm(GpuWeight, int)).
+                String mma = GemmKernels.matmulMma(type);
+                int mmaGroup = fastWorkGroup(mma);
+                ops.optionalReady(mma, mmaGroup, 1);
+                ops.optionalReady(GemmKernels.matmulMmaKSplit(type), mmaGroup, 1);
+            }
         } else if (fast.endsWith(GemmKernels.MATMUL_CM_SUFFIX)) {
             ops.optionalReady(GemmKernels.matmulCmKSplit(type), workGroup, 1);
         } else {

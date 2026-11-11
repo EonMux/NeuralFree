@@ -85,8 +85,8 @@ public final class SplitKGemmPlan {
         MMA(GemmKernels.MATMUL_MMA_KSPLIT_SUFFIX),
         /** The dequantizing CM GEMM over a quantized weight, 16-deep stages. */
         CM(GemmKernels.MATMUL_CM_KSPLIT_SUFFIX),
-        /** The workgroup-scope cooperative-matrix CM2 GEMM over a quantized weight (VK_NV_cooperative_matrix2),
-         *  stages of {@link Cm2GemmPlan#TILE_DEPTH} and the CM2 tile. */
+        /** The workgroup-scope cooperative-matrix CM2 GEMM over a quantized or dense F16 weight
+         *  (VK_NV_cooperative_matrix2), stages of {@link Cm2GemmPlan#TILE_DEPTH} and the CM2 tile. */
         CM2(GemmKernels.MATMUL_CM2_KSPLIT_SUFFIX),
         /** The int8 MMQ GEMM over staged activations, stages of the device's {@link MmqConfig}. */
         MMQ(GemmKernels.MATMUL_MMQ_KSPLIT_SUFFIX),

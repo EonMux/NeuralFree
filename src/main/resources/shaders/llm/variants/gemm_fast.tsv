@@ -7,7 +7,8 @@
 # kernels/llm/common/matmul_mma_family.h), the quantized-weight cooperative-matrix GEMM and its
 # split-K twin (shaders/llm/matmul_mmq_cm.comp; their portable scalar rows are kernels/llm/matmul_cm.cl),
 # the split-K reduce (kernels/llm/split_k_reduce.cl), and the workgroup-scope cooperative-matrix GEMM of
-# VK_NV_cooperative_matrix2 (shaders/llm/matmul_mmq_cm2.comp) with its fp16 activation staging
+# VK_NV_cooperative_matrix2 over the quantized types and dense F16 (shaders/llm/matmul_mmq_cm2.comp; the
+# F16 rows load the halves directly, NF_CM2_DENSE) with its fp16 activation staging
 # (shaders/llm/stage_f16.comp). Both are Vulkan-only (flag vulkan: no OpenCL twin, no Metal translation,
 # exempt from the inventory and coverage checks); vk13 compiles a row for the Vulkan 1.3 environment,
 # and noopt keeps the CM2 modules as glslc emits them: spirv-opt flattens their unrolled tensor loads and
@@ -197,3 +198,5 @@ Q6_K_MatMul_CM2	matmul_mmq_cm2.comp	QTYPE=QT_Q6_K	vk13,vulkan,noopt
 Q6_K_MatMul_CM2_KSplit	matmul_mmq_cm2.comp	NF_SPLIT_K=1 QTYPE=QT_Q6_K	vk13,vulkan,noopt
 I8_B128_MatMul_CM2	matmul_mmq_cm2.comp	QTYPE=QT_I8_B128	vk13,vulkan,noopt
 I8_B128_MatMul_CM2_KSplit	matmul_mmq_cm2.comp	NF_SPLIT_K=1 QTYPE=QT_I8_B128	vk13,vulkan,noopt
+F16_MatMul_CM2	matmul_mmq_cm2.comp	QTYPE=QT_F16 NF_CM2_DENSE=1	vk13,vulkan,noopt
+F16_MatMul_CM2_KSplit	matmul_mmq_cm2.comp	NF_SPLIT_K=1 QTYPE=QT_F16 NF_CM2_DENSE=1	vk13,vulkan,noopt

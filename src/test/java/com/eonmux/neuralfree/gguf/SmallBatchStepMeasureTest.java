@@ -77,10 +77,20 @@ public class SmallBatchStepMeasureTest {
             "Qwen3-Embedding-4B-Q4_K_M.gguf",
     };
 
-    /** Row counts one step is timed at: the draft maximums in between and the verify shape itself. */
-    private static final int[] ROW_COUNTS = {1, 2, 4, 8, 9, 16};
+    /**
+     * System property naming the row counts to time, comma-separated (each in 1 .. {@link #MAX_ROWS}); unset, the
+     * default {@link #DEFAULT_ROW_COUNTS}. One row and {@link #PROFILE_ROWS} are timed in every case.
+     */
+    public static final String ROWS_PROPERTY = "neuralfree.test.smallbatch.rows";
+
+    /** Default row counts one step is timed at: the draft maximums in between and the verify shape itself. */
+    private static final int[] DEFAULT_ROW_COUNTS = {1, 2, 4, 8, 9, 16};
+    /** Largest row count {@link #ROWS_PROPERTY} may name: one CM2 GEMM quarter tile. */
+    private static final int MAX_ROWS = 64;
     /** Verified rows of one 9-row tree verify (draft maximum 8 plus one), the profiled shape. */
     private static final int PROFILE_ROWS = 9;
+    /** The row counts of this run, ascending. */
+    private static final int[] ROW_COUNTS = rowCounts(System.getProperty(ROWS_PROPERTY));
     /** Context tokens filled before the timed steps of every row count. */
     private static final int CONTEXT_TOKENS = 256;
     /** Untimed steps of each row count before its timed steps. */
@@ -195,8 +205,35 @@ public class SmallBatchStepMeasureTest {
         }
     }
 
+    /** {@link #ROW_COUNTS} from the property value, or the defaults when it is null or blank. */
+    static int[] rowCounts(String value) {
+        if (value == null || value.trim().isEmpty()) {
+            return DEFAULT_ROW_COUNTS.clone();
+        }
+        java.util.TreeSet<Integer> rows = new java.util.TreeSet<>();
+        rows.add(1);
+        rows.add(PROFILE_ROWS);
+        for (String part : value.split(",")) {
+            int n = Integer.parseInt(part.trim());
+            if (n < 1 || n > MAX_ROWS) {
+                throw new IllegalArgumentException(ROWS_PROPERTY + " counts must be in 1.." + MAX_ROWS + ", got " + n);
+            }
+            rows.add(n);
+        }
+        int[] out = new int[rows.size()];
+        int i = 0;
+        for (int n : rows) {
+            out[i++] = n;
+        }
+        return out;
+    }
+
     private static EngineConfig gpuConfig() {
-        MemoryConfig mc = MemoryConfig.builder().nCtx(512).ubatch(32)
+        int maxRows = ROW_COUNTS[ROW_COUNTS.length - 1];
+        int ubatch = Math.max(32, maxRows);
+        // The context fill and every untimed and timed step of the widest row count, at least 512 positions.
+        int nCtx = Math.max(512, CONTEXT_TOKENS + (WARMUP + TIMED) * Math.max(maxRows, PROFILE_ROWS));
+        MemoryConfig mc = MemoryConfig.builder().nCtx(nCtx).ubatch(ubatch)
                 .typeK(KvDType.F16).typeV(KvDType.F16).build();
         return EngineConfig.builder().memory(mc).build();
     }

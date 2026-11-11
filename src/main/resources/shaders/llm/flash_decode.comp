@@ -542,12 +542,32 @@ void main() {
         }
     }
 
-    /* 3. per-head max, p = e^(s - m) in place, sum */
+    /* 3. per-head max, p = e^(s - m) in place, sum. Where the lockstep reductions apply (nf_wg_lockstep), the
+     * heads of the tile reduce four at a time (nf_wg_max4 / nf_wg_sum4, each component the exact single
+     * reduction), so a tile pays one barrier pair per four heads, and a group's heads past g_tile reduce their
+     * unused -inf / 0 slots, which nothing reads; otherwise each live head takes its own single reduction. */
+#if NF_FD_MAX_G % 4 != 0
+#error "flash_decode.comp reduces its heads in groups of four: NF_FD_MAX_G must be a multiple of 4"
+#endif
     float ls[NF_FD_MAX_G];
     [[unroll]] for (int g = 0; g < NF_FD_MAX_G; g++) {
         ls[g] = 0.0;
+    }
+    [[unroll]] for (int g = 0; g < NF_FD_MAX_G; g += 4) {
         if (g < g_tile) {
-            mx[g] = nf_wg_max(mx[g]);
+            if (nf_wg_lockstep(4u)) {
+                const vec4 m4 = nf_wg_max4(mx[g], mx[g + 1], mx[g + 2], mx[g + 3]);
+                mx[g] = m4.x;
+                mx[g + 1] = m4.y;
+                mx[g + 2] = m4.z;
+                mx[g + 3] = m4.w;
+            } else {
+                [[unroll]] for (int i = 0; i < 4; i++) {
+                    if (g + i < g_tile) {
+                        mx[g + i] = nf_wg_max(mx[g + i]);
+                    }
+                }
+            }
         }
     }
     for (int j = lid; j < split_len; j += NF_FA_WG) {
@@ -560,12 +580,25 @@ void main() {
             }
         }
     }
-    [[unroll]] for (int g = 0; g < NF_FD_MAX_G; g++) {
+    [[unroll]] for (int g = 0; g < NF_FD_MAX_G; g += 4) {
         if (g < g_tile) {
-            const float l = nf_wg_sum(ls[g]);
+            vec4 l4 = vec4(0.0);
+            if (nf_wg_lockstep(4u)) {
+                l4 = nf_wg_sum4(ls[g], ls[g + 1], ls[g + 2], ls[g + 3]);
+            } else {
+                [[unroll]] for (int i = 0; i < 4; i++) {
+                    if (g + i < g_tile) {
+                        l4[i] = nf_wg_sum(ls[g + i]);
+                    }
+                }
+            }
             if (lid == 0) {
-                nf_fd_stats[g] = mx[g];
-                nf_fd_stats[NF_FD_MAX_G + g] = l;
+                [[unroll]] for (int i = 0; i < 4; i++) {
+                    if (g + i < g_tile) {
+                        nf_fd_stats[g + i] = mx[g + i];
+                        nf_fd_stats[NF_FD_MAX_G + g + i] = l4[i];
+                    }
+                }
             }
         }
     }

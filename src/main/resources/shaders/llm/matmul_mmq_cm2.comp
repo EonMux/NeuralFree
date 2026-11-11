@@ -1,9 +1,10 @@
-/* matmul_mmq_cm2.comp - workgroup-scope cooperative-matrix GEMM over the MMQ quant types
- * (VK_NV_cooperative_matrix2, the llama.cpp coopmat2 design of mul_mm_cm2.comp): the weight tile loads
- * through per-element decode callbacks of the tensor loads (coopMatLoadTensorNV) and the activation tile
- * from fp16 rows staged by LLM_Stage_F16_Rows, so the shader stages nothing in shared memory itself; the
- * driver lays the workgroup's matrices out for the tensor cores. Replaces matmul_mmq_cm.comp (the KHR
- * subgroup-scope form) on devices that report DeviceFeature.COOPERATIVE_MATRIX_2.
+/* matmul_mmq_cm2.comp - workgroup-scope cooperative-matrix GEMM over the MMQ quant types and dense F16
+ * (VK_NV_cooperative_matrix2, the llama.cpp coopmat2 design of mul_mm_cm2.comp): a quantized weight tile loads
+ * through per-element decode callbacks of the tensor loads (coopMatLoadTensorNV), an F16 weight tile
+ * (QTYPE=QT_F16 NF_CM2_DENSE=1) straight through the tensor layout, and the activation tile from fp16 rows staged by
+ * LLM_Stage_F16_Rows, so the shader stages nothing in shared memory itself; the driver lays the workgroup's
+ * matrices out for the tensor cores. Replaces matmul_mmq_cm.comp (the KHR subgroup-scope form) and, for F16,
+ * matmul_mma.comp on devices that report DeviceFeature.COOPERATIVE_MATRIX_2.
  * Requires: common/nf_common.glsl, common/quant_blocks.glsl, common/quant_mmq_ref.glsl,
  * common/matmul_cm2_tile.glsl.
  *
@@ -21,21 +22,25 @@
  *   twin writes partial[(slice * N + t) * M + r] for k in slice * k_slice .. +k_slice (k_slice a
  *   multiple of NF_CM2_BK), slice taken from the work-group id, and LLM_SplitK_Reduce sums the planes.
  *
- * Compute: fp16 x fp16 -> fp16 cooperative matrix products of NF_CM2_BK reduction elements per stage
+ * Compute: fp16 x fp16 cooperative matrix products of NF_CM2_BK reduction elements per stage
  * over an NF_CM2_BM x NF_CM2_BN (rows x tokens) tile. The weight tile decodes through
  * common/quant_mmq_ref.glsl (the callback's reference points at the element's weight block, the tensor
  * layout's block size is the type's MMQ_BS; Q4_K and Q5_K read their per-row scales from workgroup memory,
  * staged once per K block and fetched one block ahead, as llama.cpp's fetch_scales / store_scales); the activation tile and the output use the engine's
  * row-major [tokens, K] / [tokens, rows] layouts through the transposed tensor view, as llama.cpp's
- * mul_mm_cm2 reads its B and stores its D matrices. The last token tile of a launch whose tokens end
+ * mul_mm_cm2 reads its B and stores its D matrices. The F16 weight is row-major [M x K] halves, read by the
+ * tensor layout with K a multiple of 8 (16-byte aligned rows). The last token tile of a launch whose tokens end
  * within its first quarter or half runs at that narrower width (llama.cpp's BNover4 / BNover2
- * matrices), so a short tail does not pay for the full tile. Products and the accumulation are fp16,
- * the accumulator saturating at +-65504 before the fp32 store: llama.cpp's coopmat2 contract for quantized
- * weights (mul_mm_cm2 ACC_TYPE float16_t with ACC_TYPE_MAX), whose tensor cores run fp16 accumulation at twice
- * the fp32 rate on GeForce parts. Measured on the RTX 5080 Laptop at 512 tokens, the fp32 accumulator of the
- * same tile reaches 38 TFLOPS on Q8_0 9728x2560 against 66 with fp16, and the driver compiles its pipelines four
- * to ten times slower. The split-K twin accumulates each slice in fp16 and LLM_SplitK_Reduce sums the slices
- * in fp32.
+ * matrices), so a short tail does not pay for the full tile. For a quantized weight the products and the
+ * accumulation are fp16, the accumulator saturating at +-65504 before the fp32 store: llama.cpp's coopmat2
+ * contract for quantized weights (mul_mm_cm2 ACC_TYPE float16_t with ACC_TYPE_MAX), whose tensor cores run fp16
+ * accumulation at twice the fp32 rate on GeForce parts. Measured on the RTX 5080 Laptop at 512 tokens, the fp32
+ * accumulator of the same tile reaches 38 TFLOPS on Q8_0 9728x2560 against 66 with fp16, and the driver compiles
+ * its pipelines four to ten times slower. The F16 rows (NF_CM2_DENSE) accumulate the fp16 products in fp32 and
+ * store every sum unclipped, the accuracy of the MMA GEMM they replace (llama.cpp's f32acc coopmat2 pipelines):
+ * an F16 checkpoint's projections reach sums past the fp16 range (pplx-embed-v1 0.6B's layer-19 feed-forward
+ * output holds an element near 2.5e5), which the saturating fp16 accumulator would clip to 65504. The split-K
+ * twin accumulates each slice in the row's accumulator type and LLM_SplitK_Reduce sums the slices in fp32.
  *
  * Dispatch: 2-D (never folded), global = {ceil(M / BM) * 256, ceil(N / BN), 1}, local = {256, 1, 1};
  * the split-K twin multiplies the x groups by the slice count and takes the slice from
@@ -65,11 +70,19 @@
 #define NF_CM2_WG 256u                        /* invocations per workgroup: the dispatch's local size */
 #define MMQ_REF_SCALE_ROWS uint(NF_CM2_BM)    /* Q4_K and Q5_K stage their scales per tile row */
 
+#ifdef NF_CM2_DENSE
+/* Dense fp16 weights: the tensor layout reads the halves directly, one element per layout "block". The rows
+ * define NF_CM2_DENSE themselves: the QT_* type ids come from common/quant_blocks.glsl, which a dense weight does
+ * not include, so QTYPE cannot be compared here. */
+#define MMQ_BS 1
+layout(std430, binding = 0) readonly buffer NfCm2Weight { float16_t w_f16[]; };
+#else
 NF_BUFFER_VIEWS(0, w)
 #include "common/quant_blocks.glsl"
 #include "common/quant_mmq_ref.glsl"
+#endif
 
-#define NF_CM2_ACC_MAX float16_t(65504.0)      /* largest finite fp16 value: the accumulator's saturation */
+#define NF_CM2_ACC_MAX float16_t(65504.0)      /* largest finite fp16 value: the fp16 accumulator's saturation */
 /* Reduction elements per unrolled group of an interior tile: one K-quant block, or eight stages of the
  * 32-element types (llama.cpp mul_mm_cm2 UNROLL_K). */
 #define NF_CM2_UNROLL_K (MMQ_BS == 256 ? 256u : 8u * NF_CM2_BK)
