@@ -108,7 +108,7 @@ void nf_fdr_poison(bool direct_out) {
 
 void main() {
     const bool direct_out = (pc.flags & NF_ATTN_FLAG_DIRECT) != 0;
-    const int unsupported = NF_ATTN_FLAG_SINKS | NF_ATTN_FLAG_V_ALIAS | NF_ATTN_FLAG_TREE;
+    const int unsupported = NF_ATTN_FLAG_V_ALIAS | NF_ATTN_FLAG_TREE;
     if (gl_WorkGroupSize.x != uint(NF_FA_WG) || pc.g_tile != 1 || pc.d_k != pc.d_v || pc.d_k <= 0
             || pc.d_k % 64 != 0 || pc.d_k > NF_FDR_MAX_D || pc.n_head_kv <= 0 || pc.n_head % pc.n_head_kv != 0
             || pc.split_len <= 0 || pc.bias_mode != NF_ATTN_BIAS_NONE || (pc.flags & unsupported) != 0
@@ -259,6 +259,12 @@ void main() {
         f[i] = m_s[i] == -NF_INF ? 0.0 : exp(m_s[i] - mt);
         lt += f[i] * l_s[i];
     }
+    float sink_f = 1.0;
+    if (direct_out && (pc.flags & NF_ATTN_FLAG_SINKS) != 0) {
+        const vec2 fl = nf_attn_sink(mt, lt, sinks[h]);
+        sink_f = fl.x;
+        lt = fl.y;
+    }
     const uint pr = (uint(h) * uint(pc.n_split) + uint(split)) * uint(pc.d_v + 2);
     for (int e = int(lid); e < pc.d_v; e += NF_FA_WG) {
         float o = 0.0;
@@ -266,7 +272,7 @@ void main() {
             o += f[i] * o_s[i * NF_FDR_MAX_D + e];
         }
         if (direct_out) {
-            dst[uint(pc.out_off + h * pc.d_v + e)] = lt > 0.0 ? o / lt : 0.0;
+            dst[uint(pc.out_off + h * pc.d_v + e)] = lt > 0.0 ? o * sink_f / lt : 0.0;
         } else {
             partial[pr + uint(e)] = o;
         }

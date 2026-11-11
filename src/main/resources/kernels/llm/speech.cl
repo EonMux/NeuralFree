@@ -259,11 +259,95 @@ NF_INLINE float nf_speech_dot(NF_GLOBAL const float* q, const nf_i64 q_off, NF_G
     return dot;
 }
 
+/* Keys whose softmax weights one work-group stages in local memory at a time. */
+#define NF_TTS_CHUNK 256
+/* Output dimensions one work-item accumulates per pass over the keys. */
+#define NF_TTS_ACC 4
+
+/*
+ * The attention of one (query row, head) over the visible key rows j_lo .. j_hi (an empty range writes zeros), run
+ * by the whole work-group:
+ *   out[o_off + d] = sum_j exp(s_j - max) * values[j][kv][d] / sum_j exp(s_j - max),
+ *   s_j = (q[q_off ..] . keys[j][kv]) / sqrt(d_head)
+ * Work-items take keys j_lo + lid, + L, ... for the scores (each dot in ascending d), the maximum is an exact tree
+ * reduction, and each chunk's weights exp(s_j - max) are staged in local memory: work-item 0 sums them in ascending
+ * j and work-item t accumulates output dimensions t, t + L, ... in ascending j. kv_off is the key head's element
+ * offset inside a row of kv_ch elements. Every work-item calls it in uniform control flow.
+ */
+NF_INLINE void nf_tts_attend(NF_GLOBAL const float* q, const nf_i64 q_off, NF_GLOBAL const float* keys,
+                             NF_GLOBAL const float* values, const int kv_ch, const int kv_off, const int d_head,
+                             const int j_lo, const int j_hi, NF_GLOBAL float* out, const nf_i64 o_off,
+                             NF_LOCAL_PTR float* w, NF_LOCAL_PTR float* red)
+{
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+    const float scale = 1.0f / sqrt((float)d_head);
+
+    float mx = -3.402823466e+38f;
+    for (int j = j_lo + lid; j <= j_hi; j += lsize) {
+        const float score = nf_speech_dot(q, q_off, keys, (nf_i64)j * kv_ch + kv_off, d_head) * scale;
+        if (score > mx) mx = score;
+    }
+    red[lid] = mx;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int stride = lsize >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride && red[lid + stride] > red[lid]) {
+            red[lid] = red[lid + stride];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    mx = red[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int d0 = 0; d0 < d_head; d0 += lsize * NF_TTS_ACC) {
+        float acc[NF_TTS_ACC];
+        for (int a = 0; a < NF_TTS_ACC; a++) {
+            acc[a] = 0.0f;
+        }
+        float sum = 0.0f;
+        for (int c0 = j_lo; c0 <= j_hi; c0 += NF_TTS_CHUNK) {
+            const int n = min(NF_TTS_CHUNK, j_hi - c0 + 1);
+            for (int t = lid; t < n; t += lsize) {
+                const float score = nf_speech_dot(q, q_off, keys, (nf_i64)(c0 + t) * kv_ch + kv_off, d_head) * scale;
+                w[t] = exp(score - mx);
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+            if (lid == 0) {
+                for (int t = 0; t < n; t++) {
+                    sum += w[t];
+                }
+            }
+            for (int a = 0; a < NF_TTS_ACC; a++) {
+                const int d = d0 + a * lsize + lid;
+                if (d < d_head) {
+                    for (int t = 0; t < n; t++) {
+                        acc[a] += w[t] * values[(nf_i64)(c0 + t) * kv_ch + kv_off + d];
+                    }
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        if (lid == 0) {
+            red[0] = sum;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        const float total = red[0];
+        const float inv = total > 0.0f ? 1.0f / total : 0.0f;
+        for (int a = 0; a < NF_TTS_ACC; a++) {
+            const int d = d0 + a * lsize + lid;
+            if (d < d_head) {
+                out[o_off + d] = acc[a] * inv;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+}
+
 /*
  * Causal attention of one step's queries over a key/value cache of rows 0..pos:
  *   out[h][d] = softmax_j(q[h] . keys[j][kv(h)] / sqrt(d_head)) * values[j][kv(h)]
  * q[n_head*d_head], keys[(pos+1)][n_head_kv*d_head], values of the same shape, out[n_head*d_head].
- * One work-item per head.
+ * One work-group per head (nf_tts_attend): global = {n_head * L}, local = {L}, L a power of two <= LLM_DIMX.
  */
 NF_KERNEL void LLM_TtsCausalAttn(
     const int n_head,
@@ -275,35 +359,13 @@ NF_KERNEL void LLM_TtsCausalAttn(
     NF_GLOBAL const float* NF_RESTRICT values,
     NF_GLOBAL float* NF_RESTRICT out)
 {
-    const int h = (int)get_global_id(0);
+    NF_LOCAL float w[NF_TTS_CHUNK];
+    NF_LOCAL float red[LLM_DIMX];
+    const int h = (int)get_group_id(0);
     if (h >= n_head) return;
-    const int heads_per_kv = n_head / n_head_kv;
-    const int kv_head = h / heads_per_kv;
-    const int kv_ch = n_head_kv * d_head;
+    const int kv_head = h / (n_head / n_head_kv);
     const nf_i64 q_off = (nf_i64)h * d_head;
-    const float scale = 1.0f / sqrt((float)d_head);
-    float max = -3.402823466e+38f;
-    for (int j = 0; j <= pos; j++) {
-        const float score = nf_speech_dot(q, q_off, keys, (nf_i64)j * kv_ch + (nf_i64)kv_head * d_head, d_head)
-                * scale;
-        if (score > max) max = score;
-    }
-    float sum = 0.0f;
-    for (int j = 0; j <= pos; j++) {
-        const float score = nf_speech_dot(q, q_off, keys, (nf_i64)j * kv_ch + (nf_i64)kv_head * d_head, d_head)
-                * scale;
-        sum += exp(score - max);
-    }
-    const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
-    for (int d = 0; d < d_head; d++) {
-        float acc = 0.0f;
-        for (int j = 0; j <= pos; j++) {
-            const float score = nf_speech_dot(q, q_off, keys, (nf_i64)j * kv_ch + (nf_i64)kv_head * d_head, d_head)
-                    * scale;
-            acc += exp(score - max) * values[(nf_i64)j * kv_ch + (nf_i64)kv_head * d_head + d];
-        }
-        out[q_off + d] = acc * inv;
-    }
+    nf_tts_attend(q, q_off, keys, values, n_head_kv * d_head, kv_head * d_head, d_head, 0, pos, out, q_off, w, red);
 }
 
 /*
@@ -311,8 +373,10 @@ NF_KERNEL void LLM_TtsCausalAttn(
  * rows (tools/mtmd/models/qwen3tts-gen.cpp:420-520): query i attends to key j when
  *   0 <= prefix + i - j < window          (the band)
  *   j - prefix + base >= 0                (the cold-start mask: no key of a negative absolute position)
+ * so its visible keys are the contiguous range max(0, prefix - base, prefix + i - window + 1) .. prefix + i.
  * q[n_q][n_head*d_head], keys[prefix+n_q][n_head_kv*d_head], values of the same shape,
- * out[n_q][n_head*d_head]. One work-item per (query row, head).
+ * out[n_q][n_head*d_head]. One work-group per (query row, head) (nf_tts_attend), group index i * n_head + h:
+ * global = {n_q * n_head * L}, local = {L}, L a power of two <= LLM_DIMX.
  */
 NF_KERNEL void LLM_TtsWindowAttn(
     const int n_q,
@@ -327,54 +391,17 @@ NF_KERNEL void LLM_TtsWindowAttn(
     NF_GLOBAL const float* NF_RESTRICT values,
     NF_GLOBAL float* NF_RESTRICT out)
 {
-    const nf_i64 idx = (nf_i64)get_global_id(0);
-    if (idx >= (nf_i64)n_q * n_head) return;
-    const int i = (int)(idx / n_head);
-    const int h = (int)(idx - (nf_i64)i * n_head);
-    const int heads_per_kv = n_head / n_head_kv;
-    const int kv_head = h / heads_per_kv;
-    const int kv_ch = n_head_kv * d_head;
-    const int total = prefix + n_q;
+    NF_LOCAL float w[NF_TTS_CHUNK];
+    NF_LOCAL float red[LLM_DIMX];
+    const nf_i64 g = (nf_i64)get_group_id(0);
+    if (g >= (nf_i64)n_q * n_head) return;
+    const int i = (int)(g / n_head);
+    const int h = (int)(g - (nf_i64)i * n_head);
+    const int kv_head = h / (n_head / n_head_kv);
     const nf_i64 q_off = (nf_i64)i * n_head * d_head + (nf_i64)h * d_head;
-    const float scale = 1.0f / sqrt((float)d_head);
-
-    float max = -3.402823466e+38f;
-    for (int j = 0; j < total; j++) {
-        const int key_pos = j - prefix + base;
-        const int diff = prefix + i - j;
-        if (key_pos < 0 || diff < 0 || diff >= window) {
-            continue;
-        }
-        const float score = nf_speech_dot(q, q_off, keys, (nf_i64)j * kv_ch + (nf_i64)kv_head * d_head, d_head)
-                * scale;
-        if (score > max) max = score;
-    }
-    float sum = 0.0f;
-    for (int j = 0; j < total; j++) {
-        const int key_pos = j - prefix + base;
-        const int diff = prefix + i - j;
-        if (key_pos < 0 || diff < 0 || diff >= window) {
-            continue;
-        }
-        const float score = nf_speech_dot(q, q_off, keys, (nf_i64)j * kv_ch + (nf_i64)kv_head * d_head, d_head)
-                * scale;
-        sum += exp(score - max);
-    }
-    const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
-    for (int d = 0; d < d_head; d++) {
-        float acc = 0.0f;
-        for (int j = 0; j < total; j++) {
-            const int key_pos = j - prefix + base;
-            const int diff = prefix + i - j;
-            if (key_pos < 0 || diff < 0 || diff >= window) {
-                continue;
-            }
-            const float score = nf_speech_dot(q, q_off, keys, (nf_i64)j * kv_ch + (nf_i64)kv_head * d_head, d_head)
-                    * scale;
-            acc += exp(score - max) * values[(nf_i64)j * kv_ch + (nf_i64)kv_head * d_head + d];
-        }
-        out[q_off + d] = acc * inv;
-    }
+    const int j_lo = max(max(0, prefix - base), prefix + i - window + 1);
+    nf_tts_attend(q, q_off, keys, values, n_head_kv * d_head, kv_head * d_head, d_head, j_lo, prefix + i, out,
+                  q_off, w, red);
 }
 
 /*
@@ -499,7 +526,8 @@ NF_KERNEL void LLM_NormalRopeRows(
  * Bidirectional attention over every row (the depthformer's codebook pass):
  *   out[r][h][d] = softmax_j(q[r][h] . keys[j][kv(h)] / sqrt(d_head)) * values[j][kv(h)]
  * q[n_pos][n_head*d_head], keys and values [n_pos][n_head_kv*d_head], out of q's shape.
- * One work-item per (row, head).
+ * One work-group per (row, head) (nf_tts_attend), group index r * n_head + h: global = {n_pos * n_head * L},
+ * local = {L}, L a power of two <= LLM_DIMX.
  */
 NF_KERNEL void LLM_TtsFullAttn(
     const int n_pos,
@@ -511,37 +539,16 @@ NF_KERNEL void LLM_TtsFullAttn(
     NF_GLOBAL const float* NF_RESTRICT values,
     NF_GLOBAL float* NF_RESTRICT out)
 {
-    const nf_i64 idx = (nf_i64)get_global_id(0);
-    if (idx >= (nf_i64)n_pos * n_head) return;
-    const int r = (int)(idx / n_head);
-    const int h = (int)(idx - (nf_i64)r * n_head);
-    const int heads_per_kv = n_head / n_head_kv;
-    const int kv_head = h / heads_per_kv;
-    const int kv_ch = n_head_kv * d_head;
+    NF_LOCAL float w[NF_TTS_CHUNK];
+    NF_LOCAL float red[LLM_DIMX];
+    const nf_i64 g = (nf_i64)get_group_id(0);
+    if (g >= (nf_i64)n_pos * n_head) return;
+    const int r = (int)(g / n_head);
+    const int h = (int)(g - (nf_i64)r * n_head);
+    const int kv_head = h / (n_head / n_head_kv);
     const nf_i64 q_off = (nf_i64)r * n_head * d_head + (nf_i64)h * d_head;
-    const float scale = 1.0f / sqrt((float)d_head);
-    float max = -3.402823466e+38f;
-    for (int j = 0; j < n_pos; j++) {
-        const float score = nf_speech_dot(q, q_off, keys, (nf_i64)j * kv_ch + (nf_i64)kv_head * d_head, d_head)
-                * scale;
-        if (score > max) max = score;
-    }
-    float sum = 0.0f;
-    for (int j = 0; j < n_pos; j++) {
-        const float score = nf_speech_dot(q, q_off, keys, (nf_i64)j * kv_ch + (nf_i64)kv_head * d_head, d_head)
-                * scale;
-        sum += exp(score - max);
-    }
-    const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
-    for (int d = 0; d < d_head; d++) {
-        float acc = 0.0f;
-        for (int j = 0; j < n_pos; j++) {
-            const float score = nf_speech_dot(q, q_off, keys, (nf_i64)j * kv_ch + (nf_i64)kv_head * d_head, d_head)
-                    * scale;
-            acc += exp(score - max) * values[(nf_i64)j * kv_ch + (nf_i64)kv_head * d_head + d];
-        }
-        out[q_off + d] = acc * inv;
-    }
+    nf_tts_attend(q, q_off, keys, values, n_head_kv * d_head, kv_head * d_head, d_head, 0, n_pos - 1, out, q_off,
+                  w, red);
 }
 
 /*

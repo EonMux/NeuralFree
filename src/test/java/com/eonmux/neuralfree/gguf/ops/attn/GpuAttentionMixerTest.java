@@ -1,5 +1,9 @@
 package com.eonmux.neuralfree.gguf.ops.attn;
 
+import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
+import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
+import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
+import com.eonmux.neuralfree.acceleration.backend.DeviceIdentity;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.arch.ActOp;
@@ -576,6 +580,83 @@ public class GpuAttentionMixerTest {
         assertEquals(Arrays.asList(GpuAttentionMixer.BIAS_ADD, GpuAttentionMixer.BIAS_ADD,
                 GpuAttentionMixer.BIAS_ADD, RopeKernels.ROPE_EXT, RopeKernels.ROPE_EXT, RopeKernels.kvStore(KvDType.F16),
                 RopeKernels.kvStore(KvDType.F16), AttnKernels.flashDecode(KvDType.F16), GpuAttentionMixer.BIAS_ADD), trace(ds));
+    }
+
+    /**
+     * A sinks layer's plain decode step on CUDA takes the grouped-query decode kernel (4 query heads over 2 KV
+     * heads), with the sink logits as its argument.
+     */
+    @Test
+    public void aSinksLayerDecodesThroughTheGroupedQueryKernelOnCuda() {
+        assertEquals(AttnKernels.flashDecodeGqa(KvDType.F16, KvDType.F16),
+                plainDecodeKernel(ComputeBackend.BackendType.CUDA, FakeComputeBackend.NVIDIA_VENDOR_ID, KvDType.F16,
+                        true));
+    }
+
+    /** Without the grouped-query kernel the sinks layer's plain decode step takes the one-row decode kernel. */
+    @Test
+    public void aSinksLayerDecodesThroughTheRowKernelWithoutTheGroupedQueryKernel() {
+        assertEquals(AttnKernels.FLASH_DECODE_ROW_F16,
+                plainDecodeKernel(ComputeBackend.BackendType.CUDA, FakeComputeBackend.NVIDIA_VENDOR_ID, KvDType.F16,
+                        true, AttnKernels.flashDecodeGqa(KvDType.F16, KvDType.F16)));
+    }
+
+    /**
+     * On Vulkan the grouped-query decode kernel serves NVIDIA devices, the vendor it was measured on; other vendors
+     * keep the split-K decode kernel.
+     */
+    @Test
+    public void theGroupedQueryKernelServesVulkanOnNvidiaDevicesOnly() {
+        assertEquals(AttnKernels.flashDecodeGqa(KvDType.Q8_0, KvDType.Q8_0),
+                plainDecodeKernel(ComputeBackend.BackendType.VULKAN, FakeComputeBackend.NVIDIA_VENDOR_ID,
+                        KvDType.Q8_0, false));
+        for (int vendor : new int[]{0x8086, 0x1002, DeviceIdentity.UNKNOWN_VENDOR}) {
+            closeRig();
+            assertEquals(AttnKernels.flashDecode(KvDType.Q8_0),
+                    plainDecodeKernel(ComputeBackend.BackendType.VULKAN, vendor, KvDType.Q8_0, false));
+        }
+    }
+
+    /**
+     * Binds a layer over {@code kv} caches (with sink logits when {@code sinks} is set) on a fake backend of the
+     * given type and vendor without the {@code missing} kernels, runs one decode step and returns the kernel of its
+     * single attention launch, after checking that a sinks layer's launch carries the flag and the sink logits.
+     */
+    private String plainDecodeKernel(ComputeBackend.BackendType type, int vendor, KvDType kv, boolean sinks,
+                                     String... missing) {
+        AttentionSpec a = llamaAttention().sinks(sinks).build();
+        ModelSpec spec = model(sinks ? Arch.OPENAI_MOE : Arch.LLAMA,
+                layerBuilder(MixerKind.ATTENTION, a).rope(rope()).build());
+        DeviceCapabilities caps = new DeviceCapabilities.Builder().deviceName("FakeGpu").totalVramBytes(8L << 30)
+                .maxAllocSizeBytes(2L << 30).computeUnits(32).maxClockFrequencyMhz(1500).maxWorkGroupSize(1024)
+                .driverVersion("fake-1.0").supportsSubgroups(true).subgroupSize(32).maxLocalMemoryBytes(48L * 1024)
+                .maxWorkGroupCount(new long[]{65535, 65535, 65535})
+                .computeCapability(type == ComputeBackend.BackendType.CUDA ? 120 : 0)
+                .feature(DeviceFeature.STORAGE_8BIT).feature(DeviceFeature.STORAGE_16BIT)
+                .feature(DeviceFeature.TIMELINE_SEMAPHORE)
+                .identity(new DeviceIdentity("FakeGpu", vendor, null, null)).build();
+        backend = FakeComputeBackend.builder().strictLlmArgs(true).backendType(type).capabilities(caps)
+                .unavailableKernels(missing).build();
+        LayerSpec l = spec.layers().get(0);
+        llamaTensors(l, false);
+        if (sinks) {
+            vector(l, TensorNames.weight(TensorNames.ATTN_SINKS), N_HEAD);
+        }
+        bindPrepared(spec, kv);
+        List<FakeDispatch> ds = run(() -> decode(2));
+        List<FakeDispatch> attn = new ArrayList<>();
+        for (String k : new String[]{AttnKernels.flashDecode(kv), AttnKernels.FLASH_DECODE_ROW_F16,
+                AttnKernels.flashDecodeGqa(kv, kv)}) {
+            attn.addAll(named(ds, k));
+        }
+        assertEquals(1, attn.size());
+        FakeDispatch fd = attn.get(0);
+        if (sinks) {
+            assertTrue((fd.intArg(AttnKernels.ARG_FD_FLAGS) & AttnKernels.FLAG_SINKS) != 0);
+            String name = TensorNames.layerName(l.stack(), 0, TensorNames.weight(TensorNames.ATTN_SINKS));
+            assertSame(tensors.get(name).shard(0), fd.bufferArg(AttnKernels.ARG_FD_BUF_SINKS));
+        }
+        return fd.kernelName();
     }
 
     /**

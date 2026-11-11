@@ -21,6 +21,8 @@ import java.util.List;
 final class GpuFlashAttention {
 
     private final FlashAttnTiling decodePlan;
+    /** The split plan of {@link #rowDecode}'s launches ({@link FlashPlan#rowPlan}); null without a row kernel. */
+    private final FlashAttnTiling rowPlan;
     private final FlashAttnTiling prefillPlan;
     private final PreparedDispatch decode;
     /**
@@ -64,6 +66,7 @@ final class GpuFlashAttention {
                               GpuPagedFlashAttention paged, StaticSinkPartial sinkPartial, PreparedDispatch lse) {
         AttentionSpec a = args.attention();
         this.decodePlan = plan.decode();
+        this.rowPlan = plan.rowPlan();
         this.prefillPlan = plan.prefill();
         this.decode = decode;
         this.rowDecode = rowDecode;
@@ -110,7 +113,7 @@ final class GpuFlashAttention {
      */
     FlashDecodePatcher patcher() {
         if (patcher == null) {
-            patcher = new FlashDecodePatcher(decodePlan, cached, keyRowBase, keyRows, nHead, flags,
+            patcher = new FlashDecodePatcher(plainPlan(), cached, keyRowBase, keyRows, nHead, flags,
                     sinkPartial != null, lse != null, mergesEveryRow(), k, q, plainDecode(), combine.dispatch(), lse,
                     sinkPartial != null ? sinkPartial.dispatch() : null);
         }
@@ -151,8 +154,8 @@ final class GpuFlashAttention {
         PreparedDispatch decode = res.prepare(plan.decodeKernel(), plan.decode().decodeGlobal(1),
                 plan.decode().decodeLocalSize(), args.decode(plan.decode()));
         PreparedDispatch rowDecode = plan.rowKernel() == null ? null
-                : res.prepare(plan.rowKernel(), plan.decode().decodeGlobal(1), FlashAttnTiling.decodeLocal(),
-                        args.decode(plan.decode()));
+                : res.prepare(plan.rowKernel(), plan.rowPlan().decodeGlobal(1), FlashAttnTiling.decodeLocal(),
+                        args.decode(plan.rowPlan()));
         PreparedDispatch prefill = BatchInvariance.enabled() ? null : preparePrefill(res, plan, args, ubatch);
         FlashCombine combine = new FlashCombine(res.prepare(AttnKernels.FLASH_COMBINE,
                 FlashAttnTiling.combineGlobal(nHead), FlashAttnTiling.combineLocal(), args.combine()), nHead);
@@ -390,15 +393,17 @@ final class GpuFlashAttention {
     }
 
     /**
-     * One query row of the decode kernel. Split count and length follow the live key count
-     * ({@link FlashAttnTiling#decodeSplit}), and the grid follows the count. {@code treeMask} is the step's tree
+     * One query row of the decode kernel. Split count and length follow the live key count under the launch's plan
+     * ({@link FlashAttnTiling#decodeSplit}: the row kernel's own plan for a row without a tree mask), and the grid
+     * follows the count. {@code treeMask} is the step's tree
      * mask (the row reads its word at {@code tree_mask[0]}, the step's one fresh row), or null. A row without a
      * tree mask on the plan's one-row kernel always writes its partial and merges it ({@link #mergesEveryRow}).
      */
     private void decodeRow(int qPos, int row, int nKeys, GpuBuffer treeMask) {
-        FlashAttnTiling.Split s = decodePlan.decodeSplit(nKeys);
-        int count = s.count();
         boolean tree = treeMask != null;
+        FlashAttnTiling launchPlan = tree ? decodePlan : plainPlan();
+        FlashAttnTiling.Split s = launchPlan.decodeSplit(nKeys);
+        int count = s.count();
         boolean direct = s.direct() && sinkPartial == null && lse == null && (tree || !mergesEveryRow());
         int layoutSplits = count + (sinkPartial != null ? 1 : 0);
         PreparedDispatch decode = tree ? this.decode : plainDecode();
@@ -412,7 +417,7 @@ final class GpuFlashAttention {
         decode.setInt(AttnKernels.ARG_FD_FLAGS, stepFlags(flags, direct, tree, 1));
         decode.setInt(AttnKernels.ARG_FD_Q_OFF, row * qDim);
         decode.setInt(AttnKernels.ARG_FD_OUT_OFF, direct ? row * outDim : 0);
-        decode.setGlobal(decodePlan.decodeGlobal(count));
+        decode.setGlobal(launchPlan.decodeGlobal(count));
         decode.dispatch();
         if (!direct) {
             int splits = count;
@@ -430,6 +435,11 @@ final class GpuFlashAttention {
     /** The decode launch of a row without a tree mask: the plan's one-row kernel when it has one. */
     private PreparedDispatch plainDecode() {
         return rowDecode != null ? rowDecode : decode;
+    }
+
+    /** The split plan of {@link #plainDecode}'s launches. */
+    private FlashAttnTiling plainPlan() {
+        return rowDecode != null ? rowPlan : decodePlan;
     }
 
     /**

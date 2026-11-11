@@ -1,5 +1,5 @@
 # kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
-# Tiled prefill GEMM for every weight type (kernels/llm/matmul_tiled.cl via kernels/llm/common/matmul_tiled_family.h) and the sampling partial top-k (kernels/llm/sampling_topk.cl).
+# Tiled prefill GEMM for every weight type (kernels/llm/matmul_tiled.cl via kernels/llm/common/matmul_tiled_family.h).
 F32_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_F32
 F16_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_F16
 BF16_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_BF16
@@ -45,4 +45,3 @@ F8_E5M2_Hw_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_F8_E5M2
 F8_E4M3_Hw_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_F8_E4M3
 F8_E4M3_B128_Hw_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_F8_E4M3_B128
 MXFP8_Hw_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_MXFP8
-LLM_TopK_Partial	topk_partial.comp

@@ -25,9 +25,10 @@ import java.util.List;
  *   <li>{@link #HEAD_RMS_NORM_ROPE} {@code (n_heads, head_dim, pos, theta_scale(f), eps(f); x, w, y)}: per-head RMS
  *       norm and NEOX RoPE at one step position.</li>
  *   <li>{@link #TTS_CAUSAL_ATTN} {@code (n_head, n_head_kv, d_head, pos; q, keys, values, out)}: one step's causal
- *       attention over cache rows {@code 0..pos}.</li>
+ *       attention over cache rows {@code 0..pos}; one work-group per head ({@link #causalAttentionGlobal}).</li>
  *   <li>{@link #TTS_WINDOW_ATTN} {@code (n_q, n_head, n_head_kv, d_head, prefix, window, base; q, keys, values,
- *       out)}: the banded causal window attention over a persisted prefix.</li>
+ *       out)}: the banded causal window attention over a persisted prefix; one work-group per (query row,
+ *       head).</li>
  *   <li>{@link #RVQ_SUM_ROWS} {@code (n_pages, n_frames, dim; x, y)}: per-frame sum of a codebook group's rows.</li>
  *   <li>{@link #MATVEC_ROWS_F32} {@code (cols, rows, row_off; w, x, y)}: one page of a stacked F32 LM head.</li>
  *   <li>{@link #RMS_NORM_ROPE_ROWS} {@code (rows, n_heads, head_dim, pos_base, off, theta_scale(f), eps(f); x, w,
@@ -35,7 +36,7 @@ import java.util.List;
  *   <li>{@link #NORMAL_ROPE_ROWS} {@code (rows, n_heads, head_dim, pos_base, off, theta_scale(f); x, y)}: per-head
  *       NORMAL (adjacent-pair) RoPE over a block of rows.</li>
  *   <li>{@link #TTS_FULL_ATTN} {@code (n_pos, n_head, n_head_kv, d_head; q, keys, values, out)}: bidirectional
- *       attention over every row.</li>
+ *       attention over every row; one work-group per (row, head).</li>
  *   <li>{@link #HEAD_SIGMOID_GATE} {@code (n_rows, n_head, d_head; x, gate, y)}: per-head sigmoid gate.</li>
  *   <li>{@link #ROW_SCALE_ADD} {@code (rows, cols, scale_off; a, b, scale, y)}: {@code a + b * scale[c]}.</li>
  *   <li>{@link #ROW_AFFINE} {@code (rows, cols; x, scale, bias, y)}: per-channel affine.</li>
@@ -111,9 +112,14 @@ public final class SpeechKernels {
         return roundUp(n, LOCAL);
     }
 
-    /** Global size of {@link #TTS_WINDOW_ATTN}: one work-item per query row and head. */
+    /** Global size of {@link #TTS_CAUSAL_ATTN}: one work-group of {@link #LOCAL} per head. */
+    public static long causalAttentionGlobal(int nHead) {
+        return (long) nHead * LOCAL;
+    }
+
+    /** Global size of {@link #TTS_WINDOW_ATTN}: one work-group of {@link #LOCAL} per query row and head. */
     public static long windowAttentionGlobal(int nQ, int nHead) {
-        return roundUp((long) nQ * nHead, LOCAL);
+        return (long) nQ * nHead * LOCAL;
     }
 
     /** Global size of {@link #HEAD_RMS_NORM_ROPE}: one work-item per head and rotation pair. */
@@ -126,9 +132,9 @@ public final class SpeechKernels {
         return roundUp((long) rows * nHeads * (headDim / 2), LOCAL);
     }
 
-    /** Global size of {@link #TTS_FULL_ATTN}: one work-item per (row, head). */
+    /** Global size of {@link #TTS_FULL_ATTN}: one work-group of {@link #LOCAL} per (row, head). */
     public static long fullAttentionGlobal(int nPos, int nHead) {
-        return roundUp((long) nPos * nHead, LOCAL);
+        return (long) nPos * nHead * LOCAL;
     }
 
     /** Global size of {@link #HEAD_SIGMOID_GATE}: one work-item per (row, head). */

@@ -22,8 +22,9 @@ import static org.junit.Assert.assertTrue;
  * the mma prefill only where the decode fast path cannot serve the step (the plan-level refusals, a paged
  * cache, or at most one workgroup of live keys) and the mma kernel exists. The mixer dispatches the base
  * kernel over a dense cache (its identity paging); the paged kernel serves launches over a
- * paginated cache. The one-row decode kernel {@code LLM_FlashDecodeRow_F16} serves the plain step of a dense F16
- * cache, which then never routes through the mma prefill; on Vulkan it serves NVIDIA devices only.
+ * paginated cache. The one-row decode kernels (the per-head {@code LLM_FlashDecodeRow_F16} for a dense F16 cache, the
+ * grouped-query {@code LLM_FlashDecodeGqa_<KV>} where it serves) take the plain step, which then never routes through
+ * the mma prefill; on Vulkan they serve NVIDIA devices only.
  */
 public class GpuAttentionMixerMmaSelectionTest {
 
@@ -82,43 +83,41 @@ public class GpuAttentionMixerMmaSelectionTest {
     @Test
     public void theRowKernelServesThePlainStepOfADenseF16Cache() {
         String row = AttnKernels.FLASH_DECODE_ROW_F16;
-        assertEquals(row, FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, false, 128, 128, BiasMode.NONE, false,
+        assertEquals(row, FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, false, 128, 128, BiasMode.NONE,
                 1024, 1024, false));
-        assertEquals(row, FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, false, 64, 64, BiasMode.NONE, false,
+        assertEquals(row, FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, false, 64, 64, BiasMode.NONE,
                 512, 512, false));
-        assertEquals(row, FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, false, 256, 256, BiasMode.NONE, false,
+        assertEquals(row, FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, false, 256, 256, BiasMode.NONE,
                 2048, 2048, false));
     }
 
     @Test
     public void theGenericDecodeKernelServesEveryOtherStep() {
         // other cache types, or V read through the K rows
-        assertNull(FlashPlan.rowKernelName(KvDType.Q8_0, KvDType.Q8_0, false, 128, 128, BiasMode.NONE, false,
+        assertNull(FlashPlan.rowKernelName(KvDType.Q8_0, KvDType.Q8_0, false, 128, 128, BiasMode.NONE,
                 1024, 1024, false));
-        assertNull(FlashPlan.rowKernelName(KvDType.F16, KvDType.F32, false, 128, 128, BiasMode.NONE, false,
+        assertNull(FlashPlan.rowKernelName(KvDType.F16, KvDType.F32, false, 128, 128, BiasMode.NONE,
                 1024, 1024, false));
-        assertNull(FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, true, 128, 128, BiasMode.NONE, false,
+        assertNull(FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, true, 128, 128, BiasMode.NONE,
                 1024, 1024, false));
         // head dims: unequal, not a multiple of 64, above the kernel's 256
-        assertNull(FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, false, 128, 64, BiasMode.NONE, false,
+        assertNull(FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, false, 128, 64, BiasMode.NONE,
                 1024, 512, false));
-        assertNull(FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, false, 96, 96, BiasMode.NONE, false,
+        assertNull(FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, false, 96, 96, BiasMode.NONE,
                 768, 768, false));
-        assertNull(FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, false, 512, 512, BiasMode.NONE, false,
+        assertNull(FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, false, 512, 512, BiasMode.NONE,
                 4096, 4096, false));
-        // position biases, sink logits, odd strides, a paged cache
-        assertNull(FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, false, 128, 128, BiasMode.ALIBI, false,
+        // position biases, odd strides, a paged cache
+        assertNull(FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, false, 128, 128, BiasMode.ALIBI,
                 1024, 1024, false));
-        assertNull(FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, false, 128, 128, BiasMode.NONE, true,
-                1024, 1024, false));
-        assertNull(FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, false, 128, 128, BiasMode.NONE, false,
+        assertNull(FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, false, 128, 128, BiasMode.NONE,
                 1025, 1024, false));
-        assertNull(FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, false, 128, 128, BiasMode.NONE, false,
+        assertNull(FlashPlan.rowKernelName(KvDType.F16, KvDType.F16, false, 128, 128, BiasMode.NONE,
                 1024, 1024, true));
     }
 
     @Test
-    public void theRowKernelServesVulkanOnNvidiaDevicesOnly() {
+    public void theRowKernelsServeVulkanOnNvidiaDevicesOnly() {
         assertTrue(rowPath(BackendType.CUDA, 0x10DE));
         assertTrue(rowPath(BackendType.VULKAN, 0x10DE));
         assertFalse("AMD", rowPath(BackendType.VULKAN, 0x1002));

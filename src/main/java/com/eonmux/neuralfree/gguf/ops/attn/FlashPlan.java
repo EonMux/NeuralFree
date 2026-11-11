@@ -11,10 +11,12 @@ import com.eonmux.neuralfree.gguf.spec.AttentionSpec.BiasMode;
  * ({@link FlashAttnTiling.Plan#TILED}, the tensor-core {@link FlashAttnTiling.Plan#MMA} on a backend whose device
  * runs the mma attention ({@link LlmKernels#flashMmaPath()}) with F16 caches, or the per-row decode fallback), the
  * paged decode plan and paged prefill kernel of a paged cache (with the CUDA grouped-query paged decode kernel where
- * it serves the caches), the one-row decode kernel ({@link #rowKernel}) and the split-K partial capacity every
- * plan's launches fit in. The dense and paged decode plans and the tiled prefill plan share one form: the subgroup
- * kernels where {@link SubgroupFlashAttention#serves} holds, the portable ones otherwise, with the kernel names of
- * {@link #decodeKernel}, {@link #pagedDecodeKernel}, {@link #tiledKernel} and {@link #pagedPrefillKernel}.
+ * it serves the caches), the one-row decode kernel ({@link #rowKernel}: the grouped-query dense decode kernel
+ * where it serves the caches, with its own split plan, else the per-head one-row kernel under the decode plan;
+ * {@link #rowPlan}) and the split-K partial capacity every plan's launches fit in. The dense and paged decode plans
+ * and the tiled prefill plan share one form: the subgroup kernels where {@link SubgroupFlashAttention#serves}
+ * holds, the portable ones otherwise, with the kernel names of {@link #decodeKernel}, {@link #pagedDecodeKernel},
+ * {@link #tiledKernel} and {@link #pagedPrefillKernel}.
  * Immutable.
  */
 final class FlashPlan {
@@ -30,8 +32,16 @@ final class FlashPlan {
     private final String pagedGqaKernel;
     private final long partialCapacity;
     private final boolean depthRouted;
-    /** The one-row decode kernel of the plain step ({@link #rowKernelName}); null where it does not serve. */
+    /**
+     * The one-row decode kernel of the plain step: the grouped-query {@link #gqaRowKernelName} or the per-head
+     * {@link #rowKernelName}; null where neither serves.
+     */
     private final String rowKernel;
+    /**
+     * The split plan of {@link #rowKernel}'s launches: {@link FlashAttnTiling#decodeOnline} for the grouped-query
+     * kernel, the decode plan for the per-head one; null without a row kernel.
+     */
+    private final FlashAttnTiling rowPlan;
 
     /**
      * Largest query heads per KV head for which the one-row step leaves the MMA prefill past one workgroup of
@@ -45,7 +55,8 @@ final class FlashPlan {
 
     private FlashPlan(FlashAttnTiling decode, String decodeKernel, String pagedDecodeKernel, FlashAttnTiling prefill,
                       String tiledKernel, String mmaKernel, FlashAttnTiling paged, String pagedPrefillKernel,
-                      String pagedGqaKernel, long partialCapacity, boolean depthRouted, String rowKernel) {
+                      String pagedGqaKernel, long partialCapacity, boolean depthRouted, String rowKernel,
+                      FlashAttnTiling rowPlan) {
         this.decode = decode;
         this.decodeKernel = decodeKernel;
         this.pagedDecodeKernel = pagedDecodeKernel;
@@ -58,6 +69,7 @@ final class FlashPlan {
         this.partialCapacity = partialCapacity;
         this.depthRouted = depthRouted;
         this.rowKernel = rowKernel;
+        this.rowPlan = rowPlan;
     }
 
     /**
@@ -111,29 +123,88 @@ final class FlashPlan {
             pagedGqa = subgroup ? null : pagedGqaKernel(kernels, paged, keys);
             cap = Math.max(cap, paged.decodePagedPartialFloats(pg.maxLaunchSeq()));
         }
+        String row = subgroup ? null : rowKernel(kernels, a, keys, pg != null);
+        FlashAttnTiling rowPlan = null;
+        if (row != null) {
+            rowPlan = rowPlan(row, decode, a.nHead(), a.nHeadKv(), a.headDimK(), a.headDimV(), rows, smem, cu);
+            /* a layer with static sink tokens lays its partials out for one split past the cached ones */
+            int layoutSplits = rowPlan.maxSplits() + (a.sinkTokens() > 0 ? 1 : 0);
+            cap = Math.max(cap, FlashAttnTiling.partialFloats(a.nHead(), layoutSplits, a.headDimV()));
+        }
         if (cap > Integer.MAX_VALUE) {
             throw new IllegalArgumentException("flash partials of " + cap + " floats exceed one buffer");
         }
-        String rowName = subgroup ? null : rowKernelName(keys.typeK(), keys.typeV(), keys.vAliasesK(), a.headDimK(),
-                a.headDimV(), a.biasMode(), a.sinks(), keys.kRowStride(), keys.vRowStride(), pg != null);
-        String row = rowName != null && kernels.flashDecodeRowPath() && kernels.has(rowName) ? rowName : null;
         return new FlashPlan(decode, decodeKernel, pagedDecodeKernel, prefill, tiledKernel, mma, paged, pagedPrefill,
-                pagedGqa, cap, row == null && depthRouted(mma, fast, pg != null, a.nHead(), a.nHeadKv()), row);
+                pagedGqa, cap, row == null && depthRouted(mma, fast, pg != null, a.nHead(), a.nHeadKv()), row,
+                rowPlan);
+    }
+
+    /**
+     * The one-row decode kernel of the layer's plain step on this backend, where the backend runs the one-row
+     * kernels ({@link LlmKernels#flashDecodeRowPath()}): the grouped-query {@link #gqaRowKernelName} where the
+     * backend has it, else the per-head {@link #rowKernelName}; null when neither serves. The grouped-query kernel
+     * reads each K and V row once for the whole group instead of once per query head, which is what a long-context
+     * step is bound by.
+     */
+    private static String rowKernel(LlmKernels kernels, AttentionSpec a, FlashKeys keys, boolean paged) {
+        if (!kernels.flashDecodeRowPath()) {
+            return null;
+        }
+        String gqa = gqaRowKernelName(keys.typeK(), keys.typeV(), keys.vAliasesK(), a.nHead(), a.nHeadKv(),
+                a.headDimK(), a.headDimV(), keys.kRowStride(), keys.vRowStride(), paged);
+        if (gqa != null && kernels.has(gqa)) {
+            return gqa;
+        }
+        String rowName = rowKernelName(keys.typeK(), keys.typeV(), keys.vAliasesK(), a.headDimK(), a.headDimV(),
+                a.biasMode(), keys.kRowStride(), keys.vRowStride(), paged);
+        return rowName != null && kernels.has(rowName) ? rowName : null;
+    }
+
+    /**
+     * The split plan of the one-row decode kernel {@code row}: the grouped-query kernel's own
+     * {@link FlashAttnTiling#decodeOnline}, a few long splits filling the units at every depth; the per-head
+     * {@value AttnKernels#FLASH_DECODE_ROW_F16} keeps the layer's {@code decode} plan. Measured with the per-head
+     * kernel on the RTX 5080 Laptop (tg128 at 4096 and 16384 cached keys, Qwen3-Embedding 0.6B and 4B), the decode
+     * plan leads the online plan on Vulkan at every point (248 against 228 t/s for 0.6B at 4096, 47 against 40 for
+     * 4B at 16384) and the result is mixed on CUDA (at 16384: 0.6B 128 against 131 t/s, 4B 56 against 52).
+     */
+    static FlashAttnTiling rowPlan(String row, FlashAttnTiling decode, int nHead, int nHeadKv, int dK, int dV,
+                                   int rows, int smem, int cu) {
+        return row.equals(AttnKernels.FLASH_DECODE_ROW_F16) ? decode
+                : FlashAttnTiling.decodeOnline(nHead, nHeadKv, dK, dV, rows, smem, cu);
+    }
+
+    /**
+     * The grouped-query dense decode kernel ({@link AttnKernels#flashDecodeGqa}) when it serves the layer's plain
+     * step: one F16, BF16 or Q8_0 type for K and V (V not read through K), a grouped-query shape it holds
+     * ({@link FlashAttnTiling#gqaDecodeServes}) with at least two query heads per KV head, row strides of whole
+     * 16-byte vectors (whole blocks for Q8_0, {@link AttnKernels#gqaStrideUnit}) and a dense cache. Null otherwise;
+     * the caller still requires {@link LlmKernels#flashDecodeRowPath()} and {@code kernels.has(name)} (the CUDA
+     * fatbins and the Vulkan shader set hold it). It takes
+     * {@code LLM_FlashDecode_<KV>}'s arguments and serves every position bias, softcap, sliding window and sink rule
+     * the generic kernel does.
+     */
+    static String gqaRowKernelName(KvDType typeK, KvDType typeV, boolean vAliasesK, int nHead, int nHeadKv, int dK,
+                                   int dV, int kRowStride, int vRowStride, boolean paged) {
+        boolean shape = FlashAttnTiling.gqaDecodeServes(nHead, nHeadKv, dK, dV) && nHead >= 2 * nHeadKv;
+        boolean layout = !vAliasesK && !paged && kRowStride % AttnKernels.gqaStrideUnit(typeK) == 0
+                && vRowStride % AttnKernels.gqaStrideUnit(typeV) == 0;
+        return shape && layout ? AttnKernels.flashDecodeGqa(typeK, typeV) : null;
     }
 
     /**
      * The one-row decode kernel {@value AttnKernels#FLASH_DECODE_ROW_F16} when it serves the layer's plain step:
      * F16 K and V caches (V not read through K), equal head dims that are multiples of 64 of at most
-     * {@value AttnKernels#FLASH_DECODE_ROW_MAX_D}, no position bias and no sink logits, even row strides and a dense
-     * cache. Null otherwise; the caller still requires {@link LlmKernels#flashDecodeRowPath()} and
-     * {@code kernels.has(name)} (the CUDA fatbins and the Vulkan shader set hold it). It takes
-     * {@code LLM_FlashDecode_F16}'s arguments and replaces it for every one-row launch without a tree mask (see
-     * {@code flash_decode_row.cl}).
+     * {@value AttnKernels#FLASH_DECODE_ROW_MAX_D}, no position bias, even row strides and a dense cache (sink logits
+     * are served: the direct output merges them, the split partials leave them to the combine). Null otherwise; the
+     * caller still requires {@link LlmKernels#flashDecodeRowPath()} and {@code kernels.has(name)} (the CUDA fatbins
+     * and the Vulkan shader set hold it). It takes {@code LLM_FlashDecode_F16}'s arguments and replaces it for every
+     * one-row launch without a tree mask (see {@code flash_decode_row.cl}).
      */
     static String rowKernelName(KvDType typeK, KvDType typeV, boolean vAliasesK, int dK, int dV, BiasMode bias,
-                                boolean sinks, int kRowStride, int vRowStride, boolean paged) {
+                                int kRowStride, int vRowStride, boolean paged) {
         boolean shape = dK == dV && dK % 64 == 0 && dK <= AttnKernels.FLASH_DECODE_ROW_MAX_D;
-        boolean plain = bias == BiasMode.NONE && !sinks && !vAliasesK && !paged;
+        boolean plain = bias == BiasMode.NONE && !vAliasesK && !paged;
         boolean layout = typeK == KvDType.F16 && typeV == KvDType.F16 && kRowStride % 2 == 0
                 && vRowStride % 2 == 0;
         return shape && plain && layout ? AttnKernels.FLASH_DECODE_ROW_F16 : null;
@@ -176,14 +247,14 @@ final class FlashPlan {
 
     /**
      * The grouped-query paged decode kernel ({@link AttnKernels#flashDecodePagedGqa}) of the paged decode plan when
-     * the backend has it and it serves the caches: one F16 or BF16 type for K and V, no V alias, row strides of
-     * whole 16-byte vectors, and a plan whose geometry and partial buffer it fits
+     * the backend has it and it serves the caches: one F16, BF16 or Q8_0 type for K and V, no V alias, row strides
+     * of whole 16-byte vectors (whole Q8_0 blocks), and a plan whose geometry and partial buffer it fits
      * ({@link FlashAttnTiling#gqaDecodeUsable}); null otherwise.
      */
     static String pagedGqaKernel(LlmKernels kernels, FlashAttnTiling paged, FlashKeys keys) {
         String name = AttnKernels.flashDecodePagedGqa(keys.typeK(), keys.typeV());
-        if (name == null || keys.vAliasesK() || keys.kRowStride() % 8 != 0 || keys.vRowStride() % 8 != 0
-                || !paged.gqaDecodeUsable()) {
+        if (name == null || keys.vAliasesK() || keys.kRowStride() % AttnKernels.gqaStrideUnit(keys.typeK()) != 0
+                || keys.vRowStride() % AttnKernels.gqaStrideUnit(keys.typeV()) != 0 || !paged.gqaDecodeUsable()) {
             return null;
         }
         return kernels.has(name) ? name : null;
@@ -251,6 +322,11 @@ final class FlashPlan {
      */
     String rowKernel() {
         return rowKernel;
+    }
+
+    /** The split plan of {@link #rowKernel}'s launches; null without a row kernel. */
+    FlashAttnTiling rowPlan() {
+        return rowPlan;
     }
 
     /**

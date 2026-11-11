@@ -103,6 +103,11 @@ public final class AttnKernels {
      * {@code LLM_FlashDecodePaged_<KV>} arguments, every query head of a KV group in one work-group); CUDA only.
      */
     public static final String FLASH_DECODE_PAGED_GQA_PREFIX = "LLM_FlashDecodePagedGqa_";
+    /**
+     * Name prefix of the grouped-query dense decode variants ({@code LLM_FlashDecodeGqa_<KV>}, the
+     * {@code LLM_FlashDecode_<KV>} arguments, every query head of a KV group in one work-group); CUDA and Vulkan.
+     */
+    public static final String FLASH_DECODE_GQA_PREFIX = "LLM_FlashDecodeGqa_";
 
     /** Bits of one type code in the packed {@code kv_types} argument ({@code NF_ATTN_KV_TYPE_BITS}). */
     public static final int KV_TYPE_BITS = 8;
@@ -573,13 +578,35 @@ public final class AttnKernels {
 
     /**
      * Grouped-query paged decode kernel ({@code LLM_FlashDecodePagedGqa_<KV>}, CUDA only) over a K cache of type
-     * {@code k} and a V cache of type {@code v}: the F16 and BF16 caches with both caches of one type; null for
-     * every other pair, so only a caller that has checked {@link FlashAttnTiling#gqaDecodeServes} reaches it.
+     * {@code k} and a V cache of type {@code v}: the F16, BF16 and Q8_0 caches with both caches of one type; null
+     * for every other pair, so only a caller that has checked {@link FlashAttnTiling#gqaDecodeServes} reaches it.
      */
     public static String flashDecodePagedGqa(KvDType k, KvDType v) {
         Objects.requireNonNull(k, "k");
         Objects.requireNonNull(v, "v");
-        return k == v && (k == KvDType.F16 || k == KvDType.BF16) ? k.kernel(FLASH_DECODE_PAGED_GQA_PREFIX) : null;
+        return k == v && gqaType(k) ? k.kernel(FLASH_DECODE_PAGED_GQA_PREFIX) : null;
+    }
+
+    /**
+     * Grouped-query dense decode kernel ({@code LLM_FlashDecodeGqa_<KV>}, CUDA and Vulkan): the dense twin of
+     * {@link #flashDecodePagedGqa(KvDType, KvDType)} over the same cache pairs, null for every other pair.
+     */
+    public static String flashDecodeGqa(KvDType k, KvDType v) {
+        Objects.requireNonNull(k, "k");
+        Objects.requireNonNull(v, "v");
+        return k == v && gqaType(k) ? k.kernel(FLASH_DECODE_GQA_PREFIX) : null;
+    }
+
+    /**
+     * The row-stride granularity, in elements, of the grouped-query decode kernels over a cache of type {@code t}:
+     * a whole Q8_0 block (32) or a whole 16-byte vector of F16 / BF16 (8).
+     */
+    public static int gqaStrideUnit(KvDType t) {
+        return t == KvDType.Q8_0 ? 32 : 8;
+    }
+
+    private static boolean gqaType(KvDType t) {
+        return t == KvDType.F16 || t == KvDType.BF16 || t == KvDType.Q8_0;
     }
 
     /**
@@ -606,10 +633,11 @@ public final class AttnKernels {
     }
 
     /**
-     * Every kernel of this family that each backend provides, for {@code LlmKernels.prewarm}. The CUDA-only
-     * kernels are absent: hosts look the tensor-core mma kernels (compute capability 8.0+) up through
-     * {@link #flashAttnMma(KvDType)} and {@link #flashAttnMmaPaged(KvDType)}, and the grouped-query paged decode
-     * through {@link #flashDecodePagedGqa(KvDType, KvDType)}.
+     * Every kernel of this family that each backend provides, for {@code LlmKernels.prewarm}. The kernels only some
+     * backends build are absent: hosts look the tensor-core mma kernels (CUDA compute capability 8.0+, Vulkan with
+     * {@code VK_NV_cooperative_matrix2}) up through {@link #flashAttnMma(KvDType)} and
+     * {@link #flashAttnMmaPaged(KvDType)}, and the grouped-query decodes (the dense one CUDA and Vulkan, the paged
+     * one CUDA) through {@link #flashDecodeGqa(KvDType, KvDType)} and {@link #flashDecodePagedGqa(KvDType, KvDType)}.
      */
     public static List<String> all() {
         return ALL;

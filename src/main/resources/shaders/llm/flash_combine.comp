@@ -11,7 +11,8 @@
  *   LLM_FlashAttn_Combine
  *     (i n_rows, i d_v, i n_split, i n_head, i has_sinks, i out_off, R partial, R sinks, W out)
  *     Dispatch: 1-D, global {n_rows * 128}, local {128, 1, 1}; one workgroup per row, folded group counts
- *     are recovered by nf_wg_id(). No barriers, so any local size is valid.
+ *     are recovered by nf_wg_id(). The split weights are staged in shared memory once per row (see the OpenCL
+ *     source); a local size above NF_FC_MAX_WG, or d_v above NF_FC_ACC * local size, runs the barrier-free form.
  *   LLM_FlashAttn_Lse
  *     (i n_rows, i d_v, i n_split, i n_head, i has_sinks, i out_off, R partial, R sinks, W lse)
  *     Dispatch as LLM_FlashAttn_Combine; only local id 0 writes the row's value.
@@ -140,41 +141,104 @@ layout(push_constant) uniform NfFcParams {
     int n_rows; int d_v; int n_split; int n_head; int has_sinks; int out_off;
 } pc;
 
+#define NF_FC_STAGE  256u  /* split weights staged at once */
+#define NF_FC_ACC    8u    /* output elements per invocation in the staged form */
+#define NF_FC_MAX_WG 256u  /* largest local size of the staged form */
+
+shared float w_s[NF_FC_STAGE];
+shared float l_s[NF_FC_STAGE];
+shared float red_s[NF_FC_MAX_WG];
+
 void main() {
     const uint row = nf_wg_id();
     if (row >= uint(pc.n_rows)) {
         return;
     }
     const uint lid = gl_LocalInvocationID.x;
+    const uint lsz = gl_WorkGroupSize.x;
     const uint d_v = uint(pc.d_v);
     const uint stride = d_v + 2u;
     const uint n_split = uint(pc.n_split);
     const uint pr = row * n_split * stride;
     const uint ob = uint(pc.out_off) + row * d_v;
-
     const float sink = pc.has_sinks != 0 ? sinks[row % uint(pc.n_head)] : -NF_INF;
-    float m = sink;
-    for (uint s = 0u; s < n_split; s++) {
-        m = max(m, partial[pr + s * stride + d_v]);
-    }
-    if (m == -NF_INF) {
-        for (uint d = lid; d < d_v; d += gl_WorkGroupSize.x) {
-            dst[ob + d] = 0.0;
+
+    if (lsz > NF_FC_MAX_WG || d_v > NF_FC_ACC * lsz) {
+        float m = sink;
+        for (uint s = 0u; s < n_split; s++) {
+            m = max(m, partial[pr + s * stride + d_v]);
+        }
+        if (m == -NF_INF) {
+            for (uint d = lid; d < d_v; d += lsz) {
+                dst[ob + d] = 0.0;
+            }
+            return;
+        }
+        float l = nf_attn_rescale(sink, m);
+        for (uint s = 0u; s < n_split; s++) {
+            const uint ps = pr + s * stride;
+            l += partial[ps + d_v + 1u] * nf_attn_rescale(partial[ps + d_v], m);
+        }
+        for (uint d = lid; d < d_v; d += lsz) {
+            float o = 0.0;
+            for (uint s = 0u; s < n_split; s++) {
+                const uint ps = pr + s * stride;
+                o += partial[ps + d] * nf_attn_rescale(partial[ps + d_v], m);
+            }
+            dst[ob + d] = l > 0.0 ? o / l : 0.0;
         }
         return;
     }
-    float l = nf_attn_rescale(sink, m);
-    for (uint s = 0u; s < n_split; s++) {
-        const uint ps = pr + s * stride;
-        l += partial[ps + d_v + 1u] * nf_attn_rescale(partial[ps + d_v], m);
+
+    float mi = -NF_INF;
+    for (uint s = lid; s < n_split; s += lsz) {
+        mi = max(mi, partial[pr + s * stride + d_v]);
     }
-    for (uint d = lid; d < d_v; d += gl_WorkGroupSize.x) {
-        float o = 0.0;
-        for (uint s = 0u; s < n_split; s++) {
-            const uint ps = pr + s * stride;
-            o += partial[ps + d] * nf_attn_rescale(partial[ps + d_v], m);
+    red_s[lid] = mi;
+    barrier();
+    float m = sink;
+    for (uint i = 0u; i < lsz; i++) {
+        m = max(m, red_s[i]);
+    }
+    if (m == -NF_INF) {
+        for (uint d = lid; d < d_v; d += lsz) {
+            dst[ob + d] = 0.0;
         }
-        dst[ob + d] = l > 0.0 ? o / l : 0.0;
+        return;   /* uniform: every invocation read the same m */
+    }
+    float l = nf_attn_rescale(sink, m);
+    float acc[NF_FC_ACC];
+    [[unroll]] for (uint k = 0u; k < NF_FC_ACC; k++) {
+        acc[k] = 0.0;
+    }
+    for (uint c0 = 0u; c0 < n_split; c0 += NF_FC_STAGE) {
+        const uint cn = min(NF_FC_STAGE, n_split - c0);
+        for (uint i = lid; i < cn; i += lsz) {
+            const uint ps = pr + (c0 + i) * stride;
+            w_s[i] = nf_attn_rescale(partial[ps + d_v], m);
+            l_s[i] = partial[ps + d_v + 1u];
+        }
+        barrier();
+        for (uint i = 0u; i < cn; i++) {
+            l += l_s[i] * w_s[i];
+        }
+        [[unroll]] for (uint k = 0u; k < NF_FC_ACC; k++) {
+            const uint d = lid + k * lsz;
+            if (d < d_v) {
+                float o = acc[k];
+                for (uint i = 0u; i < cn; i++) {
+                    o += partial[pr + (c0 + i) * stride + d] * w_s[i];
+                }
+                acc[k] = o;
+            }
+        }
+        barrier();   /* the stage is consumed before the next one overwrites it */
+    }
+    [[unroll]] for (uint k = 0u; k < NF_FC_ACC; k++) {
+        const uint d = lid + k * lsz;
+        if (d < d_v) {
+            dst[ob + d] = l > 0.0 ? acc[k] / l : 0.0;
+        }
     }
 }
 #endif

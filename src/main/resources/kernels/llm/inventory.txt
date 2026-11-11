@@ -969,8 +969,12 @@ LLM_FlashAttn_TQ_3BIT_VALUES	flash_prefill.cl	11	29	i,i,i,i,i,i,i,i,i,i,i,i,i,i,
 LLM_FlashAttn_TQ_4BIT_KEYS	flash_prefill.cl	11	29	i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiiiiiifffiiiiiiiiBBBBBBBBBBB
 LLM_FlashAttn_TQ_4BIT_VALUES	flash_prefill.cl	11	29	i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiiiiiifffiiiiiiiiBBBBBBBBBBB
 LLM_FlashAttn_TQ_K8_KEYS	flash_prefill.cl	11	29	i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiiiiiifffiiiiiiiiBBBBBBBBBBB
+LLM_FlashDecodeGqa_BF16	flash_decode_gqa.cl	10	25	i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiifffiiiiiiiiBBBBBBBBBB
+LLM_FlashDecodeGqa_F16	flash_decode_gqa.cl	10	25	i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiifffiiiiiiiiBBBBBBBBBB
+LLM_FlashDecodeGqa_Q8_0	flash_decode_gqa.cl	10	25	i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiifffiiiiiiiiBBBBBBBBBB
 LLM_FlashDecodePagedGqa_BF16	flash_decode_gqa.cl	13	30	i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiifffiiiiiiiiiiiiiBBBBBBBBBBBBB
 LLM_FlashDecodePagedGqa_F16	flash_decode_gqa.cl	13	30	i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiifffiiiiiiiiiiiiiBBBBBBBBBBBBB
+LLM_FlashDecodePagedGqa_Q8_0	flash_decode_gqa.cl	13	30	i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiifffiiiiiiiiiiiiiBBBBBBBBBBBBB
 LLM_FlashDecodePaged_BF16	flash_decode.cl	13	30	i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiifffiiiiiiiiiiiiiBBBBBBBBBBBBB
 LLM_FlashDecodePaged_F16	flash_decode.cl	13	30	i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiifffiiiiiiiiiiiiiBBBBBBBBBBBBB
 LLM_FlashDecodePaged_F32	flash_decode.cl	13	30	i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiifffiiiiiiiiiiiiiBBBBBBBBBBBBB
@@ -1233,7 +1237,6 @@ LLM_Step5_Summary	sparse/step5.cl	5	4	i,i,i,i	iiiiBBBBB
 LLM_StreamsMean	gemma3n.cl	2	6	i,i,i,i,i,i	iiiiiiBB
 LLM_SwiGLUOai	ffn_act.cl	3	1	i	iBBB
 LLM_SwitchedLoraAdd	heads.cl	6	12	i,i,i,i,i,i,i,i,i,i,i,f	iiiiiiiiiiifBBBBBB
-LLM_TopK_Partial	sampling_topk.cl	3	3	i,i,f	iifBBB
 LLM_TopK_Rows	sparse/topk_rows.cl	2	3	i,i,i	iiiBB
 LLM_TreeAccept	sampling.cl	3	1	i	iBBB
 LLM_TtsCausalAttn	speech.cl	4	4	i,i,i,i	iiiiBBBB

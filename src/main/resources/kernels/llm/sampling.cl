@@ -76,7 +76,8 @@ NF_INLINE int nf_argmax_better(float v, int i, float bv, int bi) {
 /*
  * Row-wise argmax over n_rows rows of `size` floats (row stride = size): max_idx[row] is the index
  * of the first maximum of row `row`. NaN is never selected; a row of only NaN yields 0, and so does
- * size == 0. Dispatch: global = {n_rows * L}, local = {L}; one workgroup per row.
+ * size == 0. Dispatch: global = {n_rows * L}, local = {L} (CUDA and HIP: a multiple of 32); one workgroup per
+ * row.
  */
 NF_KERNEL void LLM_Argmax(
     const int size,
@@ -101,6 +102,33 @@ NF_KERNEL void LLM_Argmax(
             bi = i;
         }
     }
+#ifdef NF_HAS_SG_SHUFFLE
+    /* the order is total, so any reduction tree gives the same winner: within each warp by shuffles, then the
+     * warps' winners through local memory */
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = nf_sg_shuffle_xor(bv, o);
+        const int oi = nf_sg_shuffle_xor_i(bi, o);
+        if (nf_argmax_better(ov, oi, bv, bi)) {
+            bv = ov;
+            bi = oi;
+        }
+    }
+    if (get_sub_group_local_id() == 0) {
+        best_v[get_sub_group_id()] = bv;
+        best_i[get_sub_group_id()] = bi;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lid == 0) {
+        const int n_sg = (int)get_num_sub_groups();
+        for (int w = 1; w < n_sg; w++) {
+            if (nf_argmax_better(best_v[w], best_i[w], bv, bi)) {
+                bv = best_v[w];
+                bi = best_i[w];
+            }
+        }
+        max_idx[row] = (bi == NF_ARGMAX_NONE) ? 0 : bi;
+    }
+#else
     best_v[lid] = bv;
     best_i[lid] = bi;
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -121,6 +149,7 @@ NF_KERNEL void LLM_Argmax(
         const int r = best_i[0];
         max_idx[row] = (r == NF_ARGMAX_NONE) ? 0 : r;
     }
+#endif
 }
 
 /*

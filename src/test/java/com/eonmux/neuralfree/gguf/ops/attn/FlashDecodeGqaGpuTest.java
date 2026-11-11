@@ -7,7 +7,6 @@ import com.eonmux.neuralfree.acceleration.backend.cuda.CudaComputeBackend;
 import com.eonmux.neuralfree.acceleration.kernels.Availability;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
-import com.eonmux.neuralfree.gguf.quant.FpBlockDecoders;
 import org.junit.After;
 import org.junit.Assume;
 import org.junit.Before;
@@ -26,8 +25,8 @@ import static org.junit.Assert.assertTrue;
 
 /**
  * The grouped-query paged decode ({@code LLM_FlashDecodePagedGqa_<KV>}, kernels/llm/flash_decode_gqa.cl) against a
- * double-precision host attention over the same paged F16 or BF16 cache, and against the paged decode it stands in
- * for ({@code LLM_FlashDecodePaged_<KV>}) on the same arguments: per-sequence key counts (including an empty
+ * double-precision host attention over the same paged F16, BF16 or Q8_0 cache, and against the paged decode it
+ * stands in for ({@code LLM_FlashDecodePaged_<KV>}) on the same arguments: per-sequence key counts (including an empty
  * sequence), shuffled physical pages, unmapped pages, empty cells, causal positions below the cached ones, softcap,
  * and both output forms — the normalized rows of one direct split (with and without sinks) and the (o, m, l)
  * partials of several splits, which the host merges into the normalized rows and which match the paged decode's
@@ -86,7 +85,7 @@ public class FlashDecodeGqaGpuTest {
     @Test
     public void everyGroupAndHeadDimMatchesThePagedDecode() throws InterruptedException {
         int seed = 1;
-        for (KvDType type : new KvDType[]{KvDType.F16, KvDType.BF16}) {
+        for (KvDType type : new KvDType[]{KvDType.F16, KvDType.BF16, KvDType.Q8_0}) {
             for (int d : new int[]{64, 128}) {
                 for (int g : new int[]{1, 2, 4}) {
                     for (int nSeq : new int[]{1, 3, 16}) {
@@ -303,14 +302,9 @@ public class FlashDecodeGqaGpuTest {
             return out;
         }
 
-        /** The values the cache stores for {@code x}: rounded to the cache type. */
+        /** The values the cache stores for {@code x}: rounded or quantized to the cache type. */
         private float[] stored(float[] x) {
-            float[] r = new float[x.length];
-            for (int i = 0; i < x.length; i++) {
-                r[i] = type == KvDType.F16 ? FpBlockDecoders.fp16ToFp32(FpBlockDecoders.fp32ToFp16(x[i]))
-                        : Float.intBitsToFloat(Float.floatToIntBits(x[i]) & 0xFFFF0000);
-            }
-            return r;
+            return KvCacheTestValues.stored(type, x);
         }
 
         private float[] run(String kernel, long[] global, int nSplit, int splitLen, int flags, float softcap,
@@ -369,12 +363,7 @@ public class FlashDecodeGqaGpuTest {
         }
 
         private GpuBuffer cache(float[] values) throws InterruptedException {
-            ByteBuffer bb = ByteBuffer.allocate(values.length * 2).order(ByteOrder.LITTLE_ENDIAN);
-            for (float x : values) {
-                bb.putShort((short) (type == KvDType.F16 ? FpBlockDecoders.fp32ToFp16(x)
-                        : Float.floatToIntBits(x) >>> 16));   /* x is already representable */
-            }
-            return bytes(bb.array());
+            return bytes(KvCacheTestValues.bytes(type, values));
         }
     }
 

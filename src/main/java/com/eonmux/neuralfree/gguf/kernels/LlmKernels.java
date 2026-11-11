@@ -131,11 +131,12 @@ public final class LlmKernels {
     }
 
     /**
-     * Whether the one-row flash decode ({@code LLM_FlashDecodeRow_F16}) may serve the plain decode step on this
-     * backend's device. Off Vulkan it serves wherever the build defines it (the CUDA fatbins; the OpenCL, HIP and
-     * Metal builds define none, so the planner also checks that the kernel exists). On Vulkan it serves NVIDIA devices
-     * only, the device kind it was measured on: other vendors' subgroup sizes run its shared-memory reduction or
-     * other lane counts, whose speed against the split flash decode no measurement covers.
+     * Whether the one-row flash decode kernels ({@code LLM_FlashDecodeRow_F16} and the grouped-query
+     * {@code LLM_FlashDecodeGqa_<KV>}) may serve the plain decode step on this backend's device. Off Vulkan they
+     * serve wherever the build defines them (the CUDA fatbins; the OpenCL, HIP and Metal builds define none, so the
+     * planner also checks that the kernel exists). On Vulkan they serve NVIDIA devices only, the device kind they
+     * were measured on: other vendors' subgroup sizes run their shared-memory reductions or other lane counts, whose
+     * speed against the split flash decode no measurement covers.
      */
     public boolean flashDecodeRowPath() {
         if (set.backend().backendType() != ComputeBackend.BackendType.VULKAN) {

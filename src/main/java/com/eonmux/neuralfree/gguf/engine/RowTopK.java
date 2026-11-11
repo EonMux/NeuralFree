@@ -14,7 +14,7 @@ import java.util.Objects;
  */
 public final class RowTopK {
 
-    /** Most candidates one device readback carries ({@code LLM_Row_TopK} supports up to 64). */
+    /** Most candidates one device readback of a sampled row carries. */
     public static final int MAX_DEVICE_CANDIDATES = 64;
 
     private final int k;

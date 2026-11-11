@@ -1,0 +1,411 @@
+/* flash_decode_gqa.comp - LLM_FlashDecodeGqa_F16 / _BF16 / _Q8_0, the grouped-query dense decode attention: the
+ * Vulkan twin of the dense entries of kernels/llm/flash_decode_gqa.cl (a [cuda] entry), with their argument list, grid,
+ * outputs and plan constraints (documented there), so the host swaps LLM_FlashDecode_<KV> for it as it does on CUDA.
+ * Requires: common/nf_common.glsl, common/act.glsl, common/kv_types.glsl, common/attn_common.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order), as LLM_FlashDecode_<KV>:
+ *   (i n_head, i n_head_kv, i d_k, i d_v, i g_tile, i n_split, i split_len, i kv_start, i kv_end, i q_pos,
+ *    i k_row_stride, i k_head_stride, i v_row_stride, i v_head_stride, f scale, f softcap, f max_bias,
+ *    i flags, i swa_type, i n_swa, i bias_mode, i n_buckets, i max_distance, i q_off, i out_off,
+ *    R q, R k, R v, R<int> kv_pos, R sinks, R rel_bias, W out, W partial, R kv_scales, R<uvec2> tree_mask)
+ * Variants rows select the cache type with KV=NF_KV_F16, NF_KV_BF16 or NF_KV_Q8_0; g_tile is ignored (the
+ * work-group always holds the whole group).
+ * Dispatch: 2-D, global {n_split * 128, n_head_kv}, local {128, 1, 1} (gguf.ops.attn.FlashAttnTiling.decodeOnline).
+ *
+ * Work-group (split, KV head kvh) holds all G = n_head / n_head_kv query heads of the group, so every K and V row of
+ * the split is read once for the G heads instead of once per head. As in the CUDA kernel, the keys stream through
+ * independent key groups of L = d / 8 invocations (16 groups at d = 64, 8 at d = 128): group c takes keys
+ * c, c + 128 / L, ... of the split, NF_FDG_KB of them per iteration with every load issued before the first use;
+ * invocation i of a group holds dims [8 i, 8 i + 8) of the G query rows and of their outputs and loads its slice of
+ * the K row and of the V row as one 16-byte vector each (a Q8_0 row: the slice's 8 codes as 2-byte loads, the 34-byte
+ * blocks being 2-byte aligned, and the block's scale), and every group keeps its own online softmax per head,
+ * rescaled once per iteration.
+ *
+ * Score reduction: the 4 x NF_FDG_KB partial dots of each invocation are summed over its key group by a transpose
+ * through shared memory inside each block of 32 invocations (the __sg modules may rely on subgroup arithmetic only,
+ * and one subgroupAdd per partial costs more): every invocation stores its partials as one row of the block's table,
+ * each invocation sums one column segment (one key group's L rows of one partial) and publishes it, and every
+ * invocation reads back its group's sums. The block's two exchanges synchronize with subgroupBarrier when the block
+ * is one subgroup (the __sg module on a device whose subgroups are 32 lanes wide, bound with full subgroups) and with
+ * barrier() otherwise; every block runs the same number of iterations, so either stays in uniform control flow.
+ * Merge: after the key loop the groups' (m, l, o) meet in shared memory, NF_FDG_MERGE_G heads per pass, and the
+ * work-group combines them; the module holds 8.5 KB of shared memory.
+ *
+ * The masking, score, position-bias, softcap, window, tree and sink rules are those of LLM_FlashDecode_<KV>; the
+ * Q8_0 entry multiplies the scores by the bound kv_scales[kvh] and the output by kv_scales[n_head_kv + kvh], as the
+ * CUDA entry does (the host binds all ones: none of these cache types is checkpoint-scaled). A launch outside the
+ * plan constraints writes NaN outputs.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/act.glsl"
+#include "common/kv_types.glsl"
+#include "common/attn_common.glsl"
+
+#if !defined(KV) || (KV != NF_KV_F16 && KV != NF_KV_BF16 && KV != NF_KV_Q8_0)
+#error "flash_decode_gqa.comp needs KV=NF_KV_F16, NF_KV_BF16 or NF_KV_Q8_0"
+#endif
+
+#define NF_FDG_DS     8                      /* dims per invocation: one 16-byte vector of an F16 / BF16 row */
+#define NF_FDG_MAX_G  4                      /* query heads per KV head (gguf.ops.attn.FlashAttnTiling.GQA_MAX_G) */
+#define NF_FDG_KB     2                      /* keys per key group in flight */
+#define NF_FDG_P      (NF_FDG_KB * NF_FDG_MAX_G) /* partial dots per invocation and iteration */
+#define NF_FDG_BLOCK  32                     /* invocations per transpose block */
+#define NF_FDG_PITCH  (NF_FDG_P + 1)         /* row pitch of a block's table: column reads hit distinct banks */
+/* A block's sums ((32 / L) key groups x NF_FDG_P partials, at most 4 x NF_FDG_P at d = 64) take one invocation each. */
+#if (NF_FDG_BLOCK / 8) * NF_FDG_P > NF_FDG_BLOCK
+#error "flash_decode_gqa.comp: a transpose block has fewer invocations than sums"
+#endif
+#define NF_FDG_MERGE_G 2                     /* query heads merged per pass after the key loop */
+#define NF_FDG_Q8_HALVES 17                  /* 2-byte words of one 34-byte Q8_0 block */
+
+layout(std430, binding = 0) readonly buffer NfFdgQ { float q_in[]; };
+layout(std430, binding = 1) readonly buffer NfFdgK4 { uvec4 k_u128[]; };
+layout(std430, binding = 1) readonly buffer NfFdgKh { uint16_t k_u16[]; };
+layout(std430, binding = 2) readonly buffer NfFdgV4 { uvec4 v_u128[]; };
+layout(std430, binding = 2) readonly buffer NfFdgVh { uint16_t v_u16[]; };
+layout(std430, binding = 3) readonly buffer NfFdgKvPos { int kv_pos[]; };
+layout(std430, binding = 4) readonly buffer NfFdgSinks { float sinks[]; };
+layout(std430, binding = 5) readonly buffer NfFdgRelBias { float rel_bias[]; };
+layout(std430, binding = 6) writeonly buffer NfFdgOut { float dst[]; };
+layout(std430, binding = 7) writeonly buffer NfFdgPartial { float partial[]; };
+layout(std430, binding = 8) readonly buffer NfFdgKvScales { float kv_scales[]; };
+layout(std430, binding = 9) readonly buffer NfFdgTreeMask { uvec2 tree_mask[]; };
+
+layout(push_constant) uniform NfFdgParams {
+    int n_head; int n_head_kv; int d_k; int d_v; int g_tile;
+    int n_split; int split_len; int kv_start; int kv_end; int q_pos;
+    int k_row_stride; int k_head_stride; int v_row_stride; int v_head_stride;
+    float scale; float softcap; float max_bias;
+    int flags; int swa_type; int n_swa;
+    int bias_mode; int n_buckets; int max_distance;
+    int q_off; int out_off;
+} pc;
+
+/* Floats of the key loop's tables (one per block of 32 invocations: 32 rows of NF_FDG_PITCH) and its sums. */
+#define NF_FDG_TABLES (NF_FA_WG * NF_FDG_PITCH)
+/* Floats of one merge pass: every invocation's 8 output dims of NF_FDG_MERGE_G heads. */
+#define NF_FDG_MERGE (NF_FA_WG * NF_FDG_DS * NF_FDG_MERGE_G)
+#define NF_FDG_POOL ((NF_FDG_TABLES + NF_FA_WG) > NF_FDG_MERGE ? (NF_FDG_TABLES + NF_FA_WG) : NF_FDG_MERGE)
+/* The key loop's tables then sums (at NF_FDG_TABLES); after the loop, one merge pass's output rows. */
+shared float pool_s[NF_FDG_POOL];
+/* The key groups' running max and sum per head after the loop (at most 16 groups). */
+shared float m_s[(NF_FA_WG / 8) * NF_FDG_MAX_G];
+shared float l_s[(NF_FA_WG / 8) * NF_FDG_MAX_G];
+
+/* True when a transpose block is one subgroup and synchronizes with subgroupBarrier. */
+bool nf_fdg_subgroup_blocks() {
+#ifdef USE_SUBGROUPS
+    return gl_SubgroupSize == uint(NF_FDG_BLOCK);
+#else
+    return false;
+#endif
+}
+
+/* Makes the block's shared-memory writes visible to the block (the whole work-group when sg is false). */
+void nf_fdg_block_sync(bool sg) {
+#ifdef USE_SUBGROUPS
+    if (sg) {
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        return;
+    }
+#endif
+    barrier();
+}
+
+/*
+ * The raw words of an invocation's slice of a K row (k) or V row (!k) at element e (e % 8 == 0): F16 / BF16 the 8
+ * packed 16-bit values; Q8_0 the 8 int8 codes in x and y (code i in bits 8 (i % 4) .. of word i / 4) and the
+ * block's half scale bits in z.
+ */
+uvec4 nf_fdg_raw(bool k, uint e) {
+#if KV == NF_KV_Q8_0
+    const uint blk = (e >> 5) * uint(NF_FDG_Q8_HALVES);
+    const uint w0 = blk + 1u + ((e & 31u) >> 1);
+    if (k) {
+        return uvec4(uint(k_u16[w0]) | (uint(k_u16[w0 + 1u]) << 16),
+                     uint(k_u16[w0 + 2u]) | (uint(k_u16[w0 + 3u]) << 16), uint(k_u16[blk]), 0u);
+    }
+    return uvec4(uint(v_u16[w0]) | (uint(v_u16[w0 + 1u]) << 16),
+                 uint(v_u16[w0 + 2u]) | (uint(v_u16[w0 + 3u]) << 16), uint(v_u16[blk]), 0u);
+#else
+    return k ? k_u128[e >> 3] : v_u128[e >> 3];
+#endif
+}
+
+/* Values 0-3 (hi false) or 4-7 (hi true) of a slice from its raw words (nf_fdg_raw). */
+vec4 nf_fdg_values(uvec4 r, bool hi) {
+#if KV == NF_KV_Q8_0
+    const uint c = hi ? r.y : r.x;
+    return nf_half(r.z) * vec4(float(nf_i8(c)), float(nf_i8(c >> 8)), float(nf_i8(c >> 16)), float(nf_i8(c >> 24)));
+#elif KV == NF_KV_BF16
+    const uvec2 c = hi ? r.zw : r.xy;
+    return vec4(uintBitsToFloat(c.x << 16), uintBitsToFloat(c.x & 0xFFFF0000u),
+                uintBitsToFloat(c.y << 16), uintBitsToFloat(c.y & 0xFFFF0000u));
+#else
+    const uvec2 c = hi ? r.zw : r.xy;
+    return vec4(unpackHalf2x16(c.x), unpackHalf2x16(c.y));
+#endif
+}
+
+/* Position bias of head h (nf_attn_bias of kernels/llm/common/attn_common.h) for the launch's one query row. */
+float nf_fdg_bias(int h, int p_k, float slope) {
+    const int p_q = pc.q_pos;
+    if (pc.bias_mode == NF_ATTN_BIAS_ALIBI) {
+        return slope * (-float(abs(p_q - p_k)));
+    }
+    if (pc.bias_mode == NF_ATTN_BIAS_ALIBI_SQRT) {
+        return p_k <= p_q ? slope * (-sqrt(float(p_q - p_k))) : 0.0;
+    }
+    if (pc.bias_mode == NF_ATTN_BIAS_T5_CAUSAL || pc.bias_mode == NF_ATTN_BIAS_T5_BIDIR) {
+        const int bucket = nf_t5_bucket(p_k, p_q, pc.n_buckets, pc.max_distance,
+                                        pc.bias_mode == NF_ATTN_BIAS_T5_BIDIR ? 1 : 0);
+        return rel_bias[bucket * pc.n_head + h];
+    }
+    if (pc.bias_mode == NF_ATTN_BIAS_INKLING) {
+        const int dist = p_q - p_k;
+        return dist < 0 || dist >= pc.n_buckets ? 0.0 : rel_bias[h * pc.n_buckets + dist];
+    }
+    return 0.0;
+}
+
+/* NaN outputs of a launch outside the plan constraints (the whole launch's rows, from work-group (0, 0) only). */
+void nf_fdg_poison(bool direct_out) {
+    if (gl_WorkGroupID.x != 0u || gl_WorkGroupID.y != 0u || pc.n_head <= 0 || pc.d_v <= 0 || pc.n_split <= 0) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    if (direct_out) {
+        for (uint i = lid; i < uint(pc.n_head * pc.d_v); i += uint(NF_FA_WG)) {
+            dst[uint(pc.out_off) + i] = NF_NAN;
+        }
+    } else {
+        const uint n = uint(pc.n_head) * uint(pc.n_split) * uint(pc.d_v + 2);
+        for (uint i = lid; i < n; i += uint(NF_FA_WG)) {
+            partial[i] = NF_NAN;
+        }
+    }
+}
+
+/* The plan constraints of kernels/llm/flash_decode_gqa.cl nf_fdg_shape_ok and its dense entry. */
+bool nf_fdg_plan_ok(bool direct_out) {
+    const int align = KV == NF_KV_Q8_0 ? 31 : 7;   /* whole Q8_0 blocks, else whole 16-byte vectors */
+    return gl_WorkGroupSize.x == uint(NF_FA_WG) && pc.n_head > 0 && pc.n_head_kv > 0
+        && pc.n_head % pc.n_head_kv == 0 && pc.n_head / pc.n_head_kv <= NF_FDG_MAX_G
+        && pc.d_k == pc.d_v && (pc.d_k == 64 || pc.d_k == 128)
+        && pc.n_split >= 1 && pc.split_len >= 1 && (!direct_out || pc.n_split == 1)
+        && ((pc.k_row_stride | pc.k_head_stride | pc.v_row_stride | pc.v_head_stride) & align) == 0
+        && (pc.flags & NF_ATTN_FLAG_V_ALIAS) == 0 && pc.kv_start >= 0;
+}
+
+void main() {
+    const bool direct_out = (pc.flags & NF_ATTN_FLAG_DIRECT) != 0;
+    if (!nf_fdg_plan_ok(direct_out)) {
+        nf_fdg_poison(direct_out);
+        return;   /* uniform: no barrier reached */
+    }
+
+    const bool sg = nf_fdg_subgroup_blocks();
+    const uint lid = gl_LocalInvocationID.x;
+    /* the invocation's transpose block and its place in it: a subgroup and its lane when sg holds */
+#ifdef USE_SUBGROUPS
+    const uint blk = sg ? gl_SubgroupID : lid / uint(NF_FDG_BLOCK);
+    const uint bl = sg ? gl_SubgroupInvocationID : lid % uint(NF_FDG_BLOCK);
+#else
+    const uint blk = lid / uint(NF_FDG_BLOCK);
+    const uint bl = lid % uint(NF_FDG_BLOCK);
+#endif
+    const int G = pc.n_head / pc.n_head_kv;
+    const int d = pc.d_k;
+    const uint L = uint(d / NF_FDG_DS);              /* invocations per key group: 8 or 16 */
+    const int groups = NF_FA_WG / int(L);            /* key groups per work-group: 16 or 8 */
+    const uint kgl = bl / L;                         /* the key group inside the block */
+    const int grp = int(blk * (uint(NF_FDG_BLOCK) / L) + kgl);
+    const uint d0 = (bl % L) * uint(NF_FDG_DS);
+    const int split = int(gl_WorkGroupID.x);
+    const int kvh = int(gl_WorkGroupID.y);
+    const int h0 = kvh * G;
+    const int causal = pc.flags & NF_ATTN_FLAG_CAUSAL;
+    const int n_fresh = nf_attn_flag_fresh(pc.flags);
+    const uvec2 tree_bits = (pc.flags & NF_ATTN_FLAG_TREE) != 0 ? tree_mask[0] : uvec2(0u);
+    const int k_begin = pc.kv_start + split * pc.split_len;
+    const int k_stop = split < pc.n_split ? min(k_begin + pc.split_len, pc.kv_end) : k_begin;
+    const int n_keys = max(0, k_stop - k_begin);
+    const uint k_head = uint(kvh * pc.k_head_stride) + d0;
+    const uint v_head = uint(kvh * pc.v_head_stride) + d0;
+    const bool alibi = pc.bias_mode == NF_ATTN_BIAS_ALIBI || pc.bias_mode == NF_ATTN_BIAS_ALIBI_SQRT;
+    const float k_scale = KV == NF_KV_Q8_0 ? kv_scales[kvh] : 1.0;
+    const float v_scale = KV == NF_KV_Q8_0 ? kv_scales[pc.n_head_kv + kvh] : 1.0;
+    /* the block's sums: S = (32 / L) groups x P partials, sum s = (group s / P, partial s % P) */
+    const uint n_sums = (uint(NF_FDG_BLOCK) / L) * uint(NF_FDG_P);
+    const uint my_sum = bl % n_sums;
+    const uint tbase = blk * uint(NF_FDG_BLOCK * NF_FDG_PITCH);
+
+    vec4 qa[NF_FDG_MAX_G];
+    vec4 qb[NF_FDG_MAX_G];
+    vec4 oa[NF_FDG_MAX_G];
+    vec4 ob[NF_FDG_MAX_G];
+    float m[NF_FDG_MAX_G];
+    float l[NF_FDG_MAX_G];
+    float slope[NF_FDG_MAX_G];
+    [[unroll]] for (int g = 0; g < NF_FDG_MAX_G; g++) {
+        qa[g] = vec4(0.0);
+        qb[g] = vec4(0.0);
+        oa[g] = vec4(0.0);
+        ob[g] = vec4(0.0);
+        m[g] = -NF_INF;
+        l[g] = 0.0;
+        slope[g] = 1.0;
+        if (g < G) {
+            const uint qi = uint(pc.q_off + (h0 + g) * d) + d0;
+            qa[g] = vec4(q_in[qi], q_in[qi + 1u], q_in[qi + 2u], q_in[qi + 3u]);
+            qb[g] = vec4(q_in[qi + 4u], q_in[qi + 5u], q_in[qi + 6u], q_in[qi + 7u]);
+            if (alibi) {
+                slope[g] = nf_alibi_slope(h0 + g, pc.n_head, pc.max_bias);
+            }
+        }
+    }
+
+    const int step = groups * NF_FDG_KB;
+    for (int j0 = 0; j0 < n_keys; j0 += step) {
+        uvec4 kr[NF_FDG_KB];
+        uvec4 vr[NF_FDG_KB];
+        int pk[NF_FDG_KB];
+        [[unroll]] for (int b = 0; b < NF_FDG_KB; b++) {
+            const int j = j0 + grp + b * groups;
+            const int row = k_begin + j;
+            pk[b] = -1;
+            kr[b] = uvec4(0u);
+            vr[b] = uvec4(0u);
+            if (j < n_keys) {
+                pk[b] = kv_pos[row];
+                kr[b] = nf_fdg_raw(true, uint(row * pc.k_row_stride) + k_head);
+                vr[b] = nf_fdg_raw(false, uint(row * pc.v_row_stride) + v_head);
+            }
+        }
+        /* the invocation's part of every (key, head) dot, as one row of the block's table */
+        float sc[NF_FDG_P];
+        [[unroll]] for (int b = 0; b < NF_FDG_KB; b++) {
+            const vec4 ka = nf_fdg_values(kr[b], false);
+            const vec4 kb = nf_fdg_values(kr[b], true);
+            [[unroll]] for (int g = 0; g < NF_FDG_MAX_G; g++) {
+                sc[b * NF_FDG_MAX_G + g] = dot(qa[g], ka) + dot(qb[g], kb);
+            }
+        }
+        [[unroll]] for (int i = 0; i < NF_FDG_P; i++) {
+            pool_s[tbase + bl * uint(NF_FDG_PITCH) + uint(i)] = sc[i];
+        }
+        nf_fdg_block_sync(sg);
+        {
+            const uint col = my_sum % uint(NF_FDG_P);
+            const uint row0 = tbase + (my_sum / uint(NF_FDG_P)) * L * uint(NF_FDG_PITCH) + col;
+            float t = 0.0;
+            for (uint r = 0u; r < L; r++) {
+                t += pool_s[row0 + r * uint(NF_FDG_PITCH)];
+            }
+            pool_s[uint(NF_FDG_TABLES) + blk * uint(NF_FDG_BLOCK) + my_sum] = t;
+        }
+        nf_fdg_block_sync(sg);
+        [[unroll]] for (int i = 0; i < NF_FDG_P; i++) {
+            sc[i] = pool_s[uint(NF_FDG_TABLES) + blk * uint(NF_FDG_BLOCK) + kgl * uint(NF_FDG_P) + uint(i)];
+        }
+        /* scores, then one rescale per head and batch; the key's visibility is uniform across the key group */
+        bool live[NF_FDG_KB];
+        [[unroll]] for (int b = 0; b < NF_FDG_KB; b++) {
+            live[b] = nf_attn_tree_visible(pk[b], tree_bits, pc.kv_end, n_fresh, pc.q_pos, causal, pc.swa_type,
+                                           pc.n_swa) != 0;
+        }
+        [[unroll]] for (int g = 0; g < NF_FDG_MAX_G; g++) {
+            if (g < G) {
+                float mb = m[g];
+                [[unroll]] for (int b = 0; b < NF_FDG_KB; b++) {
+                    const int i = b * NF_FDG_MAX_G + g;
+                    sc[i] = live[b] ? nf_attn_score(sc[i] * k_scale, pc.scale, pc.softcap)
+                                      + nf_fdg_bias(h0 + g, pk[b], slope[g])
+                                    : -NF_INF;
+                    mb = max(mb, sc[i]);
+                }
+                if (mb != -NF_INF) {
+                    const float corr = nf_attn_rescale(m[g], mb);
+                    l[g] *= corr;
+                    oa[g] *= corr;
+                    ob[g] *= corr;
+                    m[g] = mb;
+                }
+            }
+        }
+        [[unroll]] for (int b = 0; b < NF_FDG_KB; b++) {
+            const vec4 va = nf_fdg_values(vr[b], false);
+            const vec4 vb = nf_fdg_values(vr[b], true);
+            [[unroll]] for (int g = 0; g < NF_FDG_MAX_G; g++) {
+                if (g < G) {
+                    const float p = nf_attn_rescale(sc[b * NF_FDG_MAX_G + g], m[g]);
+                    l[g] += p;
+                    oa[g] += p * va;
+                    ob[g] += p * vb;
+                }
+            }
+        }
+    }
+
+    /* merge the key groups' (m, l, o), NF_FDG_MERGE_G heads per pass; G is uniform, so every barrier is too */
+    [[unroll]] for (int g = 0; g < NF_FDG_MAX_G; g++) {
+        if (g < G && d0 == 0u) {
+            m_s[grp * NF_FDG_MAX_G + g] = m[g];
+            l_s[grp * NF_FDG_MAX_G + g] = l[g];
+        }
+    }
+    const bool sinks_on = direct_out && (pc.flags & NF_ATTN_FLAG_SINKS) != 0;
+    [[unroll]] for (int g0 = 0; g0 < NF_FDG_MAX_G; g0 += NF_FDG_MERGE_G) {
+        if (g0 < G) {
+            barrier();   /* the previous pass (or the key loop's tables) is consumed */
+            [[unroll]] for (int gi = 0; gi < NF_FDG_MERGE_G; gi++) {
+                const uint o = uint((grp * NF_FDG_MERGE_G + gi) * d) + d0;
+                const vec4 a = oa[g0 + gi];
+                const vec4 b = ob[g0 + gi];
+                pool_s[o] = a.x;
+                pool_s[o + 1u] = a.y;
+                pool_s[o + 2u] = a.z;
+                pool_s[o + 3u] = a.w;
+                pool_s[o + 4u] = b.x;
+                pool_s[o + 5u] = b.y;
+                pool_s[o + 6u] = b.z;
+                pool_s[o + 7u] = b.w;
+            }
+            barrier();
+            const int n_out = min(G - g0, NF_FDG_MERGE_G) * d;
+            for (int e = int(lid); split < pc.n_split && e < n_out; e += NF_FA_WG) {
+                const int gi = e / d;
+                const int g = g0 + gi;
+                const int dd = e - gi * d;
+                float mt = -NF_INF;
+                for (int c = 0; c < groups; c++) {
+                    mt = max(mt, m_s[c * NF_FDG_MAX_G + g]);
+                }
+                float o = 0.0;
+                float lt = 0.0;
+                for (int c = 0; c < groups; c++) {
+                    const float f = nf_attn_rescale(m_s[c * NF_FDG_MAX_G + g], mt);
+                    o += f * pool_s[(c * NF_FDG_MERGE_G + gi) * d + dd];
+                    lt += f * l_s[c * NF_FDG_MAX_G + g];
+                }
+                o *= v_scale;
+                const int h = h0 + g;
+                if (direct_out) {
+                    const vec2 fl = sinks_on ? nf_attn_sink(mt, lt, sinks[h]) : vec2(1.0, lt);
+                    dst[uint(pc.out_off + h * d + dd)] = fl.y > 0.0 ? o * fl.x / fl.y : 0.0;
+                } else {
+                    const uint pr = (uint(h) * uint(pc.n_split) + uint(split)) * uint(d + 2);
+                    partial[pr + uint(dd)] = o;
+                    if (dd == 0) {
+                        partial[pr + uint(d)] = mt;
+                        partial[pr + uint(d) + 1u] = lt;
+                    }
+                }
+            }
+        }
+    }
+}

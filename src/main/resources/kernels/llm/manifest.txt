@@ -29,6 +29,7 @@ common/kv_types.h
 common/attn_common.h
 common/hadamard.h
 common/dsv4_common.h
+common/topk_select.h
 matvec_f32.cl
 matvec_f16_bf16.cl
 matvec_w12.cl

@@ -38,9 +38,9 @@ import static org.junit.Assert.assertTrue;
  * The one-row decode kernel ({@code LLM_FlashDecodeRow_F16}: {@code flash_decode_row.cl} on CUDA, its twin
  * {@code flash_decode_row.comp} on Vulkan) against the CPU reference and against the generic decode kernel it
  * replaces ({@code LLM_FlashDecode_F16}, same arguments): at every head dim it serves (64, 128, 256), GQA, key
- * counts from one key through direct steps to split-K steps with the combine, and the step forms the plain one-row
- * route meets — a key range starting past row 0, a sliding window, a softcap and empty cache cells (kv_pos -1). The
- * CPU reference covers the causal steps; the generic kernel, itself held to the same reference by
+ * counts from one key through direct steps to split-K steps with the combine, sink logits in the direct output and
+ * through the merge, and the step forms the plain one-row route meets — a key range starting past row 0, a sliding
+ * window, a softcap and empty cache cells (kv_pos -1). The CPU reference covers the causal and sink steps; the generic kernel, itself held to the same reference by
  * {@link FlashDecodeKernelGpuTest}, covers the window, softcap and empty-cell steps. The Vulkan cases run the module
  * the device binds (the subgroup module on subgroup-arithmetic devices) and the plain module, whose lane groups
  * reduce through shared memory, and both read caches whose row stride is a multiple of 4 elements (8-byte lane
@@ -147,18 +147,23 @@ public class FlashDecodeRowKernelGpuTest {
         causalSteps(2);
     }
 
+    @Test
+    public void sinkLogitsMatchTheCpuReference() {
+        Fixture f = new Fixture(new Random(19), identityPositions(), 0);
+        for (int n : KEY_COUNTS) {
+            float[] got = f.run(AttnKernels.FLASH_DECODE_ROW_F16, tiling, 0, n, n - 1, 0f, SwaType.NONE, 0, true);
+            assertClose("sinks n=" + n, f.reference(n, f.sinkLogits), got);
+        }
+        /* one direct split over every key: the kernel merges the sinks itself */
+        float[] got = f.runSplit(AttnKernels.FLASH_DECODE_ROW_F16, 1, N_KV, 0, N_KV, N_KV - 1, true);
+        assertClose("sinks direct n=" + N_KV, f.reference(N_KV, f.sinkLogits), got);
+    }
+
     private void causalSteps(int pad) {
         Fixture f = new Fixture(new Random(11), identityPositions(), pad);
-        CpuAttentionCore.Params params = CpuAttentionCore.Params.builder(N_HEAD).scale(f.scale)
-                .window(KvWindow.FULL_CAUSAL).build();
         for (int n : KEY_COUNTS) {
-            float[] want = new float[N_HEAD * d];
-            CpuAttentionCore.attendRows(params, 1, f.qHost, 0, N_HEAD * d, new int[]{n - 1}, 0,
-                    CpuAttentionCore.DenseKv.of(f.kF, 0, f.rowStride, d, f.vF, 0, f.rowStride, d,
-                            N_HEAD_KV, d, d, f.kvPos, 0),
-                    0, n, want, 0, N_HEAD * d);
             float[] got = f.run(AttnKernels.FLASH_DECODE_ROW_F16, 0, n, n - 1, 0f, SwaType.NONE, 0);
-            assertClose("pad=" + pad + " n=" + n, want, got);
+            assertClose("pad=" + pad + " n=" + n, f.reference(n, null), got);
         }
     }
 
@@ -211,11 +216,13 @@ public class FlashDecodeRowKernelGpuTest {
         final float[] kF;
         final float[] vF;
         final int[] kvPos;
+        final float[] sinkLogits;
         final GpuBuffer q;
         final GpuBuffer k;
         final GpuBuffer v;
         final GpuBuffer pos;
         final GpuBuffer one;
+        final GpuBuffer sinks;
         final GpuBuffer scales;
         final GpuBuffer mask;
         final GpuBuffer out;
@@ -238,7 +245,12 @@ public class FlashDecodeRowKernelGpuTest {
             for (int i = 0; i < qHost.length; i++) {
                 qHost[i] = 2f * (rnd.nextFloat() - 0.5f);
             }
+            sinkLogits = new float[N_HEAD];
+            for (int i = 0; i < N_HEAD; i++) {
+                sinkLogits[i] = 4f * (rnd.nextFloat() - 0.5f);
+            }
             q = upload(qHost);
+            sinks = upload(sinkLogits);
             k = uploadHalfs(k16);
             v = uploadHalfs(v16);
             pos = upload(kvPos);
@@ -251,8 +263,40 @@ public class FlashDecodeRowKernelGpuTest {
             partial = alloc(tiling.decodePartialFloats() * 4);
         }
 
+        /** The CPU reference rows of the causal step over the first {@code n} rows, with sink logits or none. */
+        float[] reference(int n, float[] sinkValues) {
+            CpuAttentionCore.Builder b = CpuAttentionCore.Params.builder(N_HEAD).scale(scale)
+                    .window(KvWindow.FULL_CAUSAL);
+            if (sinkValues != null) {
+                b.sinks(sinkValues);
+            }
+            float[] want = new float[N_HEAD * d];
+            CpuAttentionCore.attendRows(b.build(), 1, qHost, 0, N_HEAD * d, new int[]{n - 1}, 0,
+                    CpuAttentionCore.DenseKv.of(kF, 0, rowStride, d, vF, 0, rowStride, d, N_HEAD_KV, d, d, kvPos, 0),
+                    0, n, want, 0, N_HEAD * d);
+            return want;
+        }
+
         float[] run(String kernel, int kvStart, int kvEnd, int qPos, float softcap, SwaType swa, int nSwa) {
-            FlashAttnTiling.Split split = tiling.decodeSplit(kvEnd - kvStart);
+            return run(kernel, tiling, kvStart, kvEnd, qPos, softcap, swa, nSwa, false);
+        }
+
+        float[] run(String kernel, FlashAttnTiling plan, int kvStart, int kvEnd, int qPos, float softcap,
+                    SwaType swa, int nSwa, boolean withSinks) {
+            FlashAttnTiling.Split split = plan.decodeSplit(kvEnd - kvStart);
+            return launch(kernel, split.count(), split.length(), kvStart, kvEnd, qPos, softcap, swa, nSwa,
+                    withSinks);
+        }
+
+        /** One launch of {@code nSplit} splits of {@code splitLen} keys, merged when it splits. */
+        float[] runSplit(String kernel, int nSplit, int splitLen, int kvStart, int kvEnd, int qPos,
+                         boolean withSinks) {
+            return launch(kernel, nSplit, splitLen, kvStart, kvEnd, qPos, 0f, SwaType.NONE, 0, withSinks);
+        }
+
+        private float[] launch(String kernel, int nSplit, int splitLen, int kvStart, int kvEnd, int qPos,
+                               float softcap, SwaType swa, int nSwa, boolean withSinks) {
+            FlashAttnTiling.Split split = new FlashAttnTiling.Split(nSplit, splitLen);
             boolean direct = split.count() == 1;
             Object[] args = new Object[AttnKernels.FD_ARG_COUNT];
             args[AttnKernels.ARG_FD_N_HEAD] = N_HEAD;
@@ -272,7 +316,8 @@ public class FlashDecodeRowKernelGpuTest {
             args[AttnKernels.ARG_FD_SCALE] = scale;
             args[AttnKernels.ARG_FD_SOFTCAP] = softcap;
             args[AttnKernels.ARG_FD_MAX_BIAS] = 0f;
-            args[AttnKernels.ARG_FD_FLAGS] = AttnKernels.attnFlags(true, false, direct);
+            args[AttnKernels.ARG_FD_FLAGS] = AttnKernels.attnFlags(true, false, direct)
+                    | (withSinks ? AttnKernels.FLAG_SINKS : 0);
             args[AttnKernels.ARG_FD_SWA_TYPE] = swa.code();
             args[AttnKernels.ARG_FD_N_SWA] = nSwa;
             args[AttnKernels.ARG_FD_BIAS_MODE] = 0;
@@ -284,15 +329,16 @@ public class FlashDecodeRowKernelGpuTest {
             args[AttnKernels.ARG_FD_BUF_K] = k;
             args[AttnKernels.ARG_FD_BUF_V] = v;
             args[AttnKernels.ARG_FD_BUF_KV_POS] = pos;
-            args[AttnKernels.ARG_FD_BUF_SINKS] = one;
+            args[AttnKernels.ARG_FD_BUF_SINKS] = sinks;
             args[AttnKernels.ARG_FD_BUF_REL_BIAS] = one;
             args[AttnKernels.ARG_FD_BUF_OUT] = out;
             args[AttnKernels.ARG_FD_BUF_PARTIAL] = partial;
             args[AttnKernels.ARG_FD_BUF_KV_SCALES] = scales;
             args[AttnKernels.ARG_FD_BUF_TREE_MASK] = mask;
-            dispatch(kernel, tiling.decodeGlobal(split.count()), FlashAttnTiling.decodeLocal(), args);
+            dispatch(kernel, new long[]{(long) split.count() * FlashAttnTiling.WG, N_HEAD},
+                    FlashAttnTiling.decodeLocal(), args);
             if (!direct) {
-                Object[] combine = {N_HEAD, d, split.count(), N_HEAD, 0, 0, partial, one, out};
+                Object[] combine = {N_HEAD, d, split.count(), N_HEAD, withSinks ? 1 : 0, 0, partial, sinks, out};
                 dispatch(AttnKernels.FLASH_COMBINE, FlashAttnTiling.combineGlobal(N_HEAD),
                         FlashAttnTiling.combineLocal(), combine);
             }

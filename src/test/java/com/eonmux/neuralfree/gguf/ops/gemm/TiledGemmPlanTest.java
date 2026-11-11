@@ -50,11 +50,11 @@ public class TiledGemmPlanTest {
         // One tiled kernel per TILED_TYPES entry; per MMQ type the plain / KSplit / 16- and 64-token
         // twins / their two split-K planes / CM / CM_KSplit family, per FP8 and per W4A8 type the plain /
         // KSplit / two twins / two twin split-K planes family, per dense type the MMA pair; per CM2 type
-        // the CM2 / CM2_KSplit pair; then the 11 activation staging kernels and the reduce, top-k, row
-        // top-k and logit prefilter.
+        // the CM2 / CM2_KSplit pair; then the 11 activation staging kernels and the reduce, row top-k and
+        // logit prefilter.
         assertEquals(41 + GemmKernels.MMQ_TYPES.size() * 8 + GemmKernels.FP8_TYPES.size() * 6
                 + GemmKernels.W4A8_TYPES.size() * 6 + GemmKernels.MMA_TYPES.size() * 2
-                + GemmKernels.CM2_TYPES.size() * 2 + 15, names.size());
+                + GemmKernels.CM2_TYPES.size() * 2 + 14, names.size());
         assertTrue(names.contains(GemmKernels.matmulMmq(GGMLType.Q4_K)));
         assertTrue(names.contains(GemmKernels.matmulMmqKSplit(GGMLType.Q4_K)));
         assertTrue(names.contains(GemmKernels.matmulMmqSmall(GGMLType.Q4_K)));
@@ -78,19 +78,18 @@ public class TiledGemmPlanTest {
         assertTrue(names.contains(GemmKernels.matmulW4a8Small(GGMLType.MXFP4, MmqConfig.TWIN_MAX_TOKENS)));
         assertTrue(names.contains(GemmKernels.matmulW4a8SmallSplit(GGMLType.MXFP4, MmqConfig.TWIN_MAX_TOKENS)));
         assertEquals("F32_MatMul_Tiled", names.get(0));
-        assertEquals(GemmKernels.QUANT_MMQ_Q8_1, names.get(names.size() - 15));
-        assertEquals(GemmKernels.QUANT_MMQ_INT8_STATIC, names.get(names.size() - 14));
-        assertEquals(GemmKernels.QUANT_MMQ_INT8_ROW, names.get(names.size() - 13));
-        assertEquals(GemmKernels.QUANT_MMQ_INT8_GROUP128, names.get(names.size() - 12));
-        assertEquals(GemmKernels.QUANT_MMQ_INT8_ASYM, names.get(names.size() - 11));
-        assertEquals(GemmKernels.QUANT_MMQ_FP8_STATIC, names.get(names.size() - 10));
-        assertEquals(GemmKernels.QUANT_MMQ_FP8_ROW, names.get(names.size() - 9));
-        assertEquals(GemmKernels.QUANT_MMQ_FP8_GROUP128, names.get(names.size() - 8));
-        assertEquals(GemmKernels.QUANT_MMQ_FP8_MX, names.get(names.size() - 7));
-        assertEquals(GemmKernels.QUANT_MMQ_FP4_MX, names.get(names.size() - 6));
-        assertEquals(GemmKernels.QUANT_MMQ_FP4_NV, names.get(names.size() - 5));
-        assertEquals(GemmKernels.SPLIT_K_REDUCE, names.get(names.size() - 4));
-        assertEquals(GemmKernels.TOPK_PARTIAL, names.get(names.size() - 3));
+        assertEquals(GemmKernels.QUANT_MMQ_Q8_1, names.get(names.size() - 14));
+        assertEquals(GemmKernels.QUANT_MMQ_INT8_STATIC, names.get(names.size() - 13));
+        assertEquals(GemmKernels.QUANT_MMQ_INT8_ROW, names.get(names.size() - 12));
+        assertEquals(GemmKernels.QUANT_MMQ_INT8_GROUP128, names.get(names.size() - 11));
+        assertEquals(GemmKernels.QUANT_MMQ_INT8_ASYM, names.get(names.size() - 10));
+        assertEquals(GemmKernels.QUANT_MMQ_FP8_STATIC, names.get(names.size() - 9));
+        assertEquals(GemmKernels.QUANT_MMQ_FP8_ROW, names.get(names.size() - 8));
+        assertEquals(GemmKernels.QUANT_MMQ_FP8_GROUP128, names.get(names.size() - 7));
+        assertEquals(GemmKernels.QUANT_MMQ_FP8_MX, names.get(names.size() - 6));
+        assertEquals(GemmKernels.QUANT_MMQ_FP4_MX, names.get(names.size() - 5));
+        assertEquals(GemmKernels.QUANT_MMQ_FP4_NV, names.get(names.size() - 4));
+        assertEquals(GemmKernels.SPLIT_K_REDUCE, names.get(names.size() - 3));
         assertEquals(GemmKernels.ROW_TOPK, names.get(names.size() - 2));
         assertEquals(GemmKernels.LOGITS_PREFILTER, names.get(names.size() - 1));
         assertEquals(names.size(), new TreeSet<>(names).size());
@@ -211,70 +210,6 @@ public class TiledGemmPlanTest {
         String reason = TiledGemmPlan.contiguous(GGMLType.F16, 64 * 101, 64, 8).checkDevice(fewGroups);
         assertNotNull(reason);
         assertTrue(reason, reason.contains("dimension 0"));
-    }
-
-    @Test
-    public void topKPartialSlicesTheVocabulary() {
-        GemmKernels.TopKPartialPlan p = GemmKernels.TopKPartialPlan.of(152064, 40, 256);
-        assertEquals(38, p.groups());
-        assertEquals(4002, p.sliceLength());
-        assertEquals(38 * 40, p.candidateCount());
-        assertArrayEquals(new long[]{38L * 256}, p.globalWorkSize());
-        assertArrayEquals(new long[]{256}, p.localWorkSize());
-
-        GemmKernels.TopKPartialPlan small = GemmKernels.TopKPartialPlan.of(10, 64, 32);
-        assertEquals(1, small.groups());
-        assertEquals(64, small.candidateCount());
-
-        GemmKernels.TopKPartialPlan huge = GemmKernels.TopKPartialPlan.of(GemmKernels.TopKPartialPlan.MAX_N, 1, 64);
-        assertEquals(GemmKernels.TopKPartialPlan.MAX_GROUPS, huge.groups());
-
-        FakeGpuBuffer logits = new FakeGpuBuffer(1, 152064L * 4, true);
-        FakeGpuBuffer val = new FakeGpuBuffer(2, 38L * 40 * 4, false);
-        FakeGpuBuffer idx = new FakeGpuBuffer(3, 38L * 40 * 4, false);
-        Object[] args = p.args(0.5f, logits, val, idx);
-        assertEquals(GemmKernels.TOPK_ARG_COUNT, args.length);
-        assertEquals(152064, args[GemmKernels.TOPK_ARG_N]);
-        assertEquals(40, args[GemmKernels.TOPK_ARG_K]);
-        assertEquals(0.5f, (Float) args[GemmKernels.TOPK_ARG_INV_TEMP], 0.0f);
-        assertSame(logits, args[GemmKernels.TOPK_ARG_LOGITS]);
-        assertSame(val, args[GemmKernels.TOPK_ARG_CAND_VAL]);
-        assertSame(idx, args[GemmKernels.TOPK_ARG_CAND_IDX]);
-    }
-
-    @Test
-    public void topKPartialRejectsInvalidRequests() {
-        expectInvalid("1 <= k <= 64", () -> GemmKernels.TopKPartialPlan.of(100, 65, 256));
-        expectInvalid("1 <= k <= 64", () -> GemmKernels.TopKPartialPlan.of(100, 0, 256));
-        expectInvalid("at least one logit", () -> GemmKernels.TopKPartialPlan.of(0, 4, 256));
-        expectInvalid("at most", () -> GemmKernels.TopKPartialPlan.of(GemmKernels.TopKPartialPlan.MAX_N + 1, 4, 256));
-        expectInvalid("power of two", () -> GemmKernels.TopKPartialPlan.of(100, 4, 96));
-        expectInvalid("power of two", () -> GemmKernels.TopKPartialPlan.of(100, 4, 512));
-        GemmKernels.TopKPartialPlan p = GemmKernels.TopKPartialPlan.of(100, 4, 64);
-        FakeGpuBuffer b = new FakeGpuBuffer(1, 400, false);
-        expectInvalid("inv_temp", () -> p.args(0.0f, b, b, b));
-        expectInvalid("inv_temp", () -> p.args(Float.NaN, b, b, b));
-        expectInvalid("inv_temp", () -> p.args(Float.POSITIVE_INFINITY, b, b, b));
-        expectInvalid("distinct buffers", () -> p.args(1.0f, b, b, new FakeGpuBuffer(2, 16, false)));
-
-        FakeGpuBuffer logits = new FakeGpuBuffer(3, 100L * 4, true);
-        FakeGpuBuffer val = new FakeGpuBuffer(4, 4L * 4, false);
-        FakeGpuBuffer shortIdx = new FakeGpuBuffer(5, 4L * 4 - 1, false);
-        expectInvalid("cand_idx buffer", () -> p.args(1.0f, logits, val, shortIdx));
-        FakeGpuBuffer shortLogits = new FakeGpuBuffer(6, 99L * 4, true);
-        expectInvalid("logits buffer", () -> p.args(1.0f, shortLogits, val, new FakeGpuBuffer(7, 16, false)));
-    }
-
-    @Test
-    public void topKPartialDeviceLimitsAreReported() {
-        GemmKernels.TopKPartialPlan p = GemmKernels.TopKPartialPlan.of(152064, 40, 256);
-        assertNull(p.checkDevice(caps(1024, 49152, new long[]{65535, 65535, 65535})));
-        String reason = p.checkDevice(caps(128, 49152, new long[]{65535, 65535, 65535}));
-        assertNotNull(reason);
-        assertTrue(reason, reason.contains("work-groups of 256"));
-        reason = p.checkDevice(caps(1024, 49152, new long[]{16, 65535, 65535}));
-        assertNotNull(reason);
-        assertTrue(reason, reason.contains("38 work-groups"));
     }
 
     @Test

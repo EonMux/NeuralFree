@@ -29,9 +29,11 @@ import static org.junit.Assert.assertTrue;
  * replays re-record the changed dispatches, and the trusted steps patch them from the plan without running the
  * body, each recorded ahead while the step before it runs. The replay's counters must show exactly that: one
  * capture after the warmup, the verify steps as body replays, and every later step as a prepared patched replay, so
- * a replay that fell back to running the step directly fails here although its logits would match. Two models cover
- * both decode attention kernels: dim-16 heads over an fp32 cache (the split flash decode) and dim-64 heads over an
- * fp16 cache (the one-row decode kernel, which the capture must hold on an NVIDIA device and nowhere else). The
+ * a replay that fell back to running the step directly fails here although its logits would match. Three models
+ * cover the decode attention kernels: dim-16 heads over an fp32 cache (the split flash decode), and dim-64 heads
+ * over an fp16 cache with two query heads per KV head (the grouped-query decode kernel) and with one (the per-head
+ * one-row decode kernel), the one-row kernels being what the capture must hold on an NVIDIA device and nowhere
+ * else. The
  * engine picks its Vulkan device as usual; {@code -Dneuralfree.test.replay.device=<substring>} narrows that choice
  * for the run as {@code -Dneuralfree.device} does an application's (for instance {@code Intel} on a machine whose
  * first-ranked Vulkan device is another GPU).
@@ -53,16 +55,34 @@ public class GpuDecodeReplayVulkanTest {
     }
 
     @Test
-    public void replayMatchesDirectDecodeOverAnFp16CacheOfDim64Heads() throws IOException {
+    public void replayMatchesDirectDecodeOverAnFp16CacheOfGroupedDim64Heads() throws IOException {
+        assertOneRowKernel(4, 2, AttnKernels.flashDecodeGqa(KvDType.F16, KvDType.F16));
+    }
+
+    @Test
+    public void replayMatchesDirectDecodeOverAnFp16CacheOfUngroupedDim64Heads() throws IOException {
+        assertOneRowKernel(4, 4, AttnKernels.FLASH_DECODE_ROW_F16);
+    }
+
+    /**
+     * Decodes a dim-64 llama of {@code nHead} query and {@code nHeadKv} KV heads over an fp16 cache with and without
+     * the replay, and checks that the capture holds {@code kernel} in place of the split flash decode on an NVIDIA
+     * device and neither one-row kernel elsewhere.
+     */
+    private static void assertOneRowKernel(int nHead, int nHeadKv, String kernel) throws IOException {
         SyntheticModels.Config c = SyntheticModels.Config.llama().toBuilder()
-                .nEmbd(256).nHead(4).nHeadKv(2).headDim(64).nRot(64).build();
+                .nEmbd(256).nHead(nHead).nHeadKv(nHeadKv).headDim(64).nRot(64).build();
         Decode replayed = compare(SyntheticModels.llama(c).writeTempFile(), KvDType.F16);
         boolean nvidia = replayed.vendorId == PCI_VENDOR_NVIDIA;
-        assertEquals("the one-row decode kernel serves the step on NVIDIA only: " + replayed.kernels, nvidia,
-                replayed.kernels.contains(AttnKernels.FLASH_DECODE_ROW_F16));
+        assertEquals(kernel + " serves the step on NVIDIA only: " + replayed.kernels, nvidia,
+                replayed.kernels.contains(kernel));
         if (nvidia) {
             assertFalse("the one-row kernel replaces the split flash decode: " + replayed.kernels,
                     replayed.kernels.contains(AttnKernels.flashDecode(KvDType.F16, KvDType.F16)));
+        } else {
+            assertFalse("no one-row kernel off NVIDIA: " + replayed.kernels,
+                    replayed.kernels.contains(AttnKernels.FLASH_DECODE_ROW_F16)
+                            || replayed.kernels.contains(AttnKernels.flashDecodeGqa(KvDType.F16, KvDType.F16)));
         }
     }
 

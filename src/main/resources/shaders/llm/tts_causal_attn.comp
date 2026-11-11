@@ -1,10 +1,10 @@
 /* tts_causal_attn.comp - LLM_TtsCausalAttn: causal attention of one code-predictor step over a key/value cache of
- * rows 0..pos. GLSL twin of kernels/llm/speech.cl. Requires: common/nf_common.glsl.
+ * rows 0..pos. GLSL twin of kernels/llm/speech.cl. Requires: common/nf_common.glsl, common/tts_attend.glsl.
  *
  * Arguments: (i n_head, i n_head_kv, i d_head, i pos, R q, R keys, R values, W out).
  *   out[h] = softmax_j(q[h] . keys[j][kv(h)] / sqrt(d_head)) . values[j][kv(h)]
  * q[n_head*d_head], keys[(pos+1)][n_head_kv*d_head], values of that shape, out[n_head*d_head].
- * Dispatch: 1-D, one invocation per head, global = roundUp(n_head, L), local = {L, 1, 1}.
+ * Dispatch: 1-D, one workgroup per head (nf_tts_attend), global = n_head*L, local = {L, 1, 1}.
  */
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -23,41 +23,16 @@ layout(push_constant) uniform NfAttnParams {
     int pos;
 } pc;
 
-float nf_attn_dot(const uint q_off, const uint k_off) {
-    float dot = 0.0;
-    for (int d = 0; d < pc.d_head; ++d) {
-        dot += q_in[q_off + uint(d)] * keys_in[k_off + uint(d)];
-    }
-    return dot;
-}
+#include "common/tts_attend.glsl"
 
 void main() {
-    const uint h = nf_global_id();
+    const uint h = nf_wg_id();
+    /* uniform per workgroup */
     if (h >= uint(pc.n_head)) {
         return;
     }
-    const uint heads_per_kv = uint(pc.n_head / pc.n_head_kv);
-    const uint kv_head = h / heads_per_kv;
-    const uint kv_ch = uint(pc.n_head_kv) * uint(pc.d_head);
+    const uint kv_head = h / uint(pc.n_head / pc.n_head_kv);
     const uint q_off = h * uint(pc.d_head);
-    const float scale = 1.0 / sqrt(float(pc.d_head));
-    float mx = -3.402823466e+38;
-    for (int j = 0; j <= pc.pos; ++j) {
-        const float score = nf_attn_dot(q_off, uint(j) * kv_ch + kv_head * uint(pc.d_head)) * scale;
-        mx = max(mx, score);
-    }
-    float sum = 0.0;
-    for (int j = 0; j <= pc.pos; ++j) {
-        const float score = nf_attn_dot(q_off, uint(j) * kv_ch + kv_head * uint(pc.d_head)) * scale;
-        sum += exp(score - mx);
-    }
-    const float inv = sum > 0.0 ? 1.0 / sum : 0.0;
-    for (int d = 0; d < pc.d_head; ++d) {
-        float acc = 0.0;
-        for (int j = 0; j <= pc.pos; ++j) {
-            const float score = nf_attn_dot(q_off, uint(j) * kv_ch + kv_head * uint(pc.d_head)) * scale;
-            acc += exp(score - mx) * values_in[uint(j) * kv_ch + kv_head * uint(pc.d_head) + uint(d)];
-        }
-        out_data[q_off + uint(d)] = acc * inv;
-    }
+    nf_tts_attend(q_off, uint(pc.n_head_kv) * uint(pc.d_head), kv_head * uint(pc.d_head), pc.d_head, 0, pc.pos,
+                  q_off);
 }

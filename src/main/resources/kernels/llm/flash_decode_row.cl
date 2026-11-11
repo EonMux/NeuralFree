@@ -18,14 +18,15 @@
  *   softmax (running max m, sum l, output o) in registers: one rescale per batch. The four warps' states
  *   merge once through local memory at the end.
  *
- * Output as LLM_FlashDecode_F16: direct_out writes o / l (0 when l == 0) at out[out_off + h * d_v + d], else
- * the split partial partial[(h * n_split + s) * (d_v + 2) + d] = o with m at + d_v and l at + d_v + 1, an
- * empty split writing (0, -inf, 0).
+ * Output as LLM_FlashDecode_F16: direct_out writes o / l (0 when l == 0) at out[out_off + h * d_v + d], with the
+ * head's sink logit merged into (m, l) first under NF_ATTN_FLAG_SINKS (nf_attn_sink), else the split partial
+ * partial[(h * n_split + s) * (d_v + 2) + d] = o with m at + d_v and l at + d_v + 1, an empty split writing
+ * (0, -inf, 0); the partials leave the sinks to LLM_FlashAttn_Combine, as the generic kernel's do.
  *
  * Plan constraints (gguf.ops.attn.FlashPlan selects this kernel only under them; a violation writes NaN
  * outputs): local size NF_FA_WG, g_tile == 1, d_k == d_v, d_k a multiple of 64 of at most NF_FDR_MAX_D,
  * even row and head strides, a dense cache (kv_pos[row] for cache row row), bias_mode NF_ATTN_BIAS_NONE, and
- * none of the sink, V-alias and tree flags. Softcap, sliding windows and kv_start > 0 are served.
+ * neither the V-alias nor the tree flag. Softcap, sliding windows, sink logits and kv_start > 0 are served.
  */
 
 #if defined(__CUDACC__) && !defined(__HIP__)
@@ -94,7 +95,7 @@ NF_KERNEL void LLM_FlashDecodeRow_F16(
     NF_LOCAL float l_s[NF_FDR_WARPS];
 
     const int direct_out = (flags & NF_ATTN_FLAG_DIRECT) != 0;
-    const int unsupported = NF_ATTN_FLAG_SINKS | NF_ATTN_FLAG_V_ALIAS | NF_ATTN_FLAG_TREE;
+    const int unsupported = NF_ATTN_FLAG_V_ALIAS | NF_ATTN_FLAG_TREE;
     if (g_tile != 1 || d_k != d_v || d_k <= 0 || d_k % 64 != 0 || d_k > NF_FDR_MAX_D || n_head_kv <= 0
             || n_head % n_head_kv != 0 || split_len <= 0 || bias_mode != NF_ATTN_BIAS_NONE
             || (flags & unsupported) != 0 || ((k_row_stride | k_head_stride | v_row_stride | v_head_stride) & 1)
@@ -218,6 +219,12 @@ NF_KERNEL void LLM_FlashDecodeRow_F16(
         f[i] = m_s[i] == -NF_INF ? 0.0f : exp(m_s[i] - mt);
         lt += f[i] * l_s[i];
     }
+    float sink_f = 1.0f;
+    if (direct_out && (flags & NF_ATTN_FLAG_SINKS)) {
+        const float2 fl = nf_attn_sink(mt, lt, sinks[h]);
+        sink_f = fl.x;
+        lt = fl.y;
+    }
     NF_GLOBAL float* pr = partial + ((nf_i64)h * n_split + split) * (d_v + 2);
     for (int d = lid; d < d_v; d += NF_FA_WG) {
         float o = 0.0f;
@@ -226,7 +233,7 @@ NF_KERNEL void LLM_FlashDecodeRow_F16(
             o += f[i] * o_s[i * NF_FDR_MAX_D + d];
         }
         if (direct_out) {
-            out[(nf_i64)out_off + (nf_i64)h * d_v + d] = lt > 0.0f ? o / lt : 0.0f;
+            out[(nf_i64)out_off + (nf_i64)h * d_v + d] = lt > 0.0f ? o * sink_f / lt : 0.0f;
         } else {
             pr[d] = o;
         }

@@ -1,10 +1,11 @@
 /* tts_full_attn.comp - LLM_TtsFullAttn: bidirectional attention over every row (the lfm3a depthformer's codebook
- * pass). GLSL twin of kernels/llm/speech.cl. Requires: common/nf_common.glsl.
+ * pass). GLSL twin of kernels/llm/speech.cl. Requires: common/nf_common.glsl, common/tts_attend.glsl.
  *
  * Arguments: (i n_pos, i n_head, i n_head_kv, i d_head, R q, R keys, R values, W out).
  *   out[r][h][d] = softmax_j(q[r][h] . keys[j][kv(h)] / sqrt(d_head)) * values[j][kv(h)]
  * q[n_pos][n_head*d_head], keys and values [n_pos][n_head_kv*d_head], out of q's shape.
- * Dispatch: 1-D, one invocation per (row, head), global = roundUp(n_pos*n_head, L), local = {L, 1, 1}.
+ * Dispatch: 1-D, one workgroup per (row, head) (nf_tts_attend), linear group r*n_head + h,
+ * global = n_pos*n_head*L, local = {L, 1, 1}.
  */
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -23,44 +24,18 @@ layout(push_constant) uniform NfFaParams {
     int d_head;
 } pc;
 
-float nf_fa_dot(const uint q_off, const uint k_off) {
-    float dot = 0.0;
-    for (int d = 0; d < pc.d_head; ++d) {
-        dot += q_in[q_off + uint(d)] * keys_in[k_off + uint(d)];
-    }
-    return dot;
-}
+#include "common/tts_attend.glsl"
 
 void main() {
-    const uint idx = nf_global_id();
-    if (idx >= uint(pc.n_pos) * uint(pc.n_head)) {
+    const uint g = nf_wg_id();
+    /* uniform per workgroup */
+    if (g >= uint(pc.n_pos) * uint(pc.n_head)) {
         return;
     }
-    const int r = int(idx / uint(pc.n_head));
-    const uint h = idx - uint(r) * uint(pc.n_head);
-    const uint heads_per_kv = uint(pc.n_head / pc.n_head_kv);
-    const uint kv_head = h / heads_per_kv;
-    const uint kv_ch = uint(pc.n_head_kv) * uint(pc.d_head);
-    const uint q_off = uint(r) * uint(pc.n_head) * uint(pc.d_head) + h * uint(pc.d_head);
-    const float scale = 1.0 / sqrt(float(pc.d_head));
-
-    float mx = -3.402823466e+38;
-    for (int j = 0; j < pc.n_pos; ++j) {
-        const float score = nf_fa_dot(q_off, uint(j) * kv_ch + kv_head * uint(pc.d_head)) * scale;
-        mx = max(mx, score);
-    }
-    float sum = 0.0;
-    for (int j = 0; j < pc.n_pos; ++j) {
-        const float score = nf_fa_dot(q_off, uint(j) * kv_ch + kv_head * uint(pc.d_head)) * scale;
-        sum += exp(score - mx);
-    }
-    const float inv = sum > 0.0 ? 1.0 / sum : 0.0;
-    for (int d = 0; d < pc.d_head; ++d) {
-        float acc = 0.0;
-        for (int j = 0; j < pc.n_pos; ++j) {
-            const float score = nf_fa_dot(q_off, uint(j) * kv_ch + kv_head * uint(pc.d_head)) * scale;
-            acc += exp(score - mx) * values_in[uint(j) * kv_ch + kv_head * uint(pc.d_head) + uint(d)];
-        }
-        out_data[q_off + uint(d)] = acc * inv;
-    }
+    const uint r = g / uint(pc.n_head);
+    const uint h = g - r * uint(pc.n_head);
+    const uint kv_head = h / uint(pc.n_head / pc.n_head_kv);
+    const uint q_off = r * uint(pc.n_head) * uint(pc.d_head) + h * uint(pc.d_head);
+    nf_tts_attend(q_off, uint(pc.n_head_kv) * uint(pc.d_head), kv_head * uint(pc.d_head), pc.d_head, 0,
+                  pc.n_pos - 1, q_off);
 }

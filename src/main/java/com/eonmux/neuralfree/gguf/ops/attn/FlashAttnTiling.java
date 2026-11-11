@@ -155,6 +155,14 @@ public final class FlashAttnTiling {
      * of a split launch stays short.
      */
     static final int GQA_GROUPS_PER_UNIT = 2;
+    /**
+     * Work-groups per compute unit a grouped-query dense decode step aims at ({@link #decodeOnline}). The kernel
+     * holds no keys in shared memory and a few kilobytes of state per work-group, so many stay resident on a unit;
+     * a step that fills the units with that many work-groups keeps enough key loads in flight to stream the cache
+     * at bandwidth, and the split count it needs stays small at any depth, so the merge stays short. Measured on
+     * the RTX 5080 Laptop (tg128 at 4096 and 16384 cached keys, Qwen3-Embedding 0.6B and 4B): 8 leads 2, 4 and 16.
+     */
+    static final int ONLINE_GROUPS_PER_UNIT = 8;
     /** Largest mma head dim (d_k and d_v multiples of 16 of at most this). */
     public static final int MMA_MAX_HEAD_DIM = 128;
     /** Head tiles of the mma plan: at most this many query heads per work-group. */
@@ -178,10 +186,20 @@ public final class FlashAttnTiling {
     private final boolean decodeFastPath;
     /** Whether the plan's launches run the subgroup kernels ({@link SubgroupFlashAttention}). */
     private final boolean subgroup;
+    /** Whether the plan's launches run the grouped-query dense decode kernel ({@link #decodeOnline}). */
+    private final boolean online;
 
     private FlashAttnTiling(Plan plan, int nHead, int nHeadKv, int dK, int dV, int smemFloats, int computeUnits,
                             int gTile, int keyCapacity, int wantedSplits, int minSplitLen, int maxSplitLen,
                             int maxSplits, int bq, int bk, boolean decodeFastPath, boolean subgroup) {
+        this(plan, nHead, nHeadKv, dK, dV, smemFloats, computeUnits, gTile, keyCapacity, wantedSplits, minSplitLen,
+                maxSplitLen, maxSplits, bq, bk, decodeFastPath, subgroup, false);
+    }
+
+    private FlashAttnTiling(Plan plan, int nHead, int nHeadKv, int dK, int dV, int smemFloats, int computeUnits,
+                            int gTile, int keyCapacity, int wantedSplits, int minSplitLen, int maxSplitLen,
+                            int maxSplits, int bq, int bk, boolean decodeFastPath, boolean subgroup,
+                            boolean online) {
         this.plan = plan;
         this.nHead = nHead;
         this.nHeadKv = nHeadKv;
@@ -199,6 +217,7 @@ public final class FlashAttnTiling {
         this.bk = bk;
         this.decodeFastPath = decodeFastPath;
         this.subgroup = subgroup;
+        this.online = online;
     }
 
     /**
@@ -384,6 +403,30 @@ public final class FlashAttnTiling {
         return planDecode(Plan.DECODE, nHead, nHeadKv, dK, dV, maxKvLen, smemFloats, computeUnits, decodeFastPath);
     }
 
+    /**
+     * Decode plan of the grouped-query dense decode kernel {@code LLM_FlashDecodeGqa_*}: every query head of a KV
+     * group in one work-group ({@code g_tile = n_head / n_head_kv}, the grid's dimension 1 is {@code n_head_kv}).
+     * Its running max, sum and output live in registers, so no shared budget bounds a split: a step aims at
+     * {@link #ONLINE_GROUPS_PER_UNIT} work-groups per compute unit, {@code wanted =
+     * ceil(ONLINE_GROUPS_PER_UNIT * CU / n_head_kv)}, with splits of at least {@link #MIN_SPLIT} keys and no upper
+     * bound below the key range, which is the shape of llama.cpp's fattn-vec launch (fattn-common.cuh:
+     * {@code parallel_blocks} from the occupancy and the SM count, not from the depth). The split count then stays
+     * at most {@code wanted} at every depth.
+     *
+     * @throws IllegalArgumentException for invalid shapes
+     */
+    public static FlashAttnTiling decodeOnline(int nHead, int nHeadKv, int dK, int dV, int nKvMax, int smemFloats,
+                                               int computeUnits) {
+        validate(nHead, nHeadKv, dK, dV, nKvMax, smemFloats, computeUnits);
+        int g = nHead / nHeadKv;
+        int maxLen = roundUp(nKvMax, SPLIT_QUANTUM);
+        int minLen = Math.min(maxLen, MIN_SPLIT);
+        int wanted = (int) Math.max(1L, ceilDiv((long) ONLINE_GROUPS_PER_UNIT * computeUnits, nHeadKv));
+        int maxSplits = Math.max(1, Math.min(wanted, ceilDiv(nKvMax, minLen)));
+        return new FlashAttnTiling(Plan.DECODE, nHead, nHeadKv, dK, dV, smemFloats, computeUnits,
+                g, nKvMax, wanted, minLen, maxLen, maxSplits, 0, 0, false, false, true);
+    }
+
     private static FlashAttnTiling planDecode(Plan plan, int nHead, int nHeadKv, int dK, int dV, int nKvMax,
                                               int smemFloats, int computeUnits, boolean decodeFastPath) {
         int g0 = nHead / nHeadKv;
@@ -555,6 +598,8 @@ public final class FlashAttnTiling {
      * {@link #prefillSubgroup}).
      */
     public boolean subgroup() { return subgroup; }
+    /** Whether the plan runs the grouped-query dense decode kernel ({@link #decodeOnline}). */
+    public boolean online() { return online; }
     /** Query tokens per workgroup ({@code bq}); 0 unless the plan is tiled or mma. */
     public int bq() { return bq; }
     /** Keys per tile ({@code bk}); 0 unless the plan is tiled or mma. */
@@ -562,7 +607,10 @@ public final class FlashAttnTiling {
     /** Query rows per workgroup: {@code bq * g_tile} for {@link Plan#TILED} and {@link Plan#MMA}, {@code g_tile} otherwise. */
     public int rows() { return plan == Plan.TILED || plan == Plan.MMA ? bq * gTile : gTile; }
 
-    /** Most shared floats the plan uses (excluding the kernels' fixed reduction and statistics arrays). */
+    /**
+     * Most shared floats the plan uses (excluding the kernels' fixed reduction and statistics arrays); 0 for an
+     * {@link #online()} plan, whose kernels hold only fixed arrays.
+     */
     public long smemUsed() {
         if (plan == Plan.MMA) {
             return mmaSmemFloats(dK, dV);
@@ -573,6 +621,9 @@ public final class FlashAttnTiling {
         }
         if (subgroup) {
             return (long) SubgroupFlashAttention.SUBGROUPS * (SubgroupFlashAttention.MAX_HEAD_DIM + 2);
+        }
+        if (online) {
+            return 0;
         }
         return (long) gTile * (dK + maxSplitLen) + (long) PASS2_GROUPS * gTile * dV;
     }
@@ -831,7 +882,7 @@ public final class FlashAttnTiling {
         if (plan == Plan.TILED || plan == Plan.MMA) {
             return head + (subgroup ? ", subgroup" : "") + ", bq=" + bq + ", bk=" + bk + ", smem=" + smemUsed() + "/" + smemFloats + '}';
         }
-        return head + (subgroup() ? ", subgroup" : "") + ", split_len=" + minSplitLen + ".." + maxSplitLen + ", wanted_splits=" + wantedSplits
+        return head + (subgroup() ? ", subgroup" : "") + (online ? ", online" : "") + ", split_len=" + minSplitLen + ".." + maxSplitLen + ", wanted_splits=" + wantedSplits
                 + ", max_splits=" + maxSplits + ", keys<=" + keyCapacity + ", smem=" + smemUsed() + "/" + smemFloats
                 + '}';
     }

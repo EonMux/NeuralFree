@@ -175,9 +175,8 @@ final class GpuDflashBackbone implements DflashStack, AutoCloseable {
 
     /** Candidates per row of a device top-k readout of {@code spec}: the lattice width, else the sampler's 10. */
     static int topKWidth(DflashSpec spec) {
-        int k = spec.lilicorr() ? spec.lilicorrTopK() : spec.dflash2() ? spec.selectorTopK()
+        return spec.lilicorr() ? spec.lilicorrTopK() : spec.dflash2() ? spec.selectorTopK()
                 : DflashSpec.SAMPLER_TOP_K;
-        return spec.dflash2() ? k : Math.min(k, GemmKernels.TopKPartialPlan.MAX_K);
     }
 
     /**

@@ -2,7 +2,8 @@
 # Flash attention (kernels/llm/flash_decode.cl, kernels/llm/flash_prefill.cl, kernels/llm/flash_combine.cl), and the
 # Vulkan-only twins of CUDA-only kernels, whose SPIR-V signatures the inventory check compares with the CUDA kernels: the
 # VK_NV_cooperative_matrix2 tensor-core prefill (kernels/llm/flash_mma.cl; flags as the CM2 GEMM rows of gemm_fast.tsv)
-# and the one-row decode (kernels/llm/flash_decode_row.cl).
+# and the one-row and grouped-query dense decodes (kernels/llm/flash_decode_row.cl, the dense entries of
+# kernels/llm/flash_decode_gqa.cl).
 LLM_FlashDecode_F32	flash_decode.comp	KV=NF_KV_F32	sg
 LLM_FlashDecode_F16	flash_decode.comp	KV=NF_KV_F16	sg
 LLM_FlashDecode_Q8_0	flash_decode.comp	KV=NF_KV_Q8_0	sg
@@ -107,3 +108,6 @@ LLM_FlashAttnPaged_Mixed	flash_prefill.comp	KV_MIXED=1 PAGED=1	sg
 LLM_FlashAttnMma_F16	flash_mma_cm2.comp		vk13,vulkan,noopt
 LLM_FlashAttnMmaPaged_F16	flash_mma_cm2.comp	PAGED=1	vk13,vulkan,noopt
 LLM_FlashDecodeRow_F16	flash_decode_row.comp		sg,vulkan
+LLM_FlashDecodeGqa_F16	flash_decode_gqa.comp	KV=NF_KV_F16	sg,vulkan
+LLM_FlashDecodeGqa_BF16	flash_decode_gqa.comp	KV=NF_KV_BF16	sg,vulkan
+LLM_FlashDecodeGqa_Q8_0	flash_decode_gqa.comp	KV=NF_KV_Q8_0	sg,vulkan

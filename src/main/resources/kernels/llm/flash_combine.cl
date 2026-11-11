@@ -12,8 +12,19 @@
  *
  * Layout: partial[(r * n_split + s) * (d_v + 2) + d], m at + d_v, l at + d_v + 1; row r has head
  * r % n_head and writes out[out_off + r * d_v + d].
- * Grid: global {n_rows * 128}, local {128} (one workgroup per row; any local size is valid, no barriers).
+ *
+ * The work-group finds m with its items striding over the splits, then stages the split weights
+ * w_s = e^(m_s - m) and sums l_s in shared memory NF_FC_STAGE splits at a time, so each weight is computed once per
+ * row instead of once per output element; every item then accumulates its output elements over the staged weights
+ * in ascending split order, and l the same way, so the sums are those of the serial formula above term by term.
+ * Grid: global {n_rows * 128}, local {128} (one workgroup per row). Any local size of at most NF_FC_MAX_WG serves
+ * d_v <= NF_FC_ACC * local size this way; a launch outside that runs the same formula with each item recomputing
+ * the weights of its elements (no barriers).
  */
+#define NF_FC_STAGE  256   /* split weights staged at once */
+#define NF_FC_ACC    8     /* output elements per work-item in the staged form */
+#define NF_FC_MAX_WG 256   /* largest local size of the staged form */
+
 NF_KERNEL void LLM_FlashAttn_Combine(
     const int n_rows,
     const int d_v,
@@ -25,6 +36,9 @@ NF_KERNEL void LLM_FlashAttn_Combine(
     NF_GLOBAL const float* NF_RESTRICT sinks,
     NF_GLOBAL float* NF_RESTRICT out)
 {
+    NF_LOCAL float w_s[NF_FC_STAGE];
+    NF_LOCAL float l_s[NF_FC_STAGE];
+    NF_LOCAL float red[NF_FC_MAX_WG];
     const int row = (int)get_group_id(0);
     if (row >= n_rows) {
         return;
@@ -34,30 +48,89 @@ NF_KERNEL void LLM_FlashAttn_Combine(
     const int stride = d_v + 2;
     NF_GLOBAL const float* pr = partial + (nf_i64)row * n_split * stride;
     NF_GLOBAL float* dst = out + (nf_i64)out_off + (nf_i64)row * d_v;
-
     const float sink = has_sinks ? sinks[row % n_head] : -NF_INF;
+
+    if (lsz > NF_FC_MAX_WG || d_v > NF_FC_ACC * lsz) {
+        float m = sink;
+        for (int s = 0; s < n_split; s++) {
+            m = fmax(m, pr[(nf_i64)s * stride + d_v]);
+        }
+        if (m == -NF_INF) {
+            for (int d = lid; d < d_v; d += lsz) {
+                dst[d] = 0.0f;
+            }
+            return;
+        }
+        float l = nf_attn_rescale(sink, m);
+        for (int s = 0; s < n_split; s++) {
+            NF_GLOBAL const float* ps = pr + (nf_i64)s * stride;
+            l += ps[d_v + 1] * nf_attn_rescale(ps[d_v], m);
+        }
+        for (int d = lid; d < d_v; d += lsz) {
+            float o = 0.0f;
+            for (int s = 0; s < n_split; s++) {
+                NF_GLOBAL const float* ps = pr + (nf_i64)s * stride;
+                o += ps[d] * nf_attn_rescale(ps[d_v], m);
+            }
+            dst[d] = l > 0.0f ? o / l : 0.0f;
+        }
+        return;
+    }
+
+    /* m: each item's strided maximum, then every item reads all of them (max is exact in any order) */
+    float mi = -NF_INF;
+    for (int s = lid; s < n_split; s += lsz) {
+        mi = fmax(mi, pr[(nf_i64)s * stride + d_v]);
+    }
+    red[lid] = mi;
+    barrier(CLK_LOCAL_MEM_FENCE);
     float m = sink;
-    for (int s = 0; s < n_split; s++) {
-        m = fmax(m, pr[(nf_i64)s * stride + d_v]);
+    for (int i = 0; i < lsz; i++) {
+        m = fmax(m, red[i]);
     }
     if (m == -NF_INF) {
         for (int d = lid; d < d_v; d += lsz) {
             dst[d] = 0.0f;
         }
-        return;
+        return;   /* uniform: every item read the same m */
     }
     float l = nf_attn_rescale(sink, m);
-    for (int s = 0; s < n_split; s++) {
-        NF_GLOBAL const float* ps = pr + (nf_i64)s * stride;
-        l += ps[d_v + 1] * nf_attn_rescale(ps[d_v], m);
+    float acc[NF_FC_ACC];
+#pragma unroll
+    for (int k = 0; k < NF_FC_ACC; k++) {
+        acc[k] = 0.0f;
     }
-    for (int d = lid; d < d_v; d += lsz) {
-        float o = 0.0f;
-        for (int s = 0; s < n_split; s++) {
-            NF_GLOBAL const float* ps = pr + (nf_i64)s * stride;
-            o += ps[d] * nf_attn_rescale(ps[d_v], m);
+    for (int c0 = 0; c0 < n_split; c0 += NF_FC_STAGE) {
+        const int cn = min(NF_FC_STAGE, n_split - c0);
+        for (int i = lid; i < cn; i += lsz) {
+            NF_GLOBAL const float* ps = pr + (nf_i64)(c0 + i) * stride;
+            w_s[i] = nf_attn_rescale(ps[d_v], m);
+            l_s[i] = ps[d_v + 1];
         }
-        dst[d] = l > 0.0f ? o / l : 0.0f;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int i = 0; i < cn; i++) {
+            l += l_s[i] * w_s[i];
+        }
+#pragma unroll
+        for (int k = 0; k < NF_FC_ACC; k++) {
+            const int d = lid + k * lsz;
+            if (d < d_v) {
+                NF_GLOBAL const float* pd = pr + (nf_i64)c0 * stride + d;
+                float o = acc[k];
+                for (int i = 0; i < cn; i++) {
+                    o += pd[(nf_i64)i * stride] * w_s[i];
+                }
+                acc[k] = o;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);   /* the stage is consumed before the next one overwrites it */
+    }
+#pragma unroll
+    for (int k = 0; k < NF_FC_ACC; k++) {
+        const int d = lid + k * lsz;
+        if (d < d_v) {
+            dst[d] = l > 0.0f ? acc[k] / l : 0.0f;
+        }
     }
 }
 

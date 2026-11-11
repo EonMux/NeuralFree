@@ -1,5 +1,5 @@
 /* row_topk.comp - row-wise top-k in rank order with the row's softmax denominators. GLSL twin of
- * LLM_Row_TopK in kernels/llm/sampling_topk.cl. Requires: common/nf_common.glsl.
+ * LLM_Row_TopK in kernels/llm/sampling_topk.cl. Requires: common/nf_common.glsl, common/topk_select.glsl.
  *
  * Variants row:
  *     LLM_Row_TopK	row_topk.comp
@@ -7,13 +7,15 @@
  * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
  *   (i size, i k, i n_rows, R float logits, W float top_val, W int top_idx, W float sum_exp)
  * Workgroup row of n_rows scans logits[row * size .. + size) once for the maximum, once for
- * sum_exp[row] = sum_j exp(logits[j] - max), then k rounds of a workgroup argmax restricted to the
- * elements ranking after the previous round's winner: top_val[row * k + r] / top_idx[row * k + r]
- * receive the r-th best value and its index in the row's total order (larger value first, equal
- * values by lower index; NaN never ranks). Rounds past the row's element count hold -INF / -1.
+ * sum_exp[row] = sum_j exp(logits[j] - max), then selects the kk = min(k, non-NaN count) best elements by the
+ * radix select of common/topk_select.glsl and ranks them in shared memory (a readout narrower than
+ * NF_ROW_TOPK_RADIX_MIN_K or wider than NF_ROW_TOPK_MAX_K runs k rounds of a workgroup argmax restricted to the
+ * elements ranking after the previous round's winner instead): top_val[row * k + r] / top_idx[row * k + r]
+ * receive the r-th best value and its index in the row's total order (larger value first, equal values by lower
+ * index; NaN never ranks, -INF does). Slots past the row's non-NaN count hold -INF / -1.
  *
  * Dispatch: 1-D, global = {n_rows * L}, local = {L, 1, 1}, L a power of two <= LLM_DIMX,
- * 1 <= size <= 2^30, 1 <= k <= 64; n_rows stays far below maxComputeWorkGroupCount[0], so the
+ * 1 <= size <= 2^30, k >= 1; n_rows stays far below maxComputeWorkGroupCount[0], so the
  * dispatch is never folded and gl_WorkGroupID.x is the row.
  */
 #version 450
@@ -27,11 +29,30 @@ layout(std430, binding = 2) writeonly buffer NfRtIdx { int top_idx[]; };
 layout(std430, binding = 3) writeonly buffer NfRtSum { float sum_exp[]; };
 layout(push_constant) uniform NfRtParams { int size; int k; int n_rows; } pc;
 
+#define NF_ROW_TOPK_RADIX_MIN_K 8     /* narrowest readout of the radix form */
+#define NF_ROW_TOPK_MAX_K 1024        /* widest readout of the radix form */
+
+#define NF_TOPK_SRC logits
+#define NF_TOPK_SEL_MAX NF_ROW_TOPK_MAX_K
+#include "common/topk_select.glsl"
+
 /* Index sentinel of a candidate slot that holds no element. */
 #define NF_RT_NONE 0x7fffffff
 
-shared float nf_rt_v[gl_WorkGroupSize.x];
-shared int nf_rt_i[gl_WorkGroupSize.x];
+/*
+ * The shader keeps inside the 16 KB of shared memory every Vulkan device provides by reusing the selection's arrays:
+ * the workgroup reductions (value, index) run in nf_topk_part_a / nf_topk_part_e, which the selection only uses
+ * between its own barriers, and the ranking reads the candidates' values from nf_topk_hist, free once the
+ * compaction has run (NF_ROW_TOPK_MAX_K <= NF_TOPK_BINS).
+ */
+#define NF_RT_V(i) uintBitsToFloat(nf_topk_part_a[i])
+#define NF_RT_SET_V(i, x) nf_topk_part_a[i] = floatBitsToUint(x)
+#define NF_RT_I(i) int(nf_topk_part_e[i])
+#define NF_RT_SET_I(i, x) nf_topk_part_e[i] = uint(x)
+#define NF_RT_SEL_V(i) uintBitsToFloat(nf_topk_hist[i])
+#if NF_ROW_TOPK_MAX_K > NF_TOPK_BINS
+#error "row_topk.comp: the ranked candidates outgrow nf_topk_hist"
+#endif
 
 /* NaN test on the bit pattern, independent of the driver's float NaN handling. */
 bool nf_rt_isnan(float v) {
@@ -61,15 +82,15 @@ void main() {
             my_max = v;
         }
     }
-    nf_rt_v[lid] = my_max;
+    NF_RT_SET_V(lid, my_max);
     barrier();
     for (int stride = lsize >> 1; stride > 0; stride >>= 1) {
-        if (lid < stride && nf_rt_v[lid + stride] > nf_rt_v[lid]) {
-            nf_rt_v[lid] = nf_rt_v[lid + stride];
+        if (lid < stride && NF_RT_V(lid + stride) > NF_RT_V(lid)) {
+            NF_RT_SET_V(lid, NF_RT_V(lid + stride));
         }
         barrier();
     }
-    const float row_max = nf_rt_v[0];
+    const float row_max = NF_RT_V(0);
     barrier();
 
     float my_sum = 0.0f;
@@ -79,18 +100,50 @@ void main() {
             my_sum += exp(v - row_max);
         }
     }
-    nf_rt_v[lid] = my_sum;
+    NF_RT_SET_V(lid, my_sum);
     barrier();
     for (int stride = lsize >> 1; stride > 0; stride >>= 1) {
         if (lid < stride) {
-            nf_rt_v[lid] += nf_rt_v[lid + stride];
+            NF_RT_SET_V(lid, NF_RT_V(lid) + NF_RT_V(lid + stride));
         }
         barrier();
     }
     if (lid == 0) {
-        sum_exp[uint(row)] = nf_rt_v[0];
+        sum_exp[uint(row)] = NF_RT_V(0);
     }
     barrier();
+
+    if (k >= NF_ROW_TOPK_RADIX_MIN_K && k <= NF_ROW_TOPK_MAX_K) {
+        uint key_k;
+        uint kk;
+        uint n_eq;
+        nf_topk_select(base, uint(size), uint(k), true, key_k, kk, n_eq);
+        if (kk > 0u) {
+            nf_topk_compact(base, uint(size), true, key_k, kk - n_eq, n_eq);
+        }
+        for (uint i = uint(lid); i < kk; i += uint(lsize)) {
+            nf_topk_hist[i] = floatBitsToUint(logits[base + uint(nf_topk_sel[i])]);
+        }
+        barrier();
+        /* rank the kk candidates: candidate i lands at the count of candidates ranking before it */
+        for (uint i = uint(lid); i < kk; i += uint(lsize)) {
+            const float cv = NF_RT_SEL_V(i);
+            const int ci = nf_topk_sel[i];
+            uint rank = 0u;
+            for (uint j = 0u; j < kk; ++j) {
+                rank += nf_rt_before(NF_RT_SEL_V(j), nf_topk_sel[j], cv, ci) ? 1u : 0u;
+            }
+            const uint slot = uint(row) * uint(k) + rank;
+            top_val[slot] = cv;
+            top_idx[slot] = ci;
+        }
+        for (uint r = kk + uint(lid); r < uint(k); r += uint(lsize)) {
+            const uint slot = uint(row) * uint(k) + r;
+            top_val[slot] = -NF_INF;
+            top_idx[slot] = -1;
+        }
+        return;
+    }
 
     /* Previous winner; (+INF, -1) ranks before every element, so round 0 sees the whole row. */
     float pv = NF_INF;
@@ -108,22 +161,22 @@ void main() {
                 bi = i;
             }
         }
-        nf_rt_v[lid] = bv;
-        nf_rt_i[lid] = bi;
+        NF_RT_SET_V(lid, bv);
+        NF_RT_SET_I(lid, bi);
         barrier();
         for (int stride = lsize >> 1; stride > 0; stride >>= 1) {
             if (lid < stride) {
-                const float ov = nf_rt_v[lid + stride];
-                const int oi = nf_rt_i[lid + stride];
-                if (nf_rt_before(ov, oi, nf_rt_v[lid], nf_rt_i[lid])) {
-                    nf_rt_v[lid] = ov;
-                    nf_rt_i[lid] = oi;
+                const float ov = NF_RT_V(lid + stride);
+                const int oi = NF_RT_I(lid + stride);
+                if (nf_rt_before(ov, oi, NF_RT_V(lid), NF_RT_I(lid))) {
+                    NF_RT_SET_V(lid, ov);
+                    NF_RT_SET_I(lid, oi);
                 }
             }
             barrier();
         }
-        const float wv = nf_rt_v[0];
-        const int wi = nf_rt_i[0];
+        const float wv = NF_RT_V(0);
+        const int wi = NF_RT_I(0);
         barrier();
         if (lid == 0) {
             const uint slot = uint(row) * uint(k) + uint(r);

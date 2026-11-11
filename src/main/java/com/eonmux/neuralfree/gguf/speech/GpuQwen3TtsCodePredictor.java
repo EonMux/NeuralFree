@@ -284,7 +284,7 @@ final class GpuQwen3TtsCodePredictor implements Qwen3TtsCodePredictor.Engine {
             headNormRope(kRaw, kNorm[il], kNormed, pos);
             ops.copy2d(kNormed, 0, kvCh, keys[il], pos * kvCh, kvCh, 1, kvCh);
             ops.copy2d(vRaw, 0, kvCh, values[il], pos * kvCh, kvCh, 1, kvCh);
-            ops.enqueue(SpeechKernels.TTS_CAUSAL_ATTN, new long[]{SpeechKernels.elementGlobal(nHead)},
+            ops.enqueue(SpeechKernels.TTS_CAUSAL_ATTN, new long[]{SpeechKernels.causalAttentionGlobal(nHead)},
                     new long[]{SpeechKernels.LOCAL}, nHead, nHeadKv, dHead, pos, qNormed, keys[il], values[il],
                     attn);
             ops.matvec(out[il], attn, 0, projected, 0, 1);
