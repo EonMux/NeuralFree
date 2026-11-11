@@ -39,6 +39,8 @@ final class GpuCallReads {
     /** Candidate slots per row of each read part: the bound readout's k, at least the requested one. */
     private final List<Integer> candidateStrides = new ArrayList<>();
     private final List<GpuEvent> events = new ArrayList<>();
+    /** The device slot the last greedy-id read came from, which a chained decode step reads its id from. */
+    private ScratchSlot idSlot;
 
     GpuCallReads(GpuLogitsHead head, ComputeQueue queue, int count, GpuPrefillDriver.Output output) {
         this(head, queue, count, output, 0);
@@ -129,6 +131,7 @@ final class GpuCallReads {
         long srcOff = (long) src.offset() * Float.BYTES;
         if (out == GpuPrefillDriver.Output.ARGMAX) {
             byte[] dst = new byte[(int) bytes];
+            idSlot = src;
             events.add(queue.enqueueReadBuffer(src.buffer(), srcOff, bytes, dst));
             idParts.add(dst);
             floatParts.add(null);
@@ -191,6 +194,31 @@ final class GpuCallReads {
             rows[target[0]] = floatParts.get(part);   /* one row per float read */
         }
         return new GpuPrefillDriver.Result(rows, ids);
+    }
+
+    /** The device slot of the greedy ids the last {@link GpuPrefillDriver.Output#ARGMAX} read reads; null before. */
+    ScratchSlot idSlot() {
+        return idSlot;
+    }
+
+    /**
+     * Waits until every read of this call holds its data: on the last read's event, which the queue's order puts
+     * after every earlier read, or on the whole queue when the backend returned no event for it.
+     *
+     * @throws IllegalStateException when the wait is interrupted (the interrupt status is kept)
+     */
+    void await() {
+        GpuEvent last = events.isEmpty() ? null : events.get(events.size() - 1);
+        if (last == null) {
+            queue.finish();
+            return;
+        }
+        try {
+            last.awaitCompletion();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("interrupted while waiting for a forward call's readback", e);
+        }
     }
 
     void closeEvents() {

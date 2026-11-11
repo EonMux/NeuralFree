@@ -24,11 +24,16 @@ import static org.jocl.CL.*;
  * An in-order OpenCL command queue.
  *
  * <p><b>Transfers.</b> Host data goes through direct staging buffers of an {@link OclStagingPool}:
- * writes copy the caller's data at enqueue and the staging buffer stays in flight until
- * {@link #finish()}. Reads land in a staging buffer that the read's {@code CL_COMPLETE} callback
- * copies into the caller's array; a read that terminated abnormally copies nothing and is reported
- * by {@link #finish()} or by its event's {@code awaitCompletion()}. Host arrays must cover the
- * transfer size, and float transfers must be whole floats.</p>
+ * writes copy the caller's data at enqueue and the staging buffer stays in flight until the queue
+ * knows the write completed. Reads land in a staging buffer that the read's {@code CL_COMPLETE}
+ * callback copies into the caller's array; a read that terminated abnormally copies nothing and is
+ * reported by {@link #finish()} or by its event's {@code awaitCompletion()}. Every transfer first
+ * retires the oldest reads whose callbacks ran successfully: the queue is in order, so every staging
+ * buffer retained up to such a read is free again and every dispatch timed before it has its
+ * timestamps, and a run of transfers that never calls {@link #finish()} (chained decode steps that
+ * wait only on their reads' events) holds only the buffers of the reads still in flight.
+ * {@link #finish()} recycles the rest. Host arrays must cover the transfer size, and float
+ * transfers must be whole floats.</p>
  *
  * <p><b>Errors.</b> Every driver failure is translated by {@link OclErrors}: exhausted memory becomes
  * {@code GpuOutOfMemoryException}, every other status a {@code GpuBackendException} naming the call.</p>
@@ -70,8 +75,13 @@ public final class OclComputeQueue implements ComputeQueue {
     /** The device's {@code cl_khr_command_buffer} entry points, or null when capture is unsupported. */
     private final OclCommandBufferApi commandBuffers;
     private boolean closed = false;
-    /** Reads enqueued since the last finish; their callbacks run on a driver thread. */
-    private final List<OclReadCompletion> pendingReads = new ArrayList<>();
+    /**
+     * Reads enqueued since the last finish and not retired yet ({@link #retireCompletedReads}),
+     * oldest first; their callbacks run on a driver thread.
+     */
+    private final ArrayDeque<OclReadCompletion> pendingReads = new ArrayDeque<>();
+    /** Dispatch timings tracked since the queue was made ({@link #trackTiming}). */
+    private long timingsTracked;
     private final OclStagingPool staging = new OclStagingPool();
 
     private Capture capture = Capture.NONE;
@@ -167,7 +177,7 @@ public final class OclComputeQueue implements ComputeQueue {
         cl_mem mem = extractClMem(dstBuffer);
         cl_event[] waitList = extractWaitList(waitOnEvents);
 
-        ByteBuffer buf = staging.acquire((int) sizeInBytes);
+        ByteBuffer buf = stage(sizeInBytes);
         buf.put(srcData, 0, (int) sizeInBytes);
         buf.flip();
         return enqueueStagedWrite(mem, dstOffset, sizeInBytes, buf, waitList);
@@ -187,7 +197,7 @@ public final class OclComputeQueue implements ComputeQueue {
         cl_mem mem = extractClMem(dstBuffer);
         cl_event[] waitList = extractWaitList(waitOnEvents);
 
-        ByteBuffer buf = staging.acquire((int) sizeInBytes);
+        ByteBuffer buf = stage(sizeInBytes);
         buf.asFloatBuffer().put(srcData, 0, (int) (sizeInBytes / Float.BYTES));
         return enqueueStagedWrite(mem, dstOffset, sizeInBytes, buf, waitList);
     }
@@ -209,7 +219,7 @@ public final class OclComputeQueue implements ComputeQueue {
         cl_mem mem = extractClMem(dstBuffer);
         cl_event[] waitList = extractWaitList(waitOnEvents);
 
-        ByteBuffer buf = staging.acquire((int) sizeInBytes);
+        ByteBuffer buf = stage(sizeInBytes);
         ByteBuffer view = srcData.duplicate();
         view.clear();
         view.limit((int) sizeInBytes);
@@ -231,7 +241,7 @@ public final class OclComputeQueue implements ComputeQueue {
         cl_mem mem = extractClMem(srcBuffer);
         cl_event[] waitList = extractWaitList(waitOnEvents);
 
-        ByteBuffer buf = staging.acquire((int) sizeInBytes);
+        ByteBuffer buf = stage(sizeInBytes);
         int n = (int) sizeInBytes;
         return enqueueStagedRead(mem, srcOffset, sizeInBytes, buf, waitList, () -> {
             buf.rewind();
@@ -253,7 +263,7 @@ public final class OclComputeQueue implements ComputeQueue {
         cl_mem mem = extractClMem(srcBuffer);
         cl_event[] waitList = extractWaitList(waitOnEvents);
 
-        ByteBuffer buf = staging.acquire((int) sizeInBytes);
+        ByteBuffer buf = stage(sizeInBytes);
         FloatBuffer floats = buf.asFloatBuffer();
         int n = (int) (sizeInBytes / Float.BYTES);
         return enqueueStagedRead(mem, srcOffset, sizeInBytes, buf, waitList, () -> {
@@ -346,22 +356,31 @@ public final class OclComputeQueue implements ComputeQueue {
             return;
         }
         synchronized (pendingTiming) {
-            pendingTiming.addLast(new PendingTiming(name, event, releaseOnDrain));
+            pendingTiming.addLast(new PendingTiming(name, event, releaseOnDrain, timingsTracked++));
         }
     }
 
     /** Moves every event completed by the finished queue's work into the timing report. */
     private void drainTiming() {
+        drainTiming(Long.MAX_VALUE);
+    }
+
+    /**
+     * Moves the tracked events numbered below {@code mark} into the timing report; the caller knows
+     * they completed (a finished queue, or a later read that completed on the in-order queue).
+     */
+    private void drainTiming(long mark) {
         if (timing == null) {
             return;
         }
-        List<PendingTiming> batch;
+        List<PendingTiming> batch = new ArrayList<>();
         synchronized (pendingTiming) {
-            if (pendingTiming.isEmpty()) {
-                return;
+            while (!pendingTiming.isEmpty() && pendingTiming.peekFirst().sequence() < mark) {
+                batch.add(pendingTiming.pollFirst());
             }
-            batch = new ArrayList<>(pendingTiming);
-            pendingTiming.clear();
+        }
+        if (batch.isEmpty()) {
+            return;
         }
         long[] start = new long[1];
         long[] end = new long[1];
@@ -388,16 +407,25 @@ public final class OclComputeQueue implements ComputeQueue {
         }
     }
 
-    /** A completed-report entry: the command's name, its event and who releases the event. */
+    /**
+     * A completed-report entry: the command's name, its event, who releases the event and its number
+     * among the queue's tracked timings.
+     */
     private static final class PendingTiming {
         private final String name;
         private final cl_event event;
         private final boolean releaseOnDrain;
+        private final long sequence;
 
-        PendingTiming(String name, cl_event event, boolean releaseOnDrain) {
+        PendingTiming(String name, cl_event event, boolean releaseOnDrain, long sequence) {
             this.name = name;
             this.event = event;
             this.releaseOnDrain = releaseOnDrain;
+            this.sequence = sequence;
+        }
+
+        long sequence() {
+            return sequence;
         }
 
         String name() {
@@ -870,7 +898,9 @@ public final class OclComputeQueue implements ComputeQueue {
                 // Every read stays pending, so the next finish() still waits for the callbacks that
                 // have not run and reports the failures of those that have.
                 synchronized (pendingReads) {
-                    pendingReads.addAll(0, reads);
+                    for (int r = reads.size() - 1; r >= 0; r--) {
+                        pendingReads.addFirst(reads.get(r));
+                    }
                 }
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("interrupted while waiting for OpenCL read callbacks", e);
@@ -1010,10 +1040,11 @@ public final class OclComputeQueue implements ComputeQueue {
             staging.release(buf);
             throw e;
         }
-        // The driver may write the staging buffer until the read completes; it is recycled by finish().
-        staging.retain(buf);
+        // The driver may write the staging buffer until the read completes; it is recycled once this
+        // read or a later one completed, or by finish().
+        long ticket = staging.retain(buf);
 
-        OclReadCompletion completion = new OclReadCompletion(sizeInBytes);
+        OclReadCompletion completion = new OclReadCompletion(sizeInBytes, ticket, timingsTracked());
         try {
             OclErrors.check("clSetEventCallback", "read of " + sizeInBytes + " bytes",
                     () -> clSetEventCallback(event, CL_COMPLETE,
@@ -1027,6 +1058,53 @@ public final class OclComputeQueue implements ComputeQueue {
             pendingReads.add(completion);
         }
         return new OclGpuEvent(event, completion, profiled, owner);
+    }
+
+    /**
+     * A staging buffer of at least {@code sizeInBytes} for a transfer, after retiring the reads that
+     * completed so their buffers can serve it.
+     */
+    private ByteBuffer stage(long sizeInBytes) {
+        retireCompletedReads();
+        return staging.acquire((int) sizeInBytes);
+    }
+
+    /**
+     * Retires the oldest pending reads whose callbacks ran for a read that completed normally: the
+     * queue runs in order, so every command enqueued up to such a read completed, its staging
+     * buffers return to the pool and its dispatch timings move to the report. Stops at the first
+     * read still in flight or one that failed, which {@link #finish()} or its event reports.
+     */
+    private void retireCompletedReads() {
+        OclReadCompletion through = null;
+        synchronized (pendingReads) {
+            while (!pendingReads.isEmpty() && pendingReads.peekFirst().completedNormally()) {
+                through = pendingReads.pollFirst();
+            }
+        }
+        if (through != null) {
+            staging.recycleThrough(through.stagingTicket());
+            drainTiming(through.timingMark());
+        }
+    }
+
+    /** The dispatch timings tracked so far, the mark a read enqueued now records. */
+    private long timingsTracked() {
+        synchronized (pendingTiming) {
+            return timingsTracked;
+        }
+    }
+
+    /** Staging buffers the driver may still access, for diagnostics and tests. */
+    public int stagingBuffersInFlight() {
+        return staging.inFlightCount();
+    }
+
+    /** Reads not yet retired by a later transfer or a finish, for diagnostics and tests. */
+    public int pendingReadCount() {
+        synchronized (pendingReads) {
+            return pendingReads.size();
+        }
     }
 
     /** Validates a dispatch and returns the open handle. */

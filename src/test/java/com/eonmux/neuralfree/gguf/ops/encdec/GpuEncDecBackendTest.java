@@ -1,5 +1,7 @@
 package com.eonmux.neuralfree.gguf.ops.encdec;
 
+import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
+import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.GGUFTensorInfo;
 import com.eonmux.neuralfree.gguf.arch.Arch;
@@ -99,6 +101,8 @@ public class GpuEncDecBackendTest {
     private DeviceModelMemory memory;
     private Map<String, GpuWeight> weights;
     private GpuEncDecBackend fb;
+    /** The API the fake device {@link #open} makes claims to be. */
+    private ComputeBackend.BackendType backendType = ComputeBackend.BackendType.OPENCL;
 
     @After
     public void tearDown() {
@@ -271,7 +275,14 @@ public class GpuEncDecBackendTest {
 
     /** Opens the fake device, F32 weights for every tensor of the spec, the decoder memory and the context. */
     private GpuForwardContext open(ModelSpec spec) {
-        backend = FakeComputeBackend.builder().strictLlmArgs(true).build();
+        FakeComputeBackend.Builder builder = FakeComputeBackend.builder().strictLlmArgs(true).backendType(backendType);
+        if (backendType == ComputeBackend.BackendType.CUDA) {
+            builder.capabilities(new DeviceCapabilities.Builder().deviceName("EncDecDevice").totalVramBytes(8L << 30)
+                    .maxAllocSizeBytes(2L << 30).computeUnits(60).maxClockFrequencyMhz(1500).maxWorkGroupSize(1024)
+                    .driverVersion("fake-1.0").maxLocalMemoryBytes(48L * 1024)
+                    .maxWorkGroupCount(new long[]{65535, 65535, 65535}).computeCapability(120).build());
+        }
+        backend = builder.build();
         kernels = LlmKernels.open(backend);
         scratch = GpuScratch.forModel(backend, spec, UBATCH);
         placeholders = GpuPlaceholders.allocate(backend, backend.computeQueue());
@@ -404,6 +415,20 @@ public class GpuEncDecBackendTest {
             }
         }
         assertArrayEquals(new int[]{DECLARED_START, 7, 8}, memory.sequence().tokens());
+    }
+
+    @Test
+    public void closingReleasesTheDriversStepInputDispatch() {
+        backendType = ComputeBackend.BackendType.CUDA;
+        GpuEncDecBackend enc = backend(DECLARED_START, VOCAB_BOS);
+        String writer = "LLM_DecodeStepInputs";
+        assertEquals("the CUDA driver writes its decode steps' inputs with one prepared launch", 1,
+                ops.preparedCount(writer));
+        enc.prefill(SOURCE, 0);
+        enc.decode(7, 1);
+        assertTrue("a decode step ran the writer", backend.dispatchedKernelNames().contains(writer));
+        enc.close();
+        assertEquals("closing the backend releases the writer's dispatch", 0, ops.preparedCount(writer));
     }
 
     @Test

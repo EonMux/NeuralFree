@@ -9,8 +9,9 @@ import static org.junit.Assert.*;
 
 /**
  * Bounds and reuse policy of the OpenCL staging pool: buffers are aligned, native-order and
- * direct; large buffers are pooled only while reused; small free buffers stay within their count
- * and byte budget.
+ * direct; buffers retained up to a ticket are reused before the cycle ends; large buffers are pooled
+ * only while reused; small free buffers stay within their count and byte budget, keeping the
+ * smallest however many are trimmed at once.
  */
 public class OclStagingPoolTest {
 
@@ -47,6 +48,52 @@ public class OclStagingPoolTest {
         assertSame(first, again);
         assertEquals("a reused buffer is cleared", 0, again.position());
         assertEquals(0, pool.freeBytes());
+    }
+
+    @Test
+    public void buffersRetainedUpToATicketAreReusedBeforeTheCycleEnds() {
+        OclStagingPool pool = new OclStagingPool();
+        ByteBuffer first = pool.acquire(64);
+        long firstTicket = pool.retain(first);
+        ByteBuffer second = pool.acquire(64);
+        long secondTicket = pool.retain(second);
+        ByteBuffer third = pool.acquire(64);
+        pool.retain(third);
+        assertTrue("tickets grow in retention order", secondTicket > firstTicket);
+
+        pool.recycleThrough(secondTicket);
+        assertEquals("the buffer retained after the ticket stays in flight", 1, pool.inFlightCount());
+        assertEquals(2, pool.freeCount());
+        ByteBuffer reused = pool.acquire(64);
+        assertTrue(reused == first || reused == second);
+        assertNotSame(third, pool.acquire(64));
+
+        pool.recycleThrough(secondTicket);
+        assertEquals("an older ticket frees nothing more", 1, pool.inFlightCount());
+        pool.recycleInFlight();
+        assertEquals(0, pool.inFlightCount());
+    }
+
+    @Test
+    public void largeBuffersFreedByATicketAgeOnlyAtTheCycleEnd() {
+        OclStagingPool pool = new OclStagingPool();
+        int chunk = (int) OclStagingPool.MAX_SMALL_BUFFER_BYTES * 2;
+        ByteBuffer large = pool.acquire(chunk);
+        pool.recycleThrough(pool.retain(large));
+        assertEquals("a ticket keeps the cycle open, so the buffer stays pooled", 1, pool.freeCount());
+        assertSame(large, pool.acquire(chunk));
+    }
+
+    @Test
+    public void trimmingManyBuffersAtOnceKeepsTheSmallest() {
+        OclStagingPool pool = new OclStagingPool(4, 1 << 20, 1 << 20);
+        int buffers = 20_000;
+        for (int i = 0; i < buffers; i++) {
+            pool.retain(pool.acquire(OclStagingPool.ALIGNMENT * (1 + (i * 7919) % 64)));
+        }
+        pool.recycleInFlight();
+        assertEquals(4, pool.freeCount());
+        assertEquals("the four smallest buffers stay", 4L * OclStagingPool.ALIGNMENT, pool.freeBytes());
     }
 
     @Test

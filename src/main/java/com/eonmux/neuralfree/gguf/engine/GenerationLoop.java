@@ -18,6 +18,7 @@ import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
 import com.eonmux.neuralfree.gguf.memory.ModelMemory;
 import com.eonmux.neuralfree.gguf.memory.SequenceState;
 import com.eonmux.neuralfree.gguf.tokenizer.SpecialTokens;
+import com.eonmux.neuralfree.utils.Closeables;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -55,8 +56,10 @@ import java.util.Objects;
  *       memory is full, shift the context or stop with {@link StopReason#CONTEXT_FULL}; decode the token at the
  *       next position. A chain the device can sample selects there (llama.cpp backend sampling {@code -bs}, default
  *       on, {@code neuralfree.sampling.device}): plain argmax ({@link Sampler#argmaxOnly()}) decodes with
- *       {@link ForwardBackend#decodeGreedyOnDevice}, reading back only the id; a chain whose selection stays
- *       inside the top-k cone ({@code Sampler#coneWidth} — a truncated chain, or a greedy chain whose bans and
+ *       {@link ForwardBackend#decodeGreedyOnDevice}, reading back only the id (on a backend that chains greedy
+ *       steps on the device, {@link ForwardBackend#chainsGreedyOnDevice()}, each step is enqueued before the
+ *       previous id reaches the host, so the device runs ahead of the host's stop checks); a chain whose selection
+ *       stays inside the top-k cone ({@code Sampler#coneWidth} — a truncated chain, or a greedy chain whose bans and
  *       non-positive biases only lower a logit) on a backend with {@code LLM_Row_TopK} decodes with
  *       {@link ForwardBackend#decodeTopKOnDevice} and selects over the device's top candidates, the same token the
  *       host chain selects over the whole row. Every other chain reads the logits row back.</li>
@@ -550,6 +553,9 @@ public final class GenerationLoop {
                             : "the backend reads the sampled rows back");
             hostSamplingLogged = true;
         }
+        if (cone == -1 && backend.chainsGreedyOnDevice()) {
+            return greedyChainLoop(logits, seq, nCtx, seqRun, firstPromptToken);
+        }
         int deviceToken = -1;
         while (!seqRun.done()) {
             if (seqRun.cancelled()) {
@@ -583,6 +589,78 @@ public final class GenerationLoop {
             }
         }
         return seqRun.result();
+    }
+
+    /**
+     * The token loop of a device-greedy chain on a backend that chains on the device
+     * ({@link ForwardBackend#chainsGreedyOnDevice()}): the same steps as {@link #decodeLoop} in the same order, with
+     * the decode of each token's greedy successor enqueued before that successor reaches the host, so the device
+     * computes step {@code n + 1} while the host offers token {@code n}. The chained step is the decode the serial
+     * loop runs next whenever the offered token does not stop the run; it is enqueued only at a position the memory
+     * holds without a context shift and while the backend still chains (it can drop the step again), and a run that
+     * ends before using it (a stop, a cancellation, a failure) drops its position again ({@link #dropChained}), so
+     * the tokens, the stop and the stored sequence are the serial loop's.
+     */
+    private GenerationResult greedyChainLoop(float[] logits, SequenceState seq, int nCtx, SequenceRun seqRun,
+                                             int firstPromptToken) {
+        GreedyStep current = null;
+        GreedyStep chained = null;
+        try {
+            while (!seqRun.done()) {
+                if (seqRun.cancelled()) {
+                    seqRun.stop(StopReason.CANCELLED);
+                    break;
+                }
+                int token;
+                if (current == null) {
+                    token = seqRun.next(logits);
+                } else {
+                    token = current.id();
+                    seqRun.accept(token);
+                }
+                SequenceRun.Step step = seqRun.offer(token);
+                if (step.stopped()) {
+                    break;
+                }
+                if (chained == null) {
+                    if (seq.nPast() >= nCtx && !shiftContext(firstPromptToken, seq)) {
+                        seqRun.stop(StopReason.CONTEXT_FULL);
+                        break;
+                    }
+                    chained = backend.startGreedy(token, seq.nPast());
+                }
+                current = chained;
+                chained = null;
+                if (seq.nPast() < nCtx && backend.chainsGreedyOnDevice()) {
+                    chained = backend.chainGreedy(current, seq.nPast());
+                }
+            }
+        } catch (RuntimeException e) {
+            try {
+                dropChained(chained);
+            } catch (RuntimeException dropFailure) {
+                throw Closeables.chain(e, dropFailure);
+            }
+            throw e;
+        }
+        dropChained(chained);
+        return seqRun.result();
+    }
+
+    /**
+     * Drops the position of a chained greedy step the run did not use: waits for the step, then rolls its position
+     * back when the memory allows ({@link ForwardBackend#canRollback}); a memory that cannot roll back keeps the
+     * row, which holds the step's token computed exactly. A step that failed (or read its input from a step that
+     * failed) throws instead, and the generation's failure path discards the whole sequence.
+     */
+    private void dropChained(GreedyStep chained) {
+        if (chained == null) {
+            return;
+        }
+        chained.id();
+        if (backend.canRollback(1)) {
+            backend.rollback(1);
+        }
     }
 
     /** {@code config} with a whole-context penalty window bounded to the context length. */

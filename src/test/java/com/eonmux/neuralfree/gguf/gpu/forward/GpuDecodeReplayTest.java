@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.gpu.forward;
 
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
+import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.GGUFTensorInfo;
 import com.eonmux.neuralfree.gguf.arch.Arch;
@@ -16,6 +17,7 @@ import com.eonmux.neuralfree.gguf.gpu.block.GpuFfnFactory;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuLayerExtraFactory;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuMixer;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuMixerFactory;
+import com.eonmux.neuralfree.gguf.gpu.head.GpuLogitsHead;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeights;
 import com.eonmux.neuralfree.gguf.hparams.ModelHparams;
@@ -77,6 +79,20 @@ public class GpuDecodeReplayTest {
     private static final float RMS_EPS = 1e-6f;
 
     FakeComputeBackend backend;
+    /** The emulation {@link #open} gives the head's argmax kernel, or null for none. */
+    FakeComputeBackend.KernelEmulator argmaxEmulator;
+    /** The API the fake backend {@link #open} makes claims to be. */
+    ComputeBackend.BackendType backendType = ComputeBackend.BackendType.OPENCL;
+    /** The device capabilities the fake backend {@link #open} makes reports, or null for the fake's own. */
+    DeviceCapabilities capabilities;
+    /** Further kernel emulations {@link #open} registers, by kernel name. */
+    final Map<String, FakeComputeBackend.KernelEmulator> emulators = new HashMap<>();
+    /** What the rig's mixers answer to {@link GpuMixer#decodeReadsPositionSlot()}. */
+    boolean mixerReadsPositionSlot = true;
+    /** The LM head rows of the model {@link #open} makes; the token table holds {@link #VOCAB} rows. */
+    int outputRows = VOCAB;
+    /** The kernels the fake backend had prepared dispatches of when {@link #open} constructed the backend. */
+    List<String> preparedBeforeBackend = List.of();
     private DeviceModelMemory memory;
     private GpuOps ops;
     private GpuScratch scratch;
@@ -114,9 +130,18 @@ public class GpuDecodeReplayTest {
             // most cases exercise the capture/replay mechanics, not the warmup
             System.setProperty(GpuDecodeReplay.WARMUP_PROPERTY, "0");
         }
-        backend = FakeComputeBackend.builder().strictLlmArgs(true).graphCapture(capture).build();
+        FakeComputeBackend.Builder builder = FakeComputeBackend.builder().strictLlmArgs(true).graphCapture(capture)
+                .backendType(backendType);
+        if (argmaxEmulator != null) {
+            builder.emulate(GpuLogitsHead.ARGMAX, argmaxEmulator);
+        }
+        emulators.forEach(builder::emulate);
+        if (capabilities != null) {
+            builder.capabilities(capabilities);
+        }
+        backend = builder.build();
         LlmKernels kernels = LlmKernels.open(backend);
-        ModelSpec spec = llama(2);
+        ModelSpec spec = llama(2, outputRows);
         scratch = GpuScratch.forModel(backend, spec, UBATCH);
         placeholders = GpuPlaceholders.allocate(backend, backend.computeQueue());
         ops = new GpuOps(backend.computeQueue(), kernels, scratch, placeholders);
@@ -132,9 +157,20 @@ public class GpuDecodeReplayTest {
         memory = DeviceModelMemory.allocate(backend, backend.computeQueue(), plan,
                 spec.hparams().mropeTextPositions(), null);
         GpuForwardContext ctx = GpuForwardContext.builder(kernels, ops, weightMap::get, spec).memory(memory).build();
+        preparedBeforeBackend = backend.preparedKernels();
         GpuForwardBackend fb = new GpuForwardBackend(ctx, registry(), Collections.emptyList());
         closeables.add(fb);
         return fb;
+    }
+
+    /** The memory of the backend {@link #open} made. */
+    DeviceModelMemory memory() {
+        return memory;
+    }
+
+    /** The scratch of the backend {@link #open} made. */
+    GpuScratch scratch() {
+        return scratch;
     }
 
     private GpuBlockRegistry registry() {
@@ -153,6 +189,11 @@ public class GpuDecodeReplayTest {
 
                     @Override
                     public void decode(int pos, ScratchSlot in, ScratchSlot out) {
+                    }
+
+                    @Override
+                    public boolean decodeReadsPositionSlot() {
+                        return mixerReadsPositionSlot;
                     }
 
                     @Override
@@ -216,11 +257,11 @@ public class GpuDecodeReplayTest {
         return new GGUFTensorInfo(name, dims, GGMLType.F32, 0);
     }
 
-    private static List<GGUFTensorInfo> tensors(int nLayer) {
+    private static List<GGUFTensorInfo> tensors(int nLayer, int outputRows) {
         List<GGUFTensorInfo> t = new ArrayList<>();
         t.add(info(TensorNames.weight(TensorNames.TOKEN_EMBD), N_EMBD, VOCAB));
         t.add(info(TensorNames.weight(TensorNames.OUTPUT_NORM), N_EMBD));
-        t.add(info(TensorNames.weight(TensorNames.OUTPUT), N_EMBD, VOCAB));
+        t.add(info(TensorNames.weight(TensorNames.OUTPUT), N_EMBD, outputRows));
         for (int il = 0; il < nLayer; il++) {
             t.add(info(blk(il, TensorNames.ATTN_NORM), N_EMBD));
             t.add(info(blk(il, TensorNames.FFN_NORM), N_EMBD));
@@ -231,14 +272,14 @@ public class GpuDecodeReplayTest {
         return t;
     }
 
-    private static ModelSpec llama(int nLayer) {
+    private static ModelSpec llama(int nLayer, int outputRows) {
         ModelHparamsBuilder hb = new ModelHparamsBuilder(ArchRegistry.traits(Arch.LLAMA)).layerCounts(nLayer, 0)
                 .nCtxTrain(4096).nEmbd(N_EMBD).nVocab(VOCAB).normRmsEps(RMS_EPS).normEps(1e-5f)
                 .headKFull(HEAD_DIM).headVFull(HEAD_DIM);
         for (int il = 0; il < nLayer; il++) {
             hb.nHead(il, N_HEAD).nHeadKv(il, N_HEAD);
         }
-        TensorCatalog tc = TensorCatalog.of(hb.build().arch().ggufName(), tensors(nLayer));
+        TensorCatalog tc = TensorCatalog.of(hb.build().arch().ggufName(), tensors(nLayer, outputRows));
         ModelHparams hp = hb.build();
         NormResolver norms = new NormResolver(hp, tc);
         ModelSpec.Builder b = ModelSpec.builder(hp, tc)

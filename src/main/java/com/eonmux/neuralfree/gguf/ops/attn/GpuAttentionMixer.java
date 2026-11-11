@@ -287,20 +287,20 @@ public final class GpuAttentionMixer implements GpuMixer {
             throw new UnsupportedOperationException("layer " + layer.il() + " runs dual-chunk attention with a host"
                     + " KV cache; run without host KV offload");
         }
-        qBuf = offsetFree(scratch.slot(ScratchSlots.Q), (long) ubatch * spec.qRopeDim());
-        attnBuf = offsetFree(scratch.slot(ScratchSlots.ATTN_OUT), (long) ubatch * spec.outDim());
+        qBuf = scratch.slot(ScratchSlots.Q).bufferAtZero((long) ubatch * spec.qRopeDim());
+        attnBuf = scratch.slot(ScratchSlots.ATTN_OUT).bufferAtZero((long) ubatch * spec.outDim());
         if (tap != null) {
             lseBuf = scratch.temp("cp.attn.lse", (long) ubatch * spec.nHead()).buffer();
         }
         if (proj.projectsKv()) {
-            kBuf = offsetFree(scratch.slot(ScratchSlots.K), (long) ubatch * spec.kDim());
-            vBuf = offsetFree(scratch.slot(ScratchSlots.V), (long) ubatch * spec.vDim());
+            kBuf = scratch.slot(ScratchSlots.K).bufferAtZero((long) ubatch * spec.kDim());
+            vBuf = scratch.slot(ScratchSlots.V).bufferAtZero((long) ubatch * spec.vDim());
         }
         GpuKvLayer kv = bindCache();
         kvScales = new GpuKvScales(this);
         kvScales.bind(kv, hostKv);
         boolean cached = kv != null || hostKv;
-        GpuBuffer qPos = cached ? stepInputs.qPos() : offsetFree(scratch.slot(ScratchSlots.POS), (long) ubatch * 4);
+        GpuBuffer qPos = cached ? stepInputs.qPos() : scratch.slot(ScratchSlots.POS).bufferAtZero((long) ubatch * 4);
         this.posBuffer = qPos;
         GpuBuffer ropePos = cached ? stepInputs.ropePos() : qPos;
         adapters = new GpuQkvAdapters(this);
@@ -1286,15 +1286,6 @@ public final class GpuAttentionMixer implements GpuMixer {
         return b;
     }
 
-    private static GpuBuffer offsetFree(ScratchSlot slot, long floats) {
-        if (slot.offset() != 0) {
-            throw new IllegalStateException("scratch slot " + slot.name() + " must start at offset 0, got "
-                    + slot.offset());
-        }
-        slot.require(floats);
-        return slot.buffer();
-    }
-
     // ------------------------------------------------------------------ stage accessors
 
     GpuForwardContext ctx() {
@@ -1415,6 +1406,12 @@ public final class GpuAttentionMixer implements GpuMixer {
 
     GpuBuffer gateTemp() {
         return projections.gateTemp();
+    }
+
+    /** Reads the {@code POS} slot only without a KV cache: a cached layer reads the memory's step positions. */
+    @Override
+    public boolean decodeReadsPositionSlot() {
+        return kvLayer == null && !hostKv;
     }
 
     GpuBuffer posBuffer() {

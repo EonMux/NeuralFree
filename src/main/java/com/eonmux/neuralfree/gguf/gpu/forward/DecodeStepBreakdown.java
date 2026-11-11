@@ -13,7 +13,9 @@ import java.util.Locale;
  * Where the host time of single-sequence decode calls goes, under {@code -Dneuralfree.gpu.stepBreakdown=true}
  * ({@link #PROPERTY}): the GPU driver laps a monotonic clock at the boundaries of each one-token call against
  * memory, so every nanosecond between a call's entry and its return lands in one {@link Phase}, and the time from
- * one call's return to the next contiguous call's entry lands in {@link Phase#BETWEEN}. Each step is counted under
+ * one call's return to the next contiguous call's entry lands in {@link Phase#BETWEEN}. A chained greedy step returns
+ * once it is enqueued; the host's wait for its id, between that return and the next call, counts as the next call's
+ * {@link Phase#WAIT} ({@link #waited}). Each step is counted under
  * the {@link TrunkPath} its trunk took, so the steady state of a trusted decode replay reads apart from the warmup,
  * capture and verify steps.
  *
@@ -24,8 +26,10 @@ import java.util.Locale;
  * call, the step period and the device's idle time average over the steps that continued the previous call, the only
  * ones with a period. When the queue times its commands ({@code -Dneuralfree.gpu.profile}, {@link KernelTiming}),
  * each step also carries the device time its commands took, read from the queue's report after the call's finish
- * drained them: the period less that device time, over the contiguous steps ({@link Report#meanIdleNanos}), is the
- * device's idle time, what a pipelined or position-independent decode loop could win back. A queue that leaves its
+ * drained them (for a contiguous step, from the previous call's return on, so the commands of a chained step timed
+ * while the host waited for its id between the calls count too): the period less that device time, over the
+ * contiguous steps ({@link Report#meanIdleNanos}), is the device's idle time, what a pipelined or
+ * position-independent decode loop could win back. A queue that leaves its
  * graph launches untimed (an OpenCL command buffer, {@link ComputeQueue#timesGraphLaunches()}) reports no device time
  * for a trunk that ran as a graph, so the steps of every path but {@link TrunkPath#DIRECT} then carry no device time
  * and are counted apart ({@link Report#untimedSteps}) instead of reporting their trunk as idle. When the JVM
@@ -155,9 +159,14 @@ public final class DecodeStepBreakdown {
     private TrunkPath path;
     private long deviceAtBegin;
     private long graphAtBegin;
+    /** The timing report's totals when the last call returned, the device baseline of a contiguous next call. */
+    private long deviceAtLastEnd;
+    private long graphAtLastEnd;
     private long allocAtBegin;
     private long lastEnd;
     private int lastPos = Integer.MIN_VALUE;
+    /** The time spent waiting for a chained step's id since the last call returned ({@link #waited}). */
+    private long pendingWait;
 
     private DecodeStepBreakdown(boolean enabled, KernelTiming timing, boolean graphLaunchesTimed) {
         this.enabled = enabled;
@@ -235,16 +244,37 @@ public final class DecodeStepBreakdown {
         }
         long now = System.nanoTime();
         Arrays.fill(stepNanos, 0L);
-        stepNanos[Phase.BETWEEN.ordinal()] = lastPos != Integer.MIN_VALUE && pos == lastPos + 1 ? now - lastEnd : -1L;
+        long between = lastPos != Integer.MIN_VALUE && pos == lastPos + 1 ? now - lastEnd : -1L;
+        if (between >= 0) {
+            long wait = Math.min(pendingWait, between);
+            stepNanos[Phase.WAIT.ordinal()] = wait;
+            between -= wait;
+        }
+        pendingWait = 0;
+        stepNanos[Phase.BETWEEN.ordinal()] = between;
         this.pos = pos;
         this.path = TrunkPath.DIRECT;
         this.mark = now;
         this.open = true;
         if (timing != null) {
-            deviceAtBegin = timing.totalNanos();
-            graphAtBegin = timing.graphNanos();
+            // a contiguous call's period starts where the previous call returned, and so does its device time:
+            // the commands a chained step's id wait resolved between the calls belong to the step
+            boolean contiguous = stepNanos[Phase.BETWEEN.ordinal()] >= 0;
+            deviceAtBegin = contiguous ? deviceAtLastEnd : timing.totalNanos();
+            graphAtBegin = contiguous ? graphAtLastEnd : timing.graphNanos();
         }
         allocAtBegin = allocatedSoFar();
+    }
+
+    /**
+     * Between calls, the host waited {@code nanos} for the id of a step that returned without waiting (a chained
+     * greedy decode): the next contiguous call counts it as its {@link Phase#WAIT} instead of
+     * {@link Phase#BETWEEN}.
+     */
+    void waited(long nanos) {
+        if (enabled && !open) {
+            pendingWait += nanos;
+        }
     }
 
     /** Adds the time since the last lap of the open call to {@code phase}. */
@@ -310,6 +340,10 @@ public final class DecodeStepBreakdown {
                 idleSamples[p].add(period - device);
             }
         }
+        if (timing != null) {
+            deviceAtLastEnd = timing.totalNanos();
+            graphAtLastEnd = timing.graphNanos();
+        }
         lastPos = pos;
         lastEnd = mark;
     }
@@ -321,6 +355,7 @@ public final class DecodeStepBreakdown {
         }
         open = false;
         lastPos = Integer.MIN_VALUE;
+        pendingWait = 0;
     }
 
     /** Clears every total, so the next report covers the calls from here on. */
@@ -346,6 +381,7 @@ public final class DecodeStepBreakdown {
         }
         open = false;
         lastPos = Integer.MIN_VALUE;
+        pendingWait = 0;
     }
 
     /** An immutable copy of the totals recorded so far. */

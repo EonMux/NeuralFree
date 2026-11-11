@@ -369,6 +369,10 @@ public class BenchCommandTest {
         assertTrue(BenchCommand.parse(new String[]{"-m", "x.gguf", "--host-breakdown"}).hostBreakdown);
         assertEquals(BenchReadout.Kind.ARGMAX,
                 BenchCommand.parse(new String[]{"-m", "x.gguf", "--tg-readout", "argmax"}).readout.kind());
+        BenchReadout greedy = BenchCommand.parse(new String[]{"-m", "x.gguf", "--tg-readout", "greedy"}).readout;
+        assertEquals(BenchReadout.Kind.GREEDY, greedy.kind());
+        assertTrue("greedy decodes each greedy id as the next token", greedy.feedsBack());
+        assertEquals("greedy", greedy.toString());
         BenchReadout topK = BenchCommand.parse(new String[]{"-m", "x.gguf", "--tg-readout", "TopK=40"}).readout;
         assertEquals(BenchReadout.Kind.TOPK, topK.kind());
         assertEquals(40, topK.topK());
@@ -385,7 +389,7 @@ public class BenchCommandTest {
     @Test
     public void everyReadoutRunsTheGenerationAndTheBreakdownNotesACpuEngine() throws Exception {
         Path model = SyntheticModels.llama().writeTempFile();
-        for (String readout : new String[]{"logits", "argmax", "topk=8"}) {
+        for (String readout : new String[]{"logits", "argmax", "greedy", "topk=8"}) {
             ByteArrayOutputStream outBytes = new ByteArrayOutputStream();
             ByteArrayOutputStream errBytes = new ByteArrayOutputStream();
             BenchCommand.bench(args(model, "-ngl", "0", "-p", "0", "-n", "4", "-r", "1", "-o", "md",

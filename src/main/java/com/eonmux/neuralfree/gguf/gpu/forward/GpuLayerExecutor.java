@@ -424,6 +424,22 @@ public final class GpuLayerExecutor implements AutoCloseable {
     }
 
     /**
+     * Whether a one-token decode step of this stack reads the scratch {@code POS} slot: true when any layer's mixer,
+     * parallel attention or cross attention reads it ({@link GpuMixer#decodeReadsPositionSlot()}).
+     */
+    public boolean decodeReadsPositionSlot() {
+        ensureOpen();
+        for (LayerBlocks l : layers) {
+            for (GpuMixer m : new GpuMixer[]{l.mixer, l.parallelAttention, l.crossMixer}) {
+                if (m != null && m.decodeReadsPositionSlot()) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
      * Whether a decode step of this stack enqueues only kernel dispatches, which the decode-step replay records.
      * False when a layer's FFN block reads step results back to the host (a hosted MoE expert pass).
      */

@@ -450,6 +450,12 @@ public final class GpuOps implements AutoCloseable {
         prepared.remove(d);
     }
 
+    /** The prepared dispatches of {@code kernel} not closed yet, for diagnostics and tests. */
+    public int preparedCount(String kernel) {
+        Objects.requireNonNull(kernel, "kernel");
+        return (int) prepared.stream().filter(d -> d.kernelName().equals(kernel)).count();
+    }
+
     // ================================================================== projections
 
     /**

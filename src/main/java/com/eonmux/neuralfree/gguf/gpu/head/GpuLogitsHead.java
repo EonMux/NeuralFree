@@ -760,6 +760,15 @@ public final class GpuLogitsHead implements AutoCloseable {
     }
 
     /**
+     * The bound prefilter's parameter and logit-bias table uploads made and skipped
+     * ({@link GpuLogitPrefilter#fixedUploadCounts}), zeros before the first prefiltered call.
+     */
+    public long[] prefilterFixedUploads() {
+        ensureOpen();
+        return prefilterReadout == null ? new long[2] : prefilterReadout.fixedUploadCounts();
+    }
+
+    /**
      * Applies one prefilter row per output row of the first {@code prefilter.rows()} logits rows, in place: the
      * fixed logit-bias stage, the penalties and DRY, before the row top-k readout sees the row.
      *

@@ -4,6 +4,7 @@ import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.gguf.arch.MemoryKind;
 import com.eonmux.neuralfree.gguf.arch.SwaType;
 import com.eonmux.neuralfree.gguf.hparams.MropeTextPositions;
+import com.eonmux.neuralfree.gguf.memory.gpu.DecodeStepWriter;
 import com.eonmux.neuralfree.gguf.memory.gpu.DeviceModelMemory;
 import com.eonmux.neuralfree.gguf.memory.gpu.DeviceStepInputs;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuPlaceholders;
@@ -179,6 +180,56 @@ public class DeviceStepInputsTest {
             int[] kvPos = ints(in.kvPos(0), 8);
             assertArrayEquals(new int[]{-1, -1, -1, 3, 4, 5, 6, -1}, kvPos);
             assertFalse(seq.wrapped());
+        }
+    }
+
+    /**
+     * The one-token step through a device writer ({@code uploadDecodeStep}) hands the writer exactly what
+     * {@code upload(pos, 1)} writes, keeps the same host bookkeeping (stored rows, the wrap mark) on a ring that
+     * wraps, uploads nothing itself, and declines without changing anything for two KV groups.
+     */
+    @Test
+    public void aDecodeStepThroughAWriterKeepsTheUploadsValuesAndBookkeeping() {
+        SequenceState uploaded = new SequenceState(64);
+        SequenceState written = new SequenceState(64);
+        try (DeviceStepInputs up = DeviceStepInputs.allocate(backend, backend.computeQueue(),
+                Arrays.asList(ringGroup(0, 16)), UBATCH, UBATCH, MropeTextPositions.PPP0, uploaded, null);
+             DeviceStepInputs dev = DeviceStepInputs.allocate(backend, backend.computeQueue(),
+                     Arrays.asList(ringGroup(0, 16)), UBATCH, UBATCH, MropeTextPositions.PPP0, written, null)) {
+            DecodeStepWriter writer = (row, pos, r0, r1, r2, r3) -> {
+                fake(dev.cellIdx(0)).putInt(0, row);
+                fake(dev.kvPos(0)).putInt(row, pos);
+                fake(dev.qPos()).putInt(0, pos);
+                int[] rope = {r0, r1, r2, r3};
+                for (int k = 0; k < rope.length; k++) {
+                    fake(dev.ropePos()).putInt(k, rope[k]);
+                }
+            };
+            for (int pos = 0; pos < 20; pos++) {
+                up.upload(pos, 1);
+                backend.clearLog();
+                assertTrue("position " + pos, dev.uploadDecodeStep(pos, writer));
+                assertTrue("the writer path uploads nothing", opsOf(FakeOpKind.WRITE).isEmpty());
+                assertArrayEquals("cell_idx at " + pos, ints(up.cellIdx(0), 1), ints(dev.cellIdx(0), 1));
+                assertArrayEquals("kv_pos at " + pos, ints(up.kvPos(0), 16), ints(dev.kvPos(0), 16));
+                assertArrayEquals("q_pos at " + pos, ints(up.qPos(), 1), ints(dev.qPos(), 1));
+                assertArrayEquals("rope_pos at " + pos, ints(up.ropePos(), 4), ints(dev.ropePos(), 4));
+                assertEquals(up.pos0(), dev.pos0());
+                assertEquals(up.nTokens(), dev.nTokens());
+                assertEquals("the wrap mark at " + pos, uploaded.wrapped(), written.wrapped());
+                for (int r = 0; r < 16; r++) {
+                    assertEquals("row " + r + " at " + pos, up.positionOfRow(0, r), dev.positionOfRow(0, r));
+                }
+            }
+            assertTrue("the ring wrapped", written.wrapped());
+        }
+        try (DeviceStepInputs two = DeviceStepInputs.allocate(backend, backend.computeQueue(),
+                Arrays.asList(fullGroup(0, 64), ringGroup(1, 16)), UBATCH, UBATCH, MropeTextPositions.PPP0,
+                new SequenceState(64), null)) {
+            assertFalse("two groups take the uploads", two.uploadDecodeStep(0, (row, pos, r0, r1, r2, r3) -> {
+                throw new AssertionError("the writer of a declined step ran");
+            }));
+            assertEquals("a declined step changes nothing", -1, two.positionOfRow(0, 0));
         }
     }
 

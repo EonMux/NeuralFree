@@ -283,6 +283,7 @@ final class FakeQueue implements ComputeQueue {
             backend.uncapturable("a finish");
             backend.record(FakeOp.builder(FakeOpKind.FINISH, name));
         }
+        backend.checkWait();
     }
 
     @Override

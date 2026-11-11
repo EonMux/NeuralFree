@@ -77,8 +77,10 @@ final class BenchCommand {
             + "                                            and times each graph launch (Vulkan: each submission)\n"
             + "  --host-breakdown                          print where the host time of each test's decode steps\n"
             + "                                            goes, with device busy and idle time under --kernels\n"
-            + "  --tg-readout <logits|argmax|topk=k>       what each generated token reads back: the logits row\n"
-            + "                                            (default), the device's greedy id or its top k\n"
+            + "  --tg-readout <logits|argmax|greedy|topk=k>\n"
+            + "                                            what each generated token reads back: the logits row\n"
+            + "                                            (default), the device's greedy id or its top k; greedy\n"
+            + "                                            decodes each greedy id as the next token\n"
             + "  --help, -h                                this text\n"
             + "test parameters (lists accept 'a,b,c' and ranges 'first-last+step' or 'first-last*mult'):\n"
             + "  -m, --model <path>                  model to bench, repeatable\n"
@@ -895,6 +897,10 @@ final class BenchCommand {
         void decodeWarmup(int n) throws IOException {
             Random random = new Random(TOKEN_SEED + 2L);
             int first = nextToken(random);
+            if (!embeddingMode && readout.feedsBack()) {
+                BenchReadout.generateGreedy(model.forwardBackend(), first, 0, n);
+                return;
+            }
             BenchCommand.decodeWarmup(n, first, random, model.vocabSize(), embeddingMode ? this::forwardToken
                     : (token, pos) -> readout.decode(model.forwardBackend(), token, pos));
         }
@@ -936,6 +942,8 @@ final class BenchCommand {
                         for (int i = 1; i < inst.nGen; i++) {
                             forwardToken(random.nextInt(model.vocabSize()), pos + i);
                         }
+                    } else if (readout.feedsBack()) {
+                        BenchReadout.generateGreedy(model.forwardBackend(), nextToken(random), pos, inst.nGen);
                     } else {
                         readout.decode(model.forwardBackend(), nextToken(random), pos);
                         for (int i = 1; i < inst.nGen; i++) {

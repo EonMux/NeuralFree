@@ -114,6 +114,22 @@ public final class SequenceState {
         return embedding[i];
     }
 
+    /**
+     * Records {@code token} as the id of the token entry {@code i}, which was stored before its id reached the host
+     * (a chained greedy decode reads its input id from the device's previous selection): the entry's row was
+     * computed with exactly that id, so the reuse frontier stays where it is.
+     *
+     * @throws IndexOutOfBoundsException when {@code i} is not a stored entry
+     * @throws IllegalArgumentException  when the entry is an embedding row
+     */
+    public void settleToken(int i, int token) {
+        checkEntry(i);
+        if (embedding[i]) {
+            throw new IllegalArgumentException("entry " + i + " is an embedding row; only a token entry takes an id");
+        }
+        tokens[i] = token;
+    }
+
     private void checkEntry(int i) {
         if (i < 0 || i >= nPast) {
             throw new IndexOutOfBoundsException("entry " + i + " outside the stored range [0, " + nPast + ")");

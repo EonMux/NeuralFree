@@ -86,6 +86,19 @@ public final class ScratchSlot {
         return this;
     }
 
+    /**
+     * The backing buffer, for a kernel that takes no offset into it: checks that the view starts at element 0 and
+     * holds at least {@code needed} floats.
+     *
+     * @throws IllegalStateException when the view starts elsewhere or is too small ({@link #require})
+     */
+    public GpuBuffer bufferAtZero(long needed) {
+        if (offset != 0) {
+            throw new IllegalStateException("scratch slot " + name + " must start at offset 0, got " + offset);
+        }
+        return require(needed).buffer();
+    }
+
     @Override
     public String toString() {
         return "ScratchSlot{" + name + " @" + offset + " x" + floats + '}';

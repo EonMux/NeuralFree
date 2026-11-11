@@ -278,6 +278,39 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
     }
 
     /**
+     * The one-token step through {@code writer}: the same validation and host bookkeeping as {@link #upload}, with
+     * the step's {@code cell_idx}, {@code kv_pos} row, {@code q_pos} and {@code rope_pos} written by the writer. Served
+     * for a single KV group of the contiguous form that holds the position (not a context shard), outside a tree
+     * step; otherwise nothing changes and the call returns false.
+     */
+    @Override
+    public boolean uploadDecodeStep(int pos, DecodeStepWriter writer) {
+        checkOpen();
+        Objects.requireNonNull(writer, "writer");
+        if (paged != null || treeStep || positions.length != 1 || pos < 0 || pos == Integer.MAX_VALUE) {
+            return false;
+        }
+        GroupPositions p = positions[0];
+        if (p.group().sharded() || !p.group().holds(pos)) {
+            return false;
+        }
+        p.checkStep(pos, 1);
+        int row = p.group().rowOf(pos);
+        boolean overwrote = p.store(pos, 1);
+        textPositions.fill(pos, 1, ints);
+        writer.write(row, pos, ints[0], ints[1], ints[2], ints[3]);
+        this.pos0 = pos;
+        this.nTokens = 1;
+        if (overwrote) {
+            sequence.markWrapped();
+        }
+        if (compressorSteps != null) {
+            compressorSteps[0].onStep(1);
+        }
+        return true;
+    }
+
+    /**
      * Writes {@code cell_idx}, {@code q_pos} and {@code rope_pos} for the packed query rows of a prefill
      * context-parallel step: {@code positions[t]} is the true position of query row {@code t} in this rank's
      * DualChunkSwap order, and the step's rows inside this rank's context block — the positions in

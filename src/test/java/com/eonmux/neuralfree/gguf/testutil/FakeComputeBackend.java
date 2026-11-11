@@ -103,6 +103,8 @@ public final class FakeComputeBackend implements ComputeBackend {
     private int createdQueues;
     private long allocatedBytes;
     private int openEvents;
+    /** What every event wait and queue finish throws while set ({@link #failWaits}), or null. */
+    private java.util.function.Supplier<? extends RuntimeException> waitFailure;
     boolean closed;
 
     private FakeComputeBackend(Builder b) {
@@ -461,6 +463,27 @@ public final class FakeComputeBackend implements ComputeBackend {
     public List<String> preparedKernels() {
         synchronized (lock) {
             return Collections.unmodifiableList(new ArrayList<>(preparedKernels));
+        }
+    }
+
+    /**
+     * Makes every later event wait and queue finish throw a new exception from {@code failure}, as a lost device
+     * reports its commands; null makes them succeed again. Commands still run when enqueued.
+     */
+    public void failWaits(java.util.function.Supplier<? extends RuntimeException> failure) {
+        synchronized (lock) {
+            waitFailure = failure;
+        }
+    }
+
+    /** Throws the {@link #failWaits} failure while one is set. */
+    void checkWait() {
+        java.util.function.Supplier<? extends RuntimeException> failure;
+        synchronized (lock) {
+            failure = waitFailure;
+        }
+        if (failure != null) {
+            throw failure.get();
         }
     }
 
@@ -1022,6 +1045,7 @@ public final class FakeComputeBackend implements ComputeBackend {
                     throw new IllegalStateException("event #" + id + " awaited after close");
                 }
             }
+            checkWait();
         }
 
         @Override

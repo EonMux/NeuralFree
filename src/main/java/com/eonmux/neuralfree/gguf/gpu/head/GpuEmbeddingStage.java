@@ -379,6 +379,50 @@ public final class GpuEmbeddingStage {
         embedBatched(new int[n], positions, null, step);
     }
 
+    /**
+     * Whether {@link #embedDeviceIds} runs on this stage: the whole token table on the model device, looked up from
+     * the token-id slot, which starts at element 0.
+     */
+    public boolean acceptsDeviceIds() {
+        return vocabParallel == null && tokenTable.isSingleShard() && tokenIds.offset() == 0;
+    }
+
+    /**
+     * Enqueues the embedding of {@code n} token ids the device holds at {@code ids} (a chained greedy decode reads
+     * the previous step's selection) at positions {@code pos0 ..} into {@link ScratchSlots#X}: a device copy brings
+     * the ids into {@link ScratchSlots#TOKEN_IDS}, the rows take token type 0, and the step's host token record holds
+     * no ids ({@link GpuScratch#recordDeviceStepTokens}). The ids must lie inside the token table
+     * ({@link #vocabRows()}): a greedy selection over an LM head with no more rows guarantees it.
+     *
+     * @throws IllegalStateException    when the stage reads no ids from the device ({@link #acceptsDeviceIds()})
+     * @throws IllegalArgumentException when {@code n} is outside {@code [1, ubatch]} or a position exceeds the
+     *                                  learned positions
+     */
+    public void embedDeviceIds(ScratchSlot ids, int n, int pos0) {
+        Objects.requireNonNull(ids, "ids");
+        if (!acceptsDeviceIds()) {
+            throw new IllegalStateException(this + " looks its tokens up from host ids (a vocabulary-parallel or"
+                    + " sharded token table); a device id cannot feed it");
+        }
+        if (n < 1 || n > ubatch) {
+            throw new IllegalArgumentException("embedding step of " + n + " tokens outside [1, " + ubatch + "]");
+        }
+        long posRows = posTable != null ? posTable.rows() : 0;
+        for (int t = 0; t < n; t++) {
+            long pos = (long) pos0 + t + posOffset;
+            if (posTable != null && (pos < 0 || pos >= posRows)) {
+                throw new IllegalArgumentException("position " + pos + " is outside the " + posRows
+                        + " learned position rows of " + posTable.name());
+            }
+            hostTypes[t] = 0;
+            hostPositions[t] = (int) pos;
+        }
+        ctx.scratch().recordDeviceStepTokens(n);
+        ctx.queue().enqueueCopyBuffer(ids.buffer(), (long) ids.offset() * Float.BYTES, tokenIds.buffer(), 0L,
+                (long) n * Integer.BYTES);
+        embedPipeline(n, null, false);
+    }
+
     /** Whether a caller-provided embedding row of {@code width} values fits: {@code n_embd} or {@code nEmbdInp}. */
     public boolean acceptsRowWidth(int width) {
         return width == nEmbd || width == nEmbdInp;
@@ -395,12 +439,22 @@ public final class GpuEmbeddingStage {
      */
     private void embedRows(int n, float[][] rows) {
         ctx.scratch().recordStepTokens(recordIds, n);
+        embedPipeline(n, rows, true);
+    }
+
+    /**
+     * The embedding pipeline of a step whose ids are recorded; {@code writeHostIds} writes the host ids to the
+     * token-id slot first, false when the device already wrote them there.
+     */
+    private void embedPipeline(int n, float[][] rows, boolean writeHostIds) {
         ExecutionObserver obs = ctx.observer();
         boolean observed = obs.enabled();
         if (observed) {
             obs.onStageStart(-1, ExecutionObserver.Stage.EMBEDDING);
         }
-        writeIds(n);
+        if (writeHostIds) {
+            writeIds(n);
+        }
         int embeddingRows = countRows(rows, n);
         if (embeddingRows < n) {
             lookup(n, n * tokenWidth, inputProjection != null ? tokenRows : work);

@@ -326,6 +326,42 @@ public interface ForwardBackend extends AutoCloseable {
     }
 
     /**
+     * Whether {@link #chainGreedy} enqueues its step before the previous step's id reaches the host: the device
+     * copies the previous step's greedy id into the next step's input, so the host detokenizes and checks stops for
+     * one token while the device computes the next. True only while a chained step can be dropped again with
+     * {@link #rollback}{@code (1)}; it may change between steps, and asking neither waits for nor completes an
+     * outstanding step. The default false runs every greedy step to completion.
+     */
+    default boolean chainsGreedyOnDevice() {
+        return false;
+    }
+
+    /**
+     * Enqueues {@link #decodeGreedyOnDevice}{@code (token, pos)}: the token is stored at {@code pos} when the call
+     * returns and the step's greedy id comes from {@link GreedyStep#id()}. The default runs the step at once.
+     */
+    default GreedyStep startGreedy(int token, int pos) {
+        int id = decodeGreedyOnDevice(token, pos);
+        return () -> id;
+    }
+
+    /**
+     * Enqueues the greedy decode at {@code pos} of the id {@code previous} selects, the step greedy generation runs
+     * after {@code previous}: that id is stored at {@code pos} when the call returns. When
+     * {@link #chainsGreedyOnDevice()} holds, the step reads the id on the device and the call returns before
+     * {@code previous} has finished; the default waits for {@code previous}'s id and decodes it at once. A caller
+     * that does not keep the chained step (a stop the previous id triggers) drops its position again with
+     * {@link #rollback}{@code (1)} when {@link #canRollback} allows; the row it leaves otherwise holds that id
+     * computed exactly, as a decode of it would.
+     *
+     * @throws ContextFullException when {@code pos} is past the memory's context
+     */
+    default GreedyStep chainGreedy(GreedyStep previous, int pos) {
+        Objects.requireNonNull(previous, "previous");
+        return startGreedy(previous.id(), pos);
+    }
+
+    /**
      * Evaluates {@code tokens} causally at positions {@code pos0 ..} and stores them in memory, like
      * {@link #prefill}, returning the logits of the requested rows (speculative verification).
      *

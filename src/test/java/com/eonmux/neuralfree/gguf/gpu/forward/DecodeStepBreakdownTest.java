@@ -16,9 +16,10 @@ import static org.junit.Assert.assertTrue;
 /**
  * The decode-step breakdown's bookkeeping: each lap lands in its phase, a step counts under the trunk path it
  * reported, the gap before a call counts only when the call continues the previous position, an interrupted call
- * leaves nothing behind, the device time of a step is the timing report's growth over the call, the bytes the
- * decode thread allocates inside a call count toward its step, and the property yields the disabled breakdown
- * unless it is on.
+ * leaves nothing behind, the device time of a step is the timing report's growth over the call (from the previous
+ * call's return for a contiguous one), the bytes the
+ * decode thread allocates inside a call count toward its step, a wait for a chained step's id counts as the next
+ * call's wait, and the property yields the disabled breakdown unless it is on.
  */
 public class DecodeStepBreakdownTest {
 
@@ -76,6 +77,25 @@ public class DecodeStepBreakdownTest {
     }
 
     @Test
+    public void aWaitForAChainedIdCountsAsTheNextCallsWait() {
+        DecodeStepBreakdown b = DecodeStepBreakdown.recording(null);
+        step(b, 4, DecodeStepBreakdown.TrunkPath.REPLAYED);
+        long t0 = System.nanoTime();
+        sleepMillis(3);
+        b.waited(System.nanoTime() - t0);
+        step(b, 5, DecodeStepBreakdown.TrunkPath.REPLAYED);
+        step(b, 6, DecodeStepBreakdown.TrunkPath.REPLAYED);
+        b.waited(5_000_000_000L);
+        step(b, 9, DecodeStepBreakdown.TrunkPath.REPLAYED);
+        DecodeStepBreakdown.Report r = b.report();
+        double wait = r.meanNanos(DecodeStepBreakdown.TrunkPath.REPLAYED, DecodeStepBreakdown.Phase.WAIT) * 4;
+        assertTrue("the slept wait lands in the wait phase: " + wait, wait >= 3_000_000.0);
+        assertTrue("a wait before a call at another position is dropped: " + wait, wait < 1_000_000_000.0);
+        double between = r.meanNanos(DecodeStepBreakdown.TrunkPath.REPLAYED, DecodeStepBreakdown.Phase.BETWEEN);
+        assertTrue("the gap no longer holds the wait: " + between, between < 3_000_000.0);
+    }
+
+    @Test
     public void anInterruptedCallIsDroppedAndBreaksTheGap() {
         DecodeStepBreakdown b = DecodeStepBreakdown.recording(null);
         step(b, 0, DecodeStepBreakdown.TrunkPath.REPLAYED);
@@ -113,6 +133,34 @@ public class DecodeStepBreakdownTest {
         assertTrue(lines.get(0), lines.get(0).startsWith("3 decode steps (replayed 3,"));
         assertTrue(String.join("\n", lines), lines.stream().anyMatch(l -> l.startsWith("device busy")));
         assertTrue(String.join("\n", lines), lines.stream().anyMatch(l -> l.startsWith("device idle")));
+    }
+
+    /**
+     * A chained step's commands are timed when the host waits for its id between the calls (a Vulkan queue reads its
+     * timestamps once the submission completed): that device time belongs to the next contiguous step, whose period
+     * covers the gap, and never to a step after a break.
+     */
+    @Test
+    public void theDeviceTimeResolvedBetweenContiguousCallsCountsTowardTheNextStep() {
+        KernelTiming timing = new KernelTiming();
+        DecodeStepBreakdown b = DecodeStepBreakdown.recording(timing);
+        timing.add("before", 9_000);
+        for (int pos = 0; pos < 3; pos++) {
+            b.begin(pos);
+            b.trunkPath(DecodeStepBreakdown.TrunkPath.REPLAYED);
+            b.end();
+            timing.add(KernelTiming.graphKey(10), 1_000);
+            timing.add("head", 500);
+        }
+        b.interrupt();
+        timing.add("unrelated", 70_000);
+        b.begin(7);
+        b.trunkPath(DecodeStepBreakdown.TrunkPath.REPLAYED);
+        b.end();
+        DecodeStepBreakdown.Report r = b.report();
+        assertEquals("the two contiguous steps carry the time resolved before them; the others none", 1_500.0 * 2 / 4,
+                r.deviceNanos(DecodeStepBreakdown.TrunkPath.REPLAYED), 0.0);
+        assertEquals(1_000.0 * 2 / 4, r.graphNanos(null), 0.0);
     }
 
     @Test

@@ -745,7 +745,10 @@ public final class GpuEncDecBackend implements ForwardBackend, SequenceEncoder {
 
     // ================================================================== lifecycle
 
-    /** Waits for the queue, then closes the bound blocks and head preprocessors. Idempotent. */
+    /**
+     * Waits for the queue, then releases the driver's replay graphs and step-input dispatch and closes the bound
+     * blocks and head preprocessors. Idempotent.
+     */
     @Override
     public void close() {
         if (closed) {
@@ -757,6 +760,11 @@ public final class GpuEncDecBackend implements ForwardBackend, SequenceEncoder {
             ctx.queue().finish();
         } catch (RuntimeException e) {
             first = e;
+        }
+        try {
+            driver.closeDispatches();
+        } catch (RuntimeException e) {
+            first = Closeables.chain(first, e);
         }
         first = Closeables.close(decoder, first);
         first = Closeables.close(encoder, first);

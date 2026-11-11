@@ -20,12 +20,38 @@ final class OclReadCompletion {
     private final CountDownLatch latch = new CountDownLatch(1);
     private final AtomicBoolean failureReported = new AtomicBoolean();
     private final long sizeInBytes;
+    private final long stagingTicket;
+    private final long timingMark;
     private volatile int status = CL_COMPLETE;
     private volatile RuntimeException copyFailure;
 
     /** @param sizeInBytes bytes the read transfers, for messages */
     OclReadCompletion(long sizeInBytes) {
+        this(sizeInBytes, 0L, 0L);
+    }
+
+    /**
+     * @param sizeInBytes   bytes the read transfers, for messages
+     * @param stagingTicket the staging pool's ticket of the read's own staging buffer
+     *                      ({@link OclStagingPool#retain}); every buffer retained up to it is free once the
+     *                      read completed on the in-order queue
+     * @param timingMark    the number of dispatch timings the queue had tracked when the read was enqueued,
+     *                      all of which completed before the read did
+     */
+    OclReadCompletion(long sizeInBytes, long stagingTicket, long timingMark) {
         this.sizeInBytes = sizeInBytes;
+        this.stagingTicket = stagingTicket;
+        this.timingMark = timingMark;
+    }
+
+    /** The staging pool's ticket of the read's staging buffer. */
+    long stagingTicket() {
+        return stagingTicket;
+    }
+
+    /** The dispatch timings tracked before the read was enqueued. */
+    long timingMark() {
+        return timingMark;
     }
 
     /**
@@ -57,6 +83,11 @@ final class OclReadCompletion {
     /** True once the callback has run. */
     boolean isDone() {
         return latch.getCount() == 0;
+    }
+
+    /** True once the callback has run for a read that completed and copied its data. */
+    boolean completedNormally() {
+        return isDone() && status >= 0 && copyFailure == null;
     }
 
     /**

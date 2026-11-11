@@ -46,6 +46,16 @@ public interface GpuMixer extends AutoCloseable {
     void decode(int pos, ScratchSlot in, ScratchSlot out);
 
     /**
+     * Whether this mixer's one-token decode step reads the step's positions from the scratch {@code POS} slot that
+     * the forward driver writes each step. A mixer that reads its positions only from the memory's step inputs
+     * ({@code GpuStepInputs.qPos()}, {@code ropePos()}) returns false, and a decode step whose mixers all do skips
+     * that write. Default true.
+     */
+    default boolean decodeReadsPositionSlot() {
+        return true;
+    }
+
+    /**
      * The patchers of this mixer's one-row decode step launches, in the order their groups enqueue: a
      * graph replay's plan claims each captured kernel dispatch with the patcher whose group it belongs
      * to, and one claimed patch re-sets the per-step kernel arguments the step's body would set. Empty

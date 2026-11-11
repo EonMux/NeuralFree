@@ -24,9 +24,12 @@ import java.util.Objects;
  * restart sequences — before the row top-k readout of the same buffer. The logits rows sit at the buffer's
  * element 0, {@code vocab} floats apart.
  *
- * <p>The row tables are uploaded per call. Buffers grow to the widest call seen and the prepared dispatch is
- * rebuilt when one grows; a backend without the kernel binds nothing ({@link #bind} returns null), and its
- * caller keeps the whole-row path. Not thread-safe.</p>
+ * <p>The per-step tables (the row metadata, the penalty tokens and the DRY windows) are uploaded per call. The
+ * tables a request fixes (the rows' parameters, the logit-bias tables and the DRY breaker tables) are uploaded only
+ * when they differ from the ones the device holds, so a generation's steps after its first send only the per-step
+ * tables. Buffers grow to the widest call seen and the prepared dispatch is rebuilt when one grows; a backend
+ * without the kernel binds nothing ({@link #bind} returns null), and its caller keeps the whole-row path. Not
+ * thread-safe.</p>
  */
 public final class GpuLogitPrefilter implements AutoCloseable {
 
@@ -64,12 +67,18 @@ public final class GpuLogitPrefilter implements AutoCloseable {
     private int lastRows = -1;
     /**
      * The breaker table of each row of the last call (null for a row without DRY): the device breaker arrays hold
-     * exactly these tables in this order until a buffer is reallocated, so a call over the same tables skips them.
+     * exactly these tables in this order until one of them is reallocated, so a call over the same tables skips
+     * them.
      */
     private DryBreakers[] lastBreakers;
-    private boolean buffersChanged;
+    /** The parameter and bias tables the device holds, null once their buffer is reallocated. */
+    private float[] lastCfg;
+    private int[] lastBiasIds;
+    private float[] lastBiasValues;
     private long breakerUploads;
     private long breakerUploadsSkipped;
+    private long fixedUploads;
+    private long fixedUploadsSkipped;
 
     private GpuLogitPrefilter(GpuOps ops, ComputeBackend backend, ComputeQueue queue, GpuBuffer logits, int vocab,
                               int maxRows, int local) {
@@ -122,6 +131,14 @@ public final class GpuLogitPrefilter implements AutoCloseable {
      */
     public long[] breakerUploadCounts() {
         return new long[]{breakerUploads, breakerUploadsSkipped};
+    }
+
+    /**
+     * The calls that uploaded the parameter and logit-bias tables and the calls that found the device already
+     * holding them, in that order, since the prefilter was bound.
+     */
+    public long[] fixedUploadCounts() {
+        return new long[]{fixedUploads, fixedUploadsSkipped};
     }
 
     /**
@@ -186,7 +203,7 @@ public final class GpuLogitPrefilter implements AutoCloseable {
         int[] biasIdHost = new int[totalBias];
         float[] biasValHost = new float[totalBias];
         int[] tokenHost = new int[totalTokens];
-        boolean sameBreakers = Arrays.equals(dryRowBreakers, lastBreakers) && !buffersChanged;
+        boolean sameBreakers = Arrays.equals(dryRowBreakers, lastBreakers);
         int[] breakerHost = sameBreakers ? null : new int[totalBreakers * BREAKER_STRIDE];
         int[] tailHost = sameBreakers ? null : new int[totalTails];
         int biasAt = 0;
@@ -255,9 +272,18 @@ public final class GpuLogitPrefilter implements AutoCloseable {
             metaHost[m + 11] = row.penaltiesFirst() ? 1 : 0;
         }
         writeInts(meta, metaHost);
-        writeFloats(fcfg, cfgHost);
-        writeInts(biasIds, biasIdHost);
-        writeFloats(biasVals, biasValHost);
+        if (Arrays.equals(cfgHost, lastCfg) && Arrays.equals(biasIdHost, lastBiasIds)
+                && Arrays.equals(biasValHost, lastBiasValues)) {
+            fixedUploadsSkipped++;
+        } else {
+            writeFloats(fcfg, cfgHost);
+            writeInts(biasIds, biasIdHost);
+            writeFloats(biasVals, biasValHost);
+            lastCfg = cfgHost;
+            lastBiasIds = biasIdHost;
+            lastBiasValues = biasValHost;
+            fixedUploads++;
+        }
         writeInts(tokens, tokenHost);
         if (!sameBreakers) {
             writeInts(breakerMeta, breakerHost);
@@ -267,7 +293,6 @@ public final class GpuLogitPrefilter implements AutoCloseable {
         } else {
             breakerUploadsSkipped++;
         }
-        buffersChanged = false;
 
         if (rows != lastRows) {
             dispatch.setInt(1, rows);
@@ -309,6 +334,7 @@ public final class GpuLogitPrefilter implements AutoCloseable {
             closeBuffer(fcfg);
             fcfg = allocate((long) rows * FCFG_STRIDE * Float.BYTES);
             fcfgRows = rows;
+            lastCfg = null;
             changed = true;
         }
         if (biasIds == null || biasCapacity < bias) {
@@ -317,6 +343,8 @@ public final class GpuLogitPrefilter implements AutoCloseable {
             biasIds = allocate((long) bias * Integer.BYTES);
             biasVals = allocate((long) bias * Float.BYTES);
             biasCapacity = bias;
+            lastBiasIds = null;
+            lastBiasValues = null;
             changed = true;
         }
         if (tokens == null || tokenCapacity < tokenInts) {
@@ -329,15 +357,16 @@ public final class GpuLogitPrefilter implements AutoCloseable {
             closeBuffer(breakerMeta);
             breakerMeta = allocate((long) breakers * BREAKER_STRIDE * Integer.BYTES);
             breakerCapacity = breakers;
+            lastBreakers = null;
             changed = true;
         }
         if (breakerTails == null || tailCapacity < tails) {
             closeBuffer(breakerTails);
             breakerTails = allocate((long) tails * Integer.BYTES);
             tailCapacity = tails;
+            lastBreakers = null;
             changed = true;
         }
-        buffersChanged |= changed;
         if (dispatch == null || changed) {
             if (dispatch != null) {
                 dispatch.close();

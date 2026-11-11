@@ -56,6 +56,17 @@ public interface GpuStepInputs {
     void upload(int pos0, int nTokens);
 
     /**
+     * {@link #upload}{@code (pos, 1)} with the device buffers written by {@code writer} instead of host uploads, when
+     * the step inputs take that form: a single KV group of the contiguous form whose step at {@code pos} stores one
+     * cache row. Returns false, changing nothing, when they do not; the caller uploads then.
+     *
+     * @throws IllegalArgumentException as {@link #upload} for a position outside a non-ring group
+     */
+    default boolean uploadDecodeStep(int pos, DecodeStepWriter writer) {
+        return false;
+    }
+
+    /**
      * Host position of row {@code row} of the current step: {@code pos0() + row} on the contiguous form, the row's
      * own position on a paged step (the rows of a media chunk share one).
      *

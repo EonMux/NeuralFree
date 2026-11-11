@@ -32,7 +32,10 @@ import java.util.Set;
  *   <li><b>Flash partials</b> ({@link #partials}) follow the same rule for the split-K attention partial sums.</li>
  *   <li><b>GpuOps staging</b> buffers are temporaries reserved for {@link GpuOps}.</li>
  *   <li><b>Step token ids</b> ({@link #recordStepTokens}) are the host copy of the ids the embedding stage writes to
- *       {@link ScratchSlots#TOKEN_IDS}, so blocks that need them on the host read them without a device read.</li>
+ *       {@link ScratchSlots#TOKEN_IDS}, so blocks that need them on the host read them without a device read. A step
+ *       whose ids the device wrote ({@link #recordDeviceStepTokens}, a chained greedy decode) has no host copy, and
+ *       reading it fails; {@link #stepTokenReads()} counts the reads, so a caller can tell a trunk that never reads
+ *       them.</li>
  * </ul>
  *
  * <p>Every buffer is checked against the device's single-allocation limit and storage-binding range. A slot that
@@ -94,6 +97,9 @@ public final class GpuScratch implements AutoCloseable {
     private final List<GpuBuffer> owned = new ArrayList<>();
     private final int[] stepTokenIds;
     private int stepTokenCount;
+    /** Whether the current step's ids exist only on the device ({@link #recordDeviceStepTokens}). */
+    private boolean stepTokensOnDevice;
+    private long stepTokenReads;
     private long allocatedBytes;
     private boolean closed;
 
@@ -280,16 +286,43 @@ public final class GpuScratch implements AutoCloseable {
         }
         System.arraycopy(ids, 0, stepTokenIds, 0, n);
         stepTokenCount = n;
+        stepTokensOnDevice = false;
+    }
+
+    /**
+     * Records a step of {@code n} token ids that the device wrote to {@link ScratchSlots#TOKEN_IDS} without a host
+     * copy (a chained greedy decode reads its id from the previous step's selection): {@link #readStepTokens} fails
+     * until the next {@link #recordStepTokens}.
+     *
+     * @throws IllegalArgumentException when {@code n} is outside {@code [1, ubatch]}
+     */
+    public void recordDeviceStepTokens(int n) {
+        if (n < 1 || n > ubatch) {
+            throw new IllegalArgumentException("step of " + n + " token ids is outside [1, " + ubatch + "]");
+        }
+        stepTokenCount = n;
+        stepTokensOnDevice = true;
+    }
+
+    /** How many times {@link #readStepTokens} ran on this scratch. */
+    public long stepTokenReads() {
+        return stepTokenReads;
     }
 
     /**
      * Copies the current step's {@code n} token ids ({@link #recordStepTokens}) to {@code dst[dstOff ..]}.
      *
-     * @throws IllegalStateException    when the recorded step does not hold {@code n} tokens
+     * @throws IllegalStateException    when the recorded step does not hold {@code n} tokens, or its ids exist only
+     *                                  on the device ({@link #recordDeviceStepTokens})
      * @throws IllegalArgumentException when {@code dst} is too short
      */
     public void readStepTokens(int[] dst, int dstOff, int n) {
         Objects.requireNonNull(dst, "dst");
+        stepTokenReads++;
+        if (stepTokensOnDevice) {
+            throw new IllegalStateException("the step's " + stepTokenCount + " token ids exist only on the device"
+                    + " (a chained greedy decode); a block that reads them on the host cannot run in the chain");
+        }
         if (n != stepTokenCount) {
             throw new IllegalStateException("the step's token ids were recorded for " + stepTokenCount
                     + " tokens, " + n + " are read");

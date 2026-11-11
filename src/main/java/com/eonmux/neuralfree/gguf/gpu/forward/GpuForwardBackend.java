@@ -6,6 +6,7 @@ import com.eonmux.neuralfree.gguf.engine.DraftTree;
 import com.eonmux.neuralfree.gguf.engine.EmbeddingRowSupport;
 import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
 import com.eonmux.neuralfree.gguf.engine.ForwardBatch;
+import com.eonmux.neuralfree.gguf.engine.GreedyStep;
 import com.eonmux.neuralfree.gguf.engine.HiddenTap;
 import com.eonmux.neuralfree.gguf.engine.LogitPrefilter;
 import com.eonmux.neuralfree.gguf.engine.OutputKind;
@@ -81,6 +82,12 @@ public final class GpuForwardBackend implements ForwardBackend {
      * patch recorded arguments gains nothing from a kept capture.
      */
     public static final String CHAIN_REPLAY_PROPERTY = "neuralfree.gpu.chainReplay";
+    /**
+     * The system property {@code false} keeps greedy steps from chaining on the device
+     * ({@link #chainsGreedyOnDevice()}): every greedy step then waits for its id before the next one is enqueued.
+     * Default {@code true}.
+     */
+    public static final String GREEDY_CHAIN_PROPERTY = "neuralfree.gpu.greedyChain";
 
     private final GpuForwardContext ctx;
     private final GpuEmbeddingStage embedding;
@@ -89,6 +96,8 @@ public final class GpuForwardBackend implements ForwardBackend {
     private final GpuPrefillDriver driver;
     /** Whether a speculative round's steps keep and capture their trunks ({@code chainReplayConfigured(backend)}). */
     private final boolean chainReplay;
+    /** Whether greedy steps may chain on the device ({@link #GREEDY_CHAIN_PROPERTY}). */
+    private final boolean greedyChain;
     /** The open recurrent tree round, or null when no tree verify runs over a recurrent target. */
     private GpuRecurrentTreeRound treeRound;
     private HiddenTap tap;
@@ -167,6 +176,9 @@ public final class GpuForwardBackend implements ForwardBackend {
         Objects.requireNonNull(preprocessors, "preprocessors");
         ModelSpec spec = ctx.spec();
         registry.validate(spec);
+        // the properties are read before any block binds, so a malformed value leaves nothing to release
+        this.chainReplay = chainReplayConfigured(ctx.backend().backendType());
+        this.greedyChain = greedyChainConfigured();
         ctx.kernels().prewarm(kernels(spec));
         this.embedding = new GpuEmbeddingStage(ctx, embeddingSplit);
         GpuLayerExecutor exec = GpuLayerExecutor.forTrunk(ctx, registry);
@@ -187,8 +199,23 @@ public final class GpuForwardBackend implements ForwardBackend {
         this.executor = exec;
         this.head = h;
         this.driver = d;
-        this.chainReplay = chainReplayConfigured(ctx.backend().backendType());
         this.tap = ctx.hiddenTap();
+    }
+
+    /**
+     * {@code neuralfree.gpu.greedyChain} as a boolean, default {@code true}.
+     *
+     * @throws IllegalArgumentException when the property is set to something else than a boolean
+     */
+    static boolean greedyChainConfigured() {
+        String value = System.getProperty(GREEDY_CHAIN_PROPERTY);
+        if (value == null || value.isEmpty() || value.equalsIgnoreCase("true")) {
+            return true;
+        }
+        if (value.equalsIgnoreCase("false")) {
+            return false;
+        }
+        throw new IllegalArgumentException("-D" + GREEDY_CHAIN_PROPERTY + " must be a boolean, got '" + value + "'");
     }
 
     /** Kernels the executor, the head and the built-in extras launch, plus attention when a layer attends. */
@@ -243,6 +270,50 @@ public final class GpuForwardBackend implements ForwardBackend {
     @Override
     public int decodeGreedyOnDevice(int token, int pos) {
         return causal(new int[]{token}, pos, new int[]{0}, GpuPrefillDriver.Output.ARGMAX).ids()[0];
+    }
+
+    /**
+     * Whether greedy steps chain on the device: a model with memory and an LM head whose token lookup reads device
+     * ids, with no step mirror, execution observer or hidden-tap point a step would serve on the host, and a memory
+     * that can roll a chained step back, unless {@link #GREEDY_CHAIN_PROPERTY} is {@code false}. Leaves outstanding
+     * steps outstanding.
+     */
+    @Override
+    public boolean chainsGreedyOnDevice() {
+        if (closed) {
+            throw new IllegalStateException("GPU forward backend is closed");
+        }
+        return chainsGreedy() && ctx.memory().canRollback(1);
+    }
+
+    private boolean chainsGreedy() {
+        return greedyChain && !closed && driver.chainsGreedy(tap);
+    }
+
+    /** Enqueues the greedy step without waiting when greedy steps chain here; otherwise runs it at once. */
+    @Override
+    public GreedyStep startGreedy(int token, int pos) {
+        if (!chainsGreedy()) {
+            return ForwardBackend.super.startGreedy(token, pos);
+        }
+        driver.settleGreedy();
+        align(requireMemory("a greedy decode"), pos, 1);
+        return driver.enqueueGreedy(token, null, pos, tap);
+    }
+
+    /**
+     * Enqueues the greedy step of {@code previous}'s id at the next position without waiting when greedy steps
+     * chain here: on the device when {@code previous} is this backend's latest step and nothing else ran since,
+     * else from its id once it reaches the host. A step at another position, or one that cannot chain here, waits
+     * for {@code previous}'s id and starts from it ({@link #startGreedy}).
+     */
+    @Override
+    public GreedyStep chainGreedy(GreedyStep previous, int pos) {
+        Objects.requireNonNull(previous, "previous");
+        if (!chainsGreedy() || pos != ctx.memory().sequence().nPast()) {
+            return ForwardBackend.super.chainGreedy(previous, pos);
+        }
+        return driver.enqueueGreedy(-1, previous, pos, tap);
     }
 
     @Override
@@ -1131,10 +1202,15 @@ public final class GpuForwardBackend implements ForwardBackend {
         return ctx.memory();
     }
 
+    /**
+     * Throws when closed; otherwise completes the greedy steps still outstanding, so every call sees their tokens
+     * stored and their device work ordered before its own.
+     */
     private void ensureOpen() {
         if (closed) {
             throw new IllegalStateException("GPU forward backend is closed");
         }
+        driver.settleGreedy();
     }
 
     // ================================================================== lifecycle
@@ -1145,13 +1221,18 @@ public final class GpuForwardBackend implements ForwardBackend {
         if (closed) {
             return;
         }
-        closed = true;
-        logStepBreakdown();
         RuntimeException first = null;
         try {
-            driver.closeReplay();
+            driver.settleGreedy();
         } catch (RuntimeException e) {
             first = e;
+        }
+        closed = true;
+        logStepBreakdown();
+        try {
+            driver.closeDispatches();
+        } catch (RuntimeException e) {
+            first = Closeables.chain(first, e);
         }
         try {
             ctx.queue().finish();
@@ -1168,6 +1249,16 @@ public final class GpuForwardBackend implements ForwardBackend {
     /** The decode-step replay's state, for diagnostics: a captured graph's dispatches or the warmup progress. */
     public String decodeReplayStats() {
         return driver.decodeReplayStats();
+    }
+
+    /** Whether a one-token decode step writes the scratch {@code POS} slot, for tests. */
+    boolean decodeWritesPositions() {
+        return driver.decodeWritesPositions();
+    }
+
+    /** The greedy steps that read their input id on the device, for tests. */
+    long greedyDeviceChained() {
+        return driver.greedyDeviceChained();
     }
 
     /** The one-token decode replay's counters, for tests. */

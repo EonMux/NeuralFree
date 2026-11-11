@@ -7,6 +7,7 @@ import com.eonmux.neuralfree.gguf.engine.EmbeddingRowSupport;
 import com.eonmux.neuralfree.gguf.engine.ContextFullException;
 import com.eonmux.neuralfree.gguf.engine.DraftTree;
 import com.eonmux.neuralfree.gguf.engine.ForwardBatch;
+import com.eonmux.neuralfree.gguf.engine.GreedyStep;
 import com.eonmux.neuralfree.gguf.engine.LogitPrefilter;
 import com.eonmux.neuralfree.gguf.engine.OutputKind;
 import com.eonmux.neuralfree.gguf.engine.TreeAccept;
@@ -19,6 +20,7 @@ import com.eonmux.neuralfree.gguf.gpu.head.GpuLogitsHead;
 import com.eonmux.neuralfree.gguf.memory.StepLayout;
 import com.eonmux.neuralfree.gguf.memory.gpu.DeviceModelMemory;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuMemory;
+import com.eonmux.neuralfree.gguf.memory.gpu.GpuStepInputs;
 import com.eonmux.neuralfree.gguf.memory.paged.PageCopy;
 import com.eonmux.neuralfree.gguf.memory.paged.PagedStep;
 import com.eonmux.neuralfree.gguf.memory.paged.PagedSequences;
@@ -120,6 +122,17 @@ public final class GpuPrefillDriver {
     private final GpuLogitsHead head;
     private final ComputeQueue queue;
     private final GpuStepPositions positions;
+    /**
+     * Whether a one-token decode step writes the scratch {@code POS} slot: only when some layer reads it there
+     * ({@link GpuLayerExecutor#decodeReadsPositionSlot}); every other layer reads the memory's step inputs.
+     */
+    private final boolean decodeWritesPositions;
+    /**
+     * The device writer of the one-token step's inputs ({@link GpuDecodeStepWriter}) bound to {@link #writerInputs},
+     * or null when the backend provides none or the memory's step inputs do not take it.
+     */
+    private final GpuDecodeStepWriter decodeWriter;
+    private final GpuStepInputs writerInputs;
     private final GpuDecodeReplay decodeReplay;
     /** The host-time breakdown of the one-token decode calls ({@link DecodeStepBreakdown#PROPERTY}). */
     private final DecodeStepBreakdown breakdown;
@@ -145,6 +158,12 @@ public final class GpuPrefillDriver {
      * paged decode steps of its shape, and any other step drops it first.
      */
     private PagedDecodeShape pagedDecodeShape;
+    /** The greedy steps enqueued without waiting ({@link #enqueueGreedy}), until their ids reach the host. */
+    private final GpuGreedyChain greedy;
+    /** Whether a one-token decode step ran on this driver, so {@link #trunkReadsStepTokens} is known. */
+    private boolean decodeObserved;
+    /** Whether a one-token decode step read its token ids on the host ({@link GpuScratch#readStepTokens}). */
+    private boolean trunkReadsStepTokens;
 
     /**
      * A receiver of each step's positions and tokens, called after the main memory uploaded the step and after the
@@ -182,12 +201,17 @@ public final class GpuPrefillDriver {
         this.head = Objects.requireNonNull(head, "head");
         this.queue = ctx.queue();
         this.positions = new GpuStepPositions(ctx.scratch(), queue, ctx.spec().hparams().mropeTextPositions());
+        this.decodeWritesPositions = executor.decodeReadsPositionSlot();
         this.breakdown = DecodeStepBreakdown.configured(queue.kernelTiming(), queue.timesGraphLaunches());
         this.decodeReplay = new GpuDecodeReplay(queue, breakdown);
         this.stepReplay = new GpuDecodeReplay(queue);
         this.chainReplay = GpuForwardBackend.chainReplayConfigured(ctx.backend().backendType());
         this.ubatch = ctx.scratch().ubatch();
         this.embeddingRowToken = EmbeddingRowSupport.recordToken(ctx.spec());
+        this.greedy = new GpuGreedyChain(() -> ctx.hasMemory() ? ctx.memory().sequence() : null, breakdown);
+        // the writer's dispatch is prepared last, so a failure above leaves nothing to release
+        this.writerInputs = ctx.hasMemory() ? ctx.memory().stepInputs() : null;
+        this.decodeWriter = writerInputs != null ? GpuDecodeStepWriter.bind(ctx.ops(), writerInputs) : null;
     }
 
     /** The host-time breakdown of the one-token decode calls; {@link DecodeStepBreakdown#DISABLED} when off. */
@@ -284,6 +308,16 @@ public final class GpuPrefillDriver {
         return decodeReplay + " " + stepReplay;
     }
 
+    /** Whether a one-token decode step writes the scratch {@code POS} slot. */
+    boolean decodeWritesPositions() {
+        return decodeWritesPositions;
+    }
+
+    /** The greedy steps that read their input id on the device ({@link #enqueueGreedy}). */
+    long greedyDeviceChained() {
+        return greedy.deviceChained();
+    }
+
     /** The one-token decode replay's counters. */
     GpuDecodeReplay.Counters decodeReplayCounters() {
         return decodeReplay.counters();
@@ -357,6 +391,7 @@ public final class GpuPrefillDriver {
                        int topK, boolean useMemory, HiddenTap tap, LogitPrefilter prefilter) {
         Objects.requireNonNull(output, "output");
         Objects.requireNonNull(tap, "tap");
+        settleGreedy();
         if (breakdown.enabled() && useMemory && embd == null && tokens != null && tokens.length == 1) {
             breakdown.begin(pos0);
         } else {
@@ -432,6 +467,100 @@ public final class GpuPrefillDriver {
         }
     }
 
+    /**
+     * Whether this driver's greedy steps can chain on the device under {@code tap}: a model with memory and an LM
+     * head whose embedding stage takes its ids from the device ({@link GpuEmbeddingStage#acceptsDeviceIds()}) and
+     * holds a token row for every id the head selects among, with no step mirror, execution observer, recurrent
+     * tree round or hidden-tap point that a step would have to serve on the host. A chained step additionally needs
+     * a trunk that reads no host token ids, which the first decode step tells ({@link #enqueueGreedy}).
+     */
+    boolean chainsGreedy(HiddenTap tap) {
+        Objects.requireNonNull(tap, "tap");
+        if (!ctx.hasMemory() || !head.hasLmHead() || !embedding.acceptsDeviceIds()
+                || head.vocab() > embedding.vocabRows() || mirror != null || recurrentRound != null
+                || ctx.observer().enabled()) {
+            return false;
+        }
+        for (int point = 0; point <= executor.layerCount(); point++) {
+            if (tap.wants(point)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Enqueues one greedy decode step at {@code pos} and returns without waiting for it: its input is
+     * {@code token} or, when {@code previous} is not null, the id {@code previous} selects. A step chained on the
+     * latest greedy step of this driver, while nothing else ran since and the trunk reads no host token ids, copies
+     * that id on the device and stores the id, or a placeholder that the id replaces once it reaches the host
+     * ({@link GpuGreedyChain}); any other {@code previous} is waited for and its id decoded as a host token. The
+     * step's own id comes back through the returned handle; at most one older step stays outstanding, and any other
+     * call of this driver completes them all first ({@link #settleGreedy()}).
+     *
+     * @throws IllegalStateException    when the steps cannot run here ({@link #chainsGreedy}) or the memory does
+     *                                  not end at {@code pos}
+     * @throws ContextFullException     when {@code pos} is past the memory's context; nothing is enqueued
+     * @throws IllegalArgumentException for a token outside the vocabulary
+     */
+    GreedyStep enqueueGreedy(int token, GreedyStep previous, int pos, HiddenTap tap) {
+        if (!chainsGreedy(tap)) {
+            throw new IllegalStateException("greedy steps of " + ctx.spec().arch().ggufName() + " run through the"
+                    + " synchronous decode here (no memory, no LM head, host token lookup, or a host observer)");
+        }
+        boolean chained = previous != null && decodeObserved && !trunkReadsStepTokens && greedy.chainsOn(previous);
+        greedy.settleOlderThan(1);
+        int input = previous == null ? token
+                : chained ? GpuGreedyChain.inputToken((GpuGreedyChain.Step) previous) : previous.id();
+        if (breakdown.enabled()) {
+            breakdown.begin(pos);
+        }
+        GpuMemory memory = ctx.memory();
+        GpuCallReads calls = null;
+        boolean enqueued = false;
+        try {
+            checkSpan(memory, pos, 1);
+            calls = new GpuCallReads(head, queue, 1, Output.ARGMAX);
+            GpuTapReads taps = new GpuTapReads(queue, tap, 1, 0);
+            int[] tokens = {input};
+            ScratchSlot deviceIds = chained ? ((GpuGreedyChain.Step) previous).idSlot() : null;
+            enqueued = true;
+            step(chained ? null : tokens, null, null, pos, 0, 1, GREEDY_ROW, Output.ARGMAX, 0, memory, calls,
+                    taps, deviceIds);
+            memory.sequence().append(tokens, 0, 1);
+            queue.flush();
+            GreedyStep step = greedy.register(calls, chained ? (GpuGreedyChain.Step) previous : null,
+                    memory.sequence().nPast() - 1);
+            breakdown.end();
+            return step;
+        } catch (RuntimeException e) {
+            breakdown.interrupt();
+            greedy.interrupt();
+            if (enqueued) {
+                try {
+                    queue.finish();
+                } catch (RuntimeException drain) {
+                    e.addSuppressed(drain);
+                }
+            }
+            if (calls != null) {
+                calls.closeEvents();
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Completes every greedy step still outstanding ({@link #enqueueGreedy}), so the next call sees their ids in
+     * the sequence, and keeps any later step from chaining on them.
+     */
+    void settleGreedy() {
+        greedy.interrupt();
+        if (greedy.hasOutstanding()) {
+            greedy.settle();
+        }
+    }
+
     private void checkSpan(GpuMemory memory, int pos0, int total) {
         if (memory == null) {
             if (total > ubatch) {
@@ -473,6 +602,7 @@ public final class GpuPrefillDriver {
         Objects.requireNonNull(batch, "batch");
         Objects.requireNonNull(output, "output");
         Objects.requireNonNull(tap, "tap");
+        settleGreedy();
         if (output != Output.HIDDEN && output != Output.LOGITS) {
             throw new IllegalArgumentException("a memoryless batch reads logits or hidden rows, not " + output);
         }
@@ -622,6 +752,7 @@ public final class GpuPrefillDriver {
         Objects.requireNonNull(batch, "batch");
         Objects.requireNonNull(output, "output");
         Objects.requireNonNull(tap, "tap");
+        settleGreedy();
         if (output == Output.ARGMAX) {
             throw new IllegalArgumentException("a batched call reads logits, hidden rows or top-k candidates,"
                     + " not " + output);
@@ -717,6 +848,7 @@ public final class GpuPrefillDriver {
         Objects.requireNonNull(batch, "batch");
         Objects.requireNonNull(proposal, "proposal");
         Objects.requireNonNull(tap, "tap");
+        settleGreedy();
         if (!head.hasLmHead()) {
             throw new UnsupportedOperationException(ctx.spec().arch().ggufName() + " has no LM head; the device"
                     + " accept walk reads the rows' greedy ids");
@@ -828,10 +960,19 @@ public final class GpuPrefillDriver {
         decodeReplay.rearm(nextPos);
     }
 
-    /** Releases the captured trunk-replay graphs, before the blocks they dispatch are closed. */
-    void closeReplay() {
-        decodeReplay.close();
-        stepReplay.close();
+    /**
+     * Releases the captured trunk-replay graphs and the step-input writer's dispatch; the owning backend calls it
+     * on close, after the queue drained and before the blocks they dispatch are closed. Idempotent.
+     */
+    public void closeDispatches() {
+        try {
+            decodeReplay.close();
+            stepReplay.close();
+        } finally {
+            if (decodeWriter != null) {
+                decodeWriter.close();
+            }
+        }
     }
 
     /** The per-call state of {@link #runBatch} and its ubatch step. */
@@ -1139,6 +1280,15 @@ public final class GpuPrefillDriver {
 
     private void step(int[] tokens, float[][] embd, int[] types, int p, int c0, int n, int[] rows, Output output,
                       int topK, GpuMemory memory, GpuCallReads calls, GpuTapReads taps) {
+        step(tokens, embd, types, p, c0, n, rows, output, topK, memory, calls, taps, null);
+    }
+
+    /**
+     * One step of a call; {@code deviceIds} (null for host tokens or rows) holds the step's token ids on the device,
+     * a chained greedy decode's input.
+     */
+    private void step(int[] tokens, float[][] embd, int[] types, int p, int c0, int n, int[] rows, Output output,
+                      int topK, GpuMemory memory, GpuCallReads calls, GpuTapReads taps, ScratchSlot deviceIds) {
         ExecutionObserver obs = ctx.observer();
         boolean observed = obs.enabled();
         if (observed) {
@@ -1149,15 +1299,25 @@ public final class GpuPrefillDriver {
         boolean trunk = trunkRunner != null && mode == GpuLayerExecutor.StepMode.PREFILL;
         breakdown.lap(DecodeStepBreakdown.Phase.CALL);
         if (memory != null && !trunk) {
-            memory.stepInputs().upload(p, n);
+            GpuStepInputs inputs = memory.stepInputs();
+            boolean written = n == 1 && decodeWriter != null && inputs == writerInputs
+                    && inputs.uploadDecodeStep(p, decodeWriter);
+            if (!written) {
+                inputs.upload(p, n);
+            }
             if (mirror != null) {
                 mirror.beforeStep(p, n);
             }
         }
         executor.prefetchFirst();
-        positions.write(p, n);
+        if (mode != GpuLayerExecutor.StepMode.DECODE || decodeWritesPositions) {
+            positions.write(p, n);
+        }
         breakdown.lap(DecodeStepBreakdown.Phase.INPUTS);
-        if (embd != null) {
+        long tokenReads = ctx.scratch().stepTokenReads();
+        if (deviceIds != null) {
+            embedding.embedDeviceIds(deviceIds, n, p);
+        } else if (embd != null) {
             embedding.embedRows(embd, c0, n, p);
         } else {
             embedding.embed(tokens, c0, n, types, p);
@@ -1203,10 +1363,17 @@ public final class GpuPrefillDriver {
             done += count;
         }
         breakdown.lap(DecodeStepBreakdown.Phase.HEAD);
+        if (mode == GpuLayerExecutor.StepMode.DECODE) {
+            decodeObserved = true;
+            trunkReadsStepTokens |= ctx.scratch().stepTokenReads() != tokenReads;
+        }
         if (observed) {
             obs.onStepEnd(p, n);
         }
     }
+
+    /** The output row of a one-token greedy step. */
+    private static final int[] GREEDY_ROW = {0};
 
     private static int[] identity(int n) {
         int[] r = new int[n];

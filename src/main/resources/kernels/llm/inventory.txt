@@ -907,6 +907,7 @@ LLM_DSV4_LidUpdate_Q5_1	dsv4/compress.cl	7	15	i,i,i,i,i,f,f,f,f,f,f,f,i,i,i	iiii
 LLM_DSV4_LidUpdate_Q8_0	dsv4/compress.cl	7	15	i,i,i,i,i,f,f,f,f,f,f,f,i,i,i	iiiiifffffffiiiBBBBBBB
 LLM_DSV4_StateSnapshot	dsv4/compress.cl	5	7	i,i,i,i,i,i,i	iiiiiiiBBBBB
 LLM_DSV4_StateUpdate	dsv4/compress.cl	5	6	i,i,i,i,i,i	iiiiiiBBBBB
+LLM_DecodeStepInputs	step_inputs.cl	4	6	i,i,i,i,i,i	iiiiiiBBBB
 LLM_Dflash2Logits	dflash.cl	3	5	i,i,i,f,f	iiiffBBB
 LLM_Dflash2Pick	dflash.cl	4	3	i,i,i	iiiBBBB
 LLM_Dflash2Score	dflash.cl	7	4	i,i,i,i	iiiiBBBBBBB
