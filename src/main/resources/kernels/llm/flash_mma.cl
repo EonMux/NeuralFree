@@ -1,13 +1,16 @@
-/* flash_mma.cl - LLM_FlashAttnMma_F16 and LLM_FlashAttnMmaPaged_F16 tensor-core tiled prefill attention.
- * Requires: common/dialect.h, common/config.h, common/math.h, common/attn_common.h */
+/* flash_mma.cl - LLM_FlashAttnMma_<KV> and LLM_FlashAttnMmaPaged_<KV> (KV F16 or Q8_0) tensor-core tiled prefill
+ * attention.
+ * Requires: common/dialect.h, common/config.h, common/math.h, common/quant_decode_legacy.h, common/attn_common.h */
 /*
  * CUDA-only tensor-core twin of the tiled prefill kernel (flash_prefill.cl): the Q K^T and P V
  * products run on the matrix unit through mma.sync.aligned.m16n8k16 fragments, so long prompts,
  * speculative verification and batched decode reach matrix-unit throughput as llama.cpp's
  * fattn-mma-f16 does. Every other semantic matches LLM_FlashAttn_F16: same argument list, same
  * grid, same online softmax, split-K partials, GQA packing, sinks, softcap, ALiBi, T5 bias, SWA
- * and the paged KV addressing of flash_prefill.cl. K and V caches are F16; Q, the score state and
- * the output stay F32, P and the staged tiles are F16 (as in ggml-cuda/fattn-mma-f16.cuh). The
+ * and the paged KV addressing of flash_prefill.cl. K and V caches are both F16, or both Q8_0 (the
+ * LLM_FlashAttnMma_Q8_0 kernels dequantize each block to F16 while staging the tiles, as llama.cpp
+ * converts a quantized cache to F16 for fattn-mma-f16); Q, the score state and the output stay F32,
+ * P and the staged tiles are F16 (as in ggml-cuda/fattn-mma-f16.cuh). The
  * OpenCL program and the HIP build define no mma kernels, so the host runs the scalar kernels there;
  * the Vulkan twins are the workgroup-scope cooperative-matrix shaders of
  * shaders/llm/flash_mma_cm2.comp (gguf.ops.attn.FlashAttnTiling.Plan.MMA is selected only where
@@ -15,7 +18,8 @@
  *
  * Layouts (offsets in elements, 64-bit inside the kernel): as flash_prefill.cl, with
  *   q        q[q_off + t * q_row_stride + h * d_k + d], query position q_pos[t]
- *   K value  k[j * k_row_stride + kvh * k_head_stride + d] (F16), key position kv_pos[j]
+ *   K value  element j * k_row_stride + kvh * k_head_stride + d of the cache (kv_types.h), key
+ *            position kv_pos[j]
  *   out      out[out_off + t * out_row_stride + h * d_v + d]                      (direct_out = 1)
  *   partial  partial[((t * n_head + h) * n_split + s) * (d_v + 2) + d], m at + d_v, l at + d_v + 1
  *
@@ -29,11 +33,13 @@
  *
  * Shared memory: the K tile and the V tile, 64 key rows of NF_FM_LD halves each in cache order
  * (the K tile first holds the F16 Q tile while the warps load their Q fragments), and the key
- * positions of the K tile.
+ * positions of the K tile; over a Q8_0 cache also the raw tile, 64 rows of NF_FM_Q8_LD bytes, into
+ * which one K or V tile's blocks stream before they dequantize into the F16 tile.
  *
  * Each warp keeps its Q fragments in registers for the whole key loop. Key tiles invisible to
  * every row are skipped (every warp evaluates the same key positions, so the decision is uniform
- * without a barrier); the visible ones run a two-stage cp.async pipeline as fattn-mma-f16 does:
+ * without a barrier); the visible ones run a two-stage pipeline (cp.async over F16 caches) as
+ * fattn-mma-f16 does:
  * V(t) streams in while S = Q K(t)^T runs, K(t') of the next visible tile while O += P V(t) runs.
  * K fragments come from the K tile through ldmatrix, V fragments through ldmatrix.trans. Score,
  * position bias and -INF masking act on the F32 fragments; a tile every key of which is visible to
@@ -67,6 +73,8 @@
 #define NF_FM_KG     (NF_FM_BN / 8)       /* 16 x 8 score fragments of a warp per tile */
 #define NF_FM_KS     (NF_FM_MAX_D / 16)   /* 16-wide steps over the head dim */
 #define NF_FM_POS_MAX 0x7fffffff         /* above every query position */
+/* Bytes of one row of the raw Q8_0 tile: the blocks of NF_FM_MAX_D values. */
+#define NF_FM_Q8_LD  (NF_FM_MAX_D / 32 * Q8_0_BLOCK_BYTES)
 
 /* mma.sync.aligned.m16n8k16.f32.f16.f16.f32: D = A(16 x 16) * B(16 x 8) + D over F16 fragments,
  * F32 accumulate. Fragment layouts (lane 0..31, group = lane / 4, tig = lane % 4):
@@ -109,6 +117,12 @@ NF_INLINE void nf_fm_cp16(unsigned dst, NF_GLOBAL const NF_HALF* src, int src_by
                  :: "r"(dst), "l"(src), "r"(src_bytes) : "memory");
 }
 
+/* 4-byte global-to-shared copy that fills the destination with zeros past src_bytes (0 or 4). */
+NF_INLINE void nf_fm_cp4(unsigned dst, NF_GLOBAL const uchar* src, int src_bytes) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;"
+                 :: "r"(dst), "l"(src), "r"(src_bytes) : "memory");
+}
+
 /* Closes the group of cp.async copies issued since the last commit. */
 NF_INLINE void nf_fm_cp_commit(void) {
     asm volatile("cp.async.commit_group;" ::: "memory");
@@ -136,11 +150,14 @@ NF_INLINE int nf_fm_plan_ok(int n_head, int n_head_kv, int d_k, int d_v, int bq,
         && (int)get_local_size(0) == NF_FM_WG;
 }
 
-/* Shared-memory floats the mma kernel stages for d_k and d_v (FaSmem counts 4-byte floats): the K
- * (and Q) tile, the V tile and the key positions. */
-NF_INLINE long nf_fm_smem_floats(int d_k, int d_v) {
+/* Shared-memory floats the mma kernel stages for d_k and d_v over a cache of type kvt (FaSmem counts
+ * 4-byte floats): the K (and Q) tile, the V tile and the key positions, plus over a Q8_0 cache the raw
+ * tile of the larger head dim's blocks. */
+NF_INLINE long nf_fm_smem_floats(int d_k, int d_v, int kvt) {
     const long halves = (long)NF_FM_BN * (d_k + 8) + (long)NF_FM_BN * (d_v + 8);
-    return halves / 2 + NF_FM_BN;
+    const int d = d_k > d_v ? d_k : d_v;
+    const long raw = kvt == NF_KV_Q8_0 ? (long)NF_FM_BN * ((d + 31) / 32) * Q8_0_BLOCK_BYTES : 0;
+    return halves / 2 + NF_FM_BN + (raw + 3) / 4;
 }
 
 /* Writes NaN over the outputs of a call whose arguments violate the plan (block (0, 0, 0) only). */
@@ -271,18 +288,146 @@ NF_INLINE void nf_fm_stage(NF_LOCAL_PTR NF_HALF* dst, NF_GLOBAL const NF_HALF* s
     }
 }
 
+/* d * q of one Q8_0 code, saturated to the finite F16 range: a block scale can reach 65504, so d * q can
+ * exceed the largest half by up to 127 times; the tile keeps such a value at +-65504 instead of inf, which
+ * would turn the row's scores or outputs into NaN. */
+NF_INLINE float nf_fm_q8_val(const float dq, const uint code) {
+    return fminf(fmaxf(dq * (float)(nf_i8)(code & 0xFFu), -65504.0f), 65504.0f);
+}
+
+/* The 8 values of qs (2-byte aligned) times dq, as the four F16 pairs of one 16-byte tile chunk. */
+NF_INLINE uint4 nf_fm_q8_chunk(const float dq, const ushort q0, const ushort q1, const ushort q2,
+                               const ushort q3) {
+    return make_uint4(nf_fm_p2(nf_fm_q8_val(dq, q0), nf_fm_q8_val(dq, (uint)q0 >> 8)),
+                      nf_fm_p2(nf_fm_q8_val(dq, q1), nf_fm_q8_val(dq, (uint)q1 >> 8)),
+                      nf_fm_p2(nf_fm_q8_val(dq, q2), nf_fm_q8_val(dq, (uint)q2 >> 8)),
+                      nf_fm_p2(nf_fm_q8_val(dq, q3), nf_fm_q8_val(dq, (uint)q3 >> 8)));
+}
+
 /*
- * Stages the K tile at kt (nk keys) with nf_fm_stage and its key positions (kpa, kpb as every warp holds
+ * Whether the raw Q8_0 tiles of a head can stream in through 4-byte cp.async copies: every head's
+ * blocks start 4-byte aligned (an even block index from a 4-byte aligned base) and span a multiple of
+ * 4 bytes (d a multiple of 64).
+ */
+NF_INLINE int nf_fm_q8_async(NF_GLOBAL const NF_HALF* k, NF_GLOBAL const NF_HALF* v, const int d_k, const int d_v,
+                             const int k_row_stride, const int k_head_stride, const int v_row_stride,
+                             const int v_head_stride) {
+    return (((size_t)k | (size_t)v) & 3) == 0 && ((d_k | d_v) & 63) == 0
+        && ((k_row_stride | k_head_stride | v_row_stride | v_head_stride) & 63) == 0;
+}
+
+/*
+ * Issues the copies of the Q8_0 blocks of key rows kt .. kt + NF_FM_BN - 1 of one head (d values from
+ * value offset head_off of each row, row_stride values per row) into the raw tile r_s (row j at
+ * r_s + j * NF_FM_Q8_LD) as 4-byte cp.async copies; rows past nk or on a missing page are zeros.
+ * Requires nf_fm_q8_async.
+ */
+NF_INLINE void nf_fm_stage_q8_raw(NF_LOCAL_PTR uchar* r_s, NF_GLOBAL const uchar* src, const nf_i64 head_off,
+                                  const int row_stride, const int kt, const int nk, const int d,
+                                  const int page_shift, NF_GLOBAL const int* NF_RESTRICT pt, const int pt_off,
+                                  const int tid) {
+    const int words = d / 32 * Q8_0_BLOCK_BYTES / 4;
+    const unsigned s0 = (unsigned)__cvta_generic_to_shared(r_s);
+    for (int w = tid; w < NF_FM_BN * words; w += NF_FM_WG) {
+        const int j = w / words;
+        const int u = w - j * words;
+        const int ok = j < nk && nf_kv_page_ok(kt + j, page_shift, pt, pt_off);
+        const nf_i64 row = ok ? (nf_i64)nf_kv_row(kt + j, page_shift, pt, pt_off) : 0;
+        NF_GLOBAL const uchar* p = src + ((row * row_stride + head_off) >> 5) * Q8_0_BLOCK_BYTES + 4 * u;
+        nf_fm_cp4(s0 + (unsigned)(j * NF_FM_Q8_LD + 4 * u), ok ? p : src, ok ? 4 : 0);
+    }
+}
+
+/*
+ * Dequantizes the raw Q8_0 tile r_s (nf_fm_stage_q8_raw) into the F16 tile dst with nf_fm_stage's
+ * thread layout: d * q saturated to the F16 range (nf_fm_q8_val) and rounded to nearest, as llama.cpp
+ * converts a quantized cache to F16 for its mma attention; zero rows give zeros.
+ */
+NF_INLINE void nf_fm_q8_convert(NF_LOCAL_PTR NF_HALF* dst, NF_LOCAL_PTR const uchar* r_s, const int d,
+                                const int tid) {
+    const int c = tid & 15;
+    const int j0 = tid >> 4;
+    if (8 * c >= d) {
+        return;
+    }
+    const int rows = NF_FM_WG / 16;
+#pragma unroll
+    for (int i = 0; i < NF_FM_BN / rows; i++) {
+        const int j = j0 + rows * i;
+        NF_LOCAL_PTR const uchar* bp = r_s + j * NF_FM_Q8_LD + (c >> 2) * Q8_0_BLOCK_BYTES;
+        NF_LOCAL_PTR const ushort* qs = (NF_LOCAL_PTR const ushort*)(bp + 2 + 8 * (c & 3));
+        const float dq = __half2float(__ushort_as_half(*(NF_LOCAL_PTR const ushort*)bp));
+        *(NF_LOCAL_PTR uint4*)(dst + j * NF_FM_LD + 8 * c) = nf_fm_q8_chunk(dq, qs[0], qs[1], qs[2], qs[3]);
+    }
+}
+
+/*
+ * nf_fm_stage over a Q8_0 cache whose tiles cannot stream in (no nf_fm_q8_async): the same rows and
+ * chunks per thread, read with plain loads and dequantized as nf_fm_q8_convert does. A head's row is
+ * whole 32-value blocks (KvDType.supportsWidth), so a chunk lies in one block, whose qs bytes are
+ * 2-byte aligned.
+ */
+NF_INLINE void nf_fm_stage_q8(NF_LOCAL_PTR NF_HALF* dst, NF_GLOBAL const uchar* src, const nf_i64 head_off,
+                              const int row_stride, const int kt, const int nk, const int d,
+                              const int page_shift, NF_GLOBAL const int* NF_RESTRICT pt, const int pt_off,
+                              const int tid) {
+    const int c = tid & 15;
+    const int j0 = tid >> 4;
+    if (8 * c >= d) {
+        return;
+    }
+    const int rows = NF_FM_WG / 16;
+#pragma unroll
+    for (int i = 0; i < NF_FM_BN / rows; i++) {
+        const int j = j0 + rows * i;
+        const int ok = j < nk && nf_kv_page_ok(kt + j, page_shift, pt, pt_off);
+        uint4 h = make_uint4(0u, 0u, 0u, 0u);
+        if (ok) {
+            const nf_i64 e = (nf_i64)nf_kv_row(kt + j, page_shift, pt, pt_off) * row_stride + head_off + 8 * c;
+            NF_GLOBAL const uchar* bp = src + (e >> 5) * Q8_0_BLOCK_BYTES;
+            NF_GLOBAL const ushort* qs = (NF_GLOBAL const ushort*)(bp + 2 + (int)(e & 31));
+            h = nf_fm_q8_chunk(nf_ql_half(bp, 0), qs[0], qs[1], qs[2], qs[3]);
+        }
+        *(NF_LOCAL_PTR uint4*)(dst + j * NF_FM_LD + 8 * c) = h;
+    }
+}
+
+/*
+ * Starts staging the tile at kt (nk keys) of a cache of type KVT (NF_KV_F16 or NF_KV_Q8_0): F16 through
+ * nf_fm_stage into dst; Q8_0 into the raw tile r_s when q8_async (nf_fm_q8_convert then fills dst
+ * once the copies land), else dequantized into dst with plain loads.
+ */
+template <int KVT>
+NF_INLINE void nf_fm_stage_t(NF_LOCAL_PTR NF_HALF* dst, NF_LOCAL_PTR uchar* r_s, NF_GLOBAL const NF_HALF* src,
+                             const nf_i64 head_off, const int row_stride, const int kt, const int nk, const int d,
+                             const int async_ok, const int q8_async, const int page_shift,
+                             NF_GLOBAL const int* NF_RESTRICT pt, const int pt_off, const int tid) {
+    if (KVT != NF_KV_Q8_0) {
+        nf_fm_stage(dst, src, head_off, row_stride, kt, nk, d, async_ok, page_shift, pt, pt_off, tid);
+    } else if (q8_async) {
+        nf_fm_stage_q8_raw(r_s, (NF_GLOBAL const uchar*)src, head_off, row_stride, kt, nk, d, page_shift, pt,
+                           pt_off, tid);
+    } else {
+        nf_fm_stage_q8(dst, (NF_GLOBAL const uchar*)src, head_off, row_stride, kt, nk, d, page_shift, pt, pt_off,
+                       tid);
+    }
+}
+
+/*
+ * Stages the K tile at kt (nk keys) with nf_fm_stage_t and its key positions (kpa, kpb as every warp holds
  * them; warp 0 writes them), and returns whether the tile only scales for this warp (plain_ok, every key
  * valid and, causally, at most the smallest query position wqmin of the warp's rows).
  */
-NF_INLINE int nf_fm_stage_keys(NF_LOCAL_PTR NF_HALF* k_s, NF_LOCAL_PTR int* kp_s, NF_GLOBAL const NF_HALF* k,
-                               const nf_i64 k_head, const int k_row_stride, const int kt, const int nk,
-                               const int d_k, const int async_ok, const int page_shift,
+template <int KVT>
+NF_INLINE int nf_fm_stage_keys(NF_LOCAL_PTR NF_HALF* k_s, NF_LOCAL_PTR uchar* r_s, NF_LOCAL_PTR int* kp_s,
+                               NF_GLOBAL const NF_HALF* k, const nf_i64 k_head, const int k_row_stride, const int kt,
+                               const int nk, const int d_k, const int async_ok, const int q8_async,
+                               const int page_shift,
                                NF_GLOBAL const int* NF_RESTRICT pt, const int pt_off, const int tid,
                                const int kpa, const int kpb, const int plain_ok, const int causal,
                                const int wqmin) {
-    nf_fm_stage(k_s, k, k_head, k_row_stride, kt, nk, d_k, async_ok, page_shift, pt, pt_off, tid);
+    nf_fm_stage_t<KVT>(k_s, r_s, k, k_head, k_row_stride, kt, nk, d_k, async_ok, q8_async, page_shift, pt, pt_off,
+                       tid);
     nf_fm_cp_commit();
     if (tid < 32) {
         kp_s[tid] = kpa;
@@ -294,9 +439,10 @@ NF_INLINE int nf_fm_stage_keys(NF_LOCAL_PTR NF_HALF* k_s, NF_LOCAL_PTR int* kp_s
 /*
  * The mma tiled attention body over the work-group's shared tiles; DK and DV are the head dims when
  * fixed at compile time (the common 128 and 64, which drop the per-step head-dim guards), 0 to take
- * d_k and d_v at run time.
+ * d_k and d_v at run time. KVT is the type of both caches (NF_KV_F16, or NF_KV_Q8_0 with k and v the
+ * caches' bytes, whose tiles stream into the raw tile r_s and dequantize into k_s and v_s once landed).
  */
-template <int DK, int DV>
+template <int DK, int DV, int KVT>
 NF_INLINE void nf_fm_body(
     const int n_tokens, const int n_head, const int n_head_kv, const int d_k_arg, const int d_v_arg,
     const int bq, const int bk, const int g_tile, const int n_split, const int split_len,
@@ -313,7 +459,7 @@ NF_INLINE void nf_fm_body(
     NF_GLOBAL float* out, NF_GLOBAL float* partial,
     const int page_shift, NF_GLOBAL const int* NF_RESTRICT pt, const int pt_off,
     const int tree, NF_GLOBAL const ulong* NF_RESTRICT tree_mask, const int n_fresh,
-    NF_LOCAL_PTR NF_HALF* k_s, NF_LOCAL_PTR NF_HALF* v_s, NF_LOCAL_PTR int* kp_s)
+    NF_LOCAL_PTR NF_HALF* k_s, NF_LOCAL_PTR NF_HALF* v_s, NF_LOCAL_PTR int* kp_s, NF_LOCAL_PTR uchar* r_s)
 {
     const int d_k = DK > 0 ? DK : d_k_arg;
     const int d_v = DV > 0 ? DV : d_v_arg;
@@ -372,6 +518,9 @@ NF_INLINE void nf_fm_body(
     const nf_i64 v_head = (nf_i64)kvh * v_head_stride;
     const int async_ok = (((size_t)k | (size_t)v) & 15) == 0 && (k_row_stride & 7) == 0
         && (k_head_stride & 7) == 0 && (v_row_stride & 7) == 0 && (v_head_stride & 7) == 0;
+    /* Q8_0 tiles land raw in r_s and dequantize after the copy wait (a barrier more per tile). */
+    const int q8_raw = KVT == NF_KV_Q8_0
+        && nf_fm_q8_async(k, v, d_k, d_v, k_row_stride, k_head_stride, v_row_stride, v_head_stride);
 
     /* First visible tile, with its key positions. */
     int kt = k_begin;
@@ -435,15 +584,21 @@ NF_INLINE void nf_fm_body(
 
     int plain = 0;
     if (kt < k_stop) {
-        plain = nf_fm_stage_keys(k_s, kp_s, k, k_head, k_row_stride, kt, min(NF_FM_BN, k_stop - kt), d_k,
-                                 async_ok, page_shift, pt, pt_off, tid, kpa, kpb, plain_ok, causal, wqmin);
+        plain = nf_fm_stage_keys<KVT>(k_s, r_s, kp_s, k, k_head, k_row_stride, kt, min(NF_FM_BN, k_stop - kt),
+                                      d_k, async_ok, q8_raw, page_shift, pt, pt_off, tid, kpa, kpb, plain_ok, causal,
+                                      wqmin);
     }
     while (kt < k_stop) {
         const int nk = min(NF_FM_BN, k_stop - kt);
         /* 1. K(kt) and its key positions are in place, and every warp is past the previous P V. */
         nf_fm_cp_wait();
         __syncthreads();
-        nf_fm_stage(v_s, v, v_head, v_row_stride, kt, nk, d_v, async_ok, page_shift, pt, pt_off, tid);
+        if (q8_raw) {
+            nf_fm_q8_convert(k_s, r_s, d_k, tid);
+            __syncthreads();
+        }
+        nf_fm_stage_t<KVT>(v_s, r_s, v, v_head, v_row_stride, kt, nk, d_v, async_ok, q8_raw, page_shift, pt, pt_off,
+                           tid);
         nf_fm_cp_commit();
 
         /* Key positions of the next tile, loaded ahead of the S product. */
@@ -552,9 +707,13 @@ NF_INLINE void nf_fm_body(
          *    while O = O * alpha + P V runs. */
         nf_fm_cp_wait();
         __syncthreads();
+        if (q8_raw) {
+            nf_fm_q8_convert(v_s, r_s, d_v, tid);
+            __syncthreads();
+        }
         if (kn < k_stop) {
-            plain = nf_fm_stage_keys(k_s, kp_s, k, k_head, k_row_stride, kn, nkn, d_k, async_ok, page_shift, pt,
-                                     pt_off, tid, kpa, kpb, plain_ok, causal, wqmin);
+            plain = nf_fm_stage_keys<KVT>(k_s, r_s, kp_s, k, k_head, k_row_stride, kn, nkn, d_k, async_ok, q8_raw,
+                                          page_shift, pt, pt_off, tid, kpa, kpb, plain_ok, causal, wqmin);
         }
 #pragma unroll
         for (int dg = 0; dg < NF_FM_MAX_D / 8; dg++) {
@@ -641,9 +800,10 @@ NF_INLINE void nf_fm_body(
 }
 
 /*
- * The mma tiled attention; the arguments are those of nf_fa_run (flash_prefill.cl). k_type and v_type
- * are NF_KV_F16, Q positions come from q_pos, cached keys from kv_pos over the page map.
+ * The mma tiled attention; the arguments are those of nf_fa_run (flash_prefill.cl). Both caches are of
+ * type KVT (NF_KV_F16 or NF_KV_Q8_0), Q positions come from q_pos, cached keys from kv_pos over the page map.
  */
+template <int KVT>
 NF_INLINE void nf_fm_run(
     const int n_tokens, const int n_head, const int n_head_kv, const int d_k, const int d_v,
     const int bq, const int bk, const int g_tile, const int n_split, const int split_len,
@@ -669,100 +829,112 @@ NF_INLINE void nf_fm_run(
     __shared__ __align__(16) NF_HALF k_s[NF_FM_BN * NF_FM_LD];
     __shared__ __align__(16) NF_HALF v_s[NF_FM_BN * NF_FM_LD];
     __shared__ __align__(16) int kp_s[NF_FM_BN];
+    /* The raw Q8_0 tile, one K or V tile at a time; a word for the F16 caches, which never touch it. */
+    __shared__ __align__(16) uchar r_s[KVT == NF_KV_Q8_0 ? NF_FM_BN * NF_FM_Q8_LD : 4];
     /* The body's arguments: nf_fm_run's own, then the shared tiles. */
 #define NF_FM_BODY_ARGS \
     n_tokens, n_head, n_head_kv, d_k, d_v, bq, bk, g_tile, n_split, split_len, kv_start, kv_end, \
     q_row_stride, out_row_stride, k_row_stride, k_head_stride, v_row_stride, v_head_stride, \
     scale, softcap, max_bias, causal, swa_type, n_swa, bias_mode, n_buckets, max_distance, \
     has_sinks, direct_out, q_off, out_off, q, k, v, q_pos, kv_pos, sinks, rel_bias, out, partial, \
-    page_shift, pt, pt_off, tree, tree_mask, n_fresh, k_s, v_s, kp_s
+    page_shift, pt, pt_off, tree, tree_mask, n_fresh, k_s, v_s, kp_s, r_s
     if (d_k == 128 && d_v == 128) {
-        nf_fm_body<128, 128>(NF_FM_BODY_ARGS);
+        nf_fm_body<128, 128, KVT>(NF_FM_BODY_ARGS);
     } else if (d_k == 64 && d_v == 64) {
-        nf_fm_body<64, 64>(NF_FM_BODY_ARGS);
+        nf_fm_body<64, 64, KVT>(NF_FM_BODY_ARGS);
     } else {
-        nf_fm_body<0, 0>(NF_FM_BODY_ARGS);
+        nf_fm_body<0, 0, KVT>(NF_FM_BODY_ARGS);
     }
 #undef NF_FM_BODY_ARGS
 }
 
 /*
- * LLM_FlashAttnMma_F16(29 scalars, 10 buffers): the LLM_FlashAttn_F16 arguments; K and V caches are
- * F16. Grid and per-step arguments are those of LLM_FlashAttn_F16 with bq * g_tile == 64. Sinks and
- * rel_bias are read-only placeholders when unused.
+ * LLM_FlashAttnMma_<KV>(29 scalars, 10 buffers): the LLM_FlashAttn_<KV> arguments for KV F16 or Q8_0 (k and v
+ * the caches as F16 values or as Q8_0 bytes). Grid and per-step arguments are those of LLM_FlashAttn_<KV> with
+ * bq * g_tile == 64. Sinks and rel_bias are read-only placeholders when unused.
  */
-NF_KERNEL void LLM_FlashAttnMma_F16(
-    const int n_tokens, const int n_head, const int n_head_kv, const int d_k, const int d_v,
-    const int bq, const int bk, const int g_tile, const int n_split, const int split_len,
-    const int kv_start, const int kv_end,
-    const int q_row_stride, const int out_row_stride,
-    const int k_row_stride, const int k_head_stride, const int v_row_stride,
-    const int v_head_stride,
-    const float scale, const float softcap, const float max_bias,
-    const int flags, const int swa_type, const int n_swa,
-    const int bias_mode, const int n_buckets, const int max_distance,
-    const int q_off, const int out_off,
-    NF_GLOBAL const float* q,
-    NF_GLOBAL const NF_HALF* k,
-    NF_GLOBAL const NF_HALF* v,
-    NF_GLOBAL const int* NF_RESTRICT q_pos,
-    NF_GLOBAL const int* NF_RESTRICT kv_pos,
-    NF_GLOBAL const float* NF_RESTRICT sinks,
-    NF_GLOBAL const float* NF_RESTRICT rel_bias,
-    NF_GLOBAL float* out,
-    NF_GLOBAL float* partial,
-    NF_GLOBAL const ulong* NF_RESTRICT tree_mask)
-{
-    nf_fm_run(n_tokens, n_head, n_head_kv, d_k, d_v, bq, bk, g_tile, n_split, split_len,
-              kv_start, kv_end, q_row_stride, out_row_stride, k_row_stride, k_head_stride,
-              v_row_stride, v_head_stride, scale, softcap, max_bias,
-              flags & NF_ATTN_FLAG_CAUSAL, swa_type, n_swa, bias_mode, n_buckets,
-              max_distance, flags & NF_ATTN_FLAG_SINKS, flags & NF_ATTN_FLAG_DIRECT, q_off,
-              out_off, q, k, v, q_pos, kv_pos, sinks, rel_bias, out, partial, -1, kv_pos, 0,
-              flags & NF_ATTN_FLAG_TREE, tree_mask, nf_attn_flag_fresh(flags));
+#define NF_FLASH_MMA_KERNEL(SFX, KV_T, KV_CODE)                                                    \
+NF_KERNEL void LLM_FlashAttnMma_##SFX(                                                             \
+    const int n_tokens, const int n_head, const int n_head_kv, const int d_k, const int d_v,       \
+    const int bq, const int bk, const int g_tile, const int n_split, const int split_len,          \
+    const int kv_start, const int kv_end,                                                          \
+    const int q_row_stride, const int out_row_stride,                                              \
+    const int k_row_stride, const int k_head_stride, const int v_row_stride,                       \
+    const int v_head_stride,                                                                       \
+    const float scale, const float softcap, const float max_bias,                                  \
+    const int flags, const int swa_type, const int n_swa,                                          \
+    const int bias_mode, const int n_buckets, const int max_distance,                              \
+    const int q_off, const int out_off,                                                            \
+    NF_GLOBAL const float* q,                                                                      \
+    NF_GLOBAL const KV_T* k,                                                                       \
+    NF_GLOBAL const KV_T* v,                                                                       \
+    NF_GLOBAL const int* NF_RESTRICT q_pos,                                                        \
+    NF_GLOBAL const int* NF_RESTRICT kv_pos,                                                       \
+    NF_GLOBAL const float* NF_RESTRICT sinks,                                                      \
+    NF_GLOBAL const float* NF_RESTRICT rel_bias,                                                   \
+    NF_GLOBAL float* out,                                                                          \
+    NF_GLOBAL float* partial,                                                                      \
+    NF_GLOBAL const ulong* NF_RESTRICT tree_mask)                                                  \
+{                                                                                                  \
+    nf_fm_run<KV_CODE>(n_tokens, n_head, n_head_kv, d_k, d_v, bq, bk, g_tile, n_split, split_len,  \
+              kv_start, kv_end, q_row_stride, out_row_stride, k_row_stride, k_head_stride,         \
+              v_row_stride, v_head_stride, scale, softcap, max_bias,                               \
+              flags & NF_ATTN_FLAG_CAUSAL, swa_type, n_swa, bias_mode, n_buckets,                  \
+              max_distance, flags & NF_ATTN_FLAG_SINKS, flags & NF_ATTN_FLAG_DIRECT, q_off,        \
+              out_off, q, (NF_GLOBAL const NF_HALF*)k, (NF_GLOBAL const NF_HALF*)v, q_pos, kv_pos,  \
+              sinks, rel_bias, out, partial, -1, kv_pos, 0,                                        \
+              flags & NF_ATTN_FLAG_TREE, tree_mask, nf_attn_flag_fresh(flags));                    \
 }
 
+NF_FLASH_MMA_KERNEL(F16, NF_HALF, NF_KV_F16)
+NF_FLASH_MMA_KERNEL(Q8_0, uchar, NF_KV_Q8_0)
+
 /*
- * LLM_FlashAttnMmaPaged_F16(31 scalars, 11 buffers): the LLM_FlashAttnPaged_F16 arguments; K and V
- * caches are F16, K, V and kv_pos are read at the physical row nf_kv_row (common/attn_common.h).
+ * LLM_FlashAttnMmaPaged_<KV>(31 scalars, 11 buffers): the LLM_FlashAttnPaged_<KV> arguments for KV F16 or
+ * Q8_0; K, V and kv_pos are read at the physical row nf_kv_row (common/attn_common.h).
  */
-NF_KERNEL void LLM_FlashAttnMmaPaged_F16(
-    const int n_tokens, const int n_head, const int n_head_kv, const int d_k, const int d_v,
-    const int bq, const int bk, const int g_tile, const int n_split, const int split_len,
-    const int kv_start, const int kv_end,
-    const int q_row_stride, const int out_row_stride,
-    const int k_row_stride, const int k_head_stride, const int v_row_stride,
-    const int v_head_stride,
-    const float scale, const float softcap, const float max_bias,
-    const int flags, const int swa_type, const int n_swa,
-    const int bias_mode, const int n_buckets, const int max_distance,
-    const int q_off, const int out_off,
-    const int page_shift, const int pt_off,
-    NF_GLOBAL const float* q,
-    NF_GLOBAL const NF_HALF* k,
-    NF_GLOBAL const NF_HALF* v,
-    NF_GLOBAL const int* NF_RESTRICT q_pos,
-    NF_GLOBAL const int* NF_RESTRICT kv_pos,
-    NF_GLOBAL const float* NF_RESTRICT sinks,
-    NF_GLOBAL const float* NF_RESTRICT rel_bias,
-    NF_GLOBAL float* out,
-    NF_GLOBAL float* partial,
-    NF_GLOBAL const int* NF_RESTRICT page_table,
-    NF_GLOBAL const ulong* NF_RESTRICT tree_mask)
-{
-    if (page_shift < 0 || page_shift > 20 || pt_off < 0) {
-        nf_fm_poison(n_tokens, n_head, d_v, n_split, out_row_stride,
-                     flags & NF_ATTN_FLAG_DIRECT, out_off, out, partial);
-        return;   /* uniform across the work-group: no barrier has been reached */
-    }
-    nf_fm_run(n_tokens, n_head, n_head_kv, d_k, d_v, bq, bk, g_tile, n_split, split_len,
-              kv_start, kv_end, q_row_stride, out_row_stride, k_row_stride, k_head_stride,
-              v_row_stride, v_head_stride, scale, softcap, max_bias,
-              flags & NF_ATTN_FLAG_CAUSAL, swa_type, n_swa, bias_mode, n_buckets,
-              max_distance, flags & NF_ATTN_FLAG_SINKS, flags & NF_ATTN_FLAG_DIRECT, q_off,
-              out_off, q, k, v, q_pos, kv_pos, sinks, rel_bias, out, partial, page_shift,
-              page_table, pt_off, flags & NF_ATTN_FLAG_TREE, tree_mask, nf_attn_flag_fresh(flags));
+#define NF_FLASH_MMA_PAGED_KERNEL(SFX, KV_T, KV_CODE)                                              \
+NF_KERNEL void LLM_FlashAttnMmaPaged_##SFX(                                                        \
+    const int n_tokens, const int n_head, const int n_head_kv, const int d_k, const int d_v,       \
+    const int bq, const int bk, const int g_tile, const int n_split, const int split_len,          \
+    const int kv_start, const int kv_end,                                                          \
+    const int q_row_stride, const int out_row_stride,                                              \
+    const int k_row_stride, const int k_head_stride, const int v_row_stride,                       \
+    const int v_head_stride,                                                                       \
+    const float scale, const float softcap, const float max_bias,                                  \
+    const int flags, const int swa_type, const int n_swa,                                          \
+    const int bias_mode, const int n_buckets, const int max_distance,                              \
+    const int q_off, const int out_off,                                                            \
+    const int page_shift, const int pt_off,                                                        \
+    NF_GLOBAL const float* q,                                                                      \
+    NF_GLOBAL const KV_T* k,                                                                       \
+    NF_GLOBAL const KV_T* v,                                                                       \
+    NF_GLOBAL const int* NF_RESTRICT q_pos,                                                        \
+    NF_GLOBAL const int* NF_RESTRICT kv_pos,                                                       \
+    NF_GLOBAL const float* NF_RESTRICT sinks,                                                      \
+    NF_GLOBAL const float* NF_RESTRICT rel_bias,                                                   \
+    NF_GLOBAL float* out,                                                                          \
+    NF_GLOBAL float* partial,                                                                      \
+    NF_GLOBAL const int* NF_RESTRICT page_table,                                                   \
+    NF_GLOBAL const ulong* NF_RESTRICT tree_mask)                                                  \
+{                                                                                                  \
+    if (page_shift < 0 || page_shift > 20 || pt_off < 0) {                                         \
+        nf_fm_poison(n_tokens, n_head, d_v, n_split, out_row_stride,                               \
+                     flags & NF_ATTN_FLAG_DIRECT, out_off, out, partial);                          \
+        return;   /* uniform across the work-group: no barrier has been reached */                 \
+    }                                                                                              \
+    nf_fm_run<KV_CODE>(n_tokens, n_head, n_head_kv, d_k, d_v, bq, bk, g_tile, n_split, split_len,  \
+              kv_start, kv_end, q_row_stride, out_row_stride, k_row_stride, k_head_stride,         \
+              v_row_stride, v_head_stride, scale, softcap, max_bias,                               \
+              flags & NF_ATTN_FLAG_CAUSAL, swa_type, n_swa, bias_mode, n_buckets,                  \
+              max_distance, flags & NF_ATTN_FLAG_SINKS, flags & NF_ATTN_FLAG_DIRECT, q_off,        \
+              out_off, q, (NF_GLOBAL const NF_HALF*)k, (NF_GLOBAL const NF_HALF*)v, q_pos, kv_pos,  \
+              sinks, rel_bias, out, partial, page_shift, page_table, pt_off,                       \
+              flags & NF_ATTN_FLAG_TREE, tree_mask, nf_attn_flag_fresh(flags));                    \
 }
+
+NF_FLASH_MMA_PAGED_KERNEL(F16, NF_HALF, NF_KV_F16)
+NF_FLASH_MMA_PAGED_KERNEL(Q8_0, uchar, NF_KV_Q8_0)
 
 #endif /* NF_CUDA_PREPROCESS, or mma.sync.m16n8k16 on compute capability 8.0+ */
 

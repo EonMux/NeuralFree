@@ -464,6 +464,11 @@ final class GpuCachedMoePass implements AutoCloseable {
             p.update(n);
             p.bindInput(xs, xsOff);
             p.dispatch(n);
+            if (step.missCount() > 0) {
+                // The id readback drained the queue, so a batching queue would otherwise hold the hit pass until
+                // the misses' uploads: submitting it lets the device run the hits while the host computes.
+                ctx.queue().flush();
+            }
         }
         if (step.missCount() > 0) {
             float[] rows = hosted.run(ids, step.missPairs(), step.missCount(), xsValues, weightBefore ? 1 : k);

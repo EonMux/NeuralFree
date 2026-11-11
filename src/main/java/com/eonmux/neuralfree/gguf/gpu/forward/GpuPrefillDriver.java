@@ -1327,24 +1327,6 @@ public final class GpuPrefillDriver {
         if (pagedDecodeShape != null) {
             invalidateStepReplay();
         }
-        if (mode == GpuLayerExecutor.StepMode.DECODE) {
-            decodeReplay.trunk(p, executor.decodeReplayPatchers(),
-                    !replayDisabled && !taps.wantsAny(executor.layers().size()) && executor.capturableDecode(),
-                    () -> executor.run(p, n, mode, taps));
-        } else if (trunk) {
-            decodeReplay.distrust();
-            invalidateStepReplay();
-            trunkRunner.runTrunk(p, n, mode, taps);
-        } else {
-            decodeReplay.distrust();
-            // the memory-backed multi-row step (a speculative round's verify of k + 1 rows) captures its own
-            // trunk only when the speculative round's replay is on (GpuForwardBackend.CHAIN_REPLAY_PROPERTY)
-            stepReplay.trunk(p, n, executor.stepReplayPatchers(),
-                    chainReplay && !replayDisabled && !taps.wantsAny(executor.layers().size())
-                            && executor.capturableDecode(),
-                    () -> executor.run(p, n, mode, taps));
-        }
-        breakdown.lap(DecodeStepBreakdown.Phase.TRUNK);
         int k = 0;
         int[] local = new int[rows.length];
         int[] targets = new int[rows.length];
@@ -1356,9 +1338,38 @@ public final class GpuPrefillDriver {
                 k++;
             }
         }
+        int[] read = readRows(local, k);
+        boolean pruned = !trunk && executor.prunesOutputRows(n, mode, taps, read);
+        if (mode == GpuLayerExecutor.StepMode.DECODE) {
+            decodeReplay.trunk(p, executor.decodeReplayPatchers(),
+                    !replayDisabled && !taps.wantsAny(executor.layers().size()) && executor.capturableDecode(),
+                    () -> executor.run(p, n, mode, taps));
+        } else if (trunk) {
+            decodeReplay.distrust();
+            invalidateStepReplay();
+            trunkRunner.runTrunk(p, n, mode, taps);
+        } else {
+            decodeReplay.distrust();
+            // the memory-backed multi-row step (a speculative round's verify of k + 1 rows) captures its own
+            // trunk only when the speculative round's replay is on (GpuForwardBackend.CHAIN_REPLAY_PROPERTY); a
+            // pruned trunk depends on the rows read, which a replay of the row count alone cannot tell apart
+            stepReplay.trunk(p, n, executor.stepReplayPatchers(),
+                    chainReplay && !replayDisabled && !pruned && !taps.wantsAny(executor.layers().size())
+                            && executor.capturableDecode(),
+                    pruned ? () -> executor.run(p, n, mode, taps, read) : () -> executor.run(p, n, mode, taps));
+        }
+        breakdown.lap(DecodeStepBreakdown.Phase.TRUNK);
+        int stackRows = n;
+        if (pruned) {
+            // the pruned stack output holds read row read[j] at row j
+            for (int i = 0; i < k; i++) {
+                local[i] = Arrays.binarySearch(read, local[i]);
+            }
+            stackRows = read.length;
+        }
         for (int done = 0; done < k; ) {
             int count = Math.min(n, k - done);
-            ScratchSlot hidden = head.hidden(n, Arrays.copyOfRange(local, done, done + count), count);
+            ScratchSlot hidden = head.hidden(stackRows, Arrays.copyOfRange(local, done, done + count), count);
             calls.read(output, hidden, count, Arrays.copyOfRange(targets, done, done + count));
             done += count;
         }
@@ -1374,6 +1385,11 @@ public final class GpuPrefillDriver {
 
     /** The output row of a one-token greedy step. */
     private static final int[] GREEDY_ROW = {0};
+
+    /** The distinct step-local rows among the first {@code k} of {@code local}, ascending. */
+    private static int[] readRows(int[] local, int k) {
+        return Arrays.stream(local, 0, k).distinct().sorted().toArray();
+    }
 
     private static int[] identity(int n) {
         int[] r = new int[n];

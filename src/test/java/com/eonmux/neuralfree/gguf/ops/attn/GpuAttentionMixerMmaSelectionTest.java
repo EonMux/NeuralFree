@@ -17,8 +17,8 @@ import static org.junit.Assert.assertTrue;
 
 /**
  * Selection of the tensor-core prefill kernel ({@code LLM_FlashAttnMma*}) in {@link FlashPlan}:
- * the kernel name follows the cooperative-matrix feature, the F16 cache types and the head dims; a backend
- * without the feature (or without the kernel) keeps the scalar tiled kernel. The one-row step routes through
+ * the kernel name follows the cooperative-matrix feature, the cache types (F16 or Q8_0 for both) and the head
+ * dims; a backend without the feature (or without the kernel) keeps the scalar tiled kernel. The one-row step routes through
  * the mma prefill only where the decode fast path cannot serve the step (the plan-level refusals, a paged
  * cache, or at most one workgroup of live keys) and the mma kernel exists. The mixer dispatches the base
  * kernel over a dense cache (its identity paging); the paged kernel serves launches over a
@@ -39,12 +39,20 @@ public class GpuAttentionMixerMmaSelectionTest {
     }
 
     @Test
+    public void q8CacheSelectsItsMmaKernel() {
+        assertEquals("LLM_FlashAttnMma_Q8_0",
+                FlashPlan.mmaKernelName(true, KvDType.Q8_0, KvDType.Q8_0, 128, 128));
+        assertNull(FlashPlan.mmaKernelName(false, KvDType.Q8_0, KvDType.Q8_0, 128, 128));
+    }
+
+    @Test
     public void scalarKernelStaysForEveryOtherCase() {
         // no tensor cores on the backend
         assertNull(FlashPlan.mmaKernelName(false, KvDType.F16, KvDType.F16, 64, 64));
-        // quantized, mixed-type or F32 caches
-        assertNull(FlashPlan.mmaKernelName(true, KvDType.Q8_0, KvDType.Q8_0, 64, 64));
+        // 4-bit, mixed-type or F32 caches
+        assertNull(FlashPlan.mmaKernelName(true, KvDType.Q4_0, KvDType.Q4_0, 64, 64));
         assertNull(FlashPlan.mmaKernelName(true, KvDType.F16, KvDType.Q8_0, 64, 64));
+        assertNull(FlashPlan.mmaKernelName(true, KvDType.Q8_0, KvDType.F16, 64, 64));
         assertNull(FlashPlan.mmaKernelName(true, KvDType.F32, KvDType.F32, 64, 64));
         assertNull(FlashPlan.mmaKernelName(true, KvDType.BF16, KvDType.BF16, 64, 64));
         // head dims outside the mma plan: not multiples of 16, or above the staged tile budget

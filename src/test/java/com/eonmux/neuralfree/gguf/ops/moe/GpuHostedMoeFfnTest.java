@@ -428,6 +428,40 @@ public class GpuHostedMoeFfnTest {
             }
         }
         assertArrayEquals(referenceOver(n * K, routed, hostW, x), branchValues(n), 2e-4f);
+        assertHitPassSubmittedBeforeTheMissRows(n);
+    }
+
+    /**
+     * The device pairs are submitted before the host computes the misses: after the routed-id readback, a flush
+     * follows the last dispatch of the hit pass and precedes the first miss-row upload.
+     */
+    private void assertHitPassSubmittedBeforeTheMissRows(int n) {
+        List<FakeOp> ops = backend.ops();
+        int idsRead = -1;
+        for (int i = 0; i < ops.size(); i++) {
+            if (ops.get(i).kind() == FakeOpKind.READ && ops.get(i).bytes() == 4L * n * K) {
+                idsRead = i;
+            }
+        }
+        assertTrue("the routed ids are read back", idsRead >= 0);
+        int firstMissRow = -1;
+        for (int i = idsRead + 1; i < ops.size() && firstMissRow < 0; i++) {
+            if (ops.get(i).kind() == FakeOpKind.WRITE && ops.get(i).bytes() == 4L * N_EMBD) {
+                firstMissRow = i;
+            }
+        }
+        assertTrue("a miss row is uploaded after the readback", firstMissRow > idsRead);
+        int lastDispatch = -1;
+        int lastFlush = -1;
+        for (int i = idsRead + 1; i < firstMissRow; i++) {
+            if (ops.get(i).kind() == FakeOpKind.DISPATCH) {
+                lastDispatch = i;
+            } else if (ops.get(i).kind() == FakeOpKind.FLUSH) {
+                lastFlush = i;
+            }
+        }
+        assertTrue("the hit pass dispatches before the miss rows", lastDispatch > idsRead);
+        assertTrue("a flush submits the hit pass before the host computes the misses", lastFlush > lastDispatch);
     }
 
     private static int keyOf(Map<Integer, Integer> slotToExpert, int expert) {

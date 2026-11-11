@@ -414,11 +414,13 @@ NF_INLINE void nf_fp8_tc_combine(NF_LOCAL_PTR const int* wq, NF_LOCAL_PTR const 
  * of NF_MMQ_TC_LOOP). */
 #define NF_FP8_TC_COMBINE(buf, xoff, SG, ASYM, HAS_OFF, EXACT) \
     nf_fp8_tc_combine(tc_wq + (buf) * NF_MMQ_TC_CW, tc_xr + (xoff), \
-                      tc_wsc + (buf) * NF_MMQ_TC_SW, lane, wrow0, wtok0, acc);
+                      tc_wsc + (buf) * NF_MMQ_TC_SB(SG), lane, wrow0, wtok0, acc);
 
-/* The E4M3 tile's chunks [cstart, cend): one scale per 32-element chunk, no offset, no zero point. */
+/* The E4M3 tile's chunks [cstart, cend): one scale per 32-element chunk, no offset, no zero point; both
+ * chunks of a step load ahead of its combines where the target takes two prefetch register sets
+ * (NF_MMQ_TC_SETS). */
 #define NF_FP8_TC_PIPE(cstart, cend, SG, HAS_OFF, BS, BB, CODE, SCALE, OFF) \
-    NF_MMQ_TC_LOOP(cstart, cend, NF_FP8_TC_COMBINE, 32, 0, 0, 0, BS, BB, CODE, SCALE, OFF)
+    NF_MMQ_TC_LOOP(cstart, cend, NF_FP8_TC_COMBINE, 32, 0, 0, 0, BS, BB, CODE, SCALE, OFF, NF_MMQ_TC_SETS(2))
 #endif /* NF_MMQ_TENSOR */
 
 /* The weight offset of the E4M3 lane: every FP8 and 4-bit type it serves is symmetric, and the staged

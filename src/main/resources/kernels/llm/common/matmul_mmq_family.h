@@ -146,10 +146,11 @@ NF_INLINE uint nf_mmq_float_rec(float v) {
  * the tile the combine reads one iteration later. The gather of the token records runs coalesced
  * (the tile's records are consecutive in q8) into the shared record tile between the barriers, so
  * every combine reads its B fragments, scales and code sums from shared memory instead of q8
- * global. The NF_MMQ_PIPE_BUF code / (scale, offset) / code-sum tiles cycle per chunk; every lane passes the
- * same three barriers per iteration, with the gathered record tile uniform over the work-group
- * after the first barrier, so the code-sum fill under the token 0 zero-point gate stays uniform
- * too. COMBINE is a macro invoked as COMBINE(sel, XA, XB) with the pipe's last two arguments
+ * global. The NF_MMQ_PIPE_BUF code / (scale, offset) / code-sum tiles cycle per chunk; every lane
+ * passes the same two barriers per iteration, plus a third after the code-sum fill when the gathered
+ * records carry zero points: the record tile is uniform over the work-group after the second
+ * barrier, so the fill and its barrier under the token 0 zero-point gate are taken by every lane or
+ * by none. COMBINE is a macro invoked as COMBINE(sel, XA, XB) with the pipe's last two arguments
  * forwarded, combining the staged chunk of buffer sel (its pointers are that buffer's offsets into
  * wq / wsc / wof / wsu; the record tile arrives through the pipe's xr alias).
  *
@@ -264,18 +265,24 @@ NF_INLINE uint nf_mmq_float_rec(float v) {
     NF_MMQ_Q8_GATHER_SYNC(xrs, (c), (TN), q8, q_stride, q_off, n0, N)
 #define NF_MMQ_XR_READY
 
-/* Fills the half code sums of tile sel from its codes, under the zero-total gate of the gather
- * (token 0's zero-point unit, uniform over the work-group). */
+/* Fills the half code sums of tile sel from its codes and makes them visible to the combine, under the
+ * zero-total gate of the gather (token 0's zero-point unit). Every work-item reads the gate from the
+ * record tile after the barrier that retired the gather, so the gate is uniform over the work-group and
+ * the barrier inside it is reached by all or none: symmetric records (every staging but the asymmetric
+ * int8 one) write no sums and skip the barrier. */
 #define NF_MMQ_WSUFILL(sel) \
-    if (xr[NF_MMQ_QS + 1 + NF_MMQ_SH] != 0u && ty < NF_MMQ_TM / NF_MMQ_TX) { \
-        const int sr = tx + NF_MMQ_TX * ty; \
-        for (int h = 0; h < NF_MMQ_SH; h++) { \
-            int sum = 0; \
-            for (int kk = 0; kk < 16; kk++) { \
-                sum += (int)wq[(sel) * NF_MMQ_WS + sr * NF_MMQ_TK + 16 * h + kk]; \
+    if (xr[NF_MMQ_QS + 1 + NF_MMQ_SH] != 0u) { \
+        if (ty < NF_MMQ_TM / NF_MMQ_TX) { \
+            const int sr = tx + NF_MMQ_TX * ty; \
+            for (int h = 0; h < NF_MMQ_SH; h++) { \
+                int sum = 0; \
+                for (int kk = 0; kk < 16; kk++) { \
+                    sum += (int)wq[(sel) * NF_MMQ_WS + sr * NF_MMQ_TK + 16 * h + kk]; \
+                } \
+                wsu[(sel) * NF_MMQ_TM * NF_MMQ_SH + sr * NF_MMQ_SH + h] = sum; \
             } \
-            wsu[(sel) * NF_MMQ_TM * NF_MMQ_SH + sr * NF_MMQ_SH + h] = sum; \
         } \
+        barrier(CLK_LOCAL_MEM_FENCE); \
     }
 
 /*
@@ -306,7 +313,6 @@ NF_INLINE uint nf_mmq_float_rec(float v) {
         barrier(CLK_LOCAL_MEM_FENCE); \
         NF_LOCAL_PTR const uint* xr = NF_MMQ_XR_AT((j), (TN)); \
         NF_MMQ_WSUFILL(sel) \
-        barrier(CLK_LOCAL_MEM_FENCE); \
         COMBINE(sel, XA, XB); \
     }
 
@@ -332,7 +338,6 @@ NF_INLINE uint nf_mmq_float_rec(float v) {
         { \
             NF_LOCAL_PTR const uint* xr = NF_MMQ_XR_AT(0, (TN)); \
             NF_MMQ_WSUFILL(0) \
-            barrier(CLK_LOCAL_MEM_FENCE); \
             COMBINE(0, XA, XB); \
         } \
         for (int c = (cstart) + NF_MMQ_TK, j = 1; c < (kend); c += 2 * NF_MMQ_TK, j += 2) { \
@@ -592,14 +597,18 @@ NF_INLINE void nf_mmq_store(NF_GLOBAL float* NF_RESTRICT y, int M, int N,
 #if NF_MMQ_TENSOR
 /* ---- the tensor-core device tile: T_MatMul_MMQ and T_MatMul_MMQ_KSplit on CUDA sm_80+ ----
  *
- * The plain kernels over the NF_MMQ_TM x NF_MMQ_TN device tile stage one NF_MMQ_TK-deep chunk per
- * barrier: two alternating weight buffers and three rotating record stages. One step is a single
- * branch-free block: it starts the asynchronous copy of a later chunk's records into a free record stage
- * (16-byte cp.async, no register round trip), issues the next chunk's weight and (scale, offset) loads
- * into registers, combines the current chunk from shared memory, then decodes and commits the next
- * chunk's weights, waits for the
- * copy and passes the step's one barrier, so the load latency and the type's decode overlap the
- * combine instead of sitting between barriers. The NF_MMQ_WG / 32 warps form NF_MMQ_TC_RG row groups
+ * The plain kernels over the NF_MMQ_TM x NF_MMQ_TN device tile stage NF_MMQ_TC_DEPTH NF_MMQ_TK-deep
+ * chunks per barrier: two alternating groups of weight buffers and of record stages, one buffer and one
+ * stage per chunk of the group. A step starts the asynchronous copies of the next group's records into
+ * the free record stages (16-byte cp.async, no register round trip), issues the next group's weight and
+ * (scale, offset) loads into registers, combines the current group's chunks from shared memory, then
+ * decodes and commits the loaded weights, waits for the copies and passes its one barrier; the weight
+ * loads of both chunks go ahead of the combines, or one chunk's ahead of each combine for the types whose
+ * decode needs the registers (T_MMQ_CODE_SETS, NF_MMQ_TC_STEP). The load latency and the type's decode
+ * overlap the combine instead of sitting between barriers, and each barrier closes NF_MMQ_TC_DEPTH chunks
+ * of mma work (llama.cpp's mmq stages a 256-deep slab per pair of barriers). On an RTX 5080 Laptop
+ * (sm_120) two chunks per barrier run the pp512 prefill of Qwen3-Embedding-4B 15% faster in Q8_0 and 11%
+ * faster in Q4_K_M than one. The NF_MMQ_WG / 32 warps form NF_MMQ_TC_RG row groups
  * of NF_MMQ_TC_NTX = NF_MMQ_RM / 4 m16 minitiles by NF_MMQ_TC_TG token groups of NF_MMQ_TC_NB n8
  * blocks: on the 128 x 128 tile at eight rows per work-item, eight warps of 32 rows x 64 tokens
  * (llama.cpp's 256-thread block), so each A fragment read with ldmatrix feeds eight mma and each B
@@ -632,17 +641,26 @@ NF_INLINE void nf_mmq_store(NF_GLOBAL float* NF_RESTRICT y, int M, int N,
 #define NF_MMQ_TC_ACC (NF_MMQ_TC_NTX * NF_MMQ_TC_NB * 4) /* accumulators per lane */
 #define NF_MMQ_TC_CW (NF_MMQ_TM * NF_MMQ_QS)            /* staged code words of one chunk */
 #define NF_MMQ_TC_CWI (NF_MMQ_TC_CW / NF_MMQ_WG)        /* code words per work-item and chunk */
-#define NF_MMQ_TC_SW (NF_MMQ_TM * NF_MMQ_SH)            /* (scale, offset) slots of one chunk */
+#define NF_MMQ_TC_SW (NF_MMQ_TM * NF_MMQ_SH)            /* (scale, offset) slots of one chunk, at most */
 #define NF_MMQ_TC_SWI ((NF_MMQ_TC_SW + NF_MMQ_WG - 1) / NF_MMQ_WG)
 #define NF_MMQ_TC_XU (NF_MMQ_TN * NF_MMQ_RC)            /* record units of one chunk */
 #define NF_MMQ_TC_XP (NF_MMQ_TC_XU / 4)                 /* 16-byte record pieces of one chunk */
 #define NF_MMQ_TC_XPI ((NF_MMQ_TC_XP + NF_MMQ_WG - 1) / NF_MMQ_WG) /* record pieces per work-item */
 #define NF_MMQ_TC_XF NF_MMQ_QS                          /* a token's (d, half sums, zero point) in its record */
+#define NF_MMQ_TC_DEPTH 2                               /* chunks staged per barrier */
+/* The prefetch register sets of a step (NF_MMQ_TC_STEP) for a type asking for S: the two-set form is
+ * stack-free on sm_100 and sm_120 (measured on sm_120); the sm_80 to sm_90 compilers spill it for many types,
+ * so those targets take the one-set form. */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
+#define NF_MMQ_TC_SETS(S) 1
+#else
+#define NF_MMQ_TC_SETS(S) (S)
+#endif
 
-#if NF_MMQ_TK != 32 || NF_MMQ_TC_CW % NF_MMQ_WG != 0 \
+#if NF_MMQ_TK != 32 || NF_MMQ_TC_DEPTH != 2 || NF_MMQ_TC_CW % NF_MMQ_WG != 0 \
     || NF_MMQ_TM % NF_MMQ_TC_WROWS != 0 \
     || NF_MMQ_TC_WARPS % NF_MMQ_TC_RG != 0 || NF_MMQ_TN % (8 * NF_MMQ_TC_TG) != 0
-#error "the tensor-core MMQ tile needs 32-deep stages and whole warp tiles"
+#error "the tensor-core MMQ tile needs 32-deep chunks, two per stage, and whole warp tiles"
 #endif
 /* NF_MMQ_TC_SLOTS maps eight code words to a tile row (slot >> 3), and NF_MMQ_TC_PREFETCH takes the slots below
  * NF_MMQ_TC_CWI / 2 for the tile's upper half (the gate rows of the gate/up tile): that holds only for whole
@@ -663,6 +681,8 @@ NF_INLINE void nf_mmq_store(NF_GLOBAL float* NF_RESTRICT y, int M, int N,
 
 /* (scale, offset) slots per row and chunk: one per 32-element group, one per half for SG 16. */
 #define NF_MMQ_TC_SC(SG) ((SG) == 16 ? NF_MMQ_SH : 1)
+/* (scale, offset) slots of one chunk's buffer at scale group SG. */
+#define NF_MMQ_TC_SB(SG) (NF_MMQ_TM * NF_MMQ_TC_SC(SG))
 
 /* Lane order of the (scale, offset) tiles: row r of a warp's 32 rows sits at the position that makes the rows
  * g, g + 8, g + 16 and g + 24 of lane group g = r & 7 consecutive, minitile-major (the lane's rows
@@ -705,10 +725,6 @@ NF_INLINE void nf_mmq_cp_async_commit(void) {
 }
 NF_INLINE void nf_mmq_cp_async_wait(void) {
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
-}
-/* The wait for all but the work-item's most recent copy group. */
-NF_INLINE void nf_mmq_cp_async_wait_prior(void) {
-    asm volatile("cp.async.wait_group 1;\n" ::: "memory");
 }
 
 /* The integer code sum of half h (16 codes) of staged row r, for the asymmetric zero-point term. */
@@ -939,17 +955,18 @@ NF_INLINE void nf_mmq_tc_combine16(NF_LOCAL_PTR const int* wq, NF_LOCAL_PTR cons
     }
 
 /* Writes prefetch register set P into weight buffer `buf`, the (scale, offset) slots in lane order. */
-#define NF_MMQ_TC_COMMIT(buf, P, SC, HAS_OFF) \
+#define NF_MMQ_TC_COMMIT(buf, P, SG, HAS_OFF) \
     for (int s = 0; s < NF_MMQ_TC_CWI; s++) { \
         const int slot = s * NF_MMQ_WG + lid; \
         tc_wq[(buf) * NF_MMQ_TC_CW + NF_MMQ_TC_SWZ(slot >> 3, slot & 7)] = (int)tc_pw##P[s]; \
     } \
     for (int s = 0; s < NF_MMQ_TC_SWI; s++) { \
         const int i = s * NF_MMQ_WG + lid; \
-        if (i < NF_MMQ_TM * (SC)) { \
-            tc_wsc[(buf) * NF_MMQ_TC_SW + NF_MMQ_TC_WSLOT(i / (SC), i % (SC), (SC))] = tc_ps##P[s]; \
+        const int sc = NF_MMQ_TC_SC(SG); \
+        if (i < NF_MMQ_TC_SB(SG)) { \
+            tc_wsc[(buf) * NF_MMQ_TC_SB(SG) + NF_MMQ_TC_WSLOT(i / sc, i % sc, sc)] = tc_ps##P[s]; \
             if (HAS_OFF) { \
-                tc_wof[(buf) * NF_MMQ_TC_SW + NF_MMQ_TC_WSLOT(i / (SC), i % (SC), (SC))] = tc_po##P[s]; \
+                tc_wof[(buf) * NF_MMQ_TC_SB(SG) + NF_MMQ_TC_WSLOT(i / sc, i % sc, sc)] = tc_po##P[s]; \
             } \
         } \
     }
@@ -958,80 +975,100 @@ NF_INLINE void nf_mmq_tc_combine16(NF_LOCAL_PTR const int* wq, NF_LOCAL_PTR cons
  * (the COMBINE argument of NF_MMQ_TC_LOOP). */
 #define NF_MMQ_TC_INT8(buf, xoff, SG, ASYM, HAS_OFF, EXACT) \
     if ((SG) == 32) { \
-        nf_mmq_tc_combine32(tc_wq + (buf) * NF_MMQ_TC_CW, tc_xr + (xoff), tc_wsc + (buf) * NF_MMQ_TC_SW, \
-                            tc_wof + (buf) * NF_MMQ_TC_SW, lane, wrow0, wtok0, acc, (HAS_OFF), (ASYM), (EXACT)); \
+        nf_mmq_tc_combine32(tc_wq + (buf) * NF_MMQ_TC_CW, tc_xr + (xoff), tc_wsc + (buf) * NF_MMQ_TC_SB(SG), \
+                            tc_wof + (buf) * NF_MMQ_TC_SB(SG), lane, wrow0, wtok0, acc, (HAS_OFF), (ASYM), \
+                            (EXACT)); \
     } else { \
-        nf_mmq_tc_combine16(tc_wq + (buf) * NF_MMQ_TC_CW, tc_xr + (xoff), tc_wsc + (buf) * NF_MMQ_TC_SW, \
-                            tc_wof + (buf) * NF_MMQ_TC_SW, lane, wrow0, wtok0, acc, (HAS_OFF), (ASYM), (EXACT)); \
+        nf_mmq_tc_combine16(tc_wq + (buf) * NF_MMQ_TC_CW, tc_xr + (xoff), tc_wsc + (buf) * NF_MMQ_TC_SB(SG), \
+                            tc_wof + (buf) * NF_MMQ_TC_SB(SG), lane, wrow0, wtok0, acc, (HAS_OFF), (ASYM), \
+                            (EXACT)); \
     }
 
 /*
- * One step of the chunk held in weight buffer bufA and record stage tc_x0, two chunks ahead of the
- * loads: start chunk cn2's record copy into stage tc_x2 and its weight loads into register set PL,
- * combine the current chunk, commit the next chunk's weights (loaded one step earlier into set PC)
- * into the other weight buffer - which every warp finished reading before the previous barrier -,
- * wait for the next chunk's record copy (cn2's stays in flight) and pass the step's single barrier,
- * then rotate the record stages. Near the end cn2 repeats the last chunk; its copies and loads land
- * in stages and registers nothing reads.
+ * One step over the chunk group at c (chunks c and c + NF_MMQ_TK, the second only below cend), held in
+ * weight buffers 2 PAR, 2 PAR + 1 and record stages 2 PAR, 2 PAR + 1. The next group's record copies
+ * start into the other parity's stages 2 - 2 PAR + g (chunk g of the group), its weights load and
+ * commit into the other parity's buffers 2 - 2 PAR + g, which every warp finished reading before the
+ * previous barrier, and the step ends with the wait for the copies and its single barrier. With SETS 2
+ * both chunks' weight loads are issued into register sets 0 and 1 before the group's combines and
+ * committed after them, so the loads of both chunks are in flight behind the combines. With SETS 1 the
+ * chunks take turns, copying and loading into set 0 before one combine and committing after it: a type
+ * whose decode needs the registers keeps those of a one-chunk step. Near the end the next group's chunks repeat the
+ * last chunk; their copies and loads land in stages and buffers nothing reads.
  */
-#define NF_MMQ_TC_STEP(cn2, bufA, PL, PC, COMBINE, SG, ASYM, HAS_OFF, EXACT, BS, BB, CODE, SCALE, OFF) \
-    NF_MMQ_TC_XCOPY(cn2, tc_x2, BS) \
-    NF_MMQ_TC_PREFETCH(cn2, PL, HAS_OFF, BS, BB, CODE, SCALE, OFF) \
-    COMBINE(bufA, tc_x0, SG, ASYM, HAS_OFF, EXACT) \
-    NF_MMQ_TC_COMMIT(1 - (bufA), PC, NF_MMQ_TC_SC(SG), HAS_OFF) \
-    nf_mmq_cp_async_wait_prior(); \
-    barrier(CLK_LOCAL_MEM_FENCE); \
+#define NF_MMQ_TC_STEP(c, PAR, cend, clast, COMBINE, SG, ASYM, HAS_OFF, EXACT, BS, BB, CODE, SCALE, OFF, SETS) \
     { \
-        const int xfree = tc_x0; \
-        tc_x0 = tc_x1; \
-        tc_x1 = tc_x2; \
-        tc_x2 = xfree; \
-    }
-
-/*
- * The tile's chunks [cstart, cend) through COMBINE in one zero-point form, loaded two chunks ahead of
- * the combine: the prologue copies the records of the first two chunks, commits the first chunk's
- * weights and loads the second's into register set 1; two steps per iteration keep the weight buffer
- * and register set of every step compile-time constants, and the three record stages rotate through
- * tc_x0 (combined), tc_x1 (landing) and tc_x2 (being issued). The last copy group is drained before
- * the tile leaves the loop.
- */
-#define NF_MMQ_TC_LOOP(cstart, cend, COMBINE, SG, ASYM, HAS_OFF, EXACT, BS, BB, CODE, SCALE, OFF) \
-    if ((cstart) < (cend)) { \
-        const int clast = (cend) - NF_MMQ_TK; \
-        int tc_x0 = 0, tc_x1 = NF_MMQ_TC_XU, tc_x2 = 2 * NF_MMQ_TC_XU; \
-        NF_MMQ_TC_SLOTS(NF_MMQ_TC_SC(SG)) \
-        NF_MMQ_TC_XCOPY((cstart), tc_x0, BS) \
-        NF_MMQ_TC_PREFETCH((cstart), 0, HAS_OFF, BS, BB, CODE, SCALE, OFF) \
-        NF_MMQ_TC_XCOPY(min((cstart) + NF_MMQ_TK, clast), tc_x1, BS) \
-        NF_MMQ_TC_COMMIT(0, 0, NF_MMQ_TC_SC(SG), HAS_OFF) \
-        NF_MMQ_TC_PREFETCH(min((cstart) + NF_MMQ_TK, clast), 1, HAS_OFF, BS, BB, CODE, SCALE, OFF) \
-        nf_mmq_cp_async_wait_prior(); \
-        barrier(CLK_LOCAL_MEM_FENCE); \
-        for (int c = (cstart); c < (cend); c += 2 * NF_MMQ_TK) { \
-            NF_MMQ_TC_STEP(min(c + 2 * NF_MMQ_TK, clast), 0, 0, 1, COMBINE, SG, ASYM, HAS_OFF, EXACT, BS, BB, \
-                           CODE, SCALE, OFF) \
-            if (c + NF_MMQ_TK >= (cend)) { \
-                break; \
+        if ((SETS) == 2) { \
+            const int cn0 = min((c) + 2 * NF_MMQ_TK, (clast)); \
+            const int cn1 = min((c) + 3 * NF_MMQ_TK, (clast)); \
+            NF_MMQ_TC_XCOPY(cn0, (2 - 2 * (PAR)) * NF_MMQ_TC_XU, BS) \
+            NF_MMQ_TC_XCOPY(cn1, (3 - 2 * (PAR)) * NF_MMQ_TC_XU, BS) \
+            NF_MMQ_TC_PREFETCH(cn0, 0, HAS_OFF, BS, BB, CODE, SCALE, OFF) \
+            NF_MMQ_TC_PREFETCH(cn1, 1, HAS_OFF, BS, BB, CODE, SCALE, OFF) \
+            COMBINE(2 * (PAR), 2 * (PAR) * NF_MMQ_TC_XU, SG, ASYM, HAS_OFF, EXACT) \
+            if ((c) + NF_MMQ_TK < (cend)) { \
+                COMBINE(2 * (PAR) + 1, (2 * (PAR) + 1) * NF_MMQ_TC_XU, SG, ASYM, HAS_OFF, EXACT) \
             } \
-            NF_MMQ_TC_STEP(min(c + 3 * NF_MMQ_TK, clast), 1, 1, 0, COMBINE, SG, ASYM, HAS_OFF, EXACT, BS, BB, \
-                           CODE, SCALE, OFF) \
+            NF_MMQ_TC_COMMIT(2 - 2 * (PAR), 0, SG, HAS_OFF) \
+            NF_MMQ_TC_COMMIT(3 - 2 * (PAR), 1, SG, HAS_OFF) \
+        } else { \
+            _Pragma("unroll") \
+            for (int tc_g = 0; tc_g < 2 && (c) + tc_g * NF_MMQ_TK < (cend); tc_g++) { \
+                const int cn = min((c) + (2 + tc_g) * NF_MMQ_TK, (clast)); \
+                NF_MMQ_TC_XCOPY(cn, (2 - 2 * (PAR) + tc_g) * NF_MMQ_TC_XU, BS) \
+                NF_MMQ_TC_PREFETCH(cn, 0, HAS_OFF, BS, BB, CODE, SCALE, OFF) \
+                COMBINE(2 * (PAR) + tc_g, (2 * (PAR) + tc_g) * NF_MMQ_TC_XU, SG, ASYM, HAS_OFF, EXACT) \
+                NF_MMQ_TC_COMMIT(2 - 2 * (PAR) + tc_g, 0, SG, HAS_OFF) \
+            } \
         } \
         nf_mmq_cp_async_wait(); \
+        barrier(CLK_LOCAL_MEM_FENCE); \
+    }
+
+/*
+ * The tile's chunks [cstart, cend) through COMBINE in one zero-point form, NF_MMQ_TC_DEPTH chunks per
+ * step, loaded one group ahead of the combine: the prologue copies the records and commits the weights
+ * of the first group; two steps per iteration keep the parity of every step's buffers and stages a
+ * compile-time constant. The last group of the range holds fewer chunks when the range's chunk count is
+ * not a multiple of NF_MMQ_TC_DEPTH. Every output takes its chunks' terms in chunk order, as with one chunk per step.
+ */
+#define NF_MMQ_TC_LOOP(cstart, cend, COMBINE, SG, ASYM, HAS_OFF, EXACT, BS, BB, CODE, SCALE, OFF, SETS) \
+    if ((cstart) < (cend)) { \
+        const int clast = (cend) - NF_MMQ_TK; \
+        NF_MMQ_TC_SLOTS(NF_MMQ_TC_SC(SG)) \
+        _Pragma("unroll") \
+        for (int tc_g = 0; tc_g < NF_MMQ_TC_DEPTH; tc_g++) { \
+            const int c0 = min((cstart) + tc_g * NF_MMQ_TK, clast); \
+            NF_MMQ_TC_XCOPY(c0, tc_g * NF_MMQ_TC_XU, BS) \
+            NF_MMQ_TC_PREFETCH(c0, 0, HAS_OFF, BS, BB, CODE, SCALE, OFF) \
+            NF_MMQ_TC_COMMIT(tc_g, 0, SG, HAS_OFF) \
+        } \
+        nf_mmq_cp_async_wait(); \
+        barrier(CLK_LOCAL_MEM_FENCE); \
+        for (int c = (cstart); c < (cend); c += 2 * NF_MMQ_TC_DEPTH * NF_MMQ_TK) { \
+            NF_MMQ_TC_STEP(c, 0, (cend), clast, COMBINE, SG, ASYM, HAS_OFF, EXACT, BS, BB, CODE, SCALE, OFF, \
+                           SETS) \
+            if (c + NF_MMQ_TC_DEPTH * NF_MMQ_TK >= (cend)) { \
+                break; \
+            } \
+            NF_MMQ_TC_STEP(c + NF_MMQ_TC_DEPTH * NF_MMQ_TK, 1, (cend), clast, COMBINE, SG, ASYM, HAS_OFF, EXACT, \
+                           BS, BB, CODE, SCALE, OFF, SETS) \
+        } \
     }
 
 /* The tile's chunks [cstart, cend) into acc through the int8 combine, in the zero-point form of the
  * tile's first record: every staging kernel writes one zero point into all records of a launch
  * (LLM_Quant_MMQ_Int8Asym its static zp, the others 0), so the first record decides the form of the
- * whole tile. The types whose scales are SCALE##_NARROW take the folded conversion of nf_mmq_tc_prod. */
+ * whole tile. The types whose scales are SCALE##_NARROW take the folded conversion of nf_mmq_tc_prod, and
+ * CODE##_SETS picks the step's prefetch form (NF_MMQ_TC_STEP). */
 #define NF_MMQ_TC_PIPE(cstart, cend, SG, HAS_OFF, BS, BB, CODE, SCALE, OFF) \
     if ((cstart) < (cend) \
         && xtile[((cstart) / NF_MMQ_TK) * NF_MMQ_RC + NF_MMQ_QS + 1 + NF_MMQ_SH] != 0u) { \
         NF_MMQ_TC_LOOP(cstart, cend, NF_MMQ_TC_INT8, SG, 1, HAS_OFF, SCALE##_NARROW, BS, BB, \
-                       CODE, SCALE, OFF) \
+                       CODE, SCALE, OFF, NF_MMQ_TC_SETS(CODE##_SETS)) \
     } else { \
         NF_MMQ_TC_LOOP(cstart, cend, NF_MMQ_TC_INT8, SG, 0, HAS_OFF, SCALE##_NARROW, BS, BB, \
-                       CODE, SCALE, OFF) \
+                       CODE, SCALE, OFF, NF_MMQ_TC_SETS(CODE##_SETS)) \
     }
 
 /* The lane's accumulators to global memory, bounds-checked per element. */
@@ -1071,13 +1108,14 @@ NF_INLINE int nf_mmq_tc_fresh_lid(void) {
     return v;
 }
 
-/* Shared buffers, prefetch registers and accumulators of a tensor-core tile kernel. */
-#define NF_MMQ_TC_TILE_DECLS(BS, BB) \
+/* Shared buffers, prefetch registers and accumulators of a tensor-core tile kernel at scale group SG: the
+ * weight buffers and record stages of both parities' chunk groups. */
+#define NF_MMQ_TC_TILE_DECLS(BS, BB, SG) \
     const nf_i64 row_bytes = (nf_i64)(K / (BS)) * (BB); \
-    NF_LOCAL __align__(16) int tc_wq[2 * NF_MMQ_TC_CW]; \
-    NF_LOCAL __align__(16) float tc_wsc[2 * NF_MMQ_TC_SW]; \
-    NF_LOCAL __align__(16) float tc_wof[2 * NF_MMQ_TC_SW]; \
-    NF_LOCAL __align__(16) uint tc_xr[3 * NF_MMQ_TC_XU]; \
+    NF_LOCAL __align__(16) int tc_wq[2 * NF_MMQ_TC_DEPTH * NF_MMQ_TC_CW]; \
+    NF_LOCAL __align__(16) float tc_wsc[2 * NF_MMQ_TC_DEPTH * NF_MMQ_TC_SB(SG)]; \
+    NF_LOCAL __align__(16) float tc_wof[2 * NF_MMQ_TC_DEPTH * NF_MMQ_TC_SB(SG)]; \
+    NF_LOCAL __align__(16) uint tc_xr[2 * NF_MMQ_TC_DEPTH * NF_MMQ_TC_XU]; \
     int tc_wo[NF_MMQ_TC_CWI], tc_we[NF_MMQ_TC_CWI], tc_so[NF_MMQ_TC_SWI], tc_se[NF_MMQ_TC_SWI]; \
     int tc_su[NF_MMQ_TC_SWI]; \
     int tc_xo[NF_MMQ_TC_XPI], tc_x16; \
@@ -1087,9 +1125,9 @@ NF_INLINE int nf_mmq_tc_fresh_lid(void) {
     float acc[NF_MMQ_TC_ACC];
 
 /* Declarations and warp geometry of a one-tile tensor-core kernel; GEMM_ARGS is its body. */
-#define NF_MMQ_TC_KERNEL_BODY(BS, BB, GEMM_ARGS) \
+#define NF_MMQ_TC_KERNEL_BODY(BS, BB, SG, GEMM_ARGS) \
     NF_MMQ_TC_GEOMETRY(get_local_id(0)) \
-    NF_MMQ_TC_TILE_DECLS(BS, BB) \
+    NF_MMQ_TC_TILE_DECLS(BS, BB, SG) \
     for (int i = 0; i < NF_MMQ_TC_ACC; i++) \
         acc[i] = 0.0f; \
     GEMM_ARGS
@@ -1103,7 +1141,7 @@ NF_KERNEL __launch_bounds__(NF_MMQ_WG) void NAME( \
     NF_GLOBAL const uchar* NF_RESTRICT weight, \
     NF_GLOBAL const uint* NF_RESTRICT q8, \
     NF_GLOBAL float* NF_RESTRICT y) { \
-    NF_MMQ_TC_KERNEL_BODY((BS), (BB), \
+    NF_MMQ_TC_KERNEL_BODY((BS), (BB), (SG), \
         const int m0 = (int)get_group_id(0) * NF_MMQ_TM; \
         const int n0 = (int)get_group_id(1) * NF_MMQ_TN; \
         const NF_GLOBAL uchar* wtile = weight + (nf_i64)m0 * row_bytes; \
@@ -1122,7 +1160,7 @@ NF_KERNEL __launch_bounds__(NF_MMQ_WG) void NAME( \
     NF_GLOBAL const uchar* NF_RESTRICT weight, \
     NF_GLOBAL const uint* NF_RESTRICT q8, \
     NF_GLOBAL float* NF_RESTRICT partial) { \
-    NF_MMQ_TC_KERNEL_BODY((BS), (BB), \
+    NF_MMQ_TC_KERNEL_BODY((BS), (BB), (SG), \
         const int rtiles = (M + NF_MMQ_TM - 1) / NF_MMQ_TM; \
         const int slice = (int)get_group_id(0) / rtiles; \
         const int m0 = ((int)get_group_id(0) - slice * rtiles) * NF_MMQ_TM; \

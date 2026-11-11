@@ -563,17 +563,23 @@ public final class AttnKernels {
     }
 
     /**
-     * Tensor-core tiled prefill kernel ({@code LLM_FlashAttnMma_<KV>}, CUDA and Vulkan) for a KV element type whose
-     * mma variant exists: the F16 cache; null for every other type, so only a caller that has checked the
-     * mma plan reaches it.
+     * Tensor-core tiled prefill kernel ({@code LLM_FlashAttnMma_<KV>}) for a KV element type whose mma variant
+     * exists: the F16 cache (CUDA and Vulkan) and the Q8_0 cache (CUDA, which dequantizes the blocks to F16 as it
+     * stages the tiles); null for every other type, so only a caller that has checked the mma plan reaches it. The
+     * caller still requires the backend to have the kernel.
      */
     public static String flashAttnMma(KvDType kv) {
-        return kv == KvDType.F16 ? kv.kernel(FLASH_ATTN_MMA_PREFIX) : null;
+        return hasMmaVariant(kv) ? kv.kernel(FLASH_ATTN_MMA_PREFIX) : null;
     }
 
     /** Tensor-core paged tiled prefill kernel (as {@link #flashAttnMma(KvDType)}); null without an mma variant. */
     public static String flashAttnMmaPaged(KvDType kv) {
-        return kv == KvDType.F16 ? kv.kernel(FLASH_ATTN_MMA_PAGED_PREFIX) : null;
+        return hasMmaVariant(kv) ? kv.kernel(FLASH_ATTN_MMA_PAGED_PREFIX) : null;
+    }
+
+    /** Whether the tensor-core prefill has a variant for caches of type {@code kv}: F16 and Q8_0. */
+    private static boolean hasMmaVariant(KvDType kv) {
+        return kv == KvDType.F16 || kv == KvDType.Q8_0;
     }
 
     /**

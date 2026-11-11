@@ -84,7 +84,7 @@ public class MmqGemmPlanTest {
         assertTrue(names.contains(GemmKernels.LOGITS_PREFILTER));
         assertEquals(GemmKernels.TILED_TYPES.size() + GemmKernels.MMQ_TYPES.size() * 8
                         + GemmKernels.FP8_TYPES.size() * 6 + GemmKernels.W4A8_TYPES.size() * 6
-                        + GemmKernels.MMA_TYPES.size() * 2 + GemmKernels.CM2_TYPES.size() * 2 + 15,
+                        + GemmKernels.MMA_TYPES.size() * 2 + GemmKernels.CM2_TYPES.size() * 2 + 14,
                 names.size());
     }
 
@@ -209,10 +209,11 @@ public class MmqGemmPlanTest {
         assertEquals("the pipelined stage holds three copies of the weight tiles and one of the "
                 + "tokens' records", 4L * (3 * 64 * 16 + 9 * 64 + 16 * (4 + 2 + 1)),
                 MmqConfig.PACKED_DOT.sharedBytes());
-        assertEquals("the tensor tile's plain kernels hold two weight stages and three record stages",
-                4L * (2 * 128 * 32 / 4 + 4 * 128 * 2 + 3 * 128 * (8 + 2 + 2)), MmqConfig.INT8_TENSOR.sharedBytes());
-        assertEquals("its twins keep the pipelined stage's three weight copies and one record tile",
-                4L * (3 * 64 * 32 / 4 + 9 * 64 * 2 + 16 * (8 + 2 + 2)),
+        assertEquals("the tensor tile's plain kernels hold two groups of two weight and two record stages",
+                4L * (4 * 128 * 32 / 4 + 8 * 128 * 2 + 4 * 128 * (8 + 2 + 2)), MmqConfig.INT8_TENSOR.sharedBytes());
+        assertEquals("a twin's bound is the larger of the pipelined stage and the tensor tile at its geometry",
+                4L * Math.max(3 * 64 * 32 / 4 + 9 * 64 * 2 + 16 * (8 + 2 + 2),
+                        4 * 64 * 32 / 4 + 8 * 64 * 2 + 4 * 16 * (8 + 2 + 2)),
                 MmqConfig.smallTile(MmqConfig.INT8_TENSOR).sharedBytes());
     }
 

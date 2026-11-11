@@ -97,7 +97,8 @@ final class FlashPlan {
         String mma = mmaName != null && kernels.has(mmaName) ? mmaName : null;
         FlashAttnTiling prefill;
         if (mma != null) {
-            prefill = FlashAttnTiling.mma(a.nHead(), a.nHeadKv(), a.headDimK(), a.headDimV(), rows, smem, cu);
+            prefill = FlashAttnTiling.mma(a.nHead(), a.nHeadKv(), a.headDimK(), a.headDimV(), rows, smem, cu,
+                    keys.typeK());
         } else if (subgroup) {
             prefill = FlashAttnTiling.prefillSubgroup(a.nHead(), a.nHeadKv(), a.headDimK(), a.headDimV(), rows, smem,
                     cu);
@@ -212,14 +213,15 @@ final class FlashPlan {
 
     /**
      * The tensor-core prefill kernel name for these caches and head dims when the device runs the mma attention
-     * ({@code mmaPath}, {@link LlmKernels#flashMmaPath()}): F16 K and V caches only, and head dims that are multiples of
-     * 16 of at most {@link FlashAttnTiling#MMA_MAX_HEAD_DIM}. Null otherwise. The caller still requires
-     * {@code kernels.has(name)} before preparing it. The dense launches run the base kernel (its identity paging,
-     * page_shift = -1) because a dense cache has no page table; the paged kernel {@code LLM_FlashAttnMmaPaged_F16}
-     * serves launches over a paginated cache.
+     * ({@code mmaPath}, {@link LlmKernels#flashMmaPath()}): K and V caches of one type with an mma variant (F16 or
+     * Q8_0, {@link AttnKernels#flashAttnMma}), and head dims that are multiples of 16 of at most
+     * {@link FlashAttnTiling#MMA_MAX_HEAD_DIM}. Null otherwise. The caller still requires {@code kernels.has(name)}
+     * before preparing it, so a backend without the type's variant (Vulkan has F16 only) keeps the tiled kernel. The
+     * dense launches run the base kernel (its identity paging, page_shift = -1) because a dense cache has no page
+     * table; the paged kernel {@code LLM_FlashAttnMmaPaged_<KV>} serves launches over a paginated cache.
      */
     static String mmaKernelName(boolean mmaPath, KvDType typeK, KvDType typeV, int dK, int dV) {
-        if (!mmaPath || typeK != KvDType.F16 || typeV != KvDType.F16) {
+        if (!mmaPath || typeK != typeV || AttnKernels.flashAttnMma(typeK) == null) {
             return null;
         }
         if (dK > FlashAttnTiling.MMA_MAX_HEAD_DIM || dV > FlashAttnTiling.MMA_MAX_HEAD_DIM

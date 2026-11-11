@@ -71,6 +71,84 @@
 #endif /* USE_SUBGROUPS */
 
 /*
+ * NF_WG_RSUM(ts, ps, NV, lid, lsize): the workgroup sums of NV register values ps[0 .. NV) (NV a
+ * compile-time constant, ps a float array), reduced in lockstep; work-item 0 holds every total in ps
+ * afterwards, the other work-items' ps are left partial. ts is a kernel-scope NF_LOCAL float array of
+ * at least NV * NF_RSUM_SLOTS elements, free for reuse only after the caller's next barrier.
+ *
+ * Each value takes exactly REDUCE_SUM's arithmetic over a buffer holding the work-items' values: the
+ * same subgroup reduction of the same input, and the same stride tree over the subgroup leaders, whose
+ * slots are indexed by subgroup id (REDUCE_SUM's lid * subgroup-size slots in compact order), or over
+ * the lanes without subgroups. So the totals are bit-identical to writing each value, a barrier and
+ * REDUCE_SUM, while a call stages one leader store per value and subgroup and passes one barrier per
+ * tree level for all NV values: the barrier the caller's store needed and the one that retired each
+ * value's read-back go, and the last level has none, as only work-item 0 reads what it wrote.
+ * Requires the subgroup size to divide lsize (the REDUCE_SUM preconditions).
+ */
+#if defined(USE_SUBGROUPS) && defined(NF_CUDA)
+#define NF_RSUM_SLOTS (LLM_DIMX / 32)
+#define NF_RSUM_SG_SIZE 32u
+#elif defined(USE_SUBGROUPS)
+#define NF_RSUM_SLOTS LLM_DIMX
+#define NF_RSUM_SG_SIZE get_sub_group_size()
+#endif
+
+#ifdef USE_SUBGROUPS
+#define NF_WG_RSUM(ts, ps, NV, lid, lsize) \
+    { \
+        const uint nf_rs_nsg = (uint)(lsize) / NF_RSUM_SG_SIZE; \
+        _Pragma("unroll") \
+        for (int nf_rs_j = 0; nf_rs_j < (NV); nf_rs_j++) \
+            ps[nf_rs_j] = sub_group_reduce_add(ps[nf_rs_j]); \
+        if (nf_rs_nsg > 1u) { \
+            if (get_sub_group_local_id() == 0) { \
+                _Pragma("unroll") \
+                for (int nf_rs_j = 0; nf_rs_j < (NV); nf_rs_j++) \
+                    ts[nf_rs_j * NF_RSUM_SLOTS + get_sub_group_id()] = ps[nf_rs_j]; \
+            } \
+            barrier(CLK_LOCAL_MEM_FENCE); \
+            for (uint nf_rs_s = nf_rs_nsg >> 1; nf_rs_s > 0u; nf_rs_s >>= 1) { \
+                if ((uint)(lid) < nf_rs_s) { \
+                    _Pragma("unroll") \
+                    for (int nf_rs_j = 0; nf_rs_j < (NV); nf_rs_j++) \
+                        ts[nf_rs_j * NF_RSUM_SLOTS + (lid)] += ts[nf_rs_j * NF_RSUM_SLOTS + (lid) + nf_rs_s]; \
+                } \
+                if (nf_rs_s > 1u) \
+                    barrier(CLK_LOCAL_MEM_FENCE); \
+            } \
+            if ((lid) == 0) { \
+                _Pragma("unroll") \
+                for (int nf_rs_j = 0; nf_rs_j < (NV); nf_rs_j++) \
+                    ps[nf_rs_j] = ts[nf_rs_j * NF_RSUM_SLOTS]; \
+            } \
+        } \
+    }
+#else
+#define NF_RSUM_SLOTS LLM_DIMX
+#define NF_WG_RSUM(ts, ps, NV, lid, lsize) \
+    { \
+        _Pragma("unroll") \
+        for (int nf_rs_j = 0; nf_rs_j < (NV); nf_rs_j++) \
+            ts[nf_rs_j * NF_RSUM_SLOTS + (lid)] = ps[nf_rs_j]; \
+        barrier(CLK_LOCAL_MEM_FENCE); \
+        for (int nf_rs_s = (lsize) >> 1; nf_rs_s > 0; nf_rs_s >>= 1) { \
+            if ((lid) < nf_rs_s) { \
+                _Pragma("unroll") \
+                for (int nf_rs_j = 0; nf_rs_j < (NV); nf_rs_j++) \
+                    ts[nf_rs_j * NF_RSUM_SLOTS + (lid)] += ts[nf_rs_j * NF_RSUM_SLOTS + (lid) + nf_rs_s]; \
+            } \
+            if (nf_rs_s > 1) \
+                barrier(CLK_LOCAL_MEM_FENCE); \
+        } \
+        if ((lid) == 0) { \
+            _Pragma("unroll") \
+            for (int nf_rs_j = 0; nf_rs_j < (NV); nf_rs_j++) \
+                ps[nf_rs_j] = ts[nf_rs_j * NF_RSUM_SLOTS]; \
+        } \
+    }
+#endif
+
+/*
  * nf_wg_sum / nf_wg_max: reduce v over the whole workgroup and return the result to every work-item.
  * buf is free for reuse when the function returns (it ends with a barrier after the final read).
  */

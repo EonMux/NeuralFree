@@ -9,9 +9,9 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 /**
- * Names of the tensor-core mma kernels ({@code LLM_FlashAttnMma_F16}, {@code LLM_FlashAttnMmaPaged_F16}, the
- * CUDA-only files kernels/llm/flash_mma.cl): only the F16 cache has an mma variant, and the kernels stay out of
- * {@link AttnKernels#all()} so the prewarm of backends without them cannot fail.
+ * Names of the tensor-core mma kernels ({@code LLM_FlashAttnMma_<KV>}, {@code LLM_FlashAttnMmaPaged_<KV>}, the
+ * CUDA-only files kernels/llm/flash_mma.cl): only the F16 and Q8_0 caches have an mma variant, and the kernels
+ * stay out of {@link AttnKernels#all()} so the prewarm of backends without them cannot fail.
  */
 public class AttnKernelsMmaTest {
 
@@ -22,10 +22,15 @@ public class AttnKernelsMmaTest {
     }
 
     @Test
+    public void q8CarriesTheMmaNames() {
+        assertEquals("LLM_FlashAttnMma_Q8_0", AttnKernels.flashAttnMma(KvDType.Q8_0));
+        assertEquals("LLM_FlashAttnMmaPaged_Q8_0", AttnKernels.flashAttnMmaPaged(KvDType.Q8_0));
+    }
+
+    @Test
     public void otherCacheTypesHaveNoMmaVariant() {
         assertNull(AttnKernels.flashAttnMma(KvDType.F32));
         assertNull(AttnKernels.flashAttnMma(KvDType.BF16));
-        assertNull(AttnKernels.flashAttnMma(KvDType.Q8_0));
         assertNull(AttnKernels.flashAttnMma(KvDType.Q4_0));
         assertNull(AttnKernels.flashAttnMmaPaged(KvDType.F32));
         assertNull(AttnKernels.flashAttnMmaPaged(KvDType.Q5_1));

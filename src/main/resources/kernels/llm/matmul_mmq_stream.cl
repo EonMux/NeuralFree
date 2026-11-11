@@ -56,7 +56,8 @@ NF_INLINE int nf_mmq_streamk_owner(int s, int nb, int total) {
  */
 #define NF_MMQ_GU_PT 32
 #define NF_MMQ_GU_XS (NF_MMQ_TM + 4)
-#if NF_MMQ_TN % NF_MMQ_GU_PT != 0 || NF_MMQ_GU_PT * NF_MMQ_GU_XS > 3 * NF_MMQ_TN * NF_Q8_REC(NF_MMQ_TK)
+#if NF_MMQ_TN % NF_MMQ_GU_PT != 0 \
+    || NF_MMQ_GU_PT * NF_MMQ_GU_XS > 2 * NF_MMQ_TC_DEPTH * NF_MMQ_TN * NF_Q8_REC(NF_MMQ_TK)
 #error "the gate/up exchange passes must tile NF_MMQ_TN and fit the record stages"
 #endif
 NF_INLINE void nf_mmq_gate_up_store(NF_LOCAL_PTR float* xch, NF_GLOBAL float* NF_RESTRICT y, int M, int N,
@@ -120,7 +121,7 @@ NF_INLINE void nf_mmq_gate_up_store(NF_LOCAL_PTR float* xch, NF_GLOBAL float* NF
  */
 #define NF_MMQ_TC_STREAMK_BODY(PIPE, BS, BB, SG, HAS_OFF, CODE, SCALE, OFF, RT, WUP, RMASK, WHOLE, HEAD_IN_Y, \
                                SPLIT) \
-    NF_MMQ_TC_TILE_DECLS((BS), (BB)) \
+    NF_MMQ_TC_TILE_DECLS((BS), (BB), (SG)) \
     { \
         const int kc = K / NF_MMQ_TK; \
         const int ntj = (N + NF_MMQ_TN - 1) / NF_MMQ_TN; \

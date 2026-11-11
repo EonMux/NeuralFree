@@ -59,6 +59,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
@@ -152,10 +153,25 @@ public class GpuLayerExecutorTest {
         public void prefill(int pos0, int nTokens, ScratchSlot in, ScratchSlot out) {
             record("mixer " + name + " prefill " + nTokens + " " + in.name() + "->" + out.name());
         }
+
+        @Override
+        public void prefillKV(int pos0, int nTokens, ScratchSlot in) {
+            record("mixer " + name + " kv " + nTokens + " " + in.name());
+        }
+
+        @Override
+        public String kvRefusal() {
+            return null;
+        }
     }
 
     private final class RecordingFfn implements GpuFfnBlock {
+        private final boolean rowLocal;
         private int il;
+
+        RecordingFfn(boolean rowLocal) {
+            this.rowLocal = rowLocal;
+        }
 
         @Override
         public void bind(GpuForwardContext ctx, LayerSpec layer) {
@@ -164,7 +180,12 @@ public class GpuLayerExecutorTest {
 
         @Override
         public void forward(int nTokens, ScratchSlot in, ScratchSlot out) {
-            record("ffn " + il + " " + in.name() + "->" + out.name());
+            record("ffn " + il + " " + (rowLocal ? nTokens + " " : "") + in.name() + "->" + out.name());
+        }
+
+        @Override
+        public boolean rowLocal() {
+            return rowLocal;
         }
     }
 
@@ -183,6 +204,11 @@ public class GpuLayerExecutorTest {
     }
 
     private GpuBlockRegistry registry() {
+        return registry(false);
+    }
+
+    /** Recording blocks; {@code rowLocalFfn} makes the FFN blocks row-local and record their row count. */
+    private GpuBlockRegistry registry(boolean rowLocalFfn) {
         GpuFfnFactory ffn = new GpuFfnFactory() {
             @Override
             public FfnKind kind() {
@@ -191,7 +217,7 @@ public class GpuLayerExecutorTest {
 
             @Override
             public GpuFfnBlock create(LayerSpec layer) {
-                return new RecordingFfn();
+                return new RecordingFfn(rowLocalFfn);
             }
         };
         return new GpuBlockRegistry(Arrays.asList(mixerFactory(MixerKind.ATTENTION), mixerFactory(MixerKind.GDN)),
@@ -760,6 +786,79 @@ public class GpuLayerExecutorTest {
         // 6 rows at a ubatch of 4 split into 2 steps of 3, not the greedy 4 and 2
         assertEquals(2, Collections.frequency(t, "mixer ATTENTION 0 prefill 3 NORMED->BRANCH"));
         assertEquals(6, memory.sequence().nPast());
+    }
+
+    @Test
+    public void prefillRunsTheLastLayerFfnOverTheReadRowAndOnlyItsCacheWritesBeforeTheLastChunk() {
+        GpuForwardContext ctx = open(llama(2, null, null, null), true);
+        GpuForwardBackend fb = new GpuForwardBackend(ctx, registry(true), Collections.emptyList());
+        closeables.add(fb);
+        startTrace();
+
+        fb.prefill(new int[]{1, 2, 3, 4, 5, 6}, 0);
+
+        List<String> t = trace();
+        // both chunks of 3 run layer 0 whole
+        assertEquals(2, Collections.frequency(t, "mixer ATTENTION 0 prefill 3 NORMED->BRANCH"));
+        assertEquals(2, Collections.frequency(t, "ffn 0 3 NORMED->BRANCH"));
+        // the first chunk's output is read nowhere: the last layer writes its caches alone
+        int kv = t.indexOf("mixer ATTENTION 1 kv 3 NORMED");
+        int full = t.indexOf("mixer ATTENTION 1 prefill 3 NORMED->BRANCH");
+        assertTrue("the first chunk writes the last layer's caches alone", kv >= 0 && kv < full);
+        assertEquals(1, Collections.frequency(t, "mixer ATTENTION 1 prefill 3 NORMED->BRANCH"));
+        // the last chunk's attention part sees all 3 rows; its read row moves to the front for a one-row FFN
+        assertEquals(Arrays.asList("mixer ATTENTION 1 prefill 3 NORMED->BRANCH", MIX, GpuOps.COPY2D, NORM,
+                "ffn 1 1 NORMED->BRANCH"), t.subList(full, full + 5));
+        assertFalse(t.contains("ffn 1 3 NORMED->BRANCH"));
+        List<FakeDispatch> moves = dispatchesOf(GpuOps.COPY2D);
+        assertEquals(1, moves.size());
+        FakeDispatch move = moves.get(0);
+        assertEquals("one row of the stream moves", 1, move.intArg(0));
+        assertEquals(N_EMBD, move.intArg(1));
+        assertEquals("the last row moves to row 0", 2 * N_EMBD, move.intArg(3) - move.intArg(5));
+        assertEquals(6, memory.sequence().nPast());
+    }
+
+    @Test
+    public void readingEveryRowKeepsTheLastLayerWhole() {
+        GpuForwardContext ctx = open(llama(2, null, null, null), true);
+        GpuForwardBackend fb = new GpuForwardBackend(ctx, registry(true), Collections.emptyList());
+        closeables.add(fb);
+        startTrace();
+
+        fb.forwardRows(new int[]{1, 2, 3}, 0, new int[]{0, 1, 2});
+
+        assertEquals(1, Collections.frequency(trace(), "ffn 1 3 NORMED->BRANCH"));
+        assertEquals(0, dispatchesOf(GpuOps.COPY2D).size());
+    }
+
+    @Test
+    public void outputPruningNeedsARowLocalFfnAPrefillStepAndNoStackOutputTap() {
+        GpuForwardContext ctx = open(llama(2, null, null, null), true);
+        GpuLayerExecutor rowLocal = GpuLayerExecutor.forTrunk(ctx, registry(true));
+        closeables.add(rowLocal);
+        GpuLayerExecutor.StepMode prefill = GpuLayerExecutor.StepMode.PREFILL;
+        GpuLayerExecutor.TapSink none = GpuLayerExecutor.TapSink.NONE;
+        assertTrue(rowLocal.prunesOutputRows(3, prefill, none, new int[]{2}));
+        assertTrue(rowLocal.prunesOutputRows(3, prefill, none, new int[0]));
+        assertFalse("every row is read", rowLocal.prunesOutputRows(3, prefill, none, new int[]{0, 1, 2}));
+        assertFalse("rows out of order", rowLocal.prunesOutputRows(3, prefill, none, new int[]{2, 1}));
+        assertFalse("a decode step", rowLocal.prunesOutputRows(1, GpuLayerExecutor.StepMode.DECODE, none,
+                new int[0]));
+        GpuLayerExecutor.TapSink outputTap = new GpuLayerExecutor.TapSink() {
+            @Override
+            public boolean wants(int tap) {
+                return tap == 2;
+            }
+
+            @Override
+            public void capture(int tap, ScratchSlot x, int nTokens, int width) {
+            }
+        };
+        assertFalse("the stack output is tapped", rowLocal.prunesOutputRows(3, prefill, outputTap, new int[]{2}));
+        assertFalse("an FFN that is not row-local keeps every row",
+                executor(ctx).prunesOutputRows(3, prefill, none, new int[]{2}));
+        assertThrows(IllegalArgumentException.class, () -> rowLocal.run(0, 3, prefill, none, new int[]{0, 1, 2}));
     }
 
     @Test

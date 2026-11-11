@@ -55,6 +55,8 @@ public final class MmqConfig {
      */
     public static final MmqConfig CDNA = new MmqConfig("cdna", 16, 128, 64, 8);
 
+    /** Chunks the CUDA tensor-core tile stages per barrier ({@code NF_MMQ_TC_DEPTH}). */
+    public static final int TENSOR_CHUNKS_PER_STAGE = 2;
     /** Smallest CUDA compute capability of the int8 tensor path (Ampere). */
     public static final int TENSOR_MIN_COMPUTE_CAPABILITY = 80;
     /** Largest token tile over the configs ({@code NF_MMQ_TN}); bounds the int tile indices of N. */
@@ -425,10 +427,12 @@ public final class MmqConfig {
      * {@code TN} staged records ({@code TK/4 + 2 + TK/16} units: the code ints the B fragments
      * read, the chunk scales, the code sums and the zero points); the activations themselves are
      * read from the staging buffer. A 32-deep tile also bounds the tensor-core plain kernels of the
-     * CUDA dialect (common/matmul_mmq_family.h, NF_MMQ_TC_KERNEL_BODY): two copies of the weight
-     * codes ({@code TM * TK / 4} ints) and of the scale and offset tiles ({@code TM * TK / 16}
-     * floats each), and three of the record tile ({@code TN} records), whose loads run two chunks
-     * ahead of the combine.
+     * CUDA dialect (common/matmul_mmq_family.h, NF_MMQ_TC_KERNEL_BODY), which stage
+     * {@value #TENSOR_CHUNKS_PER_STAGE} chunks per barrier in two alternating groups: four copies of the weight
+     * codes ({@code TM * TK / 4} ints) and, at most, of the scale and offset tiles ({@code TM * TK / 16}
+     * floats each), and four of the record tile ({@code TN} records), whose loads run one group ahead of the
+     * combine. The bound takes both forms at every 32-deep geometry, so a twin tile's, whose kernels run only
+     * the pipelined stage, can exceed what they use.
      */
     public long sharedBytes() {
         long halves = stageDepth / 16;
@@ -439,7 +443,8 @@ public final class MmqConfig {
         if (!tensor) {
             return 4L * pipelined;
         }
-        long tensorTile = 2L * tileRows * stageDepth / 4 + 4L * tileRows * halves + 3L * recordTile;
+        long copies = 2L * TENSOR_CHUNKS_PER_STAGE;
+        long tensorTile = copies * tileRows * stageDepth / 4 + 2 * copies * tileRows * halves + copies * recordTile;
         return 4L * Math.max(pipelined, tensorTile);
     }
 

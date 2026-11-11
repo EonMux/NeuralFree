@@ -62,9 +62,8 @@ NF_REQD_SG_ATTR NF_KERNEL void N##_MatVec( \
     float ps = 0.0f; \
     for (int b = gid; b < sblk; b += gpi) \
         ps += N##_decode(wrow + b * BB, input, 0, b, ltid); \
-    NF_LOCAL float sc[LLM_DIMX]; sc[lid] = ps; barrier(CLK_LOCAL_MEM_FENCE); \
-    REDUCE_SUM(sc, lid); \
-    if (lid == 0) output[row] = sc[0]; \
+    NF_LOCAL float sc[NF_RSUM_SLOTS]; float pv[1] = {ps}; NF_WG_RSUM(sc, pv, 1, lid, lsize); \
+    if (lid == 0) output[row] = pv[0]; \
 }
 
 /*
@@ -93,13 +92,11 @@ NF_REQD_SG_ATTR NF_KERNEL void N##_MatVec2( \
     float ps0 = 0.0f, ps1 = 0.0f; \
     for (int b = gid; b < sblk; b += gpi) \
         N##_decode_dual(w0 + b * BB, w1 + b * BB, input, 0, b, ltid, &ps0, &ps1); \
-    NF_LOCAL float sc[LLM_DIMX]; \
-    sc[lid] = ps0; barrier(CLK_LOCAL_MEM_FENCE); REDUCE_SUM(sc, lid); \
-    const float o0 = sc[0]; barrier(CLK_LOCAL_MEM_FENCE); \
-    sc[lid] = ps1; barrier(CLK_LOCAL_MEM_FENCE); REDUCE_SUM(sc, lid); \
+    NF_LOCAL float sc[2 * NF_RSUM_SLOTS]; \
+    float pv[2] = {ps0, ps1}; NF_WG_RSUM(sc, pv, 2, lid, lsize); \
     if (lid == 0) { \
-        output[row0] = o0; \
-        if (row0 + 1 < out_dim) output[row0 + 1] = sc[0]; \
+        output[row0] = pv[0]; \
+        if (row0 + 1 < out_dim) output[row0 + 1] = pv[1]; \
     } \
 }
 
@@ -118,9 +115,8 @@ NF_REQD_SG_ATTR NF_KERNEL void N##_MatVecAdd( \
     float ps = 0.0f; \
     for (int b = gid; b < sblk; b += gpi) \
         ps += N##_decode(wrow + b * BB, input, 0, b, ltid); \
-    NF_LOCAL float sc[LLM_DIMX]; sc[lid] = ps; barrier(CLK_LOCAL_MEM_FENCE); \
-    REDUCE_SUM(sc, lid); \
-    if (lid == 0) addend_output[row] += sc[0]; \
+    NF_LOCAL float sc[NF_RSUM_SLOTS]; float pv[1] = {ps}; NF_WG_RSUM(sc, pv, 1, lid, lsize); \
+    if (lid == 0) addend_output[row] += pv[0]; \
 }
 
 #define IQ_FUSEDGATEUP(N, BS, BB, TPS) \
@@ -141,11 +137,9 @@ NF_REQD_SG_ATTR NF_KERNEL void N##_MatVecFusedGateUp( \
     float gs = 0.0f, us = 0.0f; \
     for (int b = gid; b < sblk; b += gpi) \
         N##_decode_dual(grow + b * BB, urow + b * BB, input, 0, b, ltid, &gs, &us); \
-    NF_LOCAL float sc[LLM_DIMX]; \
-    sc[lid] = gs; barrier(CLK_LOCAL_MEM_FENCE); REDUCE_SUM(sc, lid); \
-    float gv = sc[0]; barrier(CLK_LOCAL_MEM_FENCE); \
-    sc[lid] = us; barrier(CLK_LOCAL_MEM_FENCE); REDUCE_SUM(sc, lid); \
-    if (lid == 0) output[row] = nf_silu(gv) * sc[0]; \
+    NF_LOCAL float sc[2 * NF_RSUM_SLOTS]; \
+    float pv[2] = {gs, us}; NF_WG_RSUM(sc, pv, 2, lid, lsize); \
+    if (lid == 0) output[row] = nf_silu(pv[0]) * pv[1]; \
 }
 
 /*
@@ -179,17 +173,11 @@ NF_REQD_SG_ATTR NF_KERNEL void N##_MatVec2FusedGateUp( \
         N##_decode_dual(g0 + b * BB, u0 + b * BB, input, 0, b, ltid, &gs0, &us0); \
         N##_decode_dual(g1 + b * BB, u1 + b * BB, input, 0, b, ltid, &gs1, &us1); \
     } \
-    NF_LOCAL float sc[LLM_DIMX]; \
-    sc[lid] = gs0; barrier(CLK_LOCAL_MEM_FENCE); REDUCE_SUM(sc, lid); \
-    const float gv0 = sc[0]; barrier(CLK_LOCAL_MEM_FENCE); \
-    sc[lid] = us0; barrier(CLK_LOCAL_MEM_FENCE); REDUCE_SUM(sc, lid); \
-    const float uv0 = sc[0]; barrier(CLK_LOCAL_MEM_FENCE); \
-    sc[lid] = gs1; barrier(CLK_LOCAL_MEM_FENCE); REDUCE_SUM(sc, lid); \
-    const float gv1 = sc[0]; barrier(CLK_LOCAL_MEM_FENCE); \
-    sc[lid] = us1; barrier(CLK_LOCAL_MEM_FENCE); REDUCE_SUM(sc, lid); \
+    NF_LOCAL float sc[4 * NF_RSUM_SLOTS]; \
+    float pv[4] = {gs0, us0, gs1, us1}; NF_WG_RSUM(sc, pv, 4, lid, lsize); \
     if (lid == 0) { \
-        output[row0] = nf_silu(gv0) * uv0; \
-        if (row0 + 1 < out_dim) output[row1] = nf_silu(gv1) * sc[0]; \
+        output[row0] = nf_silu(pv[0]) * pv[1]; \
+        if (row0 + 1 < out_dim) output[row1] = nf_silu(pv[2]) * pv[3]; \
     } \
 }
 
@@ -208,9 +196,8 @@ NF_REQD_SG_ATTR NF_KERNEL void N##_ComputeLogits( \
     float ps = 0.0f; \
     for (int b = gid; b < sblk; b += gpi) \
         ps += N##_decode(wrow + b * BB, hidden, 0, b, ltid); \
-    NF_LOCAL float sc[LLM_DIMX]; sc[lid] = ps; barrier(CLK_LOCAL_MEM_FENCE); \
-    REDUCE_SUM(sc, lid); \
-    if (lid == 0) logits[row] = sc[0]; \
+    NF_LOCAL float sc[NF_RSUM_SLOTS]; float pv[1] = {ps}; NF_WG_RSUM(sc, pv, 1, lid, lsize); \
+    if (lid == 0) logits[row] = pv[0]; \
 }
 
 #define IQ_EMBEDLOOKUP(N, BS, BB) \
@@ -275,9 +262,8 @@ NF_REQD_SG_ATTR NF_KERNEL void N##_BatchMatMul_2D( \
     float ps = 0.0f; \
     for (int b = gid; b < sblk; b += gpi) \
         ps += N##_decode(wrow + b * BB, in_s, 0, b, ltid); \
-    NF_LOCAL float sc[LLM_DIMX]; sc[lid] = ps; barrier(CLK_LOCAL_MEM_FENCE); \
-    REDUCE_SUM(sc, lid); \
-    if (lid == 0) output[(nf_i64)s * out_dim + row] = sc[0]; \
+    NF_LOCAL float sc[NF_RSUM_SLOTS]; float pv[1] = {ps}; NF_WG_RSUM(sc, pv, 1, lid, lsize); \
+    if (lid == 0) output[(nf_i64)s * out_dim + row] = pv[0]; \
 }
 
 #define IQ_ALL_KERNELS(N, BS, BB, TPS) \
@@ -315,9 +301,8 @@ NF_REQD_SG_ATTR NF_KERNEL void N##_MatVec_Q8( \
     float ps = 0.0f; \
     for (int b = gid; b < sblk; b += gpi) \
         ps += N##_decode_q8(wrow + b * BB, input, b, ltid); \
-    NF_LOCAL float sc[LLM_DIMX]; sc[lid] = ps; barrier(CLK_LOCAL_MEM_FENCE); \
-    REDUCE_SUM(sc, lid); \
-    if (lid == 0) output[row] = sc[0]; \
+    NF_LOCAL float sc[NF_RSUM_SLOTS]; float pv[1] = {ps}; NF_WG_RSUM(sc, pv, 1, lid, lsize); \
+    if (lid == 0) output[row] = pv[0]; \
 }
 
 /*
@@ -617,13 +602,11 @@ NF_REQD_SG_ATTR NF_KERNEL void N##_MatVec2_Q8( \
     float ps0 = 0.0f, ps1 = 0.0f; \
     for (int b = gid; b < sblk; b += gpi) \
         N##_decode_q8_dual(w0 + b * BB, w1 + b * BB, input, b, ltid, &ps0, &ps1); \
-    NF_LOCAL float sc[LLM_DIMX]; \
-    sc[lid] = ps0; barrier(CLK_LOCAL_MEM_FENCE); REDUCE_SUM(sc, lid); \
-    const float o0 = sc[0]; barrier(CLK_LOCAL_MEM_FENCE); \
-    sc[lid] = ps1; barrier(CLK_LOCAL_MEM_FENCE); REDUCE_SUM(sc, lid); \
+    NF_LOCAL float sc[2 * NF_RSUM_SLOTS]; \
+    float pv[2] = {ps0, ps1}; NF_WG_RSUM(sc, pv, 2, lid, lsize); \
     if (lid == 0) { \
-        output[row0] = o0; \
-        if (row0 + 1 < out_dim) output[row0 + 1] = sc[0]; \
+        output[row0] = pv[0]; \
+        if (row0 + 1 < out_dim) output[row0 + 1] = pv[1]; \
     } \
 }
 
@@ -642,9 +625,8 @@ NF_REQD_SG_ATTR NF_KERNEL void N##_MatVecAdd_Q8( \
     float ps = 0.0f; \
     for (int b = gid; b < sblk; b += gpi) \
         ps += N##_decode_q8(wrow + b * BB, input, b, ltid); \
-    NF_LOCAL float sc[LLM_DIMX]; sc[lid] = ps; barrier(CLK_LOCAL_MEM_FENCE); \
-    REDUCE_SUM(sc, lid); \
-    if (lid == 0) addend_output[row] += sc[0]; \
+    NF_LOCAL float sc[NF_RSUM_SLOTS]; float pv[1] = {ps}; NF_WG_RSUM(sc, pv, 1, lid, lsize); \
+    if (lid == 0) addend_output[row] += pv[0]; \
 }
 
 #define IQ_FUSEDGATEUP_Q8(N, BS, BB, TPS) \
@@ -664,11 +646,9 @@ NF_REQD_SG_ATTR NF_KERNEL void N##_MatVecFusedGateUp_Q8( \
     for (int b = gid; b < sblk; b += gpi) \
         N##_decode_q8_dual(gate_weight + rbase + b * BB, up_weight + rbase + b * BB, \
                            input, b, ltid, &gs, &us); \
-    NF_LOCAL float sc[LLM_DIMX]; \
-    sc[lid] = gs; barrier(CLK_LOCAL_MEM_FENCE); REDUCE_SUM(sc, lid); \
-    float gv = sc[0]; barrier(CLK_LOCAL_MEM_FENCE); \
-    sc[lid] = us; barrier(CLK_LOCAL_MEM_FENCE); REDUCE_SUM(sc, lid); \
-    if (lid == 0) output[row] = nf_silu(gv) * sc[0]; \
+    NF_LOCAL float sc[2 * NF_RSUM_SLOTS]; \
+    float pv[2] = {gs, us}; NF_WG_RSUM(sc, pv, 2, lid, lsize); \
+    if (lid == 0) output[row] = nf_silu(pv[0]) * pv[1]; \
 }
 
 /*
@@ -702,17 +682,11 @@ NF_REQD_SG_ATTR NF_KERNEL void N##_MatVec2FusedGateUp_Q8( \
         N##_decode_q8_dual(g0 + b * BB, u0 + b * BB, input, b, ltid, &gs0, &us0); \
         N##_decode_q8_dual(g1 + b * BB, u1 + b * BB, input, b, ltid, &gs1, &us1); \
     } \
-    NF_LOCAL float sc[LLM_DIMX]; \
-    sc[lid] = gs0; barrier(CLK_LOCAL_MEM_FENCE); REDUCE_SUM(sc, lid); \
-    const float gv0 = sc[0]; barrier(CLK_LOCAL_MEM_FENCE); \
-    sc[lid] = us0; barrier(CLK_LOCAL_MEM_FENCE); REDUCE_SUM(sc, lid); \
-    const float uv0 = sc[0]; barrier(CLK_LOCAL_MEM_FENCE); \
-    sc[lid] = gs1; barrier(CLK_LOCAL_MEM_FENCE); REDUCE_SUM(sc, lid); \
-    const float gv1 = sc[0]; barrier(CLK_LOCAL_MEM_FENCE); \
-    sc[lid] = us1; barrier(CLK_LOCAL_MEM_FENCE); REDUCE_SUM(sc, lid); \
+    NF_LOCAL float sc[4 * NF_RSUM_SLOTS]; \
+    float pv[4] = {gs0, us0, gs1, us1}; NF_WG_RSUM(sc, pv, 4, lid, lsize); \
     if (lid == 0) { \
-        output[row0] = nf_silu(gv0) * uv0; \
-        if (row0 + 1 < out_dim) output[row1] = nf_silu(gv1) * sc[0]; \
+        output[row0] = nf_silu(pv[0]) * pv[1]; \
+        if (row0 + 1 < out_dim) output[row1] = nf_silu(pv[2]) * pv[3]; \
     } \
 }
 

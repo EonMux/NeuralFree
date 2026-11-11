@@ -32,7 +32,10 @@ import static org.junit.Assert.assertTrue;
  * Parity of the tensor-core mma prefill kernels ({@code LLM_FlashAttnMma_F16} of kernels/llm/flash_mma.cl on CUDA,
  * of shaders/llm/flash_mma_cm2.comp on Vulkan) against the CPU reference {@link CpuAttentionCore} on a device that
  * runs them ({@link LlmKernels#flashMmaPath()}): causal prefill and multi-row decode (split-K partials merged by
- * {@code LLM_FlashAttn_Combine}), GQA packing, softcap, ALiBi, sinks and the SWA windows, with F16 K and V caches.
+ * {@code LLM_FlashAttn_Combine}), GQA packing, softcap, ALiBi, sinks and the SWA windows, with F16 K and V caches,
+ * and the Q8_0 caches of {@code LLM_FlashAttnMma_Q8_0} (CUDA only), whose reference reads the dequantized blocks:
+ * head dims that are multiples of 64 stream the raw blocks in through cp.async, the 96-wide cases (dense and paged)
+ * stage them with plain loads.
  * The Vulkan case opens the first device reporting {@link DeviceFeature#COOPERATIVE_MATRIX_2_ATTENTION}. Skipped
  * where no device offers the kernel (the OpenCL and HIP builds define no mma attention).
  */
@@ -100,15 +103,33 @@ public class FlashMmaKernelGpuTest {
     /** Cache layout of a case: dense rows, or 64-key pages mapped in order or in reverse. */
     private enum Paging { DENSE, IDENTITY, REVERSED }
 
+    /** {@link #runCase(KvDType, int, int, int, int, int, CpuAttentionCore.Params, float, Paging)} over F16 caches. */
+    private void runCase(int nHead, int nHeadKv, int d, int nKv, int nTokens, CpuAttentionCore.Params params,
+                         float tol, Paging paging) {
+        runCase(KvDType.F16, nHead, nHeadKv, d, nKv, nTokens, params, tol, paging);
+    }
+
     /**
      * Runs one shape twice against the reference: split-K prefill over all {@code nKv} rows with the combine,
      * then the direct-out form of the same call, and asserts both within {@code tol}. A paged case launches
-     * {@code LLM_FlashAttnMmaPaged_F16} over 64-key pages: the K, V and position rows of logical page p sit at
-     * physical page {@code pages[p]}, the identity or the reversed map.
+     * {@code LLM_FlashAttnMmaPaged_<KV>} over 64-key pages: the K, V and position rows of logical page p sit at
+     * physical page {@code pages[p]}, the identity or the reversed map. The caches are F16 or Q8_0
+     * ({@code cache}); the reference reads the values the cache holds.
      */
-    private void runCase(int nHead, int nHeadKv, int d, int nKv, int nTokens, CpuAttentionCore.Params params,
-                         float tol, Paging paging) {
+    private void runCase(KvDType cache, int nHead, int nHeadKv, int d, int nKv, int nTokens,
+                         CpuAttentionCore.Params params, float tol, Paging paging) {
+        runCase(cache, 1f, nHead, nHeadKv, d, nKv, nTokens, params, tol, paging);
+    }
+
+    /**
+     * The case with K and V values drawn from {@code (-magnitude / 2, magnitude / 2)}; the outputs then compare
+     * relative to the largest reference output when that exceeds 1.
+     */
+    private void runCase(KvDType cache, float magnitude, int nHead, int nHeadKv, int d, int nKv, int nTokens,
+                         CpuAttentionCore.Params params, float tol, Paging paging) {
         final boolean paged = paging != Paging.DENSE;
+        final String kernel = paged ? AttnKernels.flashAttnMmaPaged(cache) : AttnKernels.flashAttnMma(cache);
+        Assume.assumeTrue("no " + kernel + " in the " + api + " index", kernels.has(kernel));
         final int G = nHead / nHeadKv;
         final int gTile = Math.min(Math.min(G, FlashAttnTiling.MMA_MAX_G_TILE), FlashAttnTiling.MMA_ROWS);
         final int bq = FlashAttnTiling.MMA_ROWS / gTile;
@@ -117,12 +138,14 @@ public class FlashMmaKernelGpuTest {
         for (int i = 0; i < q.length; i++) {
             q[i] = rnd.nextFloat() - 0.5f;
         }
-        short[] k = new short[nKv * nHeadKv * d];
-        short[] v = new short[nKv * nHeadKv * d];
-        for (int i = 0; i < k.length; i++) {
-            k[i] = f16(rnd.nextFloat() - 0.5f);
-            v[i] = f16(rnd.nextFloat() - 0.5f);
+        float[] kF32 = new float[nKv * nHeadKv * d];
+        float[] vF32 = new float[nKv * nHeadKv * d];
+        for (int i = 0; i < kF32.length; i++) {
+            kF32[i] = (rnd.nextFloat() - 0.5f) * magnitude;
+            vF32[i] = (rnd.nextFloat() - 0.5f) * magnitude;
         }
+        byte[] k = encode(cache, kF32);
+        byte[] v = encode(cache, vF32);
         int[] qPos = new int[nTokens];
         int[] kvPos = new int[nKv];
         for (int t = 0; t < nTokens; t++) {
@@ -140,16 +163,10 @@ public class FlashMmaKernelGpuTest {
             relBias[i] = rnd.nextFloat() - 0.5f;
         }
 
-        // CPU reference over the F16-rounded cache values, with the device buffers' sink and bias tables
+        // CPU reference over the cached values, with the device buffers' sink and bias tables
         CpuAttentionCore.Params reference = reference(params, sinks, relBias);
-        float[] kF32 = new float[k.length];
-        float[] vF32 = new float[v.length];
-        for (int i = 0; i < k.length; i++) {
-            kF32[i] = f32(k[i]);
-        }
-        for (int i = 0; i < v.length; i++) {
-            vF32[i] = f32(v[i]);
-        }
+        kF32 = decode(cache, k, kF32.length);
+        vF32 = decode(cache, v, vF32.length);
         CpuAttentionCore.DenseKv dense = CpuAttentionCore.DenseKv.of(kF32, 0, nHeadKv * d, d,
                 vF32, 0, nHeadKv * d, d, nHeadKv, d, d, kvPos, 0);
         float[] want = new float[nTokens * nHead * d];
@@ -161,9 +178,9 @@ public class FlashMmaKernelGpuTest {
             pages[p] = paging == Paging.REVERSED ? pages.length - 1 - p : p;
         }
         int rows = paged ? pages.length * 64 : nKv;
-        int rowLen = nHeadKv * d;
-        short[] kRows = new short[rows * rowLen];
-        short[] vRows = new short[rows * rowLen];
+        int rowLen = (int) cache.rowBytes(nHeadKv * d);
+        byte[] kRows = new byte[rows * rowLen];
+        byte[] vRows = new byte[rows * rowLen];
         int[] posRows = new int[rows];
         Arrays.fill(posRows, -1);
         for (int j = 0; j < nKv; j++) {
@@ -173,8 +190,8 @@ public class FlashMmaKernelGpuTest {
             posRows[row] = kvPos[j];
         }
         GpuBuffer dq = backend.allocateBuffer((long) q.length * 4, true);
-        GpuBuffer dk = backend.allocateBuffer((long) kRows.length * 2, true);
-        GpuBuffer dv = backend.allocateBuffer((long) vRows.length * 2, true);
+        GpuBuffer dk = backend.allocateBuffer(kRows.length, true);
+        GpuBuffer dv = backend.allocateBuffer(vRows.length, true);
         GpuBuffer dqp = backend.allocateBuffer((long) nTokens * 4, true);
         GpuBuffer dkv = backend.allocateBuffer((long) rows * 4, true);
         GpuBuffer dsinks = backend.allocateBuffer((long) nHead * 4, true);
@@ -187,22 +204,21 @@ public class FlashMmaKernelGpuTest {
         enqueue(dpt, pages);
         try {
             enqueue(dq, q);
-            enqueueHalfs(dk, kRows);
-            enqueueHalfs(dv, vRows);
+            enqueue(dk, kRows);
+            enqueue(dv, vRows);
             enqueue(dqp, qPos);
             enqueue(dkv, posRows);
             enqueue(dsinks, sinks);
             enqueue(drel, relBias);
 
             FlashAttnTiling plan = FlashAttnTiling.mma(nHead, nHeadKv, d, d, nKv, kernels.faSmemFloats(),
-                    Math.max(1, backend.capabilities().getComputeUnits()));
+                    Math.max(1, backend.capabilities().getComputeUnits()), cache);
             Assume.assumeTrue("no mma plan for this shape", plan != null);
             int splitLen = 96;
             int nSplit = (nKv + splitLen - 1) / splitLen;
             GpuBuffer dpartial = backend.allocateBuffer(
                     (long) nTokens * nHead * nSplit * (d + 2) * 4, true);
             try {
-                String kernel = paged ? "LLM_FlashAttnMmaPaged_F16" : "LLM_FlashAttnMma_F16";
                 Object[] args = paged
                         ? mmaPagedArgs(nTokens, nHead, nHeadKv, d, plan, nSplit, splitLen, nKv, params, false,
                                 dq, dk, dv, dqp, dkv, dsinks, drel, dout, dpartial, dmask, dpt)
@@ -215,9 +231,13 @@ public class FlashMmaKernelGpuTest {
                 dispatch("LLM_FlashAttn_Combine", FlashAttnTiling.combineGlobal(nTokens * nHead), combine);
                 float[] got = new float[nTokens * nHead * d];
                 read(dout, got);
+                double span = 1;
+                for (float w : want) {
+                    span = Math.max(span, Math.abs(w));
+                }
                 double err = 0;
                 for (int i = 0; i < got.length; i++) {
-                    err = Math.max(err, Math.abs(got[i] - want[i]));
+                    err = Math.max(err, Math.abs(got[i] - want[i]) / span);
                 }
                 assertTrue("split-K outputs differ from the CPU reference by " + err, err <= tol);
 
@@ -231,7 +251,7 @@ public class FlashMmaKernelGpuTest {
                 read(dout, got);
                 err = 0;
                 for (int i = 0; i < got.length; i++) {
-                    err = Math.max(err, Math.abs(got[i] - want[i]));
+                    err = Math.max(err, Math.abs(got[i] - want[i]) / span);
                 }
                 assertTrue("direct outputs differ from the CPU reference by " + err, err <= tol);
             } finally {
@@ -331,12 +351,7 @@ public class FlashMmaKernelGpuTest {
         }
     }
 
-    private void enqueueHalfs(GpuBuffer buf, short[] data) {
-        byte[] bytes = new byte[data.length * 2];
-        for (int i = 0; i < data.length; i++) {
-            bytes[2 * i] = (byte) (data[i] & 0xff);
-            bytes[2 * i + 1] = (byte) ((data[i] >> 8) & 0xff);
-        }
+    private void enqueue(GpuBuffer buf, byte[] bytes) {
         GpuEvent e = backend.computeQueue().enqueueWriteBuffer(buf, 0, bytes.length, bytes);
         if (e != null) {
             e.close();
@@ -355,6 +370,56 @@ public class FlashMmaKernelGpuTest {
         for (GpuBuffer b : bufs) {
             b.close();
         }
+    }
+
+    /**
+     * The cache bytes of {@code x}: little-endian halves for F16, ggml Q8_0 blocks for Q8_0 (d = amax / 127 as a
+     * half, q = x / d rounded to nearest, as quantize_row_q8_0_ref).
+     */
+    private static byte[] encode(KvDType cache, float[] x) {
+        if (cache == KvDType.F16) {
+            byte[] out = new byte[x.length * 2];
+            for (int i = 0; i < x.length; i++) {
+                short h = f16(x[i]);
+                out[2 * i] = (byte) h;
+                out[2 * i + 1] = (byte) (h >> 8);
+            }
+            return out;
+        }
+        byte[] out = new byte[x.length / 32 * 34];
+        for (int b = 0; b < x.length / 32; b++) {
+            float amax = 0;
+            for (int j = 0; j < 32; j++) {
+                amax = Math.max(amax, Math.abs(x[32 * b + j]));
+            }
+            float dq = amax / 127f;
+            float id = dq != 0 ? 1f / dq : 0f;
+            short h = f16(dq);
+            out[34 * b] = (byte) h;
+            out[34 * b + 1] = (byte) (h >> 8);
+            for (int j = 0; j < 32; j++) {
+                out[34 * b + 2 + j] = (byte) Math.round(x[32 * b + j] * id);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * The {@code n} values a cache of {@code bytes} holds ({@link #encode}'s inverse up to its rounding), as the
+     * F16 tiles of the kernels hold them: a Q8_0 value saturates at the largest finite half.
+     */
+    private static float[] decode(KvDType cache, byte[] bytes, int n) {
+        float[] out = new float[n];
+        for (int i = 0; i < n; i++) {
+            if (cache == KvDType.F16) {
+                out[i] = f32((short) ((bytes[2 * i] & 0xff) | (bytes[2 * i + 1] << 8)));
+            } else {
+                int b = 34 * (i / 32);
+                float dq = f32((short) ((bytes[b] & 0xff) | (bytes[b + 1] << 8)));
+                out[i] = Math.max(-65504f, Math.min(65504f, dq * bytes[b + 2 + i % 32]));
+            }
+        }
+        return out;
     }
 
     /** IEEE 754 binary16 rounding to nearest even, as the kernels' half stores. */
@@ -466,5 +531,48 @@ public class FlashMmaKernelGpuTest {
         runCase(8, 2, 64, 96, 8, CpuAttentionCore.Params.builder(8).scale(0.125f)
                 .t5(true, 32, 128, new float[32 * 8]).window(KvWindow.FULL_BIDIRECTIONAL).build(), 3e-3f,
                 Paging.DENSE);
+    }
+
+    @Test
+    public void q8CausalGqaHeadDim128MatchesTheReference() {
+        runCase(KvDType.Q8_0, 8, 2, 128, 160, 8, CpuAttentionCore.Params.builder(8).scale(0.125f)
+                .window(KvWindow.FULL_CAUSAL).build(), 4e-3f, Paging.DENSE);
+    }
+
+    @Test
+    public void q8BatchedVerifyWithSinksAndSoftcapMatchesTheReference() {
+        runCase(KvDType.Q8_0, 16, 2, 64, 400, 32, CpuAttentionCore.Params.builder(16).scale(0.125f).softcap(8f)
+                .window(KvWindow.FULL_CAUSAL).sinks(new float[16]).build(), 3e-3f, Paging.DENSE);
+    }
+
+    @Test
+    public void q8HeadDim96StagesThroughPlainLoads() {
+        runCase(KvDType.Q8_0, 8, 2, 96, 200, 16, CpuAttentionCore.Params.builder(8).scale(0.102f)
+                .window(KvWindow.FULL_CAUSAL).build(), 4e-3f, Paging.DENSE);
+    }
+
+    /**
+     * Q8_0 blocks whose scale puts most values past the F16 range (|d * q| up to 5e5): the staged tiles saturate
+     * them at 65504, so the outputs stay finite and match the reference over the saturated values, through the
+     * cp.async staging (d 128) and the plain loads (d 96). The score scale keeps the logits near 1.
+     */
+    @Test
+    public void q8ValuesBeyondTheHalfRangeSaturate() {
+        CpuAttentionCore.Params params = CpuAttentionCore.Params.builder(8).scale(1e-6f)
+                .window(KvWindow.FULL_CAUSAL).build();
+        runCase(KvDType.Q8_0, 1e6f, 8, 2, 128, 160, 8, params, 4e-3f, Paging.DENSE);
+        runCase(KvDType.Q8_0, 1e6f, 8, 2, 96, 160, 8, params, 4e-3f, Paging.REVERSED);
+    }
+
+    @Test
+    public void q8PagedHeadDim96StagesThroughPlainLoads() {
+        runCase(KvDType.Q8_0, 8, 2, 96, 300, 24, CpuAttentionCore.Params.builder(8).scale(0.102f)
+                .window(KvWindow.FULL_CAUSAL).build(), 4e-3f, Paging.REVERSED);
+    }
+
+    @Test
+    public void q8PagedReversedPagesMatchTheReference() {
+        runCase(KvDType.Q8_0, 8, 2, 128, 300, 40, CpuAttentionCore.Params.builder(8).scale(0.0884f)
+                .window(KvWindow.FULL_CAUSAL).build(), 4e-3f, Paging.REVERSED);
     }
 }

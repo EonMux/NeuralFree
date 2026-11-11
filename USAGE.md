@@ -23,6 +23,7 @@ This guide covers:
    - [Tensor-core flash attention](#tensor-core-flash-attention)
    - [Fast GEMM for prefill and batched decode](#fast-gemm-for-prefill-and-batched-decode)
    - [Fused MoE grouped GEMM](#fused-moe-grouped-gemm)
+   - [Last-layer output rows](#last-layer-output-rows)
    - [Decode-step command replay](#decode-step-command-replay)
    - [GPU event ownership](#gpu-event-ownership)
    - [Fused decode kernels](#fused-decode-kernels)
@@ -496,9 +497,9 @@ try {
 
 ### Tensor-core flash attention
 
-On a CUDA device of compute capability 8.0 or newer, prefill attention (prompts, chunked prefill steps, batched rows and speculative verification) runs on the tensor cores through `LLM_FlashAttnMma_F16` and `LLM_FlashAttnMmaPaged_F16`: Q K^T and P V use `mma.sync` m16n8k16 F16 fragments with F32 accumulation, the mechanism of llama.cpp's `fattn-mma-f16`. `GpuAttentionMixer` picks it when all of these hold, and otherwise runs the scalar tiled kernels:
+On a CUDA device of compute capability 8.0 or newer, prefill attention (prompts, chunked prefill steps, batched rows and speculative verification) runs on the tensor cores through `LLM_FlashAttnMma_F16` and `LLM_FlashAttnMmaPaged_F16`: Q K^T and P V use `mma.sync` m16n8k16 F16 fragments with F32 accumulation, the mechanism of llama.cpp's `fattn-mma-f16`. Q8_0 caches (`-ctk q8_0 -ctv q8_0`) run the same kernel as `LLM_FlashAttnMma_Q8_0` and `LLM_FlashAttnMmaPaged_Q8_0`, which dequantize each cache block to F16 while staging the key and value tiles, as llama.cpp converts a quantized cache to F16 for `fattn-mma-f16` (a dequantized value beyond the F16 range saturates to ±65504); where every head's blocks start 4-byte aligned (head dimensions and strides that are multiples of 64) the raw blocks stream into shared memory through `cp.async` and dequantize there, otherwise they load directly. `GpuAttentionMixer` picks it when all of these hold, and otherwise runs the scalar tiled kernels:
 
-- the K and V caches are F16;
+- the K and V caches are both F16, or both Q8_0 (CUDA; the Vulkan shaders have the F16 form only);
 - both head dimensions are multiples of 16, at most 128;
 - the layer uses standard attention (MLA keeps its own path).
 
@@ -589,8 +590,9 @@ rows and writes its records contiguously; its records equal `LLM_Quant_MMQ_Q8_1`
 the other backends, run `LLM_Quant_MMQ_Q8_1`. On CUDA sm_80+
 the tensor tile is 128 rows × 128 tokens on 256 work-items: eight warps of 32 rows × 64 tokens, so every
 activation fragment feeds two `mma` and each weight word decodes once per 128-token tile (four times at a
-512-token projection). The staged records arrive by `cp.async` two 32-deep chunks ahead of the `mma`, with one
-barrier per chunk, copied as the staging pass wrote them in coalesced 16-byte pieces (through L1 for the types of
+512-token projection). The tile stages two 32-deep chunks per barrier in two alternating groups: while one
+group's chunks feed the `mma`, the next group's weights load and decode into the other group's buffers and its
+records arrive by `cp.async`, copied as the staging pass wrote them in coalesced 16-byte pieces (through L1 for the types of
 blocks up to 128 elements, past it for the 256-element K and IQ super-block types), from which `ldmatrix` reads
 the activation fragments of two token blocks at once. For the types whose scales are a half-precision value times
 small integers (every MMQ type but I8_B128), the conversion of a chunk's integer dot folds into its scaling: the
@@ -705,6 +707,38 @@ It covers every expert weight type of the id-matvec kernels (F32, F16, BF16 and 
 - every reduction length is a multiple of the weight type's block size.
 
 Otherwise batched steps keep `{T}_BatchMatMulId` (`{T}_BatchMatMulIdInd` on the expert-cache path), or the per-head `{T}_MatVecId` for MLA. Single-token decode steps keep the `{T}_MatVecId*` kernels. There is nothing to configure: the choice is made per layer at bind time, and the results match the per-pair path within float reduction order (and fp16/bf16 operand rounding on tensor cores).
+
+### Last-layer output rows
+
+When a prefill step's output is read at a few rows only, the GPU forward pass runs the last layer's feed-forward
+part over those rows alone, as llama.cpp's `inp_out_ids` does. The last layer's attention part still runs over
+every row of the step, since its K/V rows and every query's keys are needed; the rows that are read then move to
+the front of the residual stream, and the FFN, the output norm and the head run over them. A prompt chunk whose
+output nothing reads (every chunk before the last, when a call reads only the prompt's last row) runs only the last
+layer's cache writes. This applies to the single-sequence prefill of the GPU engine on every GPU backend; the
+hybrid CPU+GPU split and multi-sequence batched steps run every row.
+
+The last layer keeps every row when:
+
+- every row of the step is read (a speculative verify step, a call that reads all rows);
+- the step runs the context-parallel prefill trunk (`--split-mode context`);
+- the read rows would take more than four copies to move to the front, or a run of them would overlap its
+  destination;
+- a stack-output tap or an execution observer is active, or the stack has a looped (HRM) or repeated layer
+  schedule;
+- the layer has a parallel or hyper-connection residual, extras, cross attention, an adaptive norm, a shared FFN
+  norm or a discarded output;
+- its FFN block is not known to act on each row alone: the dense and MoE blocks are, except an MoE layer whose
+  routing reads the step's token ids or embedding-row flags by row (hash routing and DeepSeek-V4's embedding-row
+  routing); the tensor-parallel split blocks and the other FFN kinds keep every row.
+
+A step with pruned rows is never captured by the step replay. The read rows' FFN runs over fewer rows than the
+step, so its projections can take a different lane (the matvec lanes at a few rows), whose accumulation order
+differs from the GEMM lanes': the logits of a prompt's last row and last-token embeddings are not bit-identical to
+those of a run over every row. Batch-invariant mode
+uses one lane per weight type at every row count, so its outputs do not change. MoE expert heat profiles
+(`neuralfree.moe.cache.ranking.save`, `neuralfree.eplb.save`) count the rows each layer routes, which at the last
+layer are the read rows.
 
 ### Decode-step command replay
 

@@ -188,18 +188,13 @@ public final class FlashAttnTiling {
     private final boolean subgroup;
     /** Whether the plan's launches run the grouped-query dense decode kernel ({@link #decodeOnline}). */
     private final boolean online;
-
-    private FlashAttnTiling(Plan plan, int nHead, int nHeadKv, int dK, int dV, int smemFloats, int computeUnits,
-                            int gTile, int keyCapacity, int wantedSplits, int minSplitLen, int maxSplitLen,
-                            int maxSplits, int bq, int bk, boolean decodeFastPath, boolean subgroup) {
-        this(plan, nHead, nHeadKv, dK, dV, smemFloats, computeUnits, gTile, keyCapacity, wantedSplits, minSplitLen,
-                maxSplitLen, maxSplits, bq, bk, decodeFastPath, subgroup, false);
-    }
+    /** The cache type an {@link Plan#MMA} plan stages ({@link #mmaSmemFloats(int, int, KvDType)}); null otherwise. */
+    private final KvDType mmaCache;
 
     private FlashAttnTiling(Plan plan, int nHead, int nHeadKv, int dK, int dV, int smemFloats, int computeUnits,
                             int gTile, int keyCapacity, int wantedSplits, int minSplitLen, int maxSplitLen,
                             int maxSplits, int bq, int bk, boolean decodeFastPath, boolean subgroup,
-                            boolean online) {
+                            boolean online, KvDType mmaCache) {
         this.plan = plan;
         this.nHead = nHead;
         this.nHeadKv = nHeadKv;
@@ -218,6 +213,7 @@ public final class FlashAttnTiling {
         this.decodeFastPath = decodeFastPath;
         this.subgroup = subgroup;
         this.online = online;
+        this.mmaCache = mmaCache;
     }
 
     /**
@@ -296,23 +292,31 @@ public final class FlashAttnTiling {
             return planDecode(Plan.PER_ROW_DECODE, nHead, nHeadKv, dK, dV, nKvMax, smemFloats, computeUnits, false);
         }
         return new FlashAttnTiling(Plan.TILED, nHead, nHeadKv, dK, dV, smemFloats, computeUnits,
-                bestG, nKvMax, 0, 0, 0, 0, bestRows / bestG, bestBk, false, false);
+                bestG, nKvMax, 0, 0, 0, 0, bestRows / bestG, bestBk, false, false, false, null);
+    }
+
+    /** {@link #mma(int, int, int, int, int, int, int, KvDType)} over F16 caches. */
+    public static FlashAttnTiling mma(int nHead, int nHeadKv, int dK, int dV, int nKvMax, int smemFloats,
+                                      int computeUnits) {
+        return mma(nHead, nHeadKv, dK, dV, nKvMax, smemFloats, computeUnits, KvDType.F16);
     }
 
     /**
-     * Tensor-core prefill plan ({@link Plan#MMA}, kernel {@code LLM_FlashAttnMma_*}): the mma work-group carries
-     * {@value MMA_ROWS} query rows ({@code bq * g_tile == MMA_ROWS}, {@code g_tile <= MMA_MAX_G_TILE}) over key
-     * tiles of {@value MMA_BK}; the head dims must be positive multiples of 16 of at most {@value
-     * #MMA_MAX_HEAD_DIM} and the staged tiles must fit {@code smemFloats}. Null when the shape does not support
-     * the mma kernel, so the caller keeps the {@link #prefill} plan.
+     * Tensor-core prefill plan ({@link Plan#MMA}, kernel {@code LLM_FlashAttnMma_<cache>}): the mma work-group
+     * carries {@value MMA_ROWS} query rows ({@code bq * g_tile == MMA_ROWS}, {@code g_tile <= MMA_MAX_G_TILE}) over
+     * key tiles of {@value MMA_BK}; the head dims must be positive multiples of 16 of at most {@value
+     * #MMA_MAX_HEAD_DIM} and the tiles staged for caches of type {@code cache} (F16 or Q8_0) must fit
+     * {@code smemFloats}. Null when the shape does not support the mma kernel, so the caller keeps the
+     * {@link #prefill} plan.
      *
-     * @throws IllegalArgumentException for shapes that fail the shared validation (a supported shape never does)
+     * @throws IllegalArgumentException for shapes that fail the shared validation (a supported shape never does),
+     *                                  or a cache type the mma kernels do not stage
      */
     public static FlashAttnTiling mma(int nHead, int nHeadKv, int dK, int dV, int nKvMax, int smemFloats,
-                                      int computeUnits) {
+                                      int computeUnits, KvDType cache) {
         validate(nHead, nHeadKv, dK, dV, nKvMax, smemFloats, computeUnits);
         if (dK > MMA_MAX_HEAD_DIM || dV > MMA_MAX_HEAD_DIM || dK % 16 != 0 || dV % 16 != 0
-                || mmaSmemFloats(dK, dV) > smemFloats) {
+                || mmaSmemFloats(dK, dV, cache) > smemFloats) {
             return null;
         }
         int g0 = nHead / nHeadKv;
@@ -322,7 +326,7 @@ public final class FlashAttnTiling {
         }
         int bq = MMA_ROWS / gTile;
         return new FlashAttnTiling(Plan.MMA, nHead, nHeadKv, dK, dV, smemFloats, computeUnits,
-                gTile, nKvMax, 0, 0, 0, 0, bq, MMA_BK, false, false);
+                gTile, nKvMax, 0, 0, 0, 0, bq, MMA_BK, false, false, false, cache);
     }
 
     /**
@@ -342,7 +346,7 @@ public final class FlashAttnTiling {
         int gTile = Integer.highestOneBit(Math.min(g0, SubgroupFlashAttention.PREFILL_ROWS));
         return new FlashAttnTiling(Plan.TILED, nHead, nHeadKv, dK, dV, smemFloats, computeUnits,
                 gTile, nKvMax, 0, 0, 0, 0, SubgroupFlashAttention.PREFILL_ROWS / gTile,
-                SubgroupFlashAttention.PREFILL_BLOCK, false, true);
+                SubgroupFlashAttention.PREFILL_BLOCK, false, true, false, null);
     }
 
     /**
@@ -371,14 +375,32 @@ public final class FlashAttnTiling {
         }
     }
 
-    /**
-     * Shared-memory floats the mma kernel stages for d_k and d_v (kernels/llm/flash_mma.cl nf_fm_smem_floats): the
-     * K tile, which first holds the Q tile ({@code MMA_ROWS <= MMA_BK}), and the V tile, {@code MMA_BK} rows of
-     * {@code d + 8} halves each, plus the tile's key positions.
-     */
+    /** {@link #mmaSmemFloats(int, int, KvDType)} over F16 caches. */
     public static long mmaSmemFloats(int dK, int dV) {
+        return mmaSmemFloats(dK, dV, KvDType.F16);
+    }
+
+    /**
+     * Shared-memory floats the mma kernel stages for d_k and d_v over caches of type {@code cache}
+     * (kernels/llm/flash_mma.cl nf_fm_smem_floats): the K tile, which first holds the Q tile
+     * ({@code MMA_ROWS <= MMA_BK}), and the V tile, {@code MMA_BK} rows of {@code d + 8} halves each, plus the
+     * tile's key positions; a Q8_0 cache adds the raw tile its blocks stream into, one K or V tile at a time:
+     * {@code MMA_BK} rows of the larger head dim's 34-byte blocks.
+     *
+     * @throws IllegalArgumentException for a cache type the mma kernels do not stage (F16 and Q8_0 only)
+     */
+    public static long mmaSmemFloats(int dK, int dV, KvDType cache) {
         long halves = (long) MMA_BK * (dK + 8) + (long) MMA_BK * (dV + 8);
-        return halves / 2 + MMA_BK;
+        long staged = halves / 2 + MMA_BK;
+        if (cache == KvDType.F16) {
+            return staged;
+        }
+        if (cache == KvDType.Q8_0) {
+            int blocks = (Math.max(dK, dV) + KvDType.Q8_0.blockSize() - 1) / KvDType.Q8_0.blockSize();
+            long rawBytes = (long) MMA_BK * blocks * KvDType.Q8_0.blockBytes();
+            return staged + (rawBytes + 3) / 4;
+        }
+        throw new IllegalArgumentException("the mma attention stages F16 or Q8_0 caches, got " + cache);
     }
 
     /**
@@ -424,7 +446,7 @@ public final class FlashAttnTiling {
         int wanted = (int) Math.max(1L, ceilDiv((long) ONLINE_GROUPS_PER_UNIT * computeUnits, nHeadKv));
         int maxSplits = Math.max(1, Math.min(wanted, ceilDiv(nKvMax, minLen)));
         return new FlashAttnTiling(Plan.DECODE, nHead, nHeadKv, dK, dV, smemFloats, computeUnits,
-                g, nKvMax, wanted, minLen, maxLen, maxSplits, 0, 0, false, false, true);
+                g, nKvMax, wanted, minLen, maxLen, maxSplits, 0, 0, false, false, true, null);
     }
 
     private static FlashAttnTiling planDecode(Plan plan, int nHead, int nHeadKv, int dK, int dV, int nKvMax,
@@ -447,7 +469,7 @@ public final class FlashAttnTiling {
         // and count <= ceil(n / minLen) always; n <= nKvMax bounds all three.
         int maxSplits = Math.max(ceilDiv(nKvMax, maxLen), Math.min(wanted, ceilDiv(nKvMax, minLen)));
         return new FlashAttnTiling(plan, nHead, nHeadKv, dK, dV, smemFloats, computeUnits,
-                g, nKvMax, wanted, minLen, maxLen, maxSplits, 0, 0, decodeFastPath, false);
+                g, nKvMax, wanted, minLen, maxLen, maxSplits, 0, 0, decodeFastPath, false, false, null);
     }
 
     /**
@@ -486,7 +508,7 @@ public final class FlashAttnTiling {
         int wanted = (int) Math.max(1L, ceilDiv(2L * computeUnits, (long) nHead));
         int maxSplits = Math.max(ceilDiv(nKvMax, maxLen), Math.min(wanted, ceilDiv(nKvMax, minLen)));
         return new FlashAttnTiling(Plan.DECODE, nHead, nHeadKv, dK, dV, smemFloats, computeUnits,
-                1, nKvMax, wanted, minLen, maxLen, maxSplits, 0, 0, false, true);
+                1, nKvMax, wanted, minLen, maxLen, maxSplits, 0, 0, false, true, false, null);
     }
 
     private static boolean decodeFits(int g, int dK, int dV, int smemFloats, boolean decodeFastPath) {
@@ -613,7 +635,7 @@ public final class FlashAttnTiling {
      */
     public long smemUsed() {
         if (plan == Plan.MMA) {
-            return mmaSmemFloats(dK, dV);
+            return mmaSmemFloats(dK, dV, mmaCache);
         }
         if (plan == Plan.TILED) {
             return subgroup ? (long) SubgroupFlashAttention.PREFILL_ROWS * SubgroupFlashAttention.MAX_HEAD_DIM

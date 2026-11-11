@@ -918,7 +918,9 @@ LLM_EmbedScale	eltwise.cl	1	2	i,f	ifB
 LLM_EmbeddingLookup	matvec_f32.cl	2	2	i,i	iiBB
 LLM_FillZero	eltwise.cl	1	1	i	iB
 LLM_FlashAttnMmaPaged_F16	flash_mma.cl	11	31	i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiiiiiifffiiiiiiiiiiBBBBBBBBBBB
+LLM_FlashAttnMmaPaged_Q8_0	flash_mma.cl	11	31	i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiiiiiifffiiiiiiiiiiBBBBBBBBBBB
 LLM_FlashAttnMma_F16	flash_mma.cl	10	29	i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiiiiiifffiiiiiiiiBBBBBBBBBB
+LLM_FlashAttnMma_Q8_0	flash_mma.cl	10	29	i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiiiiiifffiiiiiiiiBBBBBBBBBB
 LLM_FlashAttnPaged_BF16	flash_prefill.cl	12	31	i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiiiiiifffiiiiiiiiiiBBBBBBBBBBBB
 LLM_FlashAttnPaged_F16	flash_prefill.cl	12	31	i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiiiiiifffiiiiiiiiiiBBBBBBBBBBBB
 LLM_FlashAttnPaged_F32	flash_prefill.cl	12	31	i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiiiiiifffiiiiiiiiiiBBBBBBBBBBBB

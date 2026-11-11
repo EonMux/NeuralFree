@@ -343,6 +343,12 @@ public final class GpuDenseFfn implements GpuFfnBlock {
 
     // ------------------------------------------------------------------ step
 
+    /** The projections, the activation and the per-row norms act on each token row alone. */
+    @Override
+    public boolean rowLocal() {
+        return true;
+    }
+
     /**
      * Runs the FFN over {@code nTokens} rows of {@code in} (the up projection's input width) into {@code out} (the
      * down projection's output width).

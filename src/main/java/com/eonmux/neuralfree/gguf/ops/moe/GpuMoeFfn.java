@@ -524,6 +524,16 @@ public final class GpuMoeFfn implements GpuFfnBlock {
     }
 
     /**
+     * Routing, the expert products and the weighted sum act on each token row alone, unless the layer routes by a
+     * step-wide table: hash routing reads the step's token ids and media routing its embedding-row flags by step
+     * row ({@link MoeSpec#mediaRouting()}), so a subset of the rows would route with the ids of other rows.
+     */
+    @Override
+    public boolean rowLocal() {
+        return !spec.mediaRouting();
+    }
+
+    /**
      * False when a decode step reads back to the host: a hosted layer's expert pass reads the routed ids and the
      * expert input rows every step, and a heat profile reads the ids of a resident routing too.
      */

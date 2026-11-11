@@ -28,6 +28,16 @@ public interface GpuFfnBlock extends AutoCloseable {
         return true;
     }
 
+    /**
+     * Whether every output row depends on the same input row alone and a step leaves no state behind (no token
+     * shift, no carry between layers or steps), so the executor may run the block over a subset of a step's rows:
+     * the last layer of a step whose stack output is read at a few rows runs its FFN over those rows only
+     * ({@code GpuLayerExecutor#prunesOutputRows}). A block opts in; the default keeps every row.
+     */
+    default boolean rowLocal() {
+        return false;
+    }
+
     /** Releases what {@link #bind} created; the context's shared resources stay. */
     @Override
     default void close() {

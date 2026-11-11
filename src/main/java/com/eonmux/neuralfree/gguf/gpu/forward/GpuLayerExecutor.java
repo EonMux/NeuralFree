@@ -429,11 +429,9 @@ public final class GpuLayerExecutor implements AutoCloseable {
      */
     public boolean decodeReadsPositionSlot() {
         ensureOpen();
-        for (LayerBlocks l : layers) {
-            for (GpuMixer m : new GpuMixer[]{l.mixer, l.parallelAttention, l.crossMixer}) {
-                if (m != null && m.decodeReadsPositionSlot()) {
-                    return true;
-                }
+        for (GpuMixer m : stepMixers()) {
+            if (m.decodeReadsPositionSlot()) {
+                return true;
             }
         }
         return false;
@@ -462,16 +460,8 @@ public final class GpuLayerExecutor implements AutoCloseable {
     public List<GpuStepPatcher> decodeReplayPatchers() {
         ensureOpen();
         List<GpuStepPatcher> out = new ArrayList<>();
-        for (LayerBlocks l : layers) {
-            if (l.mixer != null) {
-                out.addAll(l.mixer.decodeReplayPatchers());
-            }
-            if (l.parallelAttention != null) {
-                out.addAll(l.parallelAttention.decodeReplayPatchers());
-            }
-            if (l.crossMixer != null) {
-                out.addAll(l.crossMixer.decodeReplayPatchers());
-            }
+        for (GpuMixer m : stepMixers()) {
+            out.addAll(m.decodeReplayPatchers());
         }
         return out;
     }
@@ -485,16 +475,8 @@ public final class GpuLayerExecutor implements AutoCloseable {
     public List<GpuStepPatcher> stepReplayPatchers() {
         ensureOpen();
         List<GpuStepPatcher> out = new ArrayList<>();
-        for (LayerBlocks l : layers) {
-            if (l.mixer != null) {
-                out.addAll(l.mixer.stepReplayPatchers());
-            }
-            if (l.parallelAttention != null) {
-                out.addAll(l.parallelAttention.stepReplayPatchers());
-            }
-            if (l.crossMixer != null) {
-                out.addAll(l.crossMixer.stepReplayPatchers());
-            }
+        for (GpuMixer m : stepMixers()) {
+            out.addAll(m.stepReplayPatchers());
         }
         return out;
     }
@@ -507,16 +489,25 @@ public final class GpuLayerExecutor implements AutoCloseable {
     public List<GpuStepPatcher> pagedDecodeReplayPatchers() {
         ensureOpen();
         List<GpuStepPatcher> out = new ArrayList<>();
+        for (GpuMixer m : stepMixers()) {
+            List<GpuStepPatcher> patchers = m.pagedDecodeReplayPatchers();
+            if (patchers == null) {
+                return null;
+            }
+            out.addAll(patchers);
+        }
+        return out;
+    }
+
+    /** The bound mixers a step runs: each layer's mixer, its parallel attention and its cross attention, in trunk
+     *  order. */
+    private List<GpuMixer> stepMixers() {
+        List<GpuMixer> out = new ArrayList<>();
         for (LayerBlocks l : layers) {
             for (GpuMixer m : new GpuMixer[]{l.mixer, l.parallelAttention, l.crossMixer}) {
-                if (m == null) {
-                    continue;
+                if (m != null) {
+                    out.add(m);
                 }
-                List<GpuStepPatcher> patchers = m.pagedDecodeReplayPatchers();
-                if (patchers == null) {
-                    return null;
-                }
-                out.addAll(patchers);
             }
         }
         return out;
@@ -543,6 +534,43 @@ public final class GpuLayerExecutor implements AutoCloseable {
      * @throws IllegalStateException    when a hyper-connection layer's residual was not consumed by its extra
      */
     public void run(int pos0, int nTokens, StepMode mode, TapSink taps) {
+        checkStep(pos0, nTokens, mode);
+        runStack(pos0, nTokens, mode, taps, null, null);
+    }
+
+    /**
+     * Whether {@link #run(int, int, StepMode, TapSink, int[])} prunes a {@code nTokens}-row step whose stack output
+     * is read at the step-local {@code rows} only ({@link LastLayerRows}): a PREFILL step of a stack with no looped
+     * or repeated schedule, no observer and no stack-output tap, whose last layer passes
+     * {@link LastLayerRows#layerPrunable}, with a {@link LastLayerRows#compactable} row set; an empty set (nothing
+     * read) also needs a memory to write.
+     */
+    public boolean prunesOutputRows(int nTokens, StepMode mode, TapSink taps, int[] rows) {
+        ensureOpen();
+        return mode == StepMode.PREFILL && hrmHigh == null && !repeatCombine && !ctx.observer().enabled()
+                && (taps == null || !taps.wants(layers.size())) && LastLayerRows.compactable(nTokens, rows)
+                && (rows.length > 0 || ctx.hasMemory()) && LastLayerRows.layerPrunable(layers.get(layers.size() - 1));
+    }
+
+    /**
+     * {@link #run(int, int, StepMode, TapSink)} for a step whose stack output is read at the ascending step-local
+     * {@code rows} only: the last layer's FFN part runs over those rows, which {@code X} then holds at rows
+     * {@code 0 .. rows.length - 1}; with no row read, the last layer runs its cache writes alone, as {@link #runKV}
+     * does, and leaves {@code X} mid-layer.
+     *
+     * @throws IllegalArgumentException as {@link #run(int, int, StepMode, TapSink)}, or when
+     *                                  {@link #prunesOutputRows} does not hold
+     */
+    public void run(int pos0, int nTokens, StepMode mode, TapSink taps, int[] rows) {
+        checkStep(pos0, nTokens, mode);
+        if (!prunesOutputRows(nTokens, mode, taps, rows)) {
+            throw new IllegalArgumentException("the step of " + nTokens + " rows cannot prune its output to "
+                    + Arrays.toString(rows));
+        }
+        runStack(pos0, nTokens, mode, taps, rows, null);
+    }
+
+    private void checkStep(int pos0, int nTokens, StepMode mode) {
         ensureOpen();
         Objects.requireNonNull(mode, "mode");
         if (nTokens < 1 || nTokens > ubatch) {
@@ -554,6 +582,13 @@ public final class GpuLayerExecutor implements AutoCloseable {
         if (pos0 < 0) {
             throw new IllegalArgumentException("step position " + pos0 + " is negative");
         }
+    }
+
+    /**
+     * The layer loop of the run entries: every layer over the segments of {@code batched} when it is non-null, else
+     * over the contiguous rows at {@code pos0}, the last layer pruned to {@code rows} when they are non-null.
+     */
+    private void runStack(int pos0, int nTokens, StepMode mode, TapSink taps, int[] rows, StepLayout batched) {
         TapSink sink = taps != null ? taps : TapSink.NONE;
         LayerWeightSource ws = ctx.weightSource();
         boolean hrm = hrmHigh != null;
@@ -577,7 +612,13 @@ public final class GpuLayerExecutor implements AutoCloseable {
             if (sink.wants(i)) {
                 sink.capture(i, x, nTokens, l.streamWidth);
             }
-            runLayer(l, pos0, nTokens, mode);
+            if (batched != null) {
+                runLayerBatched(l, batched);
+            } else if (rows != null && i == layers.size() - 1) {
+                runLayerForRows(l, pos0, nTokens, mode, rows);
+            } else {
+                runLayer(l, pos0, nTokens, mode);
+            }
             repeatAfterSlot(i, nTokens);
             if (hrm && schedule.passEnd(i)) {
                 endHrmPass(i, l, nTokens);
@@ -589,6 +630,22 @@ public final class GpuLayerExecutor implements AutoCloseable {
         if (sink.wants(out)) {
             sink.capture(out, x, nTokens, outputWidth());
         }
+    }
+
+    /**
+     * The pruned last layer: with rows to read, the norm and attention part over every row, then the read rows
+     * moved to the front of {@code X} and the FFN part over them; with none, the cache writes alone.
+     */
+    private void runLayerForRows(LayerBlocks l, int pos0, int n, StepMode mode, int[] rows) {
+        if (rows.length == 0) {
+            mixerBlockKV(l, pos0, n, mode);
+            return;
+        }
+        ScratchSlot in = runLayerNorm(l.spec.il(), pos0, n);
+        mixerBlock(l, pos0, n, mode, in);
+        flushPendingMix();
+        LastLayerRows.compact(ops, x, l.streamWidth, rows);
+        runLayerPost(l.spec.il(), pos0, rows.length, null);
     }
 
     /**
@@ -608,15 +665,7 @@ public final class GpuLayerExecutor implements AutoCloseable {
         if (hrmHigh != null) {
             throw new IllegalStateException("a looped-schedule stack cannot run its cache writes only");
         }
-        if (nTokens < 1 || nTokens > ubatch) {
-            throw new IllegalArgumentException("step of " + nTokens + " tokens outside [1, " + ubatch + "]");
-        }
-        if (mode == StepMode.DECODE && nTokens != 1) {
-            throw new IllegalArgumentException("DECODE steps carry one token, got " + nTokens);
-        }
-        if (pos0 < 0) {
-            throw new IllegalArgumentException("step position " + pos0 + " is negative");
-        }
+        checkStep(pos0, nTokens, mode);
         LayerWeightSource ws = ctx.weightSource();
         for (int i = 0; i < layers.size(); i++) {
             LayerBlocks l = layers.get(i);
@@ -692,41 +741,7 @@ public final class GpuLayerExecutor implements AutoCloseable {
             run(s.pos0(0), n, ctx.hasMemory() && n == 1 ? StepMode.DECODE : StepMode.PREFILL, taps);
             return;
         }
-        TapSink sink = taps != null ? taps : TapSink.NONE;
-        LayerWeightSource ws = ctx.weightSource();
-        boolean hrm = hrmHigh != null;
-        if (hrm) {
-            startHrm(n);
-        }
-        ws.prefetch(layers.get(0).spec.weightLayer());
-        for (int i = 0; i < layers.size(); i++) {
-            LayerBlocks l = layers.get(i);
-            if (i + 1 < layers.size()) {
-                ws.prefetch(layers.get(i + 1).spec.weightLayer());
-            }
-            ws.await(l.spec.weightLayer());
-            if (hrm && schedule.passStart(i)) {
-                mix(MixMode.ADD, 1.0f, hrmHigh, hrmLow, n * hrmWidth);
-            }
-            repeatBeforeSlot(i, n);
-            if (sink.wants(i) && pendingMix != null) {
-                flushPendingMix();
-            }
-            if (sink.wants(i)) {
-                sink.capture(i, x, n, l.streamWidth);
-            }
-            runLayerBatched(l, s);
-            repeatAfterSlot(i, n);
-            if (hrm && schedule.passEnd(i)) {
-                endHrmPass(i, l, n);
-            }
-            ctx.queue().flush();
-        }
-        flushPendingMix();
-        int out = layers.size();
-        if (sink.wants(out)) {
-            sink.capture(out, x, n, outputWidth());
-        }
+        runStack(s.pos0(0), n, StepMode.PREFILL, taps, null, s);
     }
 
     /** One layer over a batched step: the extras' and mixers' batched hooks instead of the contiguous ones. */

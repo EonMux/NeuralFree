@@ -94,6 +94,12 @@ public final class PooledFfnBlock implements GpuFfnBlock {
         return false;
     }
 
+    /** The owner runs the wrapped block over the rows it is handed, so the rows are as local as the block's. */
+    @Override
+    public boolean rowLocal() {
+        return delegate.rowLocal();
+    }
+
     @Override
     public void close() {
         delegate.close();

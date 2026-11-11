@@ -57,9 +57,11 @@ import java.util.Map;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
 
 /**
  * Dispatch sequences of {@link GpuMoeFfn} on the host-only fake backend with strict LLM argument rules: the
@@ -763,6 +765,15 @@ public class GpuMoeFfnTest {
         block = create(l);
         GpuForwardContext ctx = context(Arch.QWEN3MOE, l);
         assertThrows(MissingTensorException.class, () -> block.bind(ctx, l));
+    }
+
+    @Test
+    public void onlyLayersWithoutStepWideRoutingAreRowLocal() {
+        assertTrue(new GpuMoeFfn(FfnKind.MOE, layer(qwen3moe().build())).rowLocal());
+        assertFalse("hash routing reads the step's token ids by row",
+                new GpuMoeFfn(FfnKind.MOE, layer(qwen3moe().hashRouting(true).build())).rowLocal());
+        assertFalse("media routing reads the step's embedding-row flags by row",
+                new GpuMoeFfn(FfnKind.MOE, layer(qwen3moe().mediaProbBias(true).build())).rowLocal());
     }
 
     @Test

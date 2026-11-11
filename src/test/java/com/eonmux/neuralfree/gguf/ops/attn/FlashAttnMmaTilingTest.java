@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.ops.attn;
 
+import com.eonmux.neuralfree.gguf.memory.KvDType;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
@@ -106,5 +107,21 @@ public class FlashAttnMmaTilingTest {
         assertEquals((64L * 136 + 64L * 136) / 2 + FlashAttnTiling.MMA_BK, worst);
         assertTrue(FlashAttnTiling.MMA_ROWS <= FlashAttnTiling.MMA_BK);
         assertTrue(worst <= SMEM);
+        // a Q8_0 cache adds r_s, 64 rows of NF_FM_Q8_LD = 4 blocks of 34 bytes
+        long worstQ8 = FlashAttnTiling.mmaSmemFloats(FlashAttnTiling.MMA_MAX_HEAD_DIM,
+                FlashAttnTiling.MMA_MAX_HEAD_DIM, KvDType.Q8_0);
+        assertEquals(worst + 64L * 4 * 34 / 4, worstQ8);
+        assertTrue(worstQ8 <= SMEM);
+    }
+
+    @Test
+    public void q8PlansCountTheRawTileAgainstTheBudget() {
+        int f16Only = (int) FlashAttnTiling.mmaSmemFloats(128, 128);
+        assertNotNull(FlashAttnTiling.mma(8, 2, 128, 128, 4096, f16Only, CU, KvDType.F16));
+        assertNull("the raw Q8_0 tile does not fit", FlashAttnTiling.mma(8, 2, 128, 128, 4096, f16Only, CU,
+                KvDType.Q8_0));
+        FlashAttnTiling q8 = FlashAttnTiling.mma(8, 2, 64, 64, 4096, SMEM, CU, KvDType.Q8_0);
+        assertEquals(FlashAttnTiling.mmaSmemFloats(64, 64) + 64L * 2 * 34 / 4, q8.smemUsed());
+        assertThrows(IllegalArgumentException.class, () -> FlashAttnTiling.mmaSmemFloats(64, 64, KvDType.BF16));
     }
 }
