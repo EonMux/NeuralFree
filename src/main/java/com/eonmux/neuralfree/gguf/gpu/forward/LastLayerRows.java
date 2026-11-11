@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.gpu.forward;
 
 import com.eonmux.neuralfree.gguf.arch.ResidualKind;
+import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
 
 /**
  * Output-row pruning of a stack's last layer (llama.cpp {@code inp_out_ids}): when a step's stack output is read at
@@ -33,6 +34,15 @@ final class LastLayerRows {
                 && l.kind != ResidualKind.PARALLEL && l.kind != ResidualKind.HYPER_CONNECTIONS
                 && l.crossMixer == null && !l.discard && !l.sharedFfnNorm && l.ada == null
                 && (l.ffn == null || l.ffn.rowLocal());
+    }
+
+    /**
+     * Whether no matmul tap is installed: a collection tool's tap ({@link GpuMatmulTap}, or {@link CpuMatVec}'s
+     * global observer for host-run products) records the inputs of every product over every row, as llama.cpp's
+     * imatrix run computes every row's output.
+     */
+    static boolean matmulTapsIdle() {
+        return GpuMatmulTap.global() == null && CpuMatVec.globalObserver() == null;
     }
 
     /**

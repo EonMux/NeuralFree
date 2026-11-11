@@ -548,8 +548,8 @@ public final class GpuLayerExecutor implements AutoCloseable {
     public boolean prunesOutputRows(int nTokens, StepMode mode, TapSink taps, int[] rows) {
         ensureOpen();
         return mode == StepMode.PREFILL && hrmHigh == null && !repeatCombine && !ctx.observer().enabled()
-                && (taps == null || !taps.wants(layers.size())) && LastLayerRows.compactable(nTokens, rows)
-                && (rows.length > 0 || ctx.hasMemory()) && LastLayerRows.layerPrunable(layers.get(layers.size() - 1));
+                && LastLayerRows.matmulTapsIdle() && (taps == null || !taps.wants(layers.size()))
+                && LastLayerRows.compactable(nTokens, rows) && (rows.length > 0 || ctx.hasMemory()) && LastLayerRows.layerPrunable(layers.get(layers.size() - 1));
     }
 
     /**

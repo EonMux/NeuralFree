@@ -724,8 +724,8 @@ The last layer keeps every row when:
 - the step runs the context-parallel prefill trunk (`--split-mode context`);
 - the read rows would take more than four copies to move to the front, or a run of them would overlap its
   destination;
-- a stack-output tap or an execution observer is active, or the stack has a looped (HRM) or repeated layer
-  schedule;
+- a stack-output tap, an execution observer or a matmul tap (`nftool imatrix`) is active, or the stack has a
+  looped (HRM) or repeated layer schedule;
 - the layer has a parallel or hyper-connection residual, extras, cross attention, an adaptive norm, a shared FFN
   norm or a discarded output;
 - its FFN block is not known to act on each row alone: the dense and MoE blocks are, except an MoE layer whose

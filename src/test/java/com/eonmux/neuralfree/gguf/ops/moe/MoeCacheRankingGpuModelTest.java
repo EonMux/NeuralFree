@@ -85,7 +85,7 @@ public class MoeCacheRankingGpuModelTest {
         }
     }
 
-    /** The saved ranking holds the merged heats plus one row per routed expert of every forwarded token. */
+    /** The saved ranking holds the merged heats plus one row per routed expert of every row the layer runs. */
     private static void assertSavedProfile(Path ranking, SyntheticModels.Config config, long mergedHeat,
                                            int generated) throws IOException {
         List<RankedExpert> saved = MoeRankingFile.read(ranking).entries();
@@ -96,9 +96,10 @@ public class MoeCacheRankingGpuModelTest {
             routed += e.heat();
         }
         assertTrue("the chain ran at most the requested steps", generated <= N_NEW);
-        assertEquals("every forwarded token's routed rows counted once: the prefill and every generated token"
-                        + " but the last one goes through the layer, " + config.nExpertUsed() + " experts each",
-                mergedHeat + (N_PROMPT + Math.max(generated, 1) - 1) * config.nExpertUsed(), routed);
+        assertEquals("every routed row counted once: the layer is the last one, so the prefill routes only the"
+                        + " prompt row that is read, and every generated token but the last goes through it, "
+                        + config.nExpertUsed() + " experts each",
+                mergedHeat + Math.max(generated, 1) * config.nExpertUsed(), routed);
         assertEquals("the ranking stays hottest first", MoeRankingFile.sorted(saved), saved);
         assertEquals("the header names the model's expert count", config.nExpert(),
                 MoeRankingFile.read(ranking).nExperts());
