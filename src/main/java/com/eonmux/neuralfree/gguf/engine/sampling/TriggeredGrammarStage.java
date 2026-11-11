@@ -93,7 +93,9 @@ public final class TriggeredGrammarStage extends SamplerStage implements TokenGa
     private final TriggerBuffer buffer = new TriggerBuffer();
     private final List<Span> spans = new ArrayList<>();
     private GrammarStage active;
+    /** The grammar the waiting-phase check replays a would-be trigger into, reset to {@link #probeStart} each time. */
     private GrammarStage probe;
+    private Object probeStart;
     private boolean armed;
 
     /** A stage over {@code grammar} gated by {@code triggers}; pieces and end-of-generation ids from {@code vocab}. */
@@ -377,10 +379,36 @@ public final class TriggeredGrammarStage extends SamplerStage implements TokenGa
         if (start < 0) {
             return false;
         }
+        return !replayAccepts(id, piece, buffer.size() - tail.length + start);
+    }
+
+    /**
+     * Whether the grammar a trigger starting at buffer offset {@code byteStart} opens takes the replay {@link
+     * #consume} would run if {@code id} were accepted: each buffered token overlapping the trigger with its piece
+     * from the trigger start on, then the candidate's piece, token by token. A token's trailing partial UTF-8
+     * sequence is checked against the grammar where that token ends, as the replay checks it, so a multi-byte
+     * character split across tokens is judged per token, not as the joined text.
+     */
+    private boolean replayAccepts(int id, byte[] piece, int byteStart) {
         if (probe == null) {
             probe = new GrammarStage(grammar, vocab);
+            probe.arm();
+            probeStart = probe.saveState();
         }
-        return !probe.acceptsText(Arrays.copyOfRange(joined, start, joined.length));
+        probe.restoreState(probeStart);
+        byte[] bytes = buffer.array();
+        int first = spans.size();
+        while (first > 0 && spans.get(first - 1).end > byteStart) {
+            first--;
+        }
+        for (int i = first; i < spans.size(); i++) {
+            Span s = spans.get(i);
+            if (!probe.advance(s.token, Arrays.copyOfRange(bytes, Math.max(s.start, byteStart), s.end))) {
+                return false;
+            }
+        }
+        int pieceFrom = Math.max(0, byteStart - buffer.size());
+        return probe.advance(id, Arrays.copyOfRange(piece, pieceFrom, piece.length));
     }
 
     /** Whether {@code joined} gains an occurrence of an excluded string ending inside the candidate's piece. */

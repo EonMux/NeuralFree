@@ -405,28 +405,6 @@ public final class GrammarStage extends SamplerStage implements TokenGate {
         armed = s.armed;
     }
 
-    /**
-     * Whether {@code piece}, fed after the current state, leaves a partial parse alive; the state is unchanged. A
-     * trigger-gated stage uses it to keep a token from completing its trigger with text the grammar rejects.
-     */
-    boolean acceptsText(byte[] piece) {
-        scratch.clear();
-        GrammarPieces.decode(piece, partialValue, partialRemain, scratch);
-        int count = scratch.length - 1;
-        for (GrammarAutomaton.Stack stack : stacks) {
-            GrammarAutomaton.Stack started = stack.isEmpty() ? null : GrammarAutomaton.tokenStart(stack);
-            if (started == null) {
-                continue;
-            }
-            for (GrammarAutomaton.Stack surviving : acceptCodePoints(started, scratch.data, count)) {
-                if (takesPartial(surviving, scratch.endValue, scratch.endRemain)) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
     /** Arms the stage as its first {@link #apply} does: accepted tokens advance the grammar from here on. */
     void arm() {
         armed = true;

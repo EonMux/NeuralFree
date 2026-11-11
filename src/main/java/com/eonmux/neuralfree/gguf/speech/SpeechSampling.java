@@ -41,19 +41,11 @@ final class SpeechSampling {
             throw new IllegalArgumentException("the sampling draw must be in [0, 1), got " + rand);
         }
         int n = logits.length;
-        Integer[] order = new Integer[n];
-        for (int i = 0; i < n; i++) {
-            order[i] = i;
-        }
-        final float[] values = logits;
-        Arrays.sort(order, (a, b) -> {
-            int byValue = Float.compare(values[b], values[a]);
-            return byValue != 0 ? byValue : Integer.compare(a, b);
-        });
         int kept = topK > 0 && topK < n ? topK : n;
+        int[] order = topOrder(logits, kept);
         float[] sorted = new float[kept];
         for (int i = 0; i < kept; i++) {
-            sorted[i] = values[order[i]];
+            sorted[i] = logits[order[i]];
         }
         if (topP < 1f) {
             softmax(sorted);
@@ -67,7 +59,7 @@ final class SpeechSampling {
                 }
             }
             for (int i = 0; i < keep; i++) {
-                sorted[i] = values[order[i]];
+                sorted[i] = logits[order[i]];
             }
             kept = keep;
         }
@@ -81,6 +73,88 @@ final class SpeechSampling {
             }
         }
         return order[kept - 1];
+    }
+
+    /**
+     * The indices of the {@code kept} largest logits in descending order, ties by the lower index: the order of a
+     * stable descending sort under {@link Float#compare}. Each candidate is one packed primitive key — the
+     * order-reversed sortable bits of its logit above its index — so ascending key order is the wanted order; a
+     * bounded max-heap keeps the {@code kept} smallest keys when the cut is below the row length.
+     */
+    static int[] topOrder(float[] logits, int kept) {
+        int n = logits.length;
+        long[] keys;
+        if (kept >= n) {
+            keys = new long[n];
+            for (int i = 0; i < n; i++) {
+                keys[i] = key(logits[i], i);
+            }
+        } else {
+            keys = new long[kept];
+            for (int i = 0; i < kept; i++) {
+                keys[i] = key(logits[i], i);
+                siftUp(keys, i);
+            }
+            for (int i = kept; i < n; i++) {
+                long k = key(logits[i], i);
+                if (k < keys[0]) {
+                    keys[0] = k;
+                    siftDown(keys, kept);
+                }
+            }
+        }
+        Arrays.sort(keys);
+        int[] order = new int[keys.length];
+        for (int i = 0; i < keys.length; i++) {
+            order[i] = (int) keys[i];
+        }
+        return order;
+    }
+
+    /**
+     * The sort key of logit {@code v} at {@code index}: the bits of {@code v} mapped to a signed int that orders as
+     * {@link Float#compare} does (negative zero below zero, every NaN above infinity), complemented so larger logits
+     * come first, above the index so ties order by the lower index.
+     */
+    private static long key(float v, int index) {
+        int bits = Float.floatToIntBits(v);
+        int sortable = bits ^ ((bits >> 31) & 0x7fffffff);
+        return ((long) ~sortable << 32) | (index & 0xffffffffL);
+    }
+
+    /** Restores the max-heap order of {@code heap[0..i]} after {@code heap[i]} was set. */
+    private static void siftUp(long[] heap, int i) {
+        long v = heap[i];
+        while (i > 0) {
+            int parent = (i - 1) >>> 1;
+            if (heap[parent] >= v) {
+                break;
+            }
+            heap[i] = heap[parent];
+            i = parent;
+        }
+        heap[i] = v;
+    }
+
+    /** Restores the max-heap order of {@code heap[0..size)} after its root was replaced. */
+    private static void siftDown(long[] heap, int size) {
+        long v = heap[0];
+        int i = 0;
+        while (true) {
+            int child = 2 * i + 1;
+            if (child >= size) {
+                break;
+            }
+            if (child + 1 < size && heap[child + 1] > heap[child]) {
+                child++;
+            }
+            if (heap[child] <= v) {
+                break;
+            }
+            heap[i] = heap[child];
+            i = child;
+        }
+        heap[i] = v;
     }
 
     /** In-place softmax over {@code x[0, n)} with the max subtracted. */

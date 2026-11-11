@@ -88,7 +88,8 @@ import java.util.Properties;
  * ({@code --allowed-origins}, {@code --allowed-methods}, {@code --allowed-headers} and
  * {@code --allow-credentials}) included, and its router flags ({@code --models-dir},
  * {@code --models-preset}, {@code --models-max}, {@code --models-memory-margin}, {@code --models-autoload} /
- * {@code --no-models-autoload}) onto the {@code neuralfree.server.models.*} properties; an unknown flag, a missing
+ * {@code --no-models-autoload}) onto the {@code neuralfree.server.models.*} properties, SGLang's
+ * {@code --max-queued-requests} onto {@code neuralfree.server.max.queued.requests}; an unknown flag, a missing
  * value or a value that cannot work (a port outside {@code [1, 65535]}, a missing file, a malformed KV events
  * config, contradicting data-parallel flags) is refused naming the flag. The development-endpoint switch
  * ({@code --dev-mode}, vLLM's {@code VLLM_SERVER_DEV_MODE}) is a flag of its own here ({@link DevMode}), and so are
@@ -289,6 +290,8 @@ record ServerLaunchArgs(Map<String, String> properties, boolean help, boolean li
                 case "--models-preset" ->
                         properties.put(ModelRouter.PRESET_PROPERTY, regularFile(flag, value(args, flag, i++)));
                 case "--models-max" -> properties.put(ModelRouter.MAX_PROPERTY,
+                        whole(flag, value(args, flag, i++), 0, Integer.MAX_VALUE).toString());
+                case "--max-queued-requests" -> properties.put(ServerOptions.MAX_QUEUED_PROPERTY,
                         whole(flag, value(args, flag, i++), 0, Integer.MAX_VALUE).toString());
                 case "--models-memory-margin" -> properties.put(ModelRouter.MARGIN_PROPERTY,
                         whole(flag, value(args, flag, i++), 0, Integer.MAX_VALUE).toString());

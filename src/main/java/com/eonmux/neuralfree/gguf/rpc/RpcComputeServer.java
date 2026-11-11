@@ -523,23 +523,12 @@ public final class RpcComputeServer implements AutoCloseable {
             Owned<KernelHandle> kernel = owned(kernels, r.i64(), "kernel");
             long[] global = r.longArray();
             long[] local = r.longArray();
-            Map<GpuBuffer, Integer> deviceOfBuffer = new LinkedHashMap<>();
-            Map<Long, GpuBuffer> scope = new LinkedHashMap<>();
-            for (Map.Entry<Long, Owned<GpuBuffer>> e : buffers.entrySet()) {
-                scope.put(e.getKey(), e.getValue().value);
-                deviceOfBuffer.put(e.getValue().value, e.getValue().device);
-            }
+            DispatchBuffers scope = new DispatchBuffers(buffers, kernel.device);
             Object[] args = RpcWire.readArgs(r, scope);
             if (global == null) {
                 throw new IllegalArgumentException("dispatch without global work sizes");
             }
-            for (Object arg : args) {
-                Integer argDevice = arg instanceof GpuBuffer ? deviceOfBuffer.get(arg) : null;
-                if (argDevice != null && argDevice != kernel.device) {
-                    throw new IllegalArgumentException("a kernel on device " + kernel.device
-                            + " takes a buffer of device " + argDevice);
-                }
-            }
+            scope.checkDevice();
             onDevice(kernel.device, () -> {
                 closeEvent(queue(kernel.device).enqueueKernel(kernel.value, global, local, args));
             });
@@ -641,8 +630,46 @@ public final class RpcComputeServer implements AutoCloseable {
         }
     }
 
+    /**
+     * The buffer arguments of one dispatch, resolved by id against the connection's buffer table as the arguments
+     * are read: each lookup is one table probe, and the first argument living on another device than the kernel is
+     * remembered, so the dispatch is refused after the whole argument list proved well-formed.
+     */
+    static final class DispatchBuffers implements RpcWire.BufferResolver {
+        private final Map<Long, Owned<GpuBuffer>> buffers;
+        private final int device;
+        private int foreignDevice = -1;
+
+        DispatchBuffers(Map<Long, Owned<GpuBuffer>> buffers, int device) {
+            this.buffers = buffers;
+            this.device = device;
+        }
+
+        @Override
+        public GpuBuffer buffer(long id) {
+            Owned<GpuBuffer> owned = buffers.get(id);
+            if (owned == null) {
+                return null;
+            }
+            if (owned.device != device && foreignDevice < 0) {
+                foreignDevice = owned.device;
+            }
+            return owned.value;
+        }
+
+        /**
+         * @throws IllegalArgumentException when an argument buffer lives on another device than the kernel
+         */
+        void checkDevice() {
+            if (foreignDevice >= 0) {
+                throw new IllegalArgumentException("a kernel on device " + device + " takes a buffer of device "
+                        + foreignDevice);
+            }
+        }
+    }
+
     /** One id's server-side value, the device it lives on, and whether this connection owns it. */
-    private static final class Owned<T> {
+    static final class Owned<T> {
         final T value;
         final int device;
         final boolean owned;

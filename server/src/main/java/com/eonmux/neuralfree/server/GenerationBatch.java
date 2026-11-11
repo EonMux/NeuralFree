@@ -97,14 +97,17 @@ final class GenerationBatch {
     private final AtomicInteger pending;
     private volatile Runnable onAllDone;
     private final ServerOptions options;
+    /** The request's standing under the queue limit, shared by every choice. */
+    private final QueueAdmission admission;
     private final long deadline;
     /** The batch's arrival, the origin of its choices' time to first token and end-to-end latency. */
     private final long arrivalNanos;
     /** The batch's request trace, null with tracing off; set once in {@link #start} before the submissions. */
     private RequestTracing.Trace trace;
 
-    private GenerationBatch(ServerOptions options, int choices) {
+    private GenerationBatch(ServerOptions options, int choices, QueueAdmission admission) {
         this.options = options;
+        this.admission = admission;
         this.arrivalNanos = System.nanoTime();
         this.deadline = arrivalNanos + options.requestTimeout().toNanos();
         this.pending = new AtomicInteger(choices);
@@ -120,7 +123,8 @@ final class GenerationBatch {
      * @throws jakarta.ws.rs.WebApplicationException 503 when the service refuses the submission on its serving state
      *                                               ({@link EngineUnavailableException}, which can flip between the
      *                                               route's entry check and this submit), is shutting down, or the
-     *                                               caller is interrupted
+     *                                               caller is interrupted; 429 with {@code Retry-After} when every
+     *                                               replica's queue is full ({@link EngineSaturatedException})
      */
     static GenerationBatch start(EngineService service, List<Job> jobs, HttpServerRequest client) {
         return start(service, jobs, client, null);
@@ -141,7 +145,18 @@ final class GenerationBatch {
      */
     static GenerationBatch start(EngineService service, List<Job> jobs, HttpServerRequest client, String requestId,
                                  boolean cancelOnClose) {
-        GenerationBatch batch = new GenerationBatch(service.options(), jobs.size());
+        return start(service, jobs, client, requestId, cancelOnClose, new QueueAdmission());
+    }
+
+    /**
+     * {@link #start(EngineService, List, HttpServerRequest, String, boolean)} as part of the request
+     * {@code admission} stands for under the queue limit: a server tool loop passes one admission to every round,
+     * so a request admitted for its first round is never refused for a later one. The batch's choices are admitted
+     * together: the limit checks the first and never refuses the others.
+     */
+    static GenerationBatch start(EngineService service, List<Job> jobs, HttpServerRequest client, String requestId,
+                                 boolean cancelOnClose, QueueAdmission admission) {
+        GenerationBatch batch = new GenerationBatch(service.options(), jobs.size(), admission);
         batch.trace = RequestTracing.begin(service, requestId, client, jobs.size(),
                 jobs.isEmpty() ? null : jobs.get(0).request());
         if (cancelOnClose) {
@@ -251,9 +266,9 @@ final class GenerationBatch {
         };
         EngineService.Submission submission = job.media() != null
                 ? service.submitMedia(job.media(), request, sink, job.renderedPrompt(), job.constraint(),
-                        job.reasoning(), onDone)
+                        job.reasoning(), onDone, admission)
                 : service.submit(job.prompt(), request, sink, job.renderedPrompt(), job.constraint(),
-                        job.reasoning(), onDone);
+                        job.reasoning(), onDone, admission);
         submissions.add(submission);
         latency.submitted(submission::sequence);
     }
@@ -340,6 +355,14 @@ final class GenerationBatch {
         return events.poll(millis, TimeUnit.MILLISECONDS);
     }
 
+    /**
+     * The next queued event without waiting, or null when none is queued. Unlike {@link #next} it never checks the
+     * request budget: a writer drains what is already queued after a {@link #next} returned an event.
+     */
+    Event poll() {
+        return events.poll();
+    }
+
     /** Waits for every choice's terminal state; the events stay queued for {@link #next}. */
     void awaitAll() {
         try {
@@ -394,9 +417,12 @@ final class GenerationBatch {
         return sequence.result();
     }
 
-    /** The 503 answering a refusal on the engine's serving state or a replica shutting down. */
+    /**
+     * The answer to a refusal on the engine's serving state or a replica shutting down (503), or on full replica
+     * queues (429 with {@code Retry-After}).
+     */
     private static WebApplicationException unavailable(IllegalStateException e) {
-        return ServerJson.error(503, String.valueOf(e.getMessage()), "unavailable_error");
+        return ServerJson.refusal(e);
     }
 
     /** The failure of a finished choice as a message, or null when it produced a result. */

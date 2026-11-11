@@ -138,12 +138,25 @@ class PoolingBatchSchedulingTest {
         long before = pooled.stats().promptTokensCached();
         pooled.pooling().embed(null, prompt);
         pooled.pooling().embed(null, prompt);
-        long afterPooling = pooled.stats().promptTokensCached();
-        assertTrue(afterPooling > before, "the second identical pooling prompt reused the cached prefix"
+        long afterPooling = cachedAbove(before, "the second identical pooling prompt reused the cached prefix"
                 + " (LAST pooling reads the last row)");
         generate(pooled, prompt);
-        assertTrue(pooled.stats().promptTokensCached() > afterPooling,
-                "a generation prompt reuses what the pooling requests left cached");
+        cachedAbove(afterPooling, "a generation prompt reuses what the pooling requests left cached");
+    }
+
+    /**
+     * The pool's cached prompt tokens once they exceed {@code floor}: a replica publishes its counters after the step
+     * that answered a request, so a reading right after the answer can precede that step's publication.
+     */
+    private static long cachedAbove(long floor, String what) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        long cached = pooled.stats().promptTokensCached();
+        while (cached <= floor && System.nanoTime() < deadline) {
+            Thread.sleep(5);
+            cached = pooled.stats().promptTokensCached();
+        }
+        assertTrue(cached > floor, what + ": " + cached + " cached prompt tokens, " + floor + " before");
+        return cached;
     }
 
     @Test

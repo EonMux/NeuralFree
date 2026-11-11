@@ -309,7 +309,7 @@ final class GpuQwen3TtsCodePredictor implements Qwen3TtsCodePredictor.Engine {
 
     /** The page's logits over {@link #work}, sampled on the host with the session's draw. */
     private int samplePage(int page, Random rng) {
-        ops.enqueue(SpeechKernels.MATVEC_ROWS_F32, new long[]{SpeechKernels.elementGlobal(vocab)},
+        ops.enqueue(SpeechKernels.MATVEC_ROWS_F32, new long[]{SpeechKernels.rowGroupsGlobal(vocab)},
                 new long[]{SpeechKernels.LOCAL}, nEmbd, vocab, page * vocab, head, work, logits);
         device.readFloats(logits, logitsHost, vocab);
         return SpeechSampling.draw(logitsHost, topK, topP, rng.nextFloat());

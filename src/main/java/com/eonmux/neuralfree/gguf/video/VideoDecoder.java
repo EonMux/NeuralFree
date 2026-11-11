@@ -30,7 +30,10 @@ import java.util.concurrent.TimeUnit;
  * one external {@code ffprobe} and one {@code ffmpeg} process per stream, the decode path of llama.cpp's
  * {@code mtmd-helper} (tools/mtmd/mtmd-helper.cpp): the probe reports the stream's size, rate, frame count,
  * duration and start time; the decode streams raw RGB24 frames, of which the sampling plan's source indices are
- * kept. When the vision preprocessor recommends a frame size, the decode scales every frame to it with the
+ * kept. On a constant-rate stream that starts with its container ffmpeg's {@code select} filter picks the plan's
+ * frames, so only they are converted, scaled and piped; another stream (a variable rate, or a video that starts
+ * after its soundtrack, whose first frame the reference's decode repeats over the lead) pipes every frame up to
+ * the plan's last and the reader keeps the plan's. When the vision preprocessor recommends a frame size, the decode scales the frames to it with the
  * reference's bicubic RGB filter ({@code mtmd_helper_video::start_ffmpeg}), so the kept frames never hold the
  * source's full resolution. The soundtrack of an LFM3-Omni video decodes to mono float32 at the audio tower's rate
  * and splits into the temporal groups' spans. The binaries are taken from the configured directory (llama.cpp's
@@ -50,6 +53,8 @@ public final class VideoDecoder {
             "format=rgb24,scale=%d:%d:flags=bicubic+accurate_rnd+full_chroma_int:param0=0:param1=0.5";
     /** The share of the maximum heap the kept frames of one decode may take at the decoded size. */
     private static final int KEPT_HEAP_DIVISOR = 4;
+    /** The longest frame-select expression a decode passes on its command line (Windows caps one at 32767). */
+    static final int MAX_SELECT_CHARS = 24 * 1024;
     /** The share of the maximum heap one video's soundtrack samples may take. */
     private static final int SOUNDTRACK_HEAP_DIVISOR = 4;
 
@@ -267,8 +272,9 @@ public final class VideoDecoder {
     private Map<String, String> ffprobe(Path file, String field) {
         List<String> command = new ArrayList<>(List.of(ffprobe, "-v", "quiet"));
         command.addAll(FfmpegInput.ffprobeFile(FfmpegInput.Media.VIDEO, file));
-        command.addAll(List.of("-show_entries", "stream=width,height,r_frame_rate,nb_frames,duration,start_time",
-                "-select_streams", "v:0", "-of", "default=noprint_wrappers=1"));
+        command.addAll(List.of("-show_entries",
+                "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames,duration,start_time:format=start_time",
+                "-select_streams", "v:0", "-of", "default"));
         Process process = start(command, field);
         try {
             String out;
@@ -296,13 +302,26 @@ public final class VideoDecoder {
         }
     }
 
-    /** The {@code key=value} lines of an ffprobe default output. */
-    private static Map<String, String> parseProbe(String out) {
+    /**
+     * The {@code key=value} lines of an ffprobe default output: the stream's keys as printed, the container's
+     * ({@code [FORMAT]} section) prefixed {@code format.}.
+     */
+    static Map<String, String> parseProbe(String out) {
         Map<String, String> fields = new HashMap<>();
-        for (String line : out.split("\n")) {
+        String prefix = "";
+        for (String raw : out.split("\n")) {
+            String line = raw.trim();
+            if (line.equals("[FORMAT]")) {
+                prefix = "format.";
+                continue;
+            }
+            if (line.startsWith("[")) {
+                prefix = "";
+                continue;
+            }
             int eq = line.indexOf('=');
             if (eq > 0) {
-                fields.put(line.substring(0, eq).trim(), line.substring(eq + 1).trim());
+                fields.put(prefix + line.substring(0, eq).trim(), line.substring(eq + 1).trim());
             }
         }
         return fields;
@@ -326,28 +345,77 @@ public final class VideoDecoder {
 
     /**
      * The plan's frames of one decode run over the staged file: an ffmpeg run streaming raw RGB24 frames at
-     * {@code size}, scaled with the reference's filter when the size differs from the stream's.
+     * {@code size}, scaled with the reference's filter when the size differs from the stream's. An index-aligned
+     * stream ({@link VideoMeta#indexAligned()}) whose plan skips frames selects the plan's frames in the filter graph
+     * ({@link #selectFilter}) and renumbers their timestamps consecutively, so the rate-keeping output neither
+     * duplicates nor drops a frame and every frame read is kept; any other stream streams every frame up to the
+     * plan's last.
      */
     private List<RasterImage> readFrames(Path file, VideoSamplePlan plan, ImageSize size, int last, String field) {
         VideoMeta meta = plan.source();
+        int[] indices = plan.indices();
+        String select = meta.indexAligned() && indices.length < last + 1 ? selectFilter(indices) : null;
+        boolean scaled = size.width() != meta.width() || size.height() != meta.height();
+        List<String> filters = new ArrayList<>();
+        if (select != null) {
+            filters.add(select);
+        }
+        if (scaled) {
+            filters.add(String.format(Locale.ROOT, SCALE_FILTER, size.width(), size.height()));
+        }
         List<String> command = new ArrayList<>(List.of(ffmpeg));
         command.addAll(FfmpegInput.ffmpegFile(FfmpegInput.Media.VIDEO, file));
         command.addAll(List.of("-map", "0:v:0"));
-        if (size.width() != meta.width() || size.height() != meta.height()) {
-            command.addAll(List.of("-vf", String.format(Locale.ROOT, SCALE_FILTER, size.width(), size.height())));
+        if (!filters.isEmpty()) {
+            command.addAll(List.of("-vf", String.join(",", filters)));
         }
-        command.addAll(List.of("-frames:v", String.valueOf(last + 1), "-f", "rawvideo", "-pix_fmt", "rgb24",
+        int frames = select != null ? indices.length : last + 1;
+        command.addAll(List.of("-frames:v", String.valueOf(frames), "-f", "rawvideo", "-pix_fmt", "rgb24",
                 "-loglevel", "error", "pipe:1"));
         Process process = start(command, field);
         try {
-            return readFrames(process, plan, size, field);
+            return readFrames(process, plan, size, select != null, field);
         } finally {
             process.destroyForcibly();
         }
     }
 
-    /** Reads the raw frames of a running decode until the plan's last one. */
-    private List<RasterImage> readFrames(Process process, VideoSamplePlan plan, ImageSize size, String field) {
+    /**
+     * The filters that keep only the decoded frames {@code indices} (ascending) and number them consecutively at the
+     * stream's rate: {@code select} over the frame index {@code n}, a run of consecutive indices as one
+     * {@code between} term, then {@code setpts} so the kept frames sit one frame apart. Null when the expression
+     * would pass {@link #MAX_SELECT_CHARS}; the decode then streams every frame.
+     */
+    static String selectFilter(int[] indices) {
+        StringBuilder expr = new StringBuilder("select='");
+        int i = 0;
+        while (i < indices.length) {
+            int j = i;
+            while (j + 1 < indices.length && indices[j + 1] == indices[j] + 1) {
+                j++;
+            }
+            if (i > 0) {
+                expr.append('+');
+            }
+            if (j == i) {
+                expr.append("eq(n,").append(indices[i]).append(')');
+            } else {
+                expr.append("between(n,").append(indices[i]).append(',').append(indices[j]).append(')');
+            }
+            if (expr.length() > MAX_SELECT_CHARS) {
+                return null;
+            }
+            i = j + 1;
+        }
+        return expr.append("',setpts=N/FRAME_RATE/TB").toString();
+    }
+
+    /**
+     * Reads the raw frames of a running decode until the plan's last one: every frame when the decode
+     * {@code selected} the plan's frames itself, else the frames at the plan's indices.
+     */
+    private List<RasterImage> readFrames(Process process, VideoSamplePlan plan, ImageSize size, boolean selected,
+                                         String field) {
         int frameBytes = Math.multiplyExact(size.width(), Math.multiplyExact(size.height(), 3));
         int[] indices = plan.indices();
         List<RasterImage> frames = new ArrayList<>(indices.length);
@@ -361,8 +429,8 @@ public final class VideoDecoder {
             while (next < indices.length) {
                 int n = stdout.read(frame, at, frameBytes - at);
                 if (n < 0) {
-                    throw new MediaInputException(field + ": the video ended after " + source
-                            + " frame(s), before the sampled frame " + indices[next]);
+                    throw new MediaInputException(field + ": the video ended after " + (selected ? next : source)
+                            + (selected ? " sampled" : "") + " frame(s), before the sampled frame " + indices[next]);
                 }
                 at += n;
                 total += n;
@@ -371,7 +439,7 @@ public final class VideoDecoder {
                             + " bytes");
                 }
                 if (at == frameBytes) {
-                    if (indices[next] == source) {
+                    if (selected || indices[next] == source) {
                         frames.add(new RasterImage(size.width(), size.height(), frame));
                         next++;
                     }

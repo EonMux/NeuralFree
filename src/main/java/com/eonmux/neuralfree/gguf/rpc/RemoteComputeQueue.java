@@ -6,6 +6,7 @@ import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
 import com.eonmux.neuralfree.acceleration.backend.KernelHandle;
 import com.eonmux.neuralfree.acceleration.backend.KernelTaskBatch;
 
+import java.util.Arrays;
 import java.util.Objects;
 
 /**
@@ -55,8 +56,8 @@ final class RemoteComputeQueue implements ComputeQueue {
         long done = 0;
         while (done < sizeInBytes) {
             int n = (int) Math.min(RpcWire.CHUNK, sizeInBytes - done);
-            byte[] chunk = new byte[n];
-            System.arraycopy(srcData, (int) done, chunk, 0, n);
+            byte[] chunk = done == 0 && n == srcData.length ? srcData : Arrays.copyOfRange(srcData, (int) done,
+                    (int) done + n);
             seq = writeChunk(dst, dstOffset + done, chunk, cache);
             done += n;
         }
@@ -74,9 +75,8 @@ final class RemoteComputeQueue implements ComputeQueue {
         if (srcData == null || floats > srcData.length) {
             throw new IllegalArgumentException("write of " + floats + " floats exceeds the source array");
         }
-        float[] slice = new float[floats];
-        System.arraycopy(srcData, 0, slice, 0, floats);
-        return enqueueWriteBuffer(dstBuffer, dstOffset, sizeInBytes, RpcWire.floatsToBytes(slice), waitOnEvents);
+        return enqueueWriteBuffer(dstBuffer, dstOffset, sizeInBytes, RpcWire.floatsToBytes(srcData, floats),
+                waitOnEvents);
     }
 
     @Override
@@ -94,10 +94,9 @@ final class RemoteComputeQueue implements ComputeQueue {
             final long offset = srcOffset + done;
             // a read is an observation point: the server finishes the device before it answers, so every command
             // before the read counts as finished and its deferred events complete
-            byte[] chunk = backend.batch()
+            backend.batch()
                     .request(new RpcWire.Writer(RpcWire.OP_READ).i64(src.id()).i64(offset).i32(n), true)
-                    .rawBytes();
-            System.arraycopy(chunk, 0, dstData, (int) done, chunk.length);
+                    .rawBytesInto(dstData, (int) done, n);
             done += n;
         }
         return RemoteGpuEvent.COMPLETE;
@@ -116,8 +115,7 @@ final class RemoteComputeQueue implements ComputeQueue {
         }
         byte[] bytes = new byte[(int) sizeInBytes];
         enqueueReadBuffer(srcBuffer, srcOffset, sizeInBytes, bytes, waitOnEvents);
-        float[] values = RpcWire.bytesToFloats(bytes);
-        System.arraycopy(values, 0, dstData, 0, values.length);
+        RpcWire.bytesToFloats(bytes, dstData);
         return RemoteGpuEvent.COMPLETE;
     }
 

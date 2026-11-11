@@ -9,7 +9,10 @@ import java.util.Objects;
  * duration and the stream's start time (the offset the LFM3-Omni soundtrack is measured from). A probe may report
  * no frame rate (0), the variable or unknown rate of a container without one; the projector family's
  * {@link VideoConfig} then assumes the rate its reference does or refuses the source, and the plan it builds holds
- * the resolved rate. A frame count may be derived from the duration and a known rate. Immutable.
+ * the resolved rate. A frame count may be derived from the duration and a known rate. A probe whose average rate
+ * equals its base rate ({@code avg_frame_rate == r_frame_rate}) and whose stream starts with its container
+ * reports an index-aligned stream ({@link #indexAligned()}): its decoded frame {@code n} is the frame a
+ * rate-keeping decode numbers {@code n}. Immutable.
  */
 public final class VideoMeta {
 
@@ -19,14 +22,24 @@ public final class VideoMeta {
     private final int nFrames;
     private final double duration;
     private final double startTime;
+    private final boolean indexAligned;
 
-    private VideoMeta(int width, int height, double fps, int nFrames, double duration, double startTime) {
+    /**
+     * The largest lead of the video stream over its container's start, in frames, at which a rate-keeping decode
+     * still numbers the stream's first frame 0: ffmpeg repeats the first frame over a lead of about half a frame or
+     * more, and this bound keeps a margin below that.
+     */
+    static final double MAX_ALIGNED_LEAD_FRAMES = 0.25;
+
+    private VideoMeta(int width, int height, double fps, int nFrames, double duration, double startTime,
+                      boolean indexAligned) {
         this.width = width;
         this.height = height;
         this.fps = fps;
         this.nFrames = nFrames;
         this.duration = duration;
         this.startTime = startTime;
+        this.indexAligned = indexAligned;
     }
 
     /**
@@ -64,14 +77,17 @@ public final class VideoMeta {
         if (Double.isNaN(startTime) || Double.isInfinite(startTime)) {
             throw new IllegalArgumentException("a video needs a finite start time, got " + startTime);
         }
-        return new VideoMeta(width, height, fps, nFrames, duration, startTime);
+        return new VideoMeta(width, height, fps, nFrames, duration, startTime, false);
     }
 
     /**
      * The metadata of the probe fields {@code ffprobe} printed ({@code width}, {@code height},
-     * {@code r_frame_rate}, {@code nb_frames}, {@code duration}, {@code start_time}); a missing or {@code N/A}
-     * frame count comes from the duration and a known rate, a missing duration from the frame count and a known
-     * rate, a missing or {@code N/A} rate is 0 (unknown) and a missing start time is 0.
+     * {@code r_frame_rate}, {@code avg_frame_rate}, {@code nb_frames}, {@code duration}, {@code start_time}, and the
+     * container's {@code format.start_time}); a missing or {@code N/A} frame count comes from the duration and a
+     * known rate, a missing duration from the frame count and a known rate, a missing or {@code N/A} rate is 0
+     * (unknown) and a missing start time is 0. The stream is index-aligned when it reports a rate and an equal
+     * average rate and starts less than {@link #MAX_ALIGNED_LEAD_FRAMES} frames after its container's reported
+     * start.
      *
      * @throws IllegalArgumentException when no width or height is reported, no frame count can be counted (neither
      *                                  {@code nb_frames} nor a duration beside a known rate), or the values do not
@@ -111,7 +127,11 @@ public final class VideoMeta {
         if (duration < 0) {
             duration = 0; // unknown: the frame count and the rate still stand
         }
-        return new VideoMeta(width, height, fps, nFrames, duration, startTime);
+        boolean constant = fps > 0 && rationalOf(fields, "avg_frame_rate") == fps;
+        double containerStart = doubleOr(fields, "format.start_time", Double.NaN);
+        boolean aligned = constant && Double.isFinite(containerStart)
+                && Math.abs(startTime - containerStart) * fps < MAX_ALIGNED_LEAD_FRAMES;
+        return new VideoMeta(width, height, fps, nFrames, duration, startTime, aligned);
     }
 
     private static int intOf(Map<String, String> fields, String key) {
@@ -199,7 +219,18 @@ public final class VideoMeta {
         if (!(fps > 0) || Double.isNaN(fps) || Double.isInfinite(fps)) {
             throw new IllegalArgumentException("a video needs a positive frame rate, got " + fps);
         }
-        return new VideoMeta(width, height, fps, nFrames, duration, startTime);
+        return new VideoMeta(width, height, fps, nFrames, duration, startTime, false);
+    }
+
+    /**
+     * Whether the probe reported an index-aligned stream: a frame rate and an equal average rate, and a stream that
+     * starts with its container, so decoded frame {@code n} is the frame the rate-keeping decode (the reference's
+     * command) numbers {@code n}. False for metadata built without a probe, for a stream that reports no rate or no
+     * container start, and for a stream that starts after its container (a video behind its soundtrack), whose first
+     * frame the rate-keeping decode repeats over the lead.
+     */
+    public boolean indexAligned() {
+        return indexAligned;
     }
 
     /** The frame count of the stream. */
@@ -245,12 +276,12 @@ public final class VideoMeta {
         }
         VideoMeta m = (VideoMeta) o;
         return width == m.width && height == m.height && nFrames == m.nFrames && fps == m.fps
-                && duration == m.duration && startTime == m.startTime;
+                && duration == m.duration && startTime == m.startTime && indexAligned == m.indexAligned;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(width, height, fps, nFrames, duration, startTime);
+        return Objects.hash(width, height, fps, nFrames, duration, startTime, indexAligned);
     }
 
     @Override

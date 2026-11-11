@@ -13,11 +13,29 @@ public final class MelFilterbank {
     private final int nMel;
     private final int nFftBins;
     private final float[] data;
+    /** Per filter, the first bin with a non-zero tap ({@code nFftBins} for an all-zero filter). */
+    private final int[] firstBin;
+    /** Per filter, one past the last bin with a non-zero tap ({@code 0} for an all-zero filter). */
+    private final int[] endBin;
 
     private MelFilterbank(int nMel, int nFftBins, float[] data) {
         this.nMel = nMel;
         this.nFftBins = nFftBins;
         this.data = data;
+        this.firstBin = new int[nMel];
+        this.endBin = new int[nMel];
+        for (int m = 0; m < nMel; m++) {
+            int first = nFftBins;
+            int end = 0;
+            for (int k = 0; k < nFftBins; k++) {
+                if (data[m * nFftBins + k] != 0.0f) {
+                    first = Math.min(first, k);
+                    end = k + 1;
+                }
+            }
+            firstBin[m] = first;
+            endBin[m] = end;
+        }
     }
 
     /**
@@ -179,6 +197,19 @@ public final class MelFilterbank {
                     + nFftBins);
         }
         return data[m * nFftBins + k];
+    }
+
+    /**
+     * The first bin of filter {@code m}'s non-zero taps: every tap outside {@code [firstBin(m), endBin(m))} is zero,
+     * so a fold over finite powers may skip those bins without changing its sum.
+     */
+    public int firstBin(int m) {
+        return firstBin[m];
+    }
+
+    /** One past the last bin of filter {@code m}'s non-zero taps; {@code 0} when every tap is zero. */
+    public int endBin(int m) {
+        return endBin[m];
     }
 
     @Override

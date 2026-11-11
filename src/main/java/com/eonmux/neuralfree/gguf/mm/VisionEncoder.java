@@ -103,6 +103,14 @@ public interface VisionEncoder extends AutoCloseable {
      */
     void closeLoraSession(int slot);
 
+    /**
+     * Whether callers on several threads may run {@link #encode}, {@link #encodeBatch} and {@link #encodeAnyres} at
+     * once, outside a LoRA session: false for a single-caller encoder, whose calls the caller serializes.
+     */
+    default boolean concurrent() {
+        return false;
+    }
+
     /** The geometry this executor runs. */
     ClipVisionModel model();
 

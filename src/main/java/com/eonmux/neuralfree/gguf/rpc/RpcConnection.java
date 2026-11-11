@@ -137,23 +137,92 @@ final class RpcConnection implements AutoCloseable {
         Objects.requireNonNull(request, "request");
         byte[] response;
         synchronized (ioLock) {
-            if (closed) {
-                throw new IllegalStateException("remote device " + spec.describe() + " is closed");
-            }
+            ensureOpen();
             try {
                 wire.writeFrame(request.toBytes());
                 response = wire.readFrame();
             } catch (IOException e) {
-                closed = true;
-                closeQuietly(socket);
-                throw new IllegalStateException("remote device " + spec.describe() + " connection failed: "
-                        + e.getMessage(), e);
+                throw failed(e);
             }
         }
+        return answer(response, spec.describe());
+    }
+
+    /**
+     * Sends two requests back to back in one flush and reads both responses in order: one round trip where two
+     * {@link #call}s take two. The server executes the frames of a connection strictly in order, so the second
+     * request observes everything the first did. Both responses are read before either is examined, so the stream
+     * stays in step whatever they answer; the caller examines the first answer before the second ({@link
+     * Answers}). Only a request without side effects may follow a request that can fail: it still executes when
+     * the first one failed, and its answer is then dropped.
+     *
+     * @throws IllegalStateException when the connection failed
+     */
+    Answers callPipelined(RpcWire.Writer first, RpcWire.Writer second) {
+        Objects.requireNonNull(first, "first");
+        Objects.requireNonNull(second, "second");
+        byte[] firstResponse;
+        byte[] secondResponse;
+        synchronized (ioLock) {
+            ensureOpen();
+            try {
+                wire.writeFrame(first.toBytes(), false);
+                wire.writeFrame(second.toBytes());
+                firstResponse = wire.readFrame();
+                secondResponse = wire.readFrame();
+            } catch (IOException e) {
+                throw failed(e);
+            }
+        }
+        return new Answers(firstResponse, secondResponse, spec.describe());
+    }
+
+    /**
+     * The two responses of a {@link #callPipelined} exchange, each examined on demand so a caller can account for
+     * the first before the second raises its error.
+     */
+    static final class Answers {
+        private final byte[] first;
+        private final byte[] second;
+        private final String endpoint;
+
+        private Answers(byte[] first, byte[] second, String endpoint) {
+            this.first = first;
+            this.second = second;
+            this.endpoint = endpoint;
+        }
+
+        /** The first response body, positioned after the status byte; raises the error it carries. */
+        RpcWire.Reader first() {
+            return answer(first, endpoint);
+        }
+
+        /** The second response body, positioned after the status byte; raises the error it carries. */
+        RpcWire.Reader second() {
+            return answer(second, endpoint);
+        }
+    }
+
+    private void ensureOpen() {
+        if (closed) {
+            throw new IllegalStateException("remote device " + spec.describe() + " is closed");
+        }
+    }
+
+    /** Marks the connection failed after an I/O error and returns the exception to raise. */
+    private IllegalStateException failed(IOException e) {
+        closed = true;
+        closeQuietly(socket);
+        return new IllegalStateException("remote device " + spec.describe() + " connection failed: "
+                + e.getMessage(), e);
+    }
+
+    /** A response body positioned after its status byte; an error frame raises the exception it carries. */
+    private static RpcWire.Reader answer(byte[] response, String endpoint) {
         RpcWire.Reader r = new RpcWire.Reader(response);
         byte status = r.u8();
         if (status != RpcWire.STATUS_OK) {
-            stringify(status, r, spec.describe());
+            stringify(status, r, endpoint);
         }
         return r;
     }

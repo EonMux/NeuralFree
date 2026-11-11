@@ -1,6 +1,6 @@
 /* speech.cl - causal convolution, activation and attention kernels of the speech generators: the code2wav DAC
  * decoder of qwen3tts (tools/mtmd/models/qwen3tts-gen.cpp:290-700) and the speech-generator graph primitives that
- * decode windows of codec codes into PCM. Requires: common/dialect.h, common/config.h */
+ * decode windows of codec codes into PCM. Requires: common/dialect.h, common/config.h, common/reduce.h */
 /*
  * Layout. Every signal is token/frame major (`[rows][channels]`, element (t, c) at v[t*channels + c]), unlike the
  * channel-major wavtokenizer convolutions of audio.cl; the transpose-free layout matches the token-major rows the
@@ -429,9 +429,11 @@ NF_KERNEL void LLM_RvqSumRows(
 
 /*
  * One page of a stacked F32 LM head applied to one row: y[r] = sum_c w[row_off + r][c] * x[c].
- * w[rows_total][cols], x[cols], y[rows].
+ * w[rows_total][cols], x[cols], y[rows]. One workgroup per output row (global = rows * L, local = L, L a power of
+ * two <= LLM_DIMX, CUDA a multiple of 32): the lanes stride the row's columns, so neighbouring lanes read
+ * neighbouring weights, and nf_wg_sum adds the lane sums. The `r >= rows` return depends only on the workgroup.
  */
-NF_KERNEL void LLM_MatVecRowsF32(
+NF_REQD_SG_ATTR NF_KERNEL void LLM_MatVecRowsF32(
     const int cols,
     const int rows,
     const int row_off,
@@ -439,14 +441,16 @@ NF_KERNEL void LLM_MatVecRowsF32(
     NF_GLOBAL const float* NF_RESTRICT x,
     NF_GLOBAL float* NF_RESTRICT y)
 {
-    const int r = (int)get_global_id(0);
+    const int r = get_group_id(0);
     if (r >= rows) return;
-    const nf_i64 base = (nf_i64)(row_off + r) * cols;
-    float acc = 0.0f;
-    for (int c = 0; c < cols; c++) {
-        acc += w[base + c] * x[c];
+    NF_GLOBAL const float* NF_RESTRICT row = w + (nf_i64)(row_off + r) * cols;
+    float ps = 0.0f;
+    for (int c = get_local_id(0); c < cols; c += get_local_size(0)) {
+        ps += row[c] * x[c];
     }
-    y[r] = acc;
+    NF_LOCAL float scratch[LLM_DIMX];
+    const float acc = nf_wg_sum(scratch, ps);
+    if (get_local_id(0) == 0) y[r] = acc;
 }
 
 /*

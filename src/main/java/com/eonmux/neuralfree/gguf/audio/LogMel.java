@@ -1,5 +1,7 @@
 package com.eonmux.neuralfree.gguf.audio;
 
+import java.util.stream.IntStream;
+
 /**
  * The log-mel computation of llama.cpp's mtmd audio frontend (tools/mtmd/mtmd-audio.cpp:273-565): pad, apply the
  * preemphasis, frame with a Hann window, take the FFT power (or magnitude), fold the bins through the mel
@@ -12,6 +14,8 @@ public final class LogMel {
     static final float STD_EPS = 1e-5f;
     /** Whisper tail of zeros appended before framing (mtmd-audio.cpp:427). */
     static final int WHISPER_TAIL_SECONDS = 30;
+    /** Frames below which one thread computes the spectrogram; also the least frames one parallel range takes. */
+    static final int FRAMES_PER_RANGE = 64;
 
     private LogMel() {
     }
@@ -154,10 +158,26 @@ public final class LogMel {
 
     /**
      * The worker loop of mtmd-audio.cpp:290-366 over the padded signal: windowed frames (the window is centered in
-     * the frame when shorter), FFT, power or magnitude, mel fold with the floor, log.
+     * the frame when shorter), FFT, power or magnitude, mel fold with the floor, log. Frames are independent and
+     * each writes only its own column, so contiguous frame ranges run on the common pool (mtmd-audio.cpp splits
+     * frames across its worker threads the same way); every frame computes exactly what a serial loop computes.
      */
-    private static void frameLoop(float[] padded, MelFrameParams params, MelFilterbank filters, float[] hann,
+    static void frameLoop(float[] padded, MelFrameParams params, MelFilterbank filters, float[] hann,
                                   float[] data, int nLen) {
+        Fft fft = new Fft(params.frameSize());
+        int ranges = (int) Math.min(Runtime.getRuntime().availableProcessors(),
+                (nLen + FRAMES_PER_RANGE - 1) / FRAMES_PER_RANGE);
+        if (ranges <= 1) {
+            frameRange(padded, params, filters, hann, data, nLen, fft, 0, nLen);
+            return;
+        }
+        IntStream.range(0, ranges).parallel().forEach(r -> frameRange(padded, params, filters, hann, data, nLen,
+                fft, (int) ((long) nLen * r / ranges), (int) ((long) nLen * (r + 1) / ranges)));
+    }
+
+    /** Frames {@code [from, to)} of {@link #frameLoop}, with work arrays of their own. */
+    private static void frameRange(float[] padded, MelFrameParams params, MelFilterbank filters, float[] hann,
+                                   float[] data, int nLen, Fft fft, int from, int to) {
         int frame = params.frameSize();
         int hop = params.hopLength();
         int win = params.hannWindowSize();
@@ -165,11 +185,10 @@ public final class LogMel {
         int winPad = leftAligned ? 0 : (frame - win) / 2;
         int nBins = params.nFftBins();
         int nMel = params.nMel();
-        Fft fft = new Fft(frame);
         float[] fftOut = new float[2 * frame];
         float[] power = new float[nBins];
         float[] real = new float[frame];
-        for (int t = 0; t < nLen; t++) {
+        for (int t = from; t < to; t++) {
             int offset = t * hop;
             for (int j = 0; j < frame; j++) {
                 real[j] = 0.0f;
@@ -181,15 +200,20 @@ public final class LogMel {
                 }
             }
             fft.forward(real, fftOut);
+            boolean finite = true;
             for (int k = 0; k < nBins; k++) {
                 float re = fftOut[2 * k];
                 float im = fftOut[2 * k + 1];
                 float p = re * re + im * im;
                 power[k] = params.magnitude() ? (float) Math.sqrt(p) : p;
+                finite &= Float.isFinite(power[k]);
             }
             for (int m = 0; m < nMel; m++) {
+                // a zero tap adds an exact zero to the sum unless the power is infinite or NaN
+                int lo = finite ? filters.firstBin(m) : 0;
+                int hi = finite ? filters.endBin(m) : nBins;
                 double sum = 0.0;
-                for (int k = 0; k < nBins; k++) {
+                for (int k = lo; k < hi; k++) {
                     sum += power[k] * filters.weight(m, k);
                 }
                 sum = params.floorAdd() ? sum + params.melFloor() : Math.max(sum, params.melFloor());

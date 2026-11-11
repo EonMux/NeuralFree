@@ -1,10 +1,11 @@
 /* matvec_rows_f32.comp - LLM_MatVecRowsF32: one page of a stacked F32 LM head applied to one row.
- * GLSL twin of kernels/llm/speech.cl. Requires: common/nf_common.glsl.
+ * GLSL twin of kernels/llm/speech.cl. Requires: common/nf_common.glsl, common/reduce.glsl.
  *
  * Arguments: (i cols, i rows, i row_off, R w, R x, W y).
  *   y[r] = sum_c w[row_off + r][c] * x[c]
- * w[rows_total][cols], x[cols], y[rows]. Dispatch: 1-D, one invocation per output row,
- * global = roundUp(rows, L), local = {L, 1, 1}.
+ * w[rows_total][cols], x[cols], y[rows]. Dispatch: 1-D, local = {L, 1, 1}, one workgroup per output row:
+ * global = rows * L. The invocations stride the row's columns and nf_wg_sum adds their sums; the
+ * `row >= rows` return depends only on the workgroup. Folded group counts are recovered by nf_wg_id().
  */
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -21,15 +22,21 @@ layout(push_constant) uniform NfMvrParams {
     int row_off;
 } pc;
 
+#include "common/reduce.glsl"
+
 void main() {
-    const uint r = nf_global_id();
+    const uint r = nf_wg_id();
     if (r >= uint(pc.rows)) {
         return;
     }
-    const uint base = (uint(pc.row_off) + r) * uint(pc.cols);
-    float acc = 0.0;
-    for (int c = 0; c < pc.cols; ++c) {
-        acc += w_in[base + uint(c)] * x_in[uint(c)];
+    const uint cols = uint(pc.cols);
+    const uint base = (uint(pc.row_off) + r) * cols;
+    float ps = 0.0;
+    for (uint c = gl_LocalInvocationID.x; c < cols; c += gl_WorkGroupSize.x) {
+        ps += w_in[base + c] * x_in[c];
     }
-    y_out[r] = acc;
+    const float acc = nf_wg_sum(ps);
+    if (gl_LocalInvocationID.x == 0u) {
+        y_out[r] = acc;
+    }
 }

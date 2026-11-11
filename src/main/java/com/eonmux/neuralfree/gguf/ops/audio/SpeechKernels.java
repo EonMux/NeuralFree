@@ -30,7 +30,8 @@ import java.util.List;
  *       out)}: the banded causal window attention over a persisted prefix; one work-group per (query row,
  *       head).</li>
  *   <li>{@link #RVQ_SUM_ROWS} {@code (n_pages, n_frames, dim; x, y)}: per-frame sum of a codebook group's rows.</li>
- *   <li>{@link #MATVEC_ROWS_F32} {@code (cols, rows, row_off; w, x, y)}: one page of a stacked F32 LM head.</li>
+ *   <li>{@link #MATVEC_ROWS_F32} {@code (cols, rows, row_off; w, x, y)}: one page of a stacked F32 LM head, one
+ *       {@link #LOCAL}-lane workgroup per row ({@link #rowGroupsGlobal}).</li>
  *   <li>{@link #RMS_NORM_ROPE_ROWS} {@code (rows, n_heads, head_dim, pos_base, off, theta_scale(f), eps(f); x, w,
  *       y)}: per-head RMS norm plus NEOX RoPE over a block of rows.</li>
  *   <li>{@link #NORMAL_ROPE_ROWS} {@code (rows, n_heads, head_dim, pos_base, off, theta_scale(f); x, y)}: per-head
@@ -105,6 +106,11 @@ public final class SpeechKernels {
         int emit = n * stride;
         int trim = k - stride;
         return roundUp(Math.max((long) emit * oc, (long) trim * oc), LOCAL);
+    }
+
+    /** The global size of a one-workgroup-per-row kernel over {@code rows} rows ({@link #MATVEC_ROWS_F32}). */
+    public static long rowGroupsGlobal(long rows) {
+        return rows * LOCAL;
     }
 
     /** Global size of an element-wise kernel over {@code n} elements. */

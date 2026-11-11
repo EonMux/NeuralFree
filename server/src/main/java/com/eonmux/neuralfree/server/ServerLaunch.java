@@ -365,6 +365,9 @@ public final class ServerLaunch {
                   --load-balance-method NAME   shortest_queue (default), round_robin or minimum_tokens
                                                (SGLang's; also auto, total_requests, total_tokens;
                                                neuralfree.server.load.balance)
+                  --max-queued-requests N      generation requests one replica holds waiting to run; past it
+                                               a request is refused with 429 and Retry-After (SGLang's;
+                                               0, the default, for no limit; neuralfree.server.max.queued.requests)
                   --kv-events-config JSON      vLLM's KV cache event config (neuralfree.kv.events):
                                                {"enable_kv_cache_events": true} publishes BlockStored,
                                                BlockRemoved and AllBlocksCleared on the ZMQ transport

@@ -158,14 +158,21 @@ final class RpcWire {
         return out;
     }
 
-    /** Writes one frame. */
+    /** Writes one frame and flushes it to the peer. */
     void writeFrame(byte[] payload) throws IOException {
+        writeFrame(payload, true);
+    }
+
+    /** Writes one frame, flushing it to the peer when {@code flush} is set; otherwise it stays buffered. */
+    void writeFrame(byte[] payload, boolean flush) throws IOException {
         if (payload.length > MAX_FRAME) {
             throw new IOException("frame of " + payload.length + " bytes exceeds the " + MAX_FRAME + "-byte limit");
         }
         out.writeInt(payload.length);
         out.write(payload);
-        out.flush();
+        if (flush) {
+            out.flush();
+        }
     }
 
     /**
@@ -268,6 +275,11 @@ final class RpcWire {
         Writer(byte opcode) {
             this.opcode = opcode;
             u8(opcode);
+        }
+
+        /** The opcode (or response status) the payload starts with. */
+        byte opcode() {
+            return opcode;
         }
 
         Writer u8(int v) {
@@ -454,12 +466,31 @@ final class RpcWire {
                 throw new IllegalArgumentException("byte array of " + n + " bytes is outside 0.." + MAX_FRAME);
             }
             byte[] v = new byte[n];
+            readFully(v, 0, n);
+            return v;
+        }
+
+        /**
+         * Reads a length-prefixed byte array of exactly {@code length} bytes straight into {@code dst} at
+         * {@code offset}, without an intermediate array.
+         *
+         * @throws IllegalArgumentException when the payload carries another length or ends early
+         */
+        void rawBytesInto(byte[] dst, int offset, int length) {
+            int n = i32();
+            if (n != length) {
+                throw new IllegalArgumentException("expected a byte array of " + length + " bytes, the payload"
+                        + " carries " + n);
+            }
+            readFully(dst, offset, n);
+        }
+
+        private void readFully(byte[] dst, int offset, int n) {
             try {
-                in.readFully(v);
+                in.readFully(dst, offset, n);
             } catch (IOException e) {
                 throw new IllegalArgumentException("truncated RPC payload", e);
             }
-            return v;
         }
 
         /** A string of any length, UTF-8 encoded. */
@@ -759,7 +790,19 @@ final class RpcWire {
         }
     }
 
-    static Object[] readArgs(Reader r, Map<Long, GpuBuffer> buffers) {
+    /** Resolves the buffer id of a kernel argument to the buffer it names. */
+    @FunctionalInterface
+    interface BufferResolver {
+        /** The buffer {@code id} names, or null when the connection holds no buffer of that id. */
+        GpuBuffer buffer(long id);
+    }
+
+    /**
+     * Reads a kernel's arguments, resolving each buffer argument through {@code buffers} as it is read.
+     *
+     * @throws IllegalArgumentException for a malformed argument list or a buffer id the resolver does not know
+     */
+    static Object[] readArgs(Reader r, BufferResolver buffers) {
         int n = r.i32();
         if (n < 0 || n > 65536) {
             throw new IllegalArgumentException("kernel argument count " + n + " is malformed");
@@ -771,12 +814,12 @@ final class RpcWire {
         return args;
     }
 
-    private static Object readArg(Reader r, Map<Long, GpuBuffer> buffers) {
+    private static Object readArg(Reader r, BufferResolver buffers) {
         byte tag = r.u8();
         switch (tag) {
             case ARG_BUFFER:
                 long id = r.i64();
-                GpuBuffer buffer = buffers.get(id);
+                GpuBuffer buffer = buffers.buffer(id);
                 if (buffer == null) {
                     throw new IllegalArgumentException("buffer id " + id + " was not allocated by this connection");
                 }
@@ -866,23 +909,24 @@ final class RpcWire {
         return ComputeBackend.BackendType.valueOf(name);
     }
 
-    /** Little-endian bytes of {@code values}, as a device write of floats carries them. */
-    static byte[] floatsToBytes(float[] values) {
-        java.nio.ByteBuffer b = java.nio.ByteBuffer.allocate(values.length * Float.BYTES)
+    /** The little-endian bytes of the first {@code count} floats of {@code values}, as a float write carries them. */
+    static byte[] floatsToBytes(float[] values, int count) {
+        java.nio.ByteBuffer b = java.nio.ByteBuffer.allocate(count * Float.BYTES)
                 .order(java.nio.ByteOrder.LITTLE_ENDIAN);
-        b.asFloatBuffer().put(values);
+        b.asFloatBuffer().put(values, 0, count);
         return b.array();
     }
 
-    /** The floats of little-endian {@code bytes}; its length must be a multiple of four. */
-    static float[] bytesToFloats(byte[] bytes) {
+    /**
+     * Decodes the little-endian floats of {@code bytes} into the start of {@code dst}; the length of {@code bytes}
+     * must be a multiple of four.
+     */
+    static void bytesToFloats(byte[] bytes, float[] dst) {
         if ((bytes.length & 3) != 0) {
             throw new IllegalArgumentException("read of " + bytes.length + " bytes is not a whole number of floats");
         }
-        float[] out = new float[bytes.length / Float.BYTES];
         java.nio.ByteBuffer b = java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN);
-        b.asFloatBuffer().get(out);
-        return out;
+        b.asFloatBuffer().get(dst, 0, bytes.length / Float.BYTES);
     }
 
     private RpcWire() {

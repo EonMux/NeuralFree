@@ -5895,6 +5895,7 @@ The model is the first unnamed argument (as `vllm serve <model>` takes it) or `-
 | `-dpl`, `--data-parallel-size-local N`; `-dpr`, `--data-parallel-start-rank S`; `-dph`, `--data-parallel-hybrid-lb` | `neuralfree.server.replicas`, `neuralfree.server.dp.rank` | Serve `N` consecutive ranks from `S` (default 0) here (vLLM's hybrid mode) |
 | `--data-parallel-devices LIST`; `--dp-devices LIST` | `neuralfree.server.devices` | Comma-separated device names, one replica each |
 | `--load-balance-method NAME` | `neuralfree.server.load.balance` | `shortest_queue` (default), `round_robin` or `minimum_tokens` (SGLang's; also `auto`, `total_requests`, `total_tokens`) |
+| `--max-queued-requests N` | `neuralfree.server.max.queued.requests` | Generation requests one replica holds waiting to run (SGLang's flag), counted per request: the choices of `n`, the prompts of a prompt array, the steps of a beam search and the rounds of a server tool loop count as one request. A replica holds a request waiting while that request has a generation its free sequence slots do not take, so an idle replica admits a request of any size. A new request routed to a full replica goes to the routed replica with the fewest waiting, and when every replica is full it is refused before any of its generations is submitted, with 429 `rate_limit_error` and `Retry-After: 1` (SGLang and vLLM refuse with 503); an admitted request's later generations are never refused. Embedding, rerank and other pooling calls are not counted, and `run-batch` runs without the limit, as `vllm run-batch` ignores its queue limits. `0` (default) for no limit |
 | `--jinja`, `--no-jinja` | `neuralfree.chat.jinja` | Render prompts through the model's Jinja template (default), or llama.cpp's non-Jinja route ([Choosing a chat template](#choosing-a-chat-template)); the later flag wins |
 | `--metrics` | — | Accepted: the `/metrics` endpoint is always served |
 | `--otlp-traces-endpoint URL` | `neuralfree.server.otlp.traces.endpoint` | Export one OpenTelemetry `llm_request` span per generation request to this OTLP endpoint ([Request tracing](#request-tracing)); off when unset |
@@ -5950,7 +5951,10 @@ NeuralFree accepts video content parts when the projector has a vision encoder. 
 external `ffmpeg` and `ffprobe` binaries, which must be on the `PATH` or in the directory named by
 `--video-ffmpeg-dir DIR` (`neuralfree.server.video.ffmpeg.dir`). A missing or unreadable binary, an empty or
 non-video payload, an oversized video and a decoder timeout are refused with the request field that carried the
-video.
+video. On a constant-rate stream (its average frame rate equals its base rate) that starts with its container (its
+first frame within a quarter frame of the container's start time) ffmpeg's `select` filter keeps only the sampled
+frames, so only they are converted, scaled and piped; any other stream, such as a variable-rate one or a video that
+starts after its soundtrack, decodes every frame up to the last sampled one and keeps the sampled ones.
 
 Chat requests take the same two shapes vLLM and llama.cpp use:
 
@@ -8289,7 +8293,9 @@ try (MmprojModel mm = MmprojModel.open("mmproj-model-f16.gguf");
 The vision encoder can run as a data-parallel rank group (vLLM's `--mm-encoder-tp-mode`): every rank hosts the full
 encoder weights and the images of one encode batch are spread over the ranks by pixel count, so the tiles of a
 dynamic-resolution or canvas image encode in parallel. The rows are exactly those of the single-device encoder,
-returned in prompt order.
+returned in prompt order. Concurrent requests' vision encodes also run beside each other on the group, each rank
+taking one call at a time; an encode under a request's LoRA adapters, an audio encode and a single-device encoder's
+calls still hold the encoder alone.
 
 ```sh
 neuralfree serve -m model.gguf --mmproj mmproj.gguf \
@@ -8560,6 +8566,7 @@ Every `neuralfree.*` system property the code reads is listed below. Every Gradl
 | `neuralfree.server.api.prefix` | The path prefix every route serves under ([Web UI](#web-ui)) | none |
 | `neuralfree.server.models.dir`, `neuralfree.server.models.preset` | Router mode's model sources: a GGUF directory and an INI preset file ([Multi-model router](#multi-model-router)) | off |
 | `neuralfree.server.models.max`, `neuralfree.server.models.memory.margin`, `neuralfree.server.models.autoload` | Router mode's open-model limit, free-memory margin in MiB, and loading on first mention | 4, 0, true |
+| `neuralfree.server.max.queued.requests` | Generation requests one replica holds waiting to run, counted per request and only past the replica's free sequence slots, before new requests are refused with 429 and `Retry-After` (SGLang's `--max-queued-requests`, which refuses with 503); an admitted request is never refused; 0 for no limit | 0 |
 | `neuralfree.server.sleep.idle.seconds` | Seconds without work before the model is released ([sleep](#sleep-pause-and-checkpoint)); negative never sleeps | -1 |
 
 ### Hugging Face checkpoints (`ModelSourceOptions.fromProperties`)

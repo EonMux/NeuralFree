@@ -233,6 +233,60 @@ public class SpeculativeDecoderTest {
     }
 
     /**
+     * A chain whose top-k cone needs its frequency penalty applied first verifies over prefiltered device readouts
+     * when the backend applies the edits on the device: verify row {@code i} is edited over the history plus the
+     * draft's first {@code i} tokens, draftless rounds decode through the prefiltered single-row readout, and the
+     * tokens equal the host path's under the same seed. The drafts are the reference run's own continuation, so
+     * every verify row is accepted and the penalty counts of the draft tokens decide the later rows' draws.
+     */
+    @Test
+    public void aPenalizedConeVerifiesOverPrefilteredDeviceReadouts() {
+        GenerationRequest request = GenerationRequest.builder().maxNewTokens(16)
+                .sampler(SamplerConfig.builder().temperature(0.4f).topK(3).frequencyPenalty(1.5f).penaltyLastN(8)
+                        .seed(11).build()).build();
+        FakeTarget reference = new FakeTarget(false);
+        reference.twoPeaks = true;
+        int[] ref = decoder(reference, new FakeDrafter((last, n) -> new int[0]), 3, 1)
+                .generate(new int[]{0}, request, (TokenCallback) null).tokens();
+
+        FakeTarget device = new FakeTarget(false);
+        device.twoPeaks = true;
+        device.prefilterDevice = true;
+        GenerationResult onDevice = perfectDrafts(device, ref, request);
+        FakeTarget host = new FakeTarget(false);
+        host.twoPeaks = true;
+        GenerationResult onHost = perfectDrafts(host, ref, request);
+
+        assertArrayEquals(ref, onHost.tokens());
+        assertArrayEquals(ref, onDevice.tokens());
+        assertTrue("the verify rounds read prefiltered candidates", device.prefilteredVerifies > 0);
+        assertTrue("the draftless rounds decoded through the prefiltered readout", device.prefilteredDecodes > 0);
+        assertEquals(device.prefilteredVerifies, device.verifyCalls.size());
+        assertEquals(host.verifyCalls.size(), device.verifyCalls.size());
+        for (int i = 0; i < host.verifyCalls.size(); i++) {
+            assertArrayEquals(host.verifyCalls.get(i), device.verifyCalls.get(i));
+        }
+        assertEquals(0, host.prefilteredVerifies);
+    }
+
+    /**
+     * A generation over {@code target} whose drafts continue {@code ref} from the tokens emitted so far, three at a
+     * time, with every third round left without a proposal.
+     */
+    private static GenerationResult perfectDrafts(FakeTarget target, int[] ref, GenerationRequest request) {
+        int[] emitted = new int[1];
+        int[] rounds = new int[1];
+        FakeDrafter drafter = new FakeDrafter((last, n) -> {
+            int from = emitted[0];
+            if (rounds[0]++ % 3 == 2 || from >= ref.length) {
+                return new int[0];
+            }
+            return Arrays.copyOfRange(ref, from, Math.min(ref.length, from + Math.min(n, 3)));
+        });
+        return decoder(target, drafter, 3, 1).generate(new int[]{0}, request, (id, text) -> emitted[0]++);
+    }
+
+    /**
      * The same round on recurrent memory: the state is snapshot before the verify call, restored after it, and the
      * kept tokens {@code [1, 2, 3]} are prefilled again from P = 1; nothing is rolled back.
      */
@@ -509,6 +563,13 @@ public class SpeculativeDecoderTest {
         /** Verify calls and plain decodes that selected on the "device" (read back ids, not logits). */
         int greedyVerifies;
         int greedyDecodes;
+        /** Rows of two close peaks, so a penalty on either can hand the draw to the other. */
+        boolean twoPeaks;
+        /** Whether the "device" applies logit prefilters before its top-k readout. */
+        boolean prefilterDevice;
+        /** Verify calls and plain decodes that read a prefiltered top-k. */
+        int prefilteredVerifies;
+        int prefilteredDecodes;
 
         FakeTarget(boolean recurrent) {
             this(new FakeMemory(recurrent, true, Integer.MAX_VALUE));
@@ -530,14 +591,14 @@ public class SpeculativeDecoderTest {
             store(tokens, pos0);
             prefills.add(tokens.clone());
             prefillPositions.add(pos0);
-            return next(tokens[tokens.length - 1]);
+            return row(tokens[tokens.length - 1]);
         }
 
         @Override
         public float[] decode(int token, int pos) {
             store(new int[]{token}, pos);
             decodes.add(token);
-            return next(token);
+            return row(token);
         }
 
         @Override
@@ -554,9 +615,55 @@ public class SpeculativeDecoderTest {
             }
             float[][] out = new float[rows.length][];
             for (int i = 0; i < rows.length; i++) {
-                out[i] = next(tokens[rows[i]]);
+                out[i] = row(tokens[rows[i]]);
             }
             return out;
+        }
+
+        private float[] row(int token) {
+            if (!twoPeaks) {
+                return next(token);
+            }
+            float[] l = new float[VOCAB];
+            // the runner-up is the token before this one, which a verify row's pending draft tokens hold
+            l[(token + 1) % VOCAB] = 6f;
+            l[(token + VOCAB - 1) % VOCAB] = 5.5f;
+            l[(token + 4) % VOCAB] = 2f;
+            return l;
+        }
+
+        @Override
+        public boolean topKOnDevice() {
+            return prefilterDevice;
+        }
+
+        @Override
+        public boolean topKPrefilterOnDevice() {
+            return prefilterDevice;
+        }
+
+        @Override
+        public RowTopK forwardRowsTopK(int[] tokens, int pos0, int k, int[] outputRows, LogitPrefilter prefilter) {
+            if (prefilter == null || prefilter.isEmpty()) {
+                return ForwardBackend.super.forwardRowsTopK(tokens, pos0, k, outputRows, prefilter);
+            }
+            prefilteredVerifies++;
+            float[][] rows = forwardRows(tokens, pos0, outputRows);
+            assertEquals("one prefilter row per verify row", rows.length, prefilter.rows());
+            for (int i = 0; i < rows.length; i++) {
+                rows[i] = SamplerPrefilterTest.applyPrefilter(rows[i], prefilter.row(i));
+            }
+            return RowTopK.of(rows, k);
+        }
+
+        @Override
+        public RowTopK decodeTopKOnDevice(int token, int pos, int k, LogitPrefilter prefilter) {
+            if (prefilter == null || prefilter.isEmpty()) {
+                return ForwardBackend.super.decodeTopKOnDevice(token, pos, k, prefilter);
+            }
+            prefilteredDecodes++;
+            float[] edited = SamplerPrefilterTest.applyPrefilter(decode(token, pos), prefilter.row(0));
+            return RowTopK.of(new float[][]{edited}, k);
         }
 
         @Override

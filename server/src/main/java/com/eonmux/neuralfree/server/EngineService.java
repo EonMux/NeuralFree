@@ -357,7 +357,8 @@ public final class EngineService implements AutoCloseable {
             throw e;
         }
         this.replicas = List.copyOf(opened);
-        this.scheduler = new DpScheduler(opened.toArray(new EngineReplica[0]), options.dataParallel().balance());
+        this.scheduler = new DpScheduler(opened.toArray(new EngineReplica[0]), options.dataParallel().balance(),
+                options.maxQueuedRequests());
         try {
             this.media = openMedia(onEngineBackend(mediaOptions, this.config), opened.get(0));
         } catch (IOException | RuntimeException e) {
@@ -1171,6 +1172,7 @@ public final class EngineService implements AutoCloseable {
      *
      * @throws EngineUnavailableException when the service is unloaded, sleeping behind an explicit sleep, or paused
      *                                     in a rejecting mode
+     * @throws EngineSaturatedException    when every replica holds {@link ServerOptions#maxQueuedRequests} waiting
      */
     public Submission submit(int[] prompt, GenerationRequest request, ReasoningFilter.Sink sink,
                              String renderedPrompt, ConstraintSpec constraint) throws InterruptedException {
@@ -1197,19 +1199,28 @@ public final class EngineService implements AutoCloseable {
     public Submission submit(int[] prompt, GenerationRequest request, ReasoningFilter.Sink sink,
                              String renderedPrompt, ConstraintSpec constraint, ReasoningFilter filter,
                              Runnable onDone) throws InterruptedException {
+        return submit(prompt, request, sink, renderedPrompt, constraint, filter, onDone, null);
+    }
+
+    /**
+     * {@link #submit(int[], GenerationRequest, ReasoningFilter.Sink, String, ConstraintSpec, ReasoningFilter,
+     * Runnable)} as one generation of the request {@code admission} stands for under the queue limit
+     * ({@link QueueAdmission}); null for a request of its own.
+     */
+    public Submission submit(int[] prompt, GenerationRequest request, ReasoningFilter.Sink sink,
+                             String renderedPrompt, ConstraintSpec constraint, ReasoningFilter filter,
+                             Runnable onDone, QueueAdmission admission) throws InterruptedException {
         requireLoaded();
         String refusal = servingRefusal();
         if (refusal != null) {
             throw new EngineUnavailableException(refusal);
         }
-        EngineReplica replica = scheduler.pick(prompt);
         KvTransferParams transfer = request.kvTransfer();
-        if (transfer == null) {
-            return new Submission(replica.submit(prompt, request, sink, renderedPrompt, constraint, filter, onDone));
-        }
-        return submitTransferred(replica, prompt, request, transfer,
-                (prefill, terminal, chain) -> replica.submit(prompt, prefill, sink, renderedPrompt, constraint,
-                        filter, onDone, terminal, chain));
+        return scheduler.queue().submit(admission, scheduler.pick(prompt), prompt, replica -> transfer == null
+                ? new Submission(replica.submit(prompt, request, sink, renderedPrompt, constraint, filter, onDone))
+                : submitTransferred(replica, prompt, request, transfer,
+                        (prefill, terminal, chain) -> replica.submit(prompt, prefill, sink, renderedPrompt,
+                                constraint, filter, onDone, terminal, chain)));
     }
 
     /** Submits a request through the replica's token or media path, with the transfer's hooks. */
@@ -1270,14 +1281,16 @@ public final class EngineService implements AutoCloseable {
      * chunks the engine prefills, a per-request reasoning filter (null runs the configured one) and a hook run once
      * at the request's terminal state or refusal, on the replica's pump thread. The scheduler routes it like a
      * token prompt over its rows' prefix-cache keys ({@link DpScheduler#routingRows}), so a conversation's next
-     * turn favours the replica whose prefix cache holds its images.
+     * turn favours the replica whose prefix cache holds its images. {@code admission} is the request the generation
+     * belongs to under the queue limit ({@link QueueAdmission}), null for a request of its own.
      *
      * @throws EngineUnavailableException when the service is unloaded, sleeping behind an explicit sleep, or paused
      *                                     in a rejecting mode
+     * @throws EngineSaturatedException    when every replica holds {@link ServerOptions#maxQueuedRequests} waiting
      */
     public Submission submitMedia(MediaPrompt prompt, GenerationRequest request, ReasoningFilter.Sink sink,
                                   String renderedPrompt, ConstraintSpec constraint, ReasoningFilter filter,
-                                  Runnable onDone) throws InterruptedException {
+                                  Runnable onDone, QueueAdmission admission) throws InterruptedException {
         KvTransferParams transfer = request.kvTransfer();
         if (transfer != null && !prompt.isTextOnly()) {
             throw new IllegalArgumentException(KvTransferParams.FIELD + " is not supported with media or embedding"
@@ -1288,14 +1301,13 @@ public final class EngineService implements AutoCloseable {
         if (refusal != null) {
             throw new EngineUnavailableException(refusal);
         }
-        EngineReplica replica = scheduler.pick(DpScheduler.routingRows(prompt));
-        if (transfer == null) {
-            return new Submission(replica.submitMedia(prompt, request, sink, renderedPrompt, constraint, filter,
-                    onDone));
-        }
-        return submitTransferred(replica, prompt.samplerTokens(), request, transfer,
-                (media, terminal, chain) -> replica.submitMedia(prompt, media, sink, renderedPrompt, constraint,
-                        filter, onDone, terminal, chain));
+        int[] routing = DpScheduler.routingRows(prompt);
+        return scheduler.queue().submit(admission, scheduler.pick(routing), routing, replica -> transfer == null
+                ? new Submission(replica.submitMedia(prompt, request, sink, renderedPrompt, constraint, filter,
+                        onDone))
+                : submitTransferred(replica, prompt.samplerTokens(), request, transfer,
+                        (media, terminal, chain) -> replica.submitMedia(prompt, media, sink, renderedPrompt,
+                                constraint, filter, onDone, terminal, chain)));
     }
 
     /** The model's embedding width ({@code n_embd}), the width a {@code prompt_embeds} row must hold. */
@@ -1386,7 +1398,6 @@ public final class EngineService implements AutoCloseable {
         }
     }
 
-
     /** The first replica that still holds its model open, or null while none does. */
     private EngineReplica openReplica() {
         for (EngineReplica replica : replicas) {
@@ -1396,7 +1407,6 @@ public final class EngineService implements AutoCloseable {
         }
         return null;
     }
-
 
     /** Why a route outside the pooling ones refuses the CLIP dual encoder. */
     String dualRefusal() {
@@ -1441,10 +1451,8 @@ public final class EngineService implements AutoCloseable {
         return false;
     }
 
-
     /** The checkpoint capture state (vLLM's CheckpointState) and its failure, or a null error. */
     public record CheckpointStatus(String state, String error) { }
-
 
     /** The model setup captured while a model was open; null before the first open. */
     public Props capturedProps() {

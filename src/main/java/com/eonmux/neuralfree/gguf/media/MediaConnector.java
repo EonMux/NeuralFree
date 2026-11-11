@@ -100,17 +100,37 @@ public final class MediaConnector {
             throw new MediaInputException(field + " is empty: a media URL or base64 data is required");
         }
         String ref = reference.trim();
-        String lower = ref.toLowerCase(Locale.ROOT);
-        if (lower.startsWith("data:")) {
+        if (startsWithIgnoreAsciiCase(ref, "data:")) {
             return dataUrl(ref, field);
         }
-        if (lower.startsWith("http://") || lower.startsWith("https://")) {
+        if (startsWithIgnoreAsciiCase(ref, "http://") || startsWithIgnoreAsciiCase(ref, "https://")) {
             return new Loaded(fetch(ref, field), null);
         }
-        if (lower.startsWith("file:")) {
+        if (startsWithIgnoreAsciiCase(ref, "file:")) {
             return new Loaded(localFile(ref, field), null);
         }
-        return new Loaded(base64(ref, field), null);
+        return new Loaded(base64(ref, 0, ref.length(), field), null);
+    }
+
+    /**
+     * Whether {@code s} starts with the lower-case ASCII {@code prefix}, upper-case ASCII letters folded: the test
+     * {@code s.toLowerCase(Locale.ROOT).startsWith(prefix)} makes for these scheme prefixes, without lower-casing a
+     * reference that may be tens of megabytes of base64.
+     */
+    private static boolean startsWithIgnoreAsciiCase(String s, String prefix) {
+        if (s.length() < prefix.length()) {
+            return false;
+        }
+        for (int i = 0; i < prefix.length(); i++) {
+            char c = s.charAt(i);
+            if (c >= 'A' && c <= 'Z') {
+                c = (char) (c + ('a' - 'A'));
+            }
+            if (c != prefix.charAt(i)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -127,7 +147,7 @@ public final class MediaConnector {
         if (ref.regionMatches(true, 0, "data:", 0, 5)) {
             return dataUrl(ref, field);
         }
-        return new Loaded(base64(ref, field), null);
+        return new Loaded(base64(ref, 0, ref.length(), field), null);
     }
 
     // ------------------------------------------------------------------ data and base64
@@ -147,26 +167,39 @@ public final class MediaConnector {
         String head = spec.substring(0, lastSemi);
         int firstSemi = head.indexOf(';');
         String mediaType = (firstSemi < 0 ? head : head.substring(0, firstSemi)).trim();
-        return new Loaded(base64(url.substring(comma + 1), field), mediaType.isEmpty() ? null : mediaType);
+        return new Loaded(base64(url, comma + 1, url.length(), field), mediaType.isEmpty() ? null : mediaType);
     }
 
-    private byte[] base64(String data, String field) {
-        StringBuilder compact = new StringBuilder(data.length());
-        for (int i = 0; i < data.length(); i++) {
-            char c = data.charAt(i);
-            if (!Character.isWhitespace(c)) {
-                compact.append(c);
+    /**
+     * The bytes of the base64 text {@code data[from, to)}, whitespace skipped, in the standard or the URL-safe
+     * alphabet. The region is counted first, so the size refusal fires before anything is allocated, then copied
+     * once into a byte array the decoder reads; a character outside Latin-1 becomes {@code '?'}, as the string
+     * decoder's ISO-8859-1 encoding makes it, so an invalid input fails with the decoder's own message.
+     */
+    private byte[] base64(String data, int from, int to, String field) {
+        int length = 0;
+        for (int i = from; i < to; i++) {
+            if (!Character.isWhitespace(data.charAt(i))) {
+                length++;
             }
         }
-        long decodedBound = compact.length() / 4L * 3L;
+        long decodedBound = length / 4L * 3L;
         if (decodedBound > options.maxBytes() + 3L) {
             throw tooLarge(field, decodedBound);
         }
+        byte[] text = new byte[length];
+        boolean urlSafe = false;
+        int at = 0;
+        for (int i = from; i < to; i++) {
+            char c = data.charAt(i);
+            if (!Character.isWhitespace(c)) {
+                urlSafe |= c == '-' || c == '_';
+                text[at++] = c <= 0xFF ? (byte) c : (byte) '?';
+            }
+        }
         byte[] bytes;
         try {
-            String s = compact.toString();
-            bytes = s.indexOf('-') >= 0 || s.indexOf('_') >= 0
-                    ? Base64.getUrlDecoder().decode(s) : Base64.getDecoder().decode(s);
+            bytes = urlSafe ? Base64.getUrlDecoder().decode(text) : Base64.getDecoder().decode(text);
         } catch (IllegalArgumentException e) {
             throw new MediaInputException(field + " is not an http(s), data or file URL, and not valid base64: "
                     + e.getMessage());

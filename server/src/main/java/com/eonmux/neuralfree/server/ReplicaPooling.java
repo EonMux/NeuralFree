@@ -19,7 +19,9 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.IntSupplier;
 
 /**
  * The pooling and idle-engine forwards of one {@link EngineReplica}: the one-shot model calls run on the pump
@@ -74,7 +76,16 @@ final class ReplicaPooling {
      *                                       request, or the rows would run an activated LoRA
      */
     <T> T onPump(LoraSelection selection, ModelCall<T> call) throws IOException {
-        return onPump(() -> {
+        return onPump(selection, call, null);
+    }
+
+    /**
+     * {@link #onPump(LoraSelection, ModelCall)} whose caller keeps waiting past the request budget while
+     * {@code progress} (null for none) moves: a call that runs several requests in one handoff reports each one it
+     * finished, so the budget bounds each request's wait as it does for one handoff per request.
+     */
+    private <T> T onPump(LoraSelection selection, ModelCall<T> call, IntSupplier progress) throws IOException {
+        return onIdle(() -> {
             EngineModel open = owner.model();
             LoraRegistry registry = open.loraRegistry();
             if (registry == null) {
@@ -93,7 +104,7 @@ final class ReplicaPooling {
                 session.runKey();
                 return call.run();
             }
-        });
+        }, true, progress);
     }
 
     /**
@@ -105,7 +116,7 @@ final class ReplicaPooling {
      * @throws UnsupportedOperationException when the model does not pool or classify
      */
     <T> T onPump(ModelCall<T> call) throws IOException {
-        return onIdle(call, true);
+        return onIdle(call, true, null);
     }
 
     /**
@@ -115,21 +126,35 @@ final class ReplicaPooling {
      * @throws IOException when the call fails, the wait outlives the request budget, or the caller is interrupted
      */
     <T> T onIdleEngine(ModelCall<T> call) throws IOException {
-        return onIdle(call, false);
+        return onIdle(call, false, null);
     }
 
-    private <T> T onIdle(ModelCall<T> call, boolean resetsMemory) throws IOException {
+    /**
+     * Queues {@code call} for the idle engine and waits for its result for up to the request budget, and on while
+     * {@code progress} (null for none) moved within the last budget.
+     */
+    private <T> T onIdle(ModelCall<T> call, boolean resetsMemory, IntSupplier progress) throws IOException {
         PoolingCall<T> task = new PoolingCall<>(call, new CompletableFuture<>(), resetsMemory);
         poolingInFlight.incrementAndGet();
         try {
             owner.work().put(() -> pooling.add(task));
-            return task.result().get(owner.options().requestTimeout().toNanos(), TimeUnit.NANOSECONDS);
+            long budget = owner.options().requestTimeout().toNanos();
+            int seen = progress == null ? 0 : progress.getAsInt();
+            while (true) {
+                try {
+                    return task.result().get(budget, TimeUnit.NANOSECONDS);
+                } catch (TimeoutException e) {
+                    int now = progress == null ? seen : progress.getAsInt();
+                    if (now == seen) {
+                        throw new IOException("the model stayed busy past the " + owner.options().budgetText()
+                                + " request budget", e);
+                    }
+                    seen = now;
+                }
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IOException("interrupted while waiting for the model", e);
-        } catch (TimeoutException e) {
-            throw new IOException("the model stayed busy past the " + owner.options().budgetText()
-                    + " request budget", e);
         } catch (ExecutionException e) {
             throw causeOf(e.getCause());
         } finally {
@@ -163,6 +188,47 @@ final class ReplicaPooling {
     }
 
     /**
+     * The one-shot pooling forwards of every request of one call, in order, in as few pump handoffs (and adapter
+     * sessions) as the pump allows: a handoff runs the requests one after another until all ran or other work waits
+     * for the pump (a generation's registration, another caller's pooling call), which then runs before the rest.
+     * The caller's wait is bounded per request, as with one handoff per request: it fails when no request of the
+     * call finished within the request budget, and the call then runs no further request.
+     */
+    private Object[] oneShots(PoolingOutput output, int[][] requests, LoraSelection selection, boolean activation)
+            throws IOException {
+        Object[] out = new Object[requests.length];
+        AtomicInteger finished = new AtomicInteger();
+        AtomicBoolean abandoned = new AtomicBoolean();
+        try {
+            while (finished.get() < requests.length) {
+                onPump(selection, () -> oneShotsFrom(output, requests, activation, out, finished, abandoned),
+                        finished::get);
+            }
+        } catch (IOException | RuntimeException e) {
+            abandoned.set(true);
+            throw e;
+        }
+        return out;
+    }
+
+    /**
+     * One handoff of {@link #oneShots}: the requests from {@code finished} on, into {@code out}, until every request
+     * ran, other work waits for the pump, or the caller {@code abandoned} the call. Returns how many have finished.
+     */
+    private Integer oneShotsFrom(PoolingOutput output, int[][] requests, boolean activation, Object[] out,
+                                 AtomicInteger finished, AtomicBoolean abandoned) throws IOException {
+        int next = finished.get();
+        while (next < requests.length && !abandoned.get()) {
+            out[next] = oneShot(output, requests[next], activation);
+            finished.set(++next);
+            if (!owner.work().isEmpty()) {
+                break;
+            }
+        }
+        return next;
+    }
+
+    /**
      * Runs one pooling request for {@code output} over {@code tokens}: over the paged memory it queues into the
      * batch engine; over a contiguous or absent memory it runs the model's one-shot forward on the pump thread once
      * the engine is idle.
@@ -187,24 +253,16 @@ final class ReplicaPooling {
             throws IOException {
         BatchEngine eng = poolingEngine();
         if (eng == null) {
-            Object[] out = new Object[requests.length];
-            for (int i = 0; i < requests.length; i++) {
-                int[] tokens = requests[i];
-                out[i] = onPump(selection, () -> oneShot(output, tokens, activation));
-            }
-            return out;
+            return oneShots(output, requests, selection, activation);
         }
         List<CompletableFuture<Object>> futures = new ArrayList<>(requests.length);
+        for (int i = 0; i < requests.length; i++) {
+            futures.add(new CompletableFuture<>());
+        }
         try {
-            for (int[] tokens : requests) {
-                CompletableFuture<Object> done = new CompletableFuture<>();
-                futures.add(done);
-                queuePooling(eng, tokens, output, selection, activation, done);
-            }
+            queuePooling(eng, requests, output, selection, activation, futures);
         } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
             for (CompletableFuture<Object> f : futures) {
-                poolingInFlight.decrementAndGet(); // the registration never ran: its in-flight count returns
                 f.cancel(false);
             }
             throw new IOException("interrupted while queueing the pooling requests", e);
@@ -216,26 +274,33 @@ final class ReplicaPooling {
         return out;
     }
 
-    /** Queues one pooling request into {@code eng}: the submit runs on the pump thread. */
-    private void queuePooling(BatchEngine eng, int[] tokens, PoolingOutput output, LoraSelection selection,
-                              boolean activation, CompletableFuture<Object> done) throws InterruptedException {
-        poolingInFlight.incrementAndGet();
+    /**
+     * Queues the pooling requests of one call into {@code eng} as one pump task, which submits them in order on
+     * the pump thread: request {@code i} completes {@code done.get(i)}, and a refused submission fails only its own
+     * future.
+     */
+    private void queuePooling(BatchEngine eng, int[][] requests, PoolingOutput output, LoraSelection selection,
+                              boolean activation, List<CompletableFuture<Object>> done) throws InterruptedException {
+        poolingInFlight.addAndGet(requests.length);
         try {
             owner.work().put(() -> {
-                try {
-                    PoolingSequence pooling = eng.submitPooling(tokens, output, selection, activation);
-                    pooling.handle().onFinish(() -> {
+                for (int i = 0; i < requests.length; i++) {
+                    CompletableFuture<Object> answer = done.get(i);
+                    try {
+                        PoolingSequence pooling = eng.submitPooling(requests[i], output, selection, activation);
+                        pooling.handle().onFinish(() -> {
+                            poolingInFlight.decrementAndGet();
+                            completePooling(pooling, answer);
+                        });
+                    } catch (RuntimeException e) {
                         poolingInFlight.decrementAndGet();
-                        completePooling(pooling, done);
-                    });
-                } catch (RuntimeException e) {
-                    poolingInFlight.decrementAndGet();
-                    done.completeExceptionally(e);
+                        answer.completeExceptionally(e);
+                    }
                 }
             });
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            poolingInFlight.decrementAndGet(); // the registration never ran: its in-flight count returns
+            poolingInFlight.addAndGet(-requests.length); // the registration never ran: its in-flight count returns
             throw e;
         }
     }

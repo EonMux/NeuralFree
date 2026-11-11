@@ -258,6 +258,14 @@ class ServerLaunchArgsTest {
     }
 
     @Test
+    void theQueueLimitFlagMapsToItsPropertyAndRefusesANegativeCount() {
+        assertEquals("16", ServerLaunchArgs.parse("--max-queued-requests", "16").properties()
+                .get(ServerOptions.MAX_QUEUED_PROPERTY));
+        assertTrue(refusalOf(() -> ServerLaunchArgs.parse("--max-queued-requests", "-1"))
+                .contains("--max-queued-requests"));
+    }
+
+    @Test
     void llamaFlagsMapToTheirProperties() throws IOException {
         Path keys = Files.write(dir.resolve("keys.txt"), new byte[0]);
         Map<String, String> properties = ServerLaunchArgs.parse(

@@ -184,8 +184,9 @@ public final class GGUFModel implements EngineModel {
                 ContextFitter.Companion drafter =
                         LLMModelFactory.draftCompanion(config, resolved, true, (draft, placed) -> 0L)
                                 .plus(LLMModelFactory.twoLevelCompanion(config, source, false));
-                int nCtx = ContextFitter.fit(resolved, mc, HeapMemory.budgetBytes(), drafter);
                 int specCtx = mc.autoContext() ? resolved.hparams().nCtxTrain() : mc.nCtx();
+                ModelSpec fitted = resolved;
+                int nCtx = HeapMemory.fitContext(budget -> ContextFitter.fit(fitted, mc, budget, drafter), specCtx);
                 if (nCtx != specCtx) {
                     resolved = ModelSpecBuilder.build(kv, tc, mc, nCtx, config.pooling());
                 }

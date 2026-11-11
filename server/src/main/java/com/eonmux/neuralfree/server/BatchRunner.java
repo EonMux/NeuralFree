@@ -479,7 +479,9 @@ public final class BatchRunner {
     /**
      * The command: {@code neuralfree run-batch -i <input> -o <output> -m <model.gguf> [options]}, the input and the
      * output each a local path or an http(s) URL. The engine and server settings read their {@code neuralfree.*}
-     * system properties as the server does.
+     * system properties as the server does, except the queue limit ({@link ServerOptions#maxQueuedRequests}): the
+     * runner bounds its own waves by {@code maxInflight} and never refuses a record, as vLLM's {@code run_batch}
+     * ignores its queue limits.
      */
     public static void main(String[] args) {
         try {
@@ -503,7 +505,7 @@ public final class BatchRunner {
         }
         try {
             Summary summary = execute(parsed, BatchFiles.standard(), model -> new EngineService(model,
-                    EngineConfig.fromSystemProperties(), ServerOptions.fromSystemProperties(),
+                    EngineConfig.fromSystemProperties(), ServerOptions.fromSystemProperties().withMaxQueuedRequests(0),
                     MediaOptions.fromSystemProperties(), ServerLoras.fromSystemProperties()));
             System.out.println(summary.succeeded() + " of " + summary.requests() + " requests succeeded, "
                     + summary.failed() + " failed; output " + (parsed.output().isUrl() ? "uploaded" : "written")

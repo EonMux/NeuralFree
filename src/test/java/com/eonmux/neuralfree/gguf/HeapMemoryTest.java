@@ -4,6 +4,8 @@ import com.eonmux.neuralfree.gguf.engine.EngineConfig;
 import com.eonmux.neuralfree.gguf.memory.ContextFitter;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
+import com.eonmux.neuralfree.gguf.spec.ModelSpec;
+import com.eonmux.neuralfree.gguf.testutil.SyntheticModels;
 import com.eonmux.neuralfree.gguf.testutil.SyntheticRoutedModels;
 import org.junit.Test;
 
@@ -21,6 +23,7 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 /** The CPU heap budget, including model loading after an allocation burst in a bounded, separate JVM. */
@@ -47,6 +50,67 @@ public class HeapMemoryTest {
         assertEquals(0, HeapMemory.budgetBytes(512 * MIB, 512 * MIB, 40 * MIB));
         assertEquals(0, HeapMemory.budgetBytes(512 * MIB, 512 * MIB, 64 * MIB));
         assertEquals(1, HeapMemory.budgetBytes(512 * MIB, 512 * MIB, 64 * MIB + 1));
+    }
+
+    @Test
+    public void aReadingThatRefusesTheContextIsTakenAgainAfterACollection() throws Exception {
+        ModelSpec spec = llamaSpec();
+        MemoryConfig user = MemoryConfig.builder().nCtx(64).typeK(KvDType.F32).typeV(KvDType.F32).build();
+        long needed = ContextFitter.requiredBytes(spec, user, 64);
+        int[] collections = {0};
+        // garbage left a small nonzero budget: the context fits only the collected heap
+        long[] readings = {needed / 2, 4 * needed};
+        int nCtx = HeapMemory.fitContext(budget -> ContextFitter.fit(spec, user, budget), 64,
+                () -> readings[collections[0]], () -> collections[0]++);
+        assertEquals(64, nCtx);
+        assertEquals(1, collections[0]);
+    }
+
+    @Test
+    public void aShrunkAutomaticContextIsTakenAgainAfterACollection() {
+        int[] collections = {0};
+        long[] readings = {1_000, 1_000_000};
+        int nCtx = HeapMemory.fitContext(budget -> budget >= 1_000_000 ? 8192 : 512, 8192,
+                () -> readings[collections[0]], () -> collections[0]++);
+        assertEquals("the collected heap holds the training context", 8192, nCtx);
+        assertEquals(1, collections[0]);
+    }
+
+    @Test
+    public void aCollectionThatFreesNothingKeepsTheFirstFit() throws Exception {
+        ModelSpec spec = llamaSpec();
+        MemoryConfig user = MemoryConfig.builder().nCtx(64).typeK(KvDType.F32).typeV(KvDType.F32).build();
+        long needed = ContextFitter.requiredBytes(spec, user, 64);
+        int[] collections = {0};
+        long[] shrinking = {needed, needed / 2};
+        assertEquals("a shrunk fit stays when the collected heap refuses the context", 512,
+                HeapMemory.fitContext(budget -> budget >= needed ? 512 : ContextFitter.fit(spec, user, budget), 8192,
+                        () -> shrinking[collections[0]], () -> collections[0]++));
+        int[] again = {0};
+        long[] refusing = {needed / 2, needed / 3};
+        ContextFitter.ContextBudgetException refused = assertThrows(ContextFitter.ContextBudgetException.class,
+                () -> HeapMemory.fitContext(budget -> ContextFitter.fit(spec, user, budget), 64,
+                        () -> refusing[again[0]], () -> again[0]++));
+        assertEquals("the refusal names the collected heap's budget", needed / 3, refused.budgetBytes());
+    }
+
+    @Test
+    public void aHealthyReadingCollectsNothing() {
+        int[] collections = {0};
+        assertEquals(64, HeapMemory.fitContext(budget -> 64, 64, () -> 1L << 30, () -> collections[0]++));
+        assertEquals("an unbounded heap is not read again", 32, HeapMemory.fitContext(budget -> 32, 64,
+                () -> ContextFitter.UNLIMITED, () -> collections[0]++));
+        assertEquals(0, collections[0]);
+    }
+
+    private static ModelSpec llamaSpec() throws Exception {
+        Path path = SyntheticModels.llama().writeTempFile();
+        try (GGUFModel model = new GGUFModel(path.toString(), EngineConfig.builder().memory(MemoryConfig.builder()
+                .nCtx(64).typeK(KvDType.F32).typeV(KvDType.F32).build()).build())) {
+            return model.spec();
+        } finally {
+            Files.deleteIfExists(path);
+        }
     }
 
     @Test
@@ -120,7 +184,8 @@ public class HeapMemoryTest {
 
         private static void healthy() {
             long collections = collectionCount();
-            check(HeapMemory.budgetBytes() > 0, "a healthy heap must have a budget");
+            check(rawBudget() > 0, "a healthy heap must have a budget");
+            check(HeapMemory.fitContext(budget -> 64, 64) == 64, "a healthy heap must fit the context");
             check(collectionCount() == collections, "a healthy reading must not request collection");
         }
 

@@ -121,6 +121,48 @@ public class MediaConnectorTest {
     }
 
     @Test
+    public void inlineDataDecodesLikeTheStringDecoderOnEveryForm() {
+        java.util.Random random = new java.util.Random(5);
+        for (int trial = 0; trial < 50; trial++) {
+            byte[] payload = new byte[1 + random.nextInt(3000)];
+            random.nextBytes(payload);
+            String std = Base64.getEncoder().encodeToString(payload);
+            String url = Base64.getUrlEncoder().withoutPadding().encodeToString(payload);
+            String wrapped = Base64.getMimeEncoder().encodeToString(payload);
+            assertArrayEquals(payload, defaults().load(std, "f").bytes());
+            assertArrayEquals(payload, defaults().load(url, "f").bytes());
+            assertArrayEquals(payload, defaults().load(" \n" + wrapped + "\r\n", "f").bytes());
+            assertArrayEquals(payload, defaults().load("DATA:application/octet-stream;BASE64," + wrapped, "f")
+                    .bytes());
+            assertArrayEquals(payload, defaults().inline("data:;base64," + url, "f").bytes());
+        }
+    }
+
+    @Test
+    public void invalidCharactersFailWithTheDecodersMessage() {
+        String latin = B64.substring(0, 4) + "\u00e9" + B64.substring(4);
+        String wide = B64.substring(0, 4) + "\u4e2d" + B64.substring(4);
+        String expectLatin = message(() -> Base64.getDecoder().decode(latin));
+        String expectWide = message(() -> Base64.getDecoder().decode(wide));
+        assertRefused(() -> defaults().load(latin, "f"), "not valid base64: " + expectLatin);
+        assertRefused(() -> defaults().load(wide, "f"), "not valid base64: " + expectWide);
+        assertRefused(() -> defaults().load("QUJD\nQ", "f"), "not valid base64: "
+                + message(() -> Base64.getDecoder().decode("QUJDQ")));
+    }
+
+    @Test
+    public void theSizeLimitCountsTheBase64BeforeDecoding() {
+        MediaConnector small = connector(MediaConnector.Options.builder().maxBytes(8));
+        // 24 characters bound 18 bytes, over 8 + 3: refused by the bound even though the text is not valid base64
+        assertRefused(() -> small.load("!!!!!!!!!!!!!!!!!!!!!!!!", "f"), "exceeds the 8-byte limit");
+        assertRefused(() -> small.load("data:;base64," + " A".repeat(24), "f"), "exceeds the 8-byte limit");
+    }
+
+    private static String message(ThrowingRunnable call) {
+        return assertThrows(IllegalArgumentException.class, call).getMessage();
+    }
+
+    @Test
     public void inlineDataNeverFetches() {
         assertRefused(() -> defaults().inline(base + "/media", "f"), "not valid base64");
     }

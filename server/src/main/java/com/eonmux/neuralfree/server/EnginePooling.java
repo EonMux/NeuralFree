@@ -10,9 +10,13 @@ import com.eonmux.neuralfree.gguf.ops.heads.ClassifierHead;
 import com.eonmux.neuralfree.gguf.ops.heads.EncodeGate;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * The pooling, classification, reranking and scoring entry points of one {@link EngineService}: the pooled and
@@ -41,7 +45,7 @@ final class EnginePooling {
         return (float[]) owner.poolingReplica().pooling(tokens, PoolingOutput.POOLED, lora);
     }
 
-    /** The pooled embeddings of several inputs under {@code lora} over one replica, all queued before any awaits. */
+    /** The pooled embeddings of several inputs under {@code lora}, spread over the open replicas. */
     float[][] embedAll(LoraSelection lora, int[][] inputs) throws IOException {
         ClipDualEncoder dual = owner.dual();
         if (dual != null) {
@@ -53,7 +57,7 @@ final class EnginePooling {
             }
             return out;
         }
-        return cast(owner.poolingReplica().poolingAll(inputs, PoolingOutput.POOLED, lora));
+        return cast(poolAcross(inputs, PoolingOutput.POOLED, lora, true));
     }
 
     /** The embedding of one image through the CLIP dual encoder's vision tower. */
@@ -132,9 +136,9 @@ final class EnginePooling {
         return (float[][]) owner.poolingReplica().pooling(tokens, PoolingOutput.TOKEN_EMBEDDINGS, lora);
     }
 
-    /** The per-token embeddings of several inputs over one replica. */
+    /** The per-token embeddings of several inputs, spread over the open replicas. */
     float[][][] embedTokensAll(LoraSelection lora, int[][] inputs) throws IOException {
-        Object[] rows = owner.poolingReplica().poolingAll(inputs, PoolingOutput.TOKEN_EMBEDDINGS, lora);
+        Object[] rows = poolAcross(inputs, PoolingOutput.TOKEN_EMBEDDINGS, lora, true);
         float[][][] out = new float[rows.length][][];
         for (int i = 0; i < out.length; i++) {
             out[i] = (float[][]) rows[i];
@@ -291,9 +295,9 @@ final class EnginePooling {
         return (float[][]) owner.poolingReplica().pooling(tokens, PoolingOutput.TOKEN_SCORES, lora);
     }
 
-    /** The per-token classifier scores of several inputs over one replica. */
+    /** The per-token classifier scores of several inputs, spread over the open replicas. */
     float[][][] tokenClassifyAll(LoraSelection lora, int[][] inputs) throws IOException {
-        Object[] rows = owner.poolingReplica().poolingAll(inputs, PoolingOutput.TOKEN_SCORES, lora);
+        Object[] rows = poolAcross(inputs, PoolingOutput.TOKEN_SCORES, lora, true);
         float[][][] out = new float[rows.length][][];
         for (int i = 0; i < out.length; i++) {
             out[i] = (float[][]) rows[i];
@@ -336,7 +340,7 @@ final class EnginePooling {
 
     /** {@link #rerankScores} with the final probability activation applied or skipped per input. */
     float[] rerankScores(LoraSelection lora, int[][] inputs, boolean activation) throws IOException {
-        return castScores(owner.poolingReplica().poolingAll(inputs, PoolingOutput.RERANK_SCORE, lora, activation));
+        return castScores(poolAcross(inputs, PoolingOutput.RERANK_SCORE, lora, activation));
     }
 
     /** The model's pooling kind. */
@@ -385,7 +389,7 @@ final class EnginePooling {
     /** {@link #classifyOutputsAll} with the final probability activation applied or skipped per input. */
     ClassifierOutput[] classifyOutputsAll(LoraSelection lora, int[][] inputs, boolean activation)
             throws IOException {
-        Object[] out = owner.poolingReplica().poolingAll(inputs, PoolingOutput.CLASSIFIER_OUTPUT, lora, activation);
+        Object[] out = poolAcross(inputs, PoolingOutput.CLASSIFIER_OUTPUT, lora, activation);
         ClassifierOutput[] outputs = new ClassifierOutput[out.length];
         for (int i = 0; i < out.length; i++) {
             outputs[i] = (ClassifierOutput) out[i];
@@ -407,9 +411,9 @@ final class EnginePooling {
         return replica.onPump(lora, () -> replica.model().classify(tokens, order));
     }
 
-    /** The classifier scores of several inputs over one replica. */
+    /** The classifier scores of several inputs, spread over the open replicas. */
     float[][] classifyScoresAll(LoraSelection lora, int[][] inputs) throws IOException {
-        return cast(owner.poolingReplica().poolingAll(inputs, PoolingOutput.SCORES, lora));
+        return cast(poolAcross(inputs, PoolingOutput.SCORES, lora, true));
     }
 
     /**
@@ -438,6 +442,83 @@ final class EnginePooling {
     float[] decisionScores(LoraSelection lora, MediaPrompt prompt, int[] order) throws IOException {
         EngineReplica replica = owner.poolingReplica();
         return replica.onPump(lora, () -> replica.model().classifyMedia(prompt, order));
+    }
+
+    /**
+     * The answers of a multi-input pooling call in input order, its inputs spread over the open replicas (vLLM's
+     * data-parallel engines each take a share of an embedding batch): the inputs split into contiguous parts of about
+     * equal token counts, one part per replica of {@link #poolingReplicas}, each part queued on its replica as one
+     * {@link EngineReplica#poolingAll} call. The calling thread runs the first part and virtual threads the others;
+     * a failed part fails the call once every part has finished.
+     */
+    private Object[] poolAcross(int[][] inputs, PoolingOutput output, LoraSelection lora, boolean activation)
+            throws IOException {
+        List<EngineReplica> targets = poolingReplicas(inputs.length);
+        if (targets.size() == 1) {
+            return targets.get(0).poolingAll(inputs, output, lora, activation);
+        }
+        int[] bounds = PoolingSplit.bounds(inputs, targets.size());
+        Object[] out = new Object[inputs.length];
+        List<CompletableFuture<Void>> parts = new ArrayList<>(targets.size() - 1);
+        for (int p = 1; p < targets.size(); p++) {
+            EngineReplica replica = targets.get(p);
+            int from = bounds[p];
+            int to = bounds[p + 1];
+            CompletableFuture<Void> part = new CompletableFuture<>();
+            Thread.ofVirtual().name("pooling-part-" + p).start(() -> {
+                try {
+                    poolPart(replica, inputs, from, to, output, lora, activation, out);
+                    part.complete(null);
+                } catch (Throwable t) {
+                    part.completeExceptionally(t);
+                }
+            });
+            parts.add(part);
+        }
+        Throwable failure = null;
+        try {
+            poolPart(targets.get(0), inputs, bounds[0], bounds[1], output, lora, activation, out);
+        } catch (IOException | RuntimeException e) {
+            failure = e;
+        }
+        for (CompletableFuture<Void> part : parts) {
+            failure = PoolingSplit.await(part, failure);
+        }
+        PoolingSplit.rethrow(failure);
+        return out;
+    }
+
+    /** Runs inputs {@code from .. to} on {@code replica}, writing their answers into {@code out} at their indices. */
+    private static void poolPart(EngineReplica replica, int[][] inputs, int from, int to, PoolingOutput output,
+                                 LoraSelection lora, boolean activation, Object[] out) throws IOException {
+        Object[] answers = replica.poolingAll(Arrays.copyOfRange(inputs, from, to), output, lora, activation);
+        System.arraycopy(answers, 0, out, from, answers.length);
+    }
+
+    /**
+     * The replicas one multi-input pooling call spreads over, at most {@code limit}: the one the service's
+     * {@link EngineService#poolingReplica} picks first, then the scheduler's other replicas that hold their model
+     * open, the least loaded first.
+     */
+    private List<EngineReplica> poolingReplicas(int limit) throws IOException {
+        EngineReplica first = owner.poolingReplica();
+        DpScheduler scheduler = owner.scheduler();
+        if (limit <= 1 || scheduler == null) {
+            return List.of(first);
+        }
+        List<EngineReplica> others = new ArrayList<>();
+        for (EngineReplica r : scheduler.routed()) {
+            if (r != first && r.open()) {
+                others.add(r);
+            }
+        }
+        others.sort(Comparator.comparingInt(EngineReplica::load));
+        List<EngineReplica> out = new ArrayList<>();
+        out.add(first);
+        for (int i = 0; i < others.size() && out.size() < limit; i++) {
+            out.add(others.get(i));
+        }
+        return out;
     }
 
     /** The batch's answers as {@code float[]} rows ({@link EngineReplica#poolingAll} keeps them as objects). */

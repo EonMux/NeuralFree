@@ -35,6 +35,9 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 
@@ -82,7 +85,7 @@ import java.util.function.Supplier;
  *
  * <p>A request that selects adapters encodes its media inside a LoRA session on the vision encoder
  * ({@link VisionEncoder#openLoraSession}): the session slot registers the request's adapters' vision pairs in place
- * of the startup ones for exactly that encode, under the context monitor, so a concurrent request's tiles never run
+ * of the startup ones for exactly that encode, holding the encoders alone, so a concurrent request's tiles never run
  * through another request's adapters, and a request that names no adapter encodes under the startup adapters as
  * always. One context serves one projector for every replica of the model.</p>
  *
@@ -99,9 +102,10 @@ import java.util.function.Supplier;
  *
  * <p>The projector weights {@link #release() release} while the text model sleeps and {@link #reopen() reopen}
  * from the same file on the wake; the markers, widths and capabilities stay, and an encode in between refuses with
- * {@link ReleasedException}. Thread-safe: encodes are serialized (the encoders are single-threaded objects), a
- * request's whole encode under its adapters holding the context monitor. Close
- * it to release the encoders and the projector weights for good.</p>
+ * {@link ReleasedException}. Thread-safe: the vision encodes of a {@link VisionEncoder#concurrent() concurrent}
+ * encoder (a data-parallel one) run beside each other, every other encode holds the encoders alone (the encoders
+ * are single-caller objects), and a request's whole encode under its adapters holds them alone. Close it to release
+ * the encoders and the projector weights for good.</p>
  */
 public final class MediaContext implements AutoCloseable {
 
@@ -152,9 +156,16 @@ public final class MediaContext implements AutoCloseable {
     private final MediaPromptAppender appender;
     /** The shared encoder cache exchange (vLLM's encoder cache connector), inert without a connector. */
     private final SharedEncoderCache sharedCache;
+    /** The encodes running now, so concurrent requests carrying the same item encode it once. */
+    private final EncodeFlights<MediaKey, List<MediaPiece>> flights = new EncodeFlights<>();
     /** The adapters the vision encoder applies, held for a reopen. */
     private final List<LoraAttachment.Binding> loras;
-    /** The loaded projector; null while released. Guarded by {@code this}. */
+    /**
+     * Guards {@link #encoders} and {@link #closed}: the concurrent vision encodes share it; every other encode, an
+     * adapter session, a release, a reopen and the close hold it alone.
+     */
+    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+    /** The loaded projector; null while released. Guarded by {@link #lock}. */
     private MmprojEncoders encoders;
     private volatile String visionDevice;
     private volatile boolean released;
@@ -602,20 +613,23 @@ public final class MediaContext implements AutoCloseable {
         appender.append(prompt, key, encodedVideo(source, field), 0, text, markers.nonCausalImage());
     }
 
-    /** The encoding of a video: the encoded layer's or the shared encoder cache's, else its sampled frames'. */
+    /**
+     * The encoding of a video: the encoded layer's or the shared encoder cache's, else its sampled frames', encoded
+     * once while concurrent requests carry the same video ({@link EncodeFlights}).
+     */
     private List<MediaPiece> encodedVideo(MediaItem source, String field) {
         List<MediaPiece> hit = sharedCache.shared(source);
         if (hit != null) {
             return hit;
         }
-        return encodeUnderLora(source, () -> {
+        return flights.run(source.key(), () -> encodeUnderLora(source, () -> {
             List<MediaPiece> again = cache.peek(source.key());
             if (again != null) {
                 return again;
             }
             DecodedVideo decoded = sampledVideo(source, field);
             return sharedCache.store(source, layoutVideo(decoded, field));
-        });
+        }));
     }
 
     /** The sampled frames of a video: the processed layer's, else probed, planned and decoded from its bytes. */
@@ -644,7 +658,13 @@ public final class MediaContext implements AutoCloseable {
         if (!videoConfig.soundtrack() || !hasAudio) {
             return 0;
         }
-        return loaded().audio.model().hparams().audio().sampleRate();
+        Lock shared = lock.readLock();
+        shared.lock();
+        try {
+            return loaded().audio.model().hparams().audio().sampleRate();
+        } finally {
+            shared.unlock();
+        }
     }
 
     /**
@@ -719,10 +739,7 @@ public final class MediaContext implements AutoCloseable {
         if (slices.isEmpty()) {
             return;
         }
-        float[][][] parts;
-        synchronized (this) {
-            parts = VideoSoundtrack.rows(slices, loaded().audio, field);
-        }
+        float[][][] parts = withEncoders(false, loaded -> VideoSoundtrack.rows(slices, loaded.audio, field));
         for (int g = 0; g < groups.size(); g++) {
             if (parts[g].length > 0) {
                 groups.get(g).add(MediaPiece.rows(parts[g]));
@@ -878,35 +895,40 @@ public final class MediaContext implements AutoCloseable {
 
     // ------------------------------------------------------------------ encoding
 
-    /** The encoding of an image: the encoded layer's or the shared encoder cache's, else its prepared tiles'. */
+    /**
+     * The encoding of an image: the encoded layer's or the shared encoder cache's, else its prepared tiles', encoded
+     * once while concurrent requests carry the same image ({@link EncodeFlights}).
+     */
     private List<MediaPiece> encodedImage(MediaItem source) {
         List<MediaPiece> hit = sharedCache.shared(source);
         if (hit != null) {
             return hit;
         }
-        return encodeUnderLora(source, () -> {
+        return flights.run(source.key(), () -> encodeUnderLora(source, () -> {
             List<MediaPiece> again = cache.peek(source.key());
             if (again != null) {
                 return again;
             }
             ProcessedMedia prepared = preparedImage(source);
             return sharedCache.store(source, layoutImage(prepared.image));
-        });
+        }));
     }
 
     /**
-     * Runs {@code encode} with the item's request's adapters applied: a request that selects any holds the context
-     * monitor for the whole encode, opens a LoRA session on the vision encoder whose slot registers the adapters'
+     * Runs {@code encode} with the item's request's adapters applied: a request that selects any holds the encoders
+     * alone for the whole encode, opens a LoRA session on the vision encoder whose slot registers the adapters'
      * vision pairs in place of the startup ones (a bare key registers none), and closes the session after, so no
      * other encode's tiles run through the session and no other request waits mid-image. A request without adapters
-     * encodes as before, holding the monitor per tile.
+     * encodes as before, taking the encoders per tile ({@link #withEncoders}).
      */
     private List<MediaPiece> encodeUnderLora(MediaItem source, Supplier<List<MediaPiece>> encode) {
         if (source.lora() == null || !hasVision) {
             // no adapters to apply, or an audio-only projector whose encodes run none
             return encode.get();
         }
-        synchronized (this) {
+        Lock exclusive = lock.writeLock();
+        exclusive.lock();
+        try {
             VisionEncoder vision = loaded().vision;
             int slot = vision.openLoraSession(bindingsOf(source.lora()));
             try {
@@ -914,6 +936,8 @@ public final class MediaContext implements AutoCloseable {
             } finally {
                 vision.closeLoraSession(slot);
             }
+        } finally {
+            exclusive.unlock();
         }
     }
 
@@ -1061,16 +1085,15 @@ public final class MediaContext implements AutoCloseable {
             tiles.add(clipImage(tile));
         }
         ImageSize original = prepared.anyresOriginal();
+        ClipImage overview = clipImage(prepared.overview());
         float[][] rows;
-        synchronized (this) {
-            try {
-                rows = loaded().vision.encodeAnyres(clipImage(prepared.overview()), tiles, prepared.gridX(),
-                        prepared.gridY(), original.width(), original.height());
-            } catch (IllegalArgumentException e) {
-                throw new MediaInputException("the " + prepared.gridX() + "x" + prepared.gridY() + " anyres grid of"
-                        + " the " + original.width() + "x" + original.height() + " image does not fit the vision"
-                        + " encoder: " + e.getMessage(), e);
-            }
+        try {
+            rows = withEncoders(true, loaded -> loaded.vision.encodeAnyres(overview, tiles, prepared.gridX(),
+                    prepared.gridY(), original.width(), original.height()));
+        } catch (IllegalArgumentException e) {
+            throw new MediaInputException("the " + prepared.gridX() + "x" + prepared.gridY() + " anyres grid of"
+                    + " the " + original.width() + "x" + original.height() + " image does not fit the vision"
+                    + " encoder: " + e.getMessage(), e);
         }
         return MediaPiece.grid(rows, rows.length, 1);
     }
@@ -1175,13 +1198,11 @@ public final class MediaContext implements AutoCloseable {
     }
 
     private float[][] encodeTile(ClipImage image, ImageTile tile) {
-        synchronized (this) {
-            try {
-                return loaded().vision.encode(image);
-            } catch (IllegalArgumentException e) {
-                throw new MediaInputException("the image tile " + tile.width() + "x" + tile.height()
-                        + " does not fit the vision encoder: " + e.getMessage(), e);
-            }
+        try {
+            return withEncoders(true, loaded -> loaded.vision.encode(image));
+        } catch (IllegalArgumentException e) {
+            throw new MediaInputException("the image tile " + tile.width() + "x" + tile.height()
+                    + " does not fit the vision encoder: " + e.getMessage(), e);
         }
     }
 
@@ -1190,31 +1211,29 @@ public final class MediaContext implements AutoCloseable {
      * a data-parallel encoder spreads the batch over its ranks, every other encoder runs the images in turn.
      */
     private List<float[][]> encodeTiles(List<ClipImage> images) {
-        synchronized (this) {
-            try {
-                return loaded().vision.encodeBatch(images);
-            } catch (IllegalArgumentException e) {
-                throw new MediaInputException("the image tiles do not fit the vision encoder: " + e.getMessage(), e);
-            }
+        try {
+            return withEncoders(true, loaded -> loaded.vision.encodeBatch(images));
+        } catch (IllegalArgumentException e) {
+            throw new MediaInputException("the image tiles do not fit the vision encoder: " + e.getMessage(), e);
         }
     }
 
-    /** The encoding of an audio clip: the encoded layer's or the shared encoder cache's, else its decoded samples'. */
+    /**
+     * The encoding of an audio clip: the encoded layer's or the shared encoder cache's, else its decoded samples',
+     * encoded once while concurrent requests carry the same clip ({@link EncodeFlights}).
+     */
     private List<MediaPiece> encodedAudio(MediaItem source, String name) {
         List<MediaPiece> hit = sharedCache.shared(source);
         if (hit != null) {
             return hit;
         }
-        return encodeUnderLora(source, () -> {
+        return flights.run(source.key(), () -> encodeUnderLora(source, () -> {
             List<MediaPiece> again = cache.peek(source.key());
             if (again != null) {
                 return again;
             }
             ProcessedMedia samples = decodedAudio(source, name);
-            List<float[][]> chunks;
-            synchronized (this) {
-                chunks = loaded().audio.embed(samples.audio);
-            }
+            List<float[][]> chunks = withEncoders(false, loaded -> loaded.audio.embed(samples.audio));
             if (chunks.isEmpty()) {
                 throw new MediaInputException("the audio produced no encoder windows");
             }
@@ -1225,7 +1244,7 @@ public final class MediaContext implements AutoCloseable {
             }
             out.add(MediaPiece.text(markers.audioEnd()));
             return sharedCache.store(source, Collections.unmodifiableList(out));
-        });
+        }));
     }
 
     /** The decoded samples of an audio clip: the processed layer's, else decoded from its bytes. */
@@ -1334,14 +1353,20 @@ public final class MediaContext implements AutoCloseable {
      *
      * @throws IOException when the projector file does not close
      */
-    public synchronized void release() throws IOException {
-        if (closed || encoders == null) {
-            return;
+    public void release() throws IOException {
+        Lock exclusive = lock.writeLock();
+        exclusive.lock();
+        try {
+            if (closed || encoders == null) {
+                return;
+            }
+            MmprojEncoders current = encoders;
+            encoders = null;
+            released = true;
+            current.close();
+        } finally {
+            exclusive.unlock();
         }
-        MmprojEncoders current = encoders;
-        encoders = null;
-        released = true;
-        current.close();
     }
 
     /**
@@ -1352,22 +1377,53 @@ public final class MediaContext implements AutoCloseable {
      * @throws IllegalStateException    when the context is closed
      * @throws IllegalArgumentException when the file no longer fits the text model (the context stays released)
      */
-    public synchronized void reopen() throws IOException {
-        ensureOpen();
-        if (encoders != null) {
-            return;
+    public void reopen() throws IOException {
+        Lock exclusive = lock.writeLock();
+        exclusive.lock();
+        try {
+            ensureOpen();
+            if (encoders != null) {
+                return;
+            }
+            MmprojEncoders loaded = MmprojEncoders.open(path, encoderOptions, width, loras);
+            if ((loaded.vision != null) != hasVision || (loaded.audio != null) != hasAudio) {
+                loaded.close();
+                throw new IllegalArgumentException("the projector " + path + " changed its encoders since it opened");
+            }
+            encoders = loaded;
+            visionDevice = hasVision ? loaded.vision.device() : null;
+            released = false;
+        } finally {
+            exclusive.unlock();
         }
-        MmprojEncoders loaded = MmprojEncoders.open(path, encoderOptions, width, loras);
-        if ((loaded.vision != null) != hasVision || (loaded.audio != null) != hasAudio) {
-            loaded.close();
-            throw new IllegalArgumentException("the projector " + path + " changed its encoders since it opened");
-        }
-        encoders = loaded;
-        visionDevice = hasVision ? loaded.vision.device() : null;
-        released = false;
     }
 
-    /** The loaded encoders; the caller holds {@code this}. */
+    /**
+     * {@code encode} over the loaded encoders: a vision encode ({@code vision}) on a
+     * {@link VisionEncoder#concurrent() concurrent} encoder runs beside the other vision encodes, every other encode
+     * holds the encoders alone. A thread that holds them alone already (an adapter session) runs it in place.
+     */
+    private <T> T withEncoders(boolean vision, Function<MmprojEncoders, T> encode) {
+        Lock shared = lock.readLock();
+        shared.lock();
+        try {
+            MmprojEncoders current = loaded();
+            if (vision && current.vision.concurrent()) {
+                return encode.apply(current);
+            }
+        } finally {
+            shared.unlock();
+        }
+        Lock exclusive = lock.writeLock();
+        exclusive.lock();
+        try {
+            return encode.apply(loaded());
+        } finally {
+            exclusive.unlock();
+        }
+    }
+
+    /** The loaded encoders; the caller holds {@link #lock}. */
     private MmprojEncoders loaded() {
         ensureOpen();
         if (encoders == null) {
@@ -1383,15 +1439,22 @@ public final class MediaContext implements AutoCloseable {
     }
 
     @Override
-    public synchronized void close() throws IOException {
-        if (closed) {
-            return;
+    public void close() throws IOException {
+        MmprojEncoders current;
+        Lock exclusive = lock.writeLock();
+        exclusive.lock();
+        try {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            current = encoders;
+            encoders = null;
+        } finally {
+            exclusive.unlock();
         }
-        closed = true;
         cache.clear();
         processed.clear();
-        MmprojEncoders current = encoders;
-        encoders = null;
         IOException failure = null;
         if (current != null) {
             try {

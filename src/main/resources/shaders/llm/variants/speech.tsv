@@ -11,7 +11,7 @@ LLM_HeadRmsNormRope	head_norm_rope.comp
 LLM_TtsCausalAttn	tts_causal_attn.comp
 LLM_TtsWindowAttn	tts_window_attn.comp
 LLM_RvqSumRows	rvq_sum_rows.comp
-LLM_MatVecRowsF32	matvec_rows_f32.comp
+LLM_MatVecRowsF32	matvec_rows_f32.comp		sg
 LLM_RmsNormRopeRows	rms_norm_rope_rows.comp
 LLM_NormalRopeRows	normal_rope_rows.comp
 LLM_TtsFullAttn	tts_full_attn.comp

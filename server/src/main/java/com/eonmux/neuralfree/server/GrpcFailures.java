@@ -39,6 +39,9 @@ final class GrpcFailures {
         if (error instanceof StatusRuntimeException status) {
             return status;
         }
+        if (error instanceof EngineSaturatedException saturated) {
+            return Status.RESOURCE_EXHAUSTED.withDescription(messageOf(saturated)).asRuntimeException();
+        }
         if (error instanceof EngineUnavailableException unavailable) {
             return Status.UNAVAILABLE.withDescription(messageOf(unavailable)).asRuntimeException();
         }

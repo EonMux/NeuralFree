@@ -113,11 +113,13 @@ final class ToolsLoop {
     /**
      * The rounds: generate, execute the round's server tool calls when it made only those, feed the answers
      * back, generate again — until a round answers without such calls or the round bound is reached, whichever
-     * comes first.
+     * comes first. The rounds share one queue admission ({@link QueueAdmission}): a request the queue limit
+     * admitted for its first round is never refused after its tools ran.
      */
     static Outcome run(EngineService service, Map<String, Object> body, Set<String> serverTools,
                        HttpServerRequest client) {
         int maxRounds = maxRounds();
+        QueueAdmission admission = new QueueAdmission();
         List<Executed> executed = new ArrayList<>();
         List<GenerationResult> rounds = new ArrayList<>();
         long promptRows = 0;
@@ -131,7 +133,7 @@ final class ToolsLoop {
                 throw ServerJson.badRequest("server tool execution answers the best candidate of one: set"
                         + " best_of to 1 or drop it");
             }
-            GenerationBatch batch = GenerationBatch.start(service, plan.jobs(), client);
+            GenerationBatch batch = GenerationBatch.start(service, plan.jobs(), client, null, true, admission);
             batch.awaitAll();
             List<ChatChoice> choices = new ArrayList<>();
             for (int i = 0; i < batch.size(); i++) {

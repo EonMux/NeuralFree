@@ -8,11 +8,14 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -30,11 +33,15 @@ import java.util.concurrent.atomic.AtomicInteger;
  *       order, so a data-parallel encode returns exactly the rows the sequential encoder does.</li>
  *   <li>{@link #encode} sends its one image to the next rank in turn, and {@link #encodeAnyres} runs on rank 0,
  *       whose graph assembles the overview and the tile grid as one image.</li>
+ *   <li>Every encode runs on its rank's thread, so callers on several threads may encode at once
+ *       ({@link #concurrent()}); a LoRA session is global to the ranks and needs the encoder to itself.</li>
  * </ul>
  *
  * The ranks are independent executors bound over the same model, so a rank's rows never depend on the other ranks'.
  * One task per rank is in flight at a time (each rank runs on its own single-thread executor); a failed rank's
- * exception is rethrown and the other ranks are waited for, so no rank is left computing into its scratch.
+ * exception is rethrown and the other ranks are waited for, so no rank is left computing into its scratch. An
+ * interrupted caller returns only once none of its calls runs on a rank any more, and {@link #close} waits for a
+ * running call before it closes the ranks.
  * Thread-safe; closing the encoder closes every rank and the owner of the ranks' backends.
  */
 public final class DataParallelVisionEncoder implements VisionEncoder {
@@ -128,7 +135,7 @@ public final class DataParallelVisionEncoder implements VisionEncoder {
             return new ArrayList<>();
         }
         if (ranks.size() == 1) {
-            return ranks.get(0).encodeBatch(images);
+            return run(0, images);
         }
         int[] assignedTo = assignment(sizes(images), ranks.size());
         List<List<Integer>> shares = new ArrayList<>(ranks.size());
@@ -138,11 +145,14 @@ public final class DataParallelVisionEncoder implements VisionEncoder {
         for (int i = 0; i < assignedTo.length; i++) {
             shares.get(assignedTo[i]).add(i);
         }
+        List<RankTask<List<float[][]>>> tasks = new ArrayList<>(ranks.size());
         List<Future<List<float[][]>>> futures = new ArrayList<>(ranks.size());
         for (int r = 0; r < ranks.size(); r++) {
             final int rank = r;
             final List<Integer> share = shares.get(r);
-            futures.add(threads.get(r).submit(() -> runShare(rank, images, share)));
+            RankTask<List<float[][]>> task = new RankTask<>(() -> runShare(rank, images, share));
+            tasks.add(task);
+            futures.add(threads.get(r).submit(task));
         }
         List<float[][]> out = new ArrayList<>(Collections.nCopies(images.size(), (float[][]) null));
         RuntimeException failure = null;
@@ -155,11 +165,15 @@ public final class DataParallelVisionEncoder implements VisionEncoder {
                     out.set(share.get(i), rows.get(i));
                 }
             } catch (InterruptedException e) {
+                tasks.get(r).withdrawOrAwait();
                 Thread.currentThread().interrupt();
                 if (failure == null) {
                     failure = new IllegalStateException("the data-parallel vision encoder was interrupted", e);
                 }
-                futures.get(r).cancel(true);
+            } catch (CancellationException e) {
+                if (failure == null) {
+                    failure = closedDuringTheCall(e);
+                }
             } catch (ExecutionException e) {
                 RuntimeException cause = rethrowable(e.getCause());
                 if (failure == null) {
@@ -195,16 +209,32 @@ public final class DataParallelVisionEncoder implements VisionEncoder {
 
     /** Encodes {@code images} on rank {@code rank} through its thread, awaiting the result. */
     private List<float[][]> run(int rank, List<ClipImage> images) {
-        Future<List<float[][]>> future = threads.get(rank).submit(() -> ranks.get(rank).encodeBatch(images));
+        return onRank(rank, () -> ranks.get(rank).encodeBatch(images));
+    }
+
+    /**
+     * The result of {@code call} run on rank {@code rank}'s thread. An interrupted caller withdraws the call when it
+     * has not started, else waits until it ended ({@link RankTask}), and only then throws.
+     */
+    private <T> T onRank(int rank, Callable<T> call) {
+        RankTask<T> task = new RankTask<>(call);
+        Future<T> future = threads.get(rank).submit(task);
         try {
             return future.get();
         } catch (InterruptedException e) {
+            task.withdrawOrAwait();
             Thread.currentThread().interrupt();
-            future.cancel(true);
             throw new IllegalStateException("the data-parallel vision encoder was interrupted", e);
+        } catch (CancellationException e) {
+            throw closedDuringTheCall(e);
         } catch (ExecutionException e) {
             throw rethrowable(e.getCause());
         }
+    }
+
+    /** The failure of a call that a {@link #close} dropped from its rank's queue before it started. */
+    private static IllegalStateException closedDuringTheCall(CancellationException e) {
+        return new IllegalStateException("the vision encoder was closed before the call ran", e);
     }
 
     /**
@@ -263,7 +293,13 @@ public final class DataParallelVisionEncoder implements VisionEncoder {
     public float[][] encodeAnyres(ClipImage overview, List<ClipImage> tiles, int gridX, int gridY, int origWidth,
                                   int origHeight) {
         ensureOpen();
-        return ranks.get(0).encodeAnyres(overview, tiles, gridX, gridY, origWidth, origHeight);
+        return onRank(0, () -> ranks.get(0).encodeAnyres(overview, tiles, gridX, gridY, origWidth, origHeight));
+    }
+
+    /** Every encode runs on its rank's single thread, whichever thread calls it. */
+    @Override
+    public boolean concurrent() {
+        return true;
     }
 
     /**
@@ -349,9 +385,7 @@ public final class DataParallelVisionEncoder implements VisionEncoder {
             return;
         }
         closed = true;
-        for (ExecutorService thread : threads) {
-            thread.shutdownNow();
-        }
+        stopRankThreads();
         RuntimeException failure = null;
         for (int i = ranks.size() - 1; i >= 0; i--) {
             try {
@@ -386,6 +420,35 @@ public final class DataParallelVisionEncoder implements VisionEncoder {
     public String toString() {
         return String.format(Locale.ROOT, "DataParallelVisionEncoder{%s, ranks=%d, on %s}",
                 model().hparams().projectorType(), ranks.size(), device);
+    }
+
+    /**
+     * Stops the rank threads before the ranks close: the calls still queued are dropped (their callers learn the
+     * encoder closed), and a call already running is waited for, so no rank is closed under its own encode.
+     */
+    private void stopRankThreads() {
+        for (ExecutorService thread : threads) {
+            for (Runnable queued : thread.shutdownNow()) {
+                if (queued instanceof Future) {
+                    ((Future<?>) queued).cancel(false);
+                }
+            }
+        }
+        boolean interrupted = false;
+        for (ExecutorService thread : threads) {
+            while (true) {
+                try {
+                    if (thread.awaitTermination(1, TimeUnit.MINUTES)) {
+                        break;
+                    }
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private void ensureOpen() {

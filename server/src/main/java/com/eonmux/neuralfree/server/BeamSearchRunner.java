@@ -30,7 +30,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * cancels the search at the next step boundary ({@link ClientLink}).
  *
  * <p>Errors map to HTTP like a generation batch: a refused submission by name is a 400, a refusal on the engine's
- * serving state a 503, a request that outlived its budget a 503 naming it, anything else a 500.
+ * serving state a 503, full replica queues at the first step a 429 (the search is one request under the queue limit,
+ * so a later step is never refused by it), a request that outlived its budget a 503 naming it, anything else a 500.
  */
 final class BeamSearchRunner {
 
@@ -44,6 +45,8 @@ final class BeamSearchRunner {
     private final AtomicBoolean cancelled = new AtomicBoolean();
     private final AtomicLong cachedRows = new AtomicLong();
     private final RequestTracing.Trace trace;
+    /** The search's standing under the queue limit: its first step admits it, the later steps are never refused. */
+    private final QueueAdmission admission = new QueueAdmission();
     /** The submissions of the most recent step, the trace's engine handles. */
     private volatile List<EngineService.Submission> lastStep = List.of();
 
@@ -63,7 +66,8 @@ final class BeamSearchRunner {
      * @throws EngineUnavailableException        when the service stops serving between the caller's check and a
      *                                           submission
      * @throws jakarta.ws.rs.WebApplicationException on a refused submission (400), a serving-state refusal (503),
-     *                                           a spent request budget (503) or a failed step (500)
+     *                                           full replica queues (429), a spent request budget (503) or a
+     *                                           failed step (500)
      */
     static Run run(EngineService service, GenerationRequest request, int[] prompt, HttpServerRequest client,
                    String requestId) {
@@ -105,12 +109,13 @@ final class BeamSearchRunner {
                 if (t != null) {
                     t.registered(submissions.size(), sequence.length);
                 }
-                submissions.add(service.submit(sequence, step, (tokenId, text) -> { }));
+                submissions.add(service.submit(sequence, step, ReasoningFilter.contentTo((tokenId, text) -> { }),
+                        null, null, null, null, admission));
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw ServerJson.error(503, "request interrupted", "unavailable_error");
-        } catch (EngineUnavailableException e) {
+        } catch (EngineUnavailableException | EngineSaturatedException e) {
             throw unavailable(e);
         }
         lastStep = submissions;
@@ -196,8 +201,8 @@ final class BeamSearchRunner {
         t.finish(forced, sequences, refusals);
     }
 
-    /** The 503 answering a refusal on the engine's serving state or a replica shutting down. */
+    /** The answer to a refusal on the serving state (503) or on full replica queues (429 with Retry-After). */
     private static WebApplicationException unavailable(IllegalStateException e) {
-        return ServerJson.error(503, String.valueOf(e.getMessage()), "unavailable_error");
+        return ServerJson.refusal(e);
     }
 }

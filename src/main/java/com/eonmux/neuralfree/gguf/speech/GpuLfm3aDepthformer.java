@@ -285,7 +285,7 @@ final class GpuLfm3aDepthformer implements Lfm3aDepthformer.Engine {
         ops.norm(NormKind.RMS, outputNorm, null, eps, cur, 0, normed, 0, nCodebooks, nEmbd);
         for (int p = 0; p < nCodebooks; p++) {
             ops.norm(NormKind.RMS, headNorm[p], null, eps, normed, p * nEmbd, row, 0, 1, nEmbd);
-            ops.enqueue(SpeechKernels.MATVEC_ROWS_F32, new long[]{SpeechKernels.roundUp(vocab)},
+            ops.enqueue(SpeechKernels.MATVEC_ROWS_F32, new long[]{SpeechKernels.rowGroupsGlobal(vocab)},
                     new long[]{SpeechKernels.LOCAL}, nEmbd, vocab, p * vocab, headF32, row, logitsPage);
             ops.copy(logitsPage, 0, logits, p * vocab, vocab);
         }

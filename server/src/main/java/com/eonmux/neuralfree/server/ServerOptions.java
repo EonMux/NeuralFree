@@ -34,7 +34,8 @@ import java.util.Objects;
  * {@code --default-chat-template-kwargs}, llama.cpp's {@code --chat-template-kwargs}), the distribution the
  * OpenAI endpoints' logprobs score (vLLM's {@code --logprobs-mode}, {@code raw_logprobs} by default as there), and
  * the OTLP endpoint request traces are exported to (vLLM's {@code --otlp-traces-endpoint}); null keeps per-request
- * OpenTelemetry tracing off.
+ * OpenTelemetry tracing off; and the most generation requests one replica holds waiting to run (SGLang's
+ * {@code --max-queued-requests}).
  * Immutable.
  *
  * @param servedNames      the comma-separated served names, or null to serve the model path
@@ -65,13 +66,16 @@ import java.util.Objects;
  *                         {@code watermarking} field
  * @param kvTransfer       the disaggregated prefill/decode connector (vLLM's {@code --kv-transfer-config}), or
  *                         null for an instance that transfers no KV
+ * @param maxQueuedRequests the most generation requests one replica holds waiting to run (SGLang's
+ *                         {@code --max-queued-requests}): a request past it is refused with 429 and
+ *                         {@code Retry-After}; 0 queues without limit
  */
 record ServerOptions(String servedNames, Duration requestTimeout, boolean spmInfill, int responseStore,
                      Path slotSavePath, int sleepIdleSeconds, int replicas, List<String> devices,
                      boolean trustRequestChatTemplate, DpLayout dataParallel,
                      Map<String, Object> chatTemplateKwargs, LogprobsMode logprobsMode,
                      List<String> tools, List<McpServerConfig> mcpServers, String otlpTracesEndpoint,
-                     WatermarkConfig watermark, KvTransferConfig kvTransfer) {
+                     WatermarkConfig watermark, KvTransferConfig kvTransfer, int maxQueuedRequests) {
 
     /** The request budget in seconds. */
     static final String TIMEOUT_PROPERTY = "neuralfree.server.request.timeout";
@@ -97,6 +101,9 @@ record ServerOptions(String servedNames, Duration requestTimeout, boolean spmInf
 
     /** The default idle sleep: never. */
     static final int DEFAULT_SLEEP_IDLE_SECONDS = -1;
+
+    /** The most generation requests one replica holds waiting to run; 0 (the default) for no limit. */
+    static final String MAX_QUEUED_PROPERTY = "neuralfree.server.max.queued.requests";
 
     /** How many engine replicas serve the model (vLLM's {@code --data-parallel-size}). */
     static final String REPLICAS_PROPERTY = "neuralfree.server.replicas";
@@ -172,6 +179,9 @@ record ServerOptions(String servedNames, Duration requestTimeout, boolean spmInf
         if (slotSavePath != null && !Files.isDirectory(slotSavePath)) {
             throw new IllegalArgumentException(SLOT_SAVE_PATH_PROPERTY + " must name a directory, got " + slotSavePath);
         }
+        if (maxQueuedRequests < 0) {
+            throw new IllegalArgumentException(MAX_QUEUED_PROPERTY + " must be 0 or more, got " + maxQueuedRequests);
+        }
         if (replicas < 1) {
             throw new IllegalArgumentException(REPLICAS_PROPERTY + " must be 1 or more, got " + replicas);
         }
@@ -211,6 +221,17 @@ record ServerOptions(String servedNames, Duration requestTimeout, boolean spmInf
         mcpServers = mcpServers == null ? null : List.copyOf(mcpServers);
         otlpTracesEndpoint = otlpTracesEndpoint == null || otlpTracesEndpoint.isBlank()
                 ? null : otlpTracesEndpoint.trim();
+    }
+
+    /** The seventeen settings with no limit on the requests waiting per replica. */
+    ServerOptions(String servedNames, Duration requestTimeout, boolean spmInfill, int responseStore,
+                  Path slotSavePath, int sleepIdleSeconds, int replicas, List<String> devices,
+                  boolean trustRequestChatTemplate, DpLayout dataParallel, Map<String, Object> chatTemplateKwargs,
+                  LogprobsMode logprobsMode, List<String> tools, List<McpServerConfig> mcpServers,
+                  String otlpTracesEndpoint, WatermarkConfig watermark, KvTransferConfig kvTransfer) {
+        this(servedNames, requestTimeout, spmInfill, responseStore, slotSavePath, sleepIdleSeconds, replicas,
+                devices, trustRequestChatTemplate, dataParallel, chatTemplateKwargs, logprobsMode, tools, mcpServers,
+                otlpTracesEndpoint, watermark, kvTransfer, 0);
     }
 
     /** The twelve settings with no server tools enabled (the {@code /tools} endpoint off) and tracing off. */
@@ -295,63 +316,70 @@ record ServerOptions(String servedNames, Duration requestTimeout, boolean spmInf
     ServerOptions withResponseStore(int responses) {
         return new ServerOptions(servedNames, requestTimeout, spmInfill, responses, slotSavePath, sleepIdleSeconds,
                 replicas, devices, trustRequestChatTemplate, dataParallel, chatTemplateKwargs, logprobsMode,
-                tools, mcpServers, otlpTracesEndpoint, watermark, kvTransfer);
+                tools, mcpServers, otlpTracesEndpoint, watermark, kvTransfer, maxQueuedRequests);
     }
 
     /** A copy that accepts ({@code trust} true) or refuses request-supplied chat templates. */
     ServerOptions withTrustRequestChatTemplate(boolean trust) {
         return new ServerOptions(servedNames, requestTimeout, spmInfill, responseStore, slotSavePath,
                 sleepIdleSeconds, replicas, devices, trust, dataParallel, chatTemplateKwargs, logprobsMode,
-                tools, mcpServers, otlpTracesEndpoint, watermark, kvTransfer);
+                tools, mcpServers, otlpTracesEndpoint, watermark, kvTransfer, maxQueuedRequests);
     }
 
     /** A copy whose chat requests render with {@code kwargs} as their default template variables. */
     ServerOptions withChatTemplateKwargs(Map<String, Object> kwargs) {
         return new ServerOptions(servedNames, requestTimeout, spmInfill, responseStore, slotSavePath,
                 sleepIdleSeconds, replicas, devices, trustRequestChatTemplate, dataParallel, kwargs, logprobsMode,
-                tools, mcpServers, otlpTracesEndpoint, watermark, kvTransfer);
+                tools, mcpServers, otlpTracesEndpoint, watermark, kvTransfer, maxQueuedRequests);
     }
 
     /** A copy placing the local replicas at {@code layout}'s ranks and routing by its method. */
     ServerOptions withDataParallel(DpLayout layout) {
         return new ServerOptions(servedNames, requestTimeout, spmInfill, responseStore, slotSavePath,
                 sleepIdleSeconds, replicas, devices, trustRequestChatTemplate, layout, chatTemplateKwargs,
-                logprobsMode, tools, mcpServers, otlpTracesEndpoint, watermark, kvTransfer);
+                logprobsMode, tools, mcpServers, otlpTracesEndpoint, watermark, kvTransfer, maxQueuedRequests);
     }
 
     /** A copy whose OpenAI endpoints score logprobs in {@code mode}. */
     ServerOptions withLogprobsMode(LogprobsMode mode) {
         return new ServerOptions(servedNames, requestTimeout, spmInfill, responseStore, slotSavePath,
                 sleepIdleSeconds, replicas, devices, trustRequestChatTemplate, dataParallel, chatTemplateKwargs,
-                mode, tools, mcpServers, otlpTracesEndpoint, watermark, kvTransfer);
+                mode, tools, mcpServers, otlpTracesEndpoint, watermark, kvTransfer, maxQueuedRequests);
     }
 
     /** A copy serving the model under {@code names}, the comma-separated list {@link ServedModels} parses. */
     ServerOptions withServedNames(String names) {
         return new ServerOptions(names, requestTimeout, spmInfill, responseStore, slotSavePath,
                 sleepIdleSeconds, replicas, devices, trustRequestChatTemplate, dataParallel, chatTemplateKwargs,
-                logprobsMode, tools, mcpServers, otlpTracesEndpoint, watermark, kvTransfer);
+                logprobsMode, tools, mcpServers, otlpTracesEndpoint, watermark, kvTransfer, maxQueuedRequests);
     }
 
     /** A copy whose per-request spans are exported to {@code endpoint}; null turns request tracing off. */
     ServerOptions withOtlpTracesEndpoint(String endpoint) {
         return new ServerOptions(servedNames, requestTimeout, spmInfill, responseStore, slotSavePath,
                 sleepIdleSeconds, replicas, devices, trustRequestChatTemplate, dataParallel, chatTemplateKwargs,
-                logprobsMode, tools, mcpServers, endpoint, watermark, kvTransfer);
+                logprobsMode, tools, mcpServers, endpoint, watermark, kvTransfer, maxQueuedRequests);
     }
 
     /** A copy serving every request under {@code config}'s watermark; null serves unwatermarked generation. */
     ServerOptions withWatermark(WatermarkConfig config) {
         return new ServerOptions(servedNames, requestTimeout, spmInfill, responseStore, slotSavePath,
                 sleepIdleSeconds, replicas, devices, trustRequestChatTemplate, dataParallel, chatTemplateKwargs,
-                logprobsMode, tools, mcpServers, otlpTracesEndpoint, config, kvTransfer);
+                logprobsMode, tools, mcpServers, otlpTracesEndpoint, config, kvTransfer, maxQueuedRequests);
     }
 
     /** A copy that serves disaggregated prefill/decode through {@code config}'s connector; null transfers no KV. */
     ServerOptions withKvTransfer(KvTransferConfig config) {
         return new ServerOptions(servedNames, requestTimeout, spmInfill, responseStore, slotSavePath,
                 sleepIdleSeconds, replicas, devices, trustRequestChatTemplate, dataParallel, chatTemplateKwargs,
-                logprobsMode, tools, mcpServers, otlpTracesEndpoint, watermark, config);
+                logprobsMode, tools, mcpServers, otlpTracesEndpoint, watermark, config, maxQueuedRequests);
+    }
+
+    /** A copy holding at most {@code requests} generation requests waiting per replica; 0 for no limit. */
+    ServerOptions withMaxQueuedRequests(int requests) {
+        return new ServerOptions(servedNames, requestTimeout, spmInfill, responseStore, slotSavePath,
+                sleepIdleSeconds, replicas, devices, trustRequestChatTemplate, dataParallel, chatTemplateKwargs,
+                logprobsMode, tools, mcpServers, otlpTracesEndpoint, watermark, kvTransfer, requests);
     }
 
     /** The global data-parallel rank local replica {@code index} serves. */
@@ -392,6 +420,10 @@ record ServerOptions(String servedNames, Duration requestTimeout, boolean spmInf
         if (idle > Integer.MAX_VALUE) {
             throw new IllegalArgumentException(SLEEP_IDLE_PROPERTY + " is too large: " + idle);
         }
+        long maxQueued = wholeNumber(MAX_QUEUED_PROPERTY, 0);
+        if (maxQueued > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(MAX_QUEUED_PROPERTY + " is too large: " + maxQueued);
+        }
         List<String> devices = devices(System.getProperty(DEVICES_PROPERTY));
         long fallbackReplicas = devices == null ? 1 : devices.size();
         long replicas = wholeNumber(REPLICAS_PROPERTY, fallbackReplicas);
@@ -404,7 +436,8 @@ record ServerOptions(String servedNames, Duration requestTimeout, boolean spmInf
                 Boolean.parseBoolean(System.getProperty(TRUST_REQUEST_CHAT_TEMPLATE_PROPERTY, "false").trim()),
                 dataParallelProperties((int) replicas), ChatTemplateKwargs.fromProperties(System.getProperties()),
                 logprobsModeProperty(), toolsProperty(), mcpServersProperty(), otlpTracesProperty(),
-                WatermarkConfig.fromProperties(System.getProperties(), env), kvTransferProperty(env));
+                WatermarkConfig.fromProperties(System.getProperties(), env), kvTransferProperty(env),
+                (int) maxQueued);
     }
 
     /**

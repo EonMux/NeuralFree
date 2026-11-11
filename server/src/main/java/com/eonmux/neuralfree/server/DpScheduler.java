@@ -7,6 +7,7 @@ import com.eonmux.neuralfree.gguf.media.MediaKey;
 
 import java.security.MessageDigest;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -29,6 +30,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * prompt routes by {@link #routingRows its rows' prefix-cache keys}, so a conversation's next turn favours the
  * replica that cached its images.
  * Routing is safe from any thread: it reads only published snapshots, atomic counters and synchronized tables.
+ * Generation submissions pass the scheduler's {@link QueueLimit} after the routing.
  */
 final class DpScheduler {
 
@@ -45,11 +47,19 @@ final class DpScheduler {
     private int[][][] affinity;
     /** Guards the affinity tables together with a {@link #replace} of the replica set. */
     private final Object table = new Object();
+    /** The limit on the generation requests waiting per replica. */
+    private final QueueLimit queue;
 
     DpScheduler(EngineReplica[] replicas, LoadBalance method) {
+        this(replicas, method, 0);
+    }
+
+    /** A scheduler whose submissions pass a limit of {@code maxQueuedRequests} waiting requests per replica. */
+    DpScheduler(EngineReplica[] replicas, LoadBalance method, int maxQueuedRequests) {
         this.replicas = replicas.clone();
         this.method = Objects.requireNonNull(method, "method");
         this.affinity = new int[replicas.length][0][];
+        this.queue = new QueueLimit(this, maxQueuedRequests);
     }
 
     /**
@@ -102,6 +112,58 @@ final class DpScheduler {
             row += take;
         }
         return out;
+    }
+
+    /** The per-replica limit on waiting generation requests the submissions pass through. */
+    QueueLimit queue() {
+        return queue;
+    }
+
+    /**
+     * Moves {@code prompt}'s affinity from {@code from}, the replica {@link #pick} chose, to {@code to}, where the
+     * queue limit placed the request: the entry the pick remembered under {@code from} is dropped and the prompt is
+     * remembered under {@code to}, so the next request extending the prompt follows it to the replica whose prefix
+     * cache holds it. A replica no longer in the pool, or a method without affinity, changes nothing.
+     */
+    void rerouted(EngineReplica from, EngineReplica to, int[] prompt) {
+        if (method != LoadBalance.SHORTEST_QUEUE) {
+            return;
+        }
+        int[] prefix = Arrays.copyOf(prompt, Math.min(prompt.length, PREFIX_TOKENS));
+        synchronized (table) {
+            int source = indexOf(from);
+            int target = indexOf(to);
+            if (source < 0 || target < 0) {
+                return;
+            }
+            int[][] entries = affinity[source];
+            for (int i = entries.length - 1; i >= 0; i--) {
+                if (Arrays.equals(entries[i], prefix)) {
+                    int[][] kept = new int[entries.length - 1][];
+                    System.arraycopy(entries, 0, kept, 0, i);
+                    System.arraycopy(entries, i + 1, kept, i, entries.length - i - 1);
+                    affinity[source] = kept;
+                    break;
+                }
+            }
+            remember(target, prompt);
+        }
+    }
+
+    /** The pool position of {@code replica}, or -1 when it is not in the pool; guarded by {@code table}. */
+    private int indexOf(EngineReplica replica) {
+        EngineReplica[] current = replicas;
+        for (int i = 0; i < current.length; i++) {
+            if (current[i] == replica) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** The replicas the scheduler routes over, in pool order, as of the call. */
+    List<EngineReplica> routed() {
+        return List.of(replicas);
     }
 
     /** The method the scheduler routes by. */

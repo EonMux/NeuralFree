@@ -63,6 +63,19 @@ final class ServerJson {
                 .entity(write(errorBody(message, type))).build());
     }
 
+    /**
+     * The HTTP refusal of a submission on the engine's state: 429 {@code rate_limit_error} with {@code Retry-After}
+     * when the replicas' queues are full ({@link EngineSaturatedException}), else 503 {@code unavailable_error}.
+     */
+    static WebApplicationException refusal(IllegalStateException e) {
+        if (e instanceof EngineSaturatedException saturated) {
+            return new WebApplicationException(Response.status(429).type(MediaType.APPLICATION_JSON)
+                    .header("Retry-After", Integer.toString(saturated.retryAfterSeconds()))
+                    .entity(write(errorBody(String.valueOf(e.getMessage()), "rate_limit_error"))).build());
+        }
+        return error(503, String.valueOf(e.getMessage()), "unavailable_error");
+    }
+
     /** A 400 {@code invalid_request_error}. */
     static WebApplicationException badRequest(String message) {
         return error(400, message, "invalid_request_error");
@@ -118,15 +131,32 @@ final class ServerJson {
         }
     }
 
-    /** Writes one server-sent event: an optional {@code event:} line, then {@code data:} with the JSON body. */
+    /** Writes one server-sent event and flushes it: {@link #event(OutputStream, String, Object, boolean)}. */
     static void event(OutputStream out, String type, Object body) throws IOException {
-        StringBuilder sb = new StringBuilder();
+        event(out, type, body, true);
+    }
+
+    /**
+     * Writes one server-sent event: an optional {@code event:} line, then {@code data:} with the JSON body, written
+     * straight into the event's one text buffer. With {@code flush} false the bytes stay in the stream's buffer
+     * for a later flush, so a writer that drains several queued events sends them in one flush.
+     */
+    static void event(OutputStream out, String type, Object body, boolean flush) throws IOException {
+        StringBuilder sb = new StringBuilder(256);
         if (type != null) {
             sb.append("event: ").append(type).append('\n');
         }
-        sb.append("data: ").append(write(body)).append("\n\n");
+        sb.append("data: ");
+        try {
+            Json.write(body, Json.Style.API, sb);
+        } catch (IOException e) {
+            throw new IllegalStateException("a response body does not write as JSON", e);
+        }
+        sb.append("\n\n");
         out.write(sb.toString().getBytes(StandardCharsets.UTF_8));
-        out.flush();
+        if (flush) {
+            out.flush();
+        }
     }
 
     /** Writes a raw {@code data:} line (the OpenAI stream's {@code [DONE]}). */

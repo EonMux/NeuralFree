@@ -145,34 +145,10 @@ final class RemoteEndpoint {
         if (pending.isEmpty()) {
             return;
         }
-        List<byte[]> bodies = new ArrayList<>(pending);
-        pending.clear();
-        pendingBytes = 0;
+        List<Batch> batches = takeBatches();
         try {
-            int i = 0;
-            while (i < bodies.size()) {
-                // the member count goes before the bodies, so the server can bound its member loop
-                int start = i;
-                int count = 0;
-                int size = BATCH_OVERHEAD;
-                while (i < bodies.size()) {
-                    int needed = 1 + bodies.get(i).length;
-                    if (count > 0 && size + needed > RpcWire.MAX_FRAME) {
-                        break;
-                    }
-                    count++;
-                    size += needed;
-                    i++;
-                }
-                RpcWire.Writer w = new RpcWire.Writer(RpcWire.OP_BATCH).i32(count);
-                for (int j = start; j < i; j++) {
-                    w.body(bodies.get(j));
-                }
-                int executed = connection.call(w).i32();
-                if (executed != count) {
-                    throw new IllegalStateException("remote device " + connection.describe() + " executed "
-                            + executed + " of " + count + " batch commands");
-                }
+            for (Batch batch : batches) {
+                batch.checkExecuted(connection.call(batch.frame));
                 flushedUpTo = sequence;
             }
         } catch (RuntimeException e) {
@@ -181,6 +157,58 @@ final class RemoteEndpoint {
             pendingBytes = 0;
             throw e;
         }
+    }
+
+    /** One {@link RpcWire#OP_BATCH} frame of buffered commands and its member count. */
+    private final class Batch {
+        final RpcWire.Writer frame;
+        final int count;
+
+        Batch(RpcWire.Writer frame, int count) {
+            this.frame = frame;
+            this.count = count;
+        }
+
+        /** Checks the server's answer to the frame: it executed every member. */
+        void checkExecuted(RpcWire.Reader answer) {
+            int executed = answer.i32();
+            if (executed != count) {
+                throw new IllegalStateException("remote device " + connection.describe() + " executed "
+                        + executed + " of " + count + " batch commands");
+            }
+        }
+    }
+
+    /**
+     * Takes the buffered commands as batch frames of at most {@link RpcWire#MAX_FRAME} bytes each, in order; the
+     * member count goes before the bodies, so the server can bound its member loop.
+     */
+    private List<Batch> takeBatches() {
+        List<byte[]> bodies = new ArrayList<>(pending);
+        pending.clear();
+        pendingBytes = 0;
+        List<Batch> batches = new ArrayList<>(1);
+        int i = 0;
+        while (i < bodies.size()) {
+            int start = i;
+            int count = 0;
+            int size = BATCH_OVERHEAD;
+            while (i < bodies.size()) {
+                int needed = 1 + bodies.get(i).length;
+                if (count > 0 && size + needed > RpcWire.MAX_FRAME) {
+                    break;
+                }
+                count++;
+                size += needed;
+                i++;
+            }
+            RpcWire.Writer w = new RpcWire.Writer(RpcWire.OP_BATCH).i32(count);
+            for (int j = start; j < i; j++) {
+                w.body(bodies.get(j));
+            }
+            batches.add(new Batch(w, count));
+        }
+        return batches;
     }
 
     /**
@@ -195,17 +223,47 @@ final class RemoteEndpoint {
     /**
      * A request that needs an answer. When {@code finishesPrefix} is set, the request is an observation point — a
      * read, whose data the server makes durable before answering — and the commands before it count as finished,
-     * so their deferred events complete without another round trip.
+     * so their deferred events complete without another round trip. A read rides in the same round trip as the
+     * last batch of buffered commands ({@link RpcConnection#callPipelined}): it has no side effects, so when the
+     * batch fails, the read the server still answered is dropped and the batch's error is raised.
      */
     synchronized RpcWire.Reader request(RpcWire.Writer w, boolean finishesPrefix) {
         Objects.requireNonNull(w, "writer");
-        flush();
         long at = sequence;
-        RpcWire.Reader r = connection.call(w);
+        RpcWire.Reader r = w.opcode() == RpcWire.OP_READ ? flushWithRead(w) : flushThenCall(w);
         if (finishesPrefix && finishedUpTo < at) {
             finishedUpTo = at;
         }
         return r;
+    }
+
+    private RpcWire.Reader flushThenCall(RpcWire.Writer w) {
+        flush();
+        return connection.call(w);
+    }
+
+    /** Flushes the buffered commands with {@code read} pipelined behind the last batch frame. */
+    private RpcWire.Reader flushWithRead(RpcWire.Writer read) {
+        if (pending.isEmpty()) {
+            return connection.call(read);
+        }
+        List<Batch> batches = takeBatches();
+        try {
+            for (int i = 0; i < batches.size() - 1; i++) {
+                Batch batch = batches.get(i);
+                batch.checkExecuted(connection.call(batch.frame));
+                flushedUpTo = sequence;
+            }
+            Batch last = batches.get(batches.size() - 1);
+            RpcConnection.Answers answers = connection.callPipelined(last.frame, read);
+            last.checkExecuted(answers.first());
+            flushedUpTo = sequence;
+            return answers.second();
+        } catch (RuntimeException e) {
+            pending.clear();
+            pendingBytes = 0;
+            throw e;
+        }
     }
 
     /**

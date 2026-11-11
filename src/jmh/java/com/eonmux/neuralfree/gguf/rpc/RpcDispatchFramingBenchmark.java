@@ -22,9 +22,9 @@ import java.util.concurrent.TimeUnit;
  * The wire cost of one remote kernel dispatch ({@link RpcWire}): the client's {@code OP_ENQUEUE} member as
  * {@code RemoteComputeQueue} writes it (kernel id, work sizes, six buffer arguments and five scalars, the shape of a
  * decode matvec) and the server's read of it back into arguments. A decode step of a 0.6B model sends about 420.
- * {@code serverEnqueue} adds what {@code RpcComputeServer}'s enqueue does around that read: it copies the
- * connection's whole buffer table into an id-to-buffer and a buffer-to-device map for every dispatch, so its cost
- * grows with {@code connectionBuffers}, the buffers the connection holds (a model's weights and activations).
+ * {@code serverEnqueue} is {@code RpcComputeServer}'s enqueue read: each buffer argument resolves through the
+ * connection's buffer table ({@link RpcComputeServer.DispatchBuffers}) with its device checked against the kernel's,
+ * at {@code connectionBuffers} buffers held by the connection (a model's weights and activations).
  */
 @State(Scope.Benchmark)
 @BenchmarkMode(Mode.AverageTime)
@@ -42,7 +42,7 @@ public class RpcDispatchFramingBenchmark {
     public int connectionBuffers;
 
     private Object[] args;
-    private Map<Long, Owned> table;
+    private Map<Long, RpcComputeServer.Owned<GpuBuffer>> table;
     private byte[] frame;
     private Map<Long, GpuBuffer> buffers;
 
@@ -62,10 +62,10 @@ public class RpcDispatchFramingBenchmark {
         args[10] = 7L;
         table = new LinkedHashMap<>();
         for (GpuBuffer b : buffers.values()) {
-            table.put(((RemoteBuffer) b).id(), new Owned(b, 0));
+            table.put(((RemoteBuffer) b).id(), new RpcComputeServer.Owned<>(b, 0));
         }
         for (int i = table.size(); i < connectionBuffers; i++) {
-            table.put(1000L + i, new Owned(new RemoteBuffer(null, 1000L + i, 1 << 20), 0));
+            table.put(1000L + i, new RpcComputeServer.Owned<>(new RemoteBuffer(null, 1000L + i, 1 << 20), 0));
         }
         frame = encode();
         if (decode().length != args.length) {
@@ -80,18 +80,7 @@ public class RpcDispatchFramingBenchmark {
         return w.toBytes();
     }
 
-    /** A buffer and the device it lives on, the server's per-connection table entry. */
-    static final class Owned {
-        final GpuBuffer value;
-        final int device;
-
-        Owned(GpuBuffer value, int device) {
-            this.value = value;
-            this.device = device;
-        }
-    }
-
-    /** The server's read of one dispatch, its per-dispatch copy of the connection's buffer table included. */
+    /** The server's read of one dispatch with its arguments resolved and device-checked against the table. */
     @Benchmark
     public Object[] serverEnqueue() {
         RpcWire.Reader r = new RpcWire.Reader(frame);
@@ -99,18 +88,9 @@ public class RpcDispatchFramingBenchmark {
         r.i64();
         r.longArray();
         r.longArray();
-        Map<GpuBuffer, Integer> deviceOfBuffer = new LinkedHashMap<>();
-        Map<Long, GpuBuffer> scope = new LinkedHashMap<>();
-        for (Map.Entry<Long, Owned> e : table.entrySet()) {
-            scope.put(e.getKey(), e.getValue().value);
-            deviceOfBuffer.put(e.getValue().value, e.getValue().device);
-        }
+        RpcComputeServer.DispatchBuffers scope = new RpcComputeServer.DispatchBuffers(table, 0);
         Object[] read = RpcWire.readArgs(r, scope);
-        for (Object arg : read) {
-            if (arg instanceof GpuBuffer && deviceOfBuffer.get(arg) == null) {
-                throw new IllegalStateException("an argument buffer is not in the table");
-            }
-        }
+        scope.checkDevice();
         return read;
     }
 
@@ -121,6 +101,6 @@ public class RpcDispatchFramingBenchmark {
         r.i64();
         r.longArray();
         r.longArray();
-        return RpcWire.readArgs(r, buffers);
+        return RpcWire.readArgs(r, buffers::get);
     }
 }

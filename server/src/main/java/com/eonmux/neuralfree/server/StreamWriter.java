@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 
 /**
@@ -20,8 +21,20 @@ import java.util.function.BooleanSupplier;
  * prompt's ids; chat chunks carry {@code token_ids} on the choice. The finish chunk of a choice names its
  * {@code stop_reason}. A write that fails — the client went away — cancels the batch, as does any failure while
  * mapping the output (which the client receives as an error event).
+ *
+ * <p>The writer drains the events already queued behind the one it waited for and flushes the stream once when the
+ * queue is empty, or after {@link #MAX_DRAIN_EVENTS} events or {@link #MAX_DRAIN_NANOS} of draining, whichever comes
+ * first, so the chunks of several tokens (a speculative step's accepted run, or a writer that fell behind) leave in
+ * one flush while a writer that never catches up still flushes regularly and checks the request budget between
+ * drains; the bytes are those of one flush per chunk. Chunks written outside {@link #run}, such as a stream's
+ * opening chunk, flush at once.</p>
  */
 final class StreamWriter {
+
+    /** The most queued events one drain writes before it flushes. */
+    static final int MAX_DRAIN_EVENTS = 64;
+    /** The longest one drain writes before it flushes. */
+    static final long MAX_DRAIN_NANOS = TimeUnit.MILLISECONDS.toNanos(10);
 
     /** Handles one event, writing its chunks through the writer. */
     interface Handler {
@@ -41,6 +54,8 @@ final class StreamWriter {
     private final long promptTokens;
     private final Flags flags;
     private int remaining;
+    /** Whether {@link #run} is handling a run of queued events, whose chunks it flushes together afterwards. */
+    private boolean draining;
 
     /**
      * A writer of {@code object} chunks over {@code batch}; {@code promptTokens} is the usage's prompt count and
@@ -81,16 +96,34 @@ final class StreamWriter {
                 if (event == null) {
                     continue;
                 }
-                handler.on(event);
-                if (event instanceof GenerationBatch.Done) {
-                    done++;
+                // the events queued behind this one go out with it, flushed once the queue is empty or the drain
+                // reached its bound
+                draining = true;
+                try {
+                    long started = System.nanoTime();
+                    int drained = 0;
+                    while (event != null) {
+                        handler.on(event);
+                        drained++;
+                        if (event instanceof GenerationBatch.Done) {
+                            done++;
+                        }
+                        if (done == batch.size() || (stop != null && stop.getAsBoolean())
+                                || drained >= MAX_DRAIN_EVENTS || System.nanoTime() - started >= MAX_DRAIN_NANOS) {
+                            break;
+                        }
+                        event = batch.poll();
+                    }
+                } finally {
+                    draining = false;
                 }
+                out.flush();
             }
             if (flags.includeUsage()) {
                 Map<String, Object> chunk = bodies.head(id, object, created);
                 chunk.put("choices", List.of());
                 chunk.put("usage", OpenAiBodies.usage(promptTokens, cachedTokens(), results));
-                ServerJson.event(out, null, chunk);
+                ServerJson.event(out, null, chunk, false);
             }
             ServerJson.data(out, "[DONE]");
         } catch (IOException e) {
@@ -123,7 +156,7 @@ final class StreamWriter {
         remaining--;
         String failure = batch.failure(choice);
         if (failure != null) {
-            ServerJson.event(out, null, ServerJson.errorBody(failure, "invalid_request_error"));
+            ServerJson.event(out, null, ServerJson.errorBody(failure, "invalid_request_error"), !draining);
             return null;
         }
         GenerationResult result = batch.result(choice);
@@ -253,6 +286,6 @@ final class StreamWriter {
                 chunk.put("kv_transfer_params", transfer);
             }
         }
-        ServerJson.event(out, null, chunk);
+        ServerJson.event(out, null, chunk, !draining);
     }
 }

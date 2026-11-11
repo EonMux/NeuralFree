@@ -166,6 +166,144 @@ public class VideoDecoderTest {
     }
 
     @Test
+    public void theSelectFilterMergesRunsOfConsecutiveFrames() {
+        assertEquals("select='eq(n,0)+between(n,2,4)+eq(n,9)',setpts=N/FRAME_RATE/TB",
+                VideoDecoder.selectFilter(new int[] {0, 2, 3, 4, 9}));
+        assertEquals("select='between(n,5,6)',setpts=N/FRAME_RATE/TB", VideoDecoder.selectFilter(new int[] {5, 6}));
+        int[] scattered = new int[VideoDecoder.MAX_SELECT_CHARS / 4];
+        for (int i = 0; i < scattered.length; i++) {
+            scattered[i] = 2 * i;
+        }
+        assertEquals("an expression past the command-line budget streams every frame instead", null,
+                VideoDecoder.selectFilter(scattered));
+    }
+
+    /**
+     * The decode of a constant-rate stream selects the plan's frames inside ffmpeg; the frames equal the ones the
+     * full stream holds at the plan's indices, unscaled and scaled.
+     */
+    @Test
+    public void theSelectedFramesEqualTheFullStreamsFramesAtThePlansIndices() throws Exception {
+        Assume.assumeTrue("no ffmpeg on the PATH", ffmpegOnPath());
+        byte[] video = mp4Frames(32, 24, 10, 30);
+        VideoDecoder decoder = new VideoDecoder();
+        VideoMeta meta = decoder.probe(video, "video_url.url");
+        assertTrue("the fixture is constant-rate and starts with its container", meta.indexAligned());
+        int[] picks = {0, 3, 4, 5, 11, 17, 29};
+        VideoSamplePlan sampled = VideoSamplePlan.of(meta, picks, 2.0, VideoTemplate.DEFAULT, 1);
+        VideoSamplePlan all = VideoSamplePlan.ofAll(meta, VideoTemplate.DEFAULT, 1);
+        for (ImageSize size : new ImageSize[] {null, new ImageSize(16, 12)}) {
+            List<RasterImage> every = decoder.decode(video, all, size, 0, "video_url.url").frames();
+            List<RasterImage> kept = decoder.decode(video, sampled, size, 0, "video_url.url").frames();
+            assertEquals(30, every.size());
+            assertEquals(picks.length, kept.size());
+            for (int i = 0; i < picks.length; i++) {
+                assertArrayEquals("frame " + picks[i] + " at " + size, every.get(picks[i]).rgb(), kept.get(i).rgb());
+            }
+        }
+    }
+
+    /**
+     * A variable-rate stream (its second half spaced two frame times apart) keeps the rate-sampled numbering: the
+     * decode streams every frame and keeps the plan's, so the frames equal the full stream's at the plan's indices,
+     * where a frame-index select would pick other frames from the second half.
+     */
+    @Test
+    public void aVariableRateStreamKeepsTheRateSampledFrames() throws Exception {
+        Assume.assumeTrue("no ffmpeg on the PATH", ffmpegOnPath());
+        Path out = Files.createTempFile("nf-video-vfr-test-", ".mp4");
+        byte[] video;
+        try {
+            Process p = new ProcessBuilder("ffmpeg", "-y", "-nostdin", "-f", "lavfi",
+                    "-i", "testsrc=size=32x24:rate=10", "-frames:v", "30",
+                    "-vf", "setpts='if(lt(N,15),N,2*N-15)/(10*TB)'", "-fps_mode", "passthrough",
+                    "-pix_fmt", "yuv420p", out.toString())
+                    .redirectErrorStream(false).start();
+            drain(p.getErrorStream());
+            assertTrue("ffmpeg failed to encode the fixture", p.waitFor(120, TimeUnit.SECONDS));
+            assertEquals(0, p.exitValue());
+            video = Files.readAllBytes(out);
+        } finally {
+            Files.deleteIfExists(out);
+        }
+        VideoDecoder decoder = new VideoDecoder();
+        VideoMeta meta = decoder.probe(video, "video_url.url");
+        assertFalse("the fixture is variable-rate", meta.indexAligned());
+        int[] picks = {0, 7, 16, 20, 25, 29};
+        List<RasterImage> every = decoder.decode(video, VideoSamplePlan.ofAll(meta, VideoTemplate.DEFAULT, 1),
+                null, 0, "video_url.url").frames();
+        List<RasterImage> kept = decoder.decode(video, VideoSamplePlan.of(meta, picks, 2.0, VideoTemplate.DEFAULT, 1),
+                null, 0, "video_url.url").frames();
+        assertEquals(picks.length, kept.size());
+        for (int i = 0; i < picks.length; i++) {
+            assertArrayEquals("frame " + picks[i], every.get(picks[i]).rgb(), kept.get(i).rgb());
+        }
+    }
+
+    /**
+     * A constant-rate video that starts 0.2 s (two frames) after its soundtrack: the reference's rate-keeping decode
+     * repeats the first frame over the lead, so its frame {@code n} is not decoded frame {@code n}; the probe
+     * reports the stream as not index-aligned and the decode keeps the rate-sampled frames, equal to the full
+     * stream's at the plan's indices.
+     */
+    @Test
+    public void aVideoThatStartsAfterItsSoundtrackKeepsTheRateSampledFrames() throws Exception {
+        Assume.assumeTrue("no ffmpeg on the PATH", ffmpegOnPath());
+        Path out = Files.createTempFile("nf-video-lead-test-", ".mp4");
+        byte[] video;
+        try {
+            Process p = new ProcessBuilder("ffmpeg", "-y", "-nostdin",
+                    "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
+                    "-itsoffset", "0.2", "-f", "lavfi", "-i", "testsrc=size=32x24:rate=10",
+                    "-map", "1:v", "-map", "0:a", "-frames:v", "30", "-t", "3.2",
+                    "-pix_fmt", "yuv420p", "-c:a", "aac", out.toString())
+                    .redirectErrorStream(false).start();
+            drain(p.getErrorStream());
+            assertTrue("ffmpeg failed to encode the fixture", p.waitFor(120, TimeUnit.SECONDS));
+            assertEquals(0, p.exitValue());
+            video = Files.readAllBytes(out);
+        } finally {
+            Files.deleteIfExists(out);
+        }
+        VideoDecoder decoder = new VideoDecoder();
+        VideoMeta meta = decoder.probe(video, "video_url.url");
+        assertEquals("the video stream starts behind the soundtrack", 0.2, meta.startTime(), 1e-3);
+        assertFalse("a stream behind its container start is not index-aligned", meta.indexAligned());
+        int[] picks = {0, 3, 7, 12, 20, 26};
+        List<RasterImage> every = decoder.decode(video, VideoSamplePlan.ofAll(meta, VideoTemplate.DEFAULT, 1),
+                null, 0, "video_url.url").frames();
+        List<RasterImage> kept = decoder.decode(video, VideoSamplePlan.of(meta, picks, 2.0, VideoTemplate.DEFAULT, 1),
+                null, 0, "video_url.url").frames();
+        assertEquals(picks.length, kept.size());
+        for (int i = 0; i < picks.length; i++) {
+            assertArrayEquals("frame " + picks[i], every.get(picks[i]).rgb(), kept.get(i).rgb());
+        }
+    }
+
+    /**
+     * The probe output's container section reads as {@code format.} keys, and only a constant-rate stream that
+     * starts within {@link VideoMeta#MAX_ALIGNED_LEAD_FRAMES} frames of its container is index-aligned.
+     */
+    @Test
+    public void onlyAStreamThatStartsWithItsContainerIsIndexAligned() {
+        java.util.Map<String, String> fields = VideoDecoder.parseProbe("[STREAM]\nwidth=8\nheight=8\n"
+                + "r_frame_rate=10/1\navg_frame_rate=10/1\nnb_frames=30\nstart_time=0.200000\n[/STREAM]\n"
+                + "[FORMAT]\nstart_time=0.000000\n[/FORMAT]\n");
+        assertEquals("0.200000", fields.get("start_time"));
+        assertEquals("0.000000", fields.get("format.start_time"));
+        assertFalse("two frames behind the container", VideoMeta.ofProbe(fields).indexAligned());
+        java.util.Map<String, String> aligned = new java.util.HashMap<>(fields);
+        aligned.put("format.start_time", "0.200000");
+        assertTrue("a container that starts with the stream", VideoMeta.ofProbe(aligned).indexAligned());
+        aligned.put("format.start_time", "0.180000");
+        assertTrue("a fifth of a frame behind", VideoMeta.ofProbe(aligned).indexAligned());
+        aligned.put("format.start_time", "0.150000");
+        assertFalse("half a frame behind", VideoMeta.ofProbe(aligned).indexAligned());
+        aligned.remove("format.start_time");
+        assertFalse("no container start reported", VideoMeta.ofProbe(aligned).indexAligned());
+    }
+
+    @Test
     public void theQwen2VlFamilyDecodesThePatchFlooredFrames() throws Exception {
         Assume.assumeTrue("no ffmpeg on the PATH", ffmpegOnPath());
         byte[] video = mp4Frames(8, 8, 2, 7);

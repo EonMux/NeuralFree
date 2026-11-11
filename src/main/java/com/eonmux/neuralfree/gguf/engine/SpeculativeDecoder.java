@@ -97,8 +97,11 @@ import java.util.function.IntUnaryOperator;
  * logit bias, no grammar or other masking request stage, no whole-row statistics before the chain's top-k) takes
  * {@link ForwardBackend#forwardRowsTopK} and selects each row through the chain over the device's top candidates
  * ({@code Sampler#applyTopK}) — the same token the host chain selects over the whole row, with the request's seed.
- * Every other chain reads the {@code k + 1} logits rows back, and the fallback log names the reason. The tokens are
- * the same either way.
+ * A chain whose cone needs its penalties, DRY or positive bias applied first ({@code Sampler#deviceConeWidth}) takes
+ * the same readout with one {@link LogitPrefilter} row per verify row — row {@code i} edited over the history plus
+ * the draft's first {@code i} tokens — when the backend applies prefilters on the device
+ * ({@link ForwardBackend#topKPrefilterOnDevice}). Every other chain reads the {@code k + 1} logits rows back, and
+ * the fallback log names the reason. The tokens are the same either way.
  *
  * <p><b>Request features.</b> The chain is the plain loop's: banned tokens, {@code logit_bias}, penalties, DRY, the
  * grammar constraint, {@code min_tokens}, {@code bad_words}, {@code allowed_token_ids} and the reasoning budget. A
@@ -589,17 +592,20 @@ public final class SpeculativeDecoder {
     /**
      * How this generation's rounds select their tokens: {@link #HOST} reads the rows back and samples on the host,
      * {@link #GREEDY} selects greedy ids on the device, {@link #SAMPLED} samples truncated chains over the device's
-     * per-row top candidates (llama.cpp backend sampling {@code -bs}).
+     * per-row top candidates (llama.cpp backend sampling {@code -bs}), and {@link #PREFILTERED} does so after the
+     * device applied each row's pre-top-k edits (the bias, penalties and DRY of {@code Sampler#deviceConeWidth}).
      */
     private enum DeviceMode {
-        HOST, GREEDY, SAMPLED
+        HOST, GREEDY, SAMPLED, PREFILTERED
     }
 
     /**
      * Whether this generation's rounds select on the target's device, and how: {@code MATCH} without a logprobs
      * capture and without a verifier over a plain argmax chain selects greedy ids; over a chain whose keeps stay
-     * inside a top-k cone ({@code Sampler#coneWidth}) it samples the device's top candidates; anything else reads
-     * the rows back, the reason named in the fallback log.
+     * inside a top-k cone ({@code Sampler#coneWidth}) it samples the device's top candidates, and over a chain whose
+     * cone needs the rows' bias, penalties or DRY first ({@code Sampler#deviceConeWidth}) it samples the candidates
+     * of a prefiltered readout when the backend applies the edits on the device; anything else reads the rows back,
+     * the reason named in the fallback log.
      */
     private DeviceMode deviceMode(Verifier verifier, Sampler sampler, Scores scores) {
         if (!verifyOnDevice || verifier != null || scores.wanted()) {
@@ -609,7 +615,16 @@ public final class SpeculativeDecoder {
             return DeviceMode.GREEDY;
         }
         int cone = sampler.coneWidth();
-        return cone > 0 && cone <= MAX_DEVICE_TOPK && backend.topKOnDevice() ? DeviceMode.SAMPLED : DeviceMode.HOST;
+        if (cone > 0) {
+            return cone <= MAX_DEVICE_TOPK && backend.topKOnDevice() ? DeviceMode.SAMPLED : DeviceMode.HOST;
+        }
+        if (sampler.prefilterRequired() && backend.topKPrefilterOnDevice()) {
+            int prefiltered = sampler.deviceConeWidth();
+            if (prefiltered > 0 && prefiltered <= MAX_DEVICE_TOPK && backend.topKOnDevice()) {
+                return DeviceMode.PREFILTERED;
+            }
+        }
+        return DeviceMode.HOST;
     }
 
     /** Why a generation selects on the host, for the fallback log. */
@@ -655,6 +670,12 @@ public final class SpeculativeDecoder {
             RowTopK top = backend.decodeTopKOnDevice(token, pos, coneWidth(sampler));
             drafter.accept(0);
             Sampler.Candidates cur = sampler.applyTopK(top.ids(0), top.logits(0));
+            next = cur.id(cur.selected());
+        } else if (mode == DeviceMode.PREFILTERED) {
+            RowTopK top = backend.decodeTopKOnDevice(token, pos, sampler.deviceConeWidth(),
+                    LogitPrefilter.single(sampler.prefilterRow()));
+            drafter.accept(0);
+            Sampler.Candidates cur = sampler.applyTopK(top.ids(0), top.logits(0), true);
             next = cur.id(cur.selected());
         } else {
             float[] logits = backend.decode(token, pos);
@@ -818,6 +839,8 @@ public final class SpeculativeDecoder {
             outcome = deviceVerify(sampler, session, draft, batch, pos);
         } else if (mode == DeviceMode.SAMPLED) {
             outcome = sampledVerify(sampler, session, draft, batch, pos);
+        } else if (mode == DeviceMode.PREFILTERED) {
+            outcome = prefilteredVerify(sampler, session, draft, batch, pos);
         } else {
             outcome = hostVerify(verifier, roundsRng, sampler, session, draft, batch, pos, scores);
         }
@@ -862,6 +885,30 @@ public final class SpeculativeDecoder {
         }
         return matchVerify(sampler, session, draft, i -> {
             Sampler.Candidates cur = sampler.applyTopK(rows.ids(i), rows.logits(i));
+            return cur.id(cur.selected());
+        });
+    }
+
+    /**
+     * {@link VerifyMode#MATCH} over the device's per-row top candidates after the device applied each row's
+     * pre-top-k edits: row {@code i} is edited over the chain's history plus {@code draft[0..i)}, the history the
+     * chain holds when {@link #matchVerify} samples that row, and the chain then samples the row's candidates
+     * without repeating the edits ({@code Sampler#applyTopK(int[], float[], boolean)}).
+     */
+    private Verified prefilteredVerify(Sampler sampler, StopCriteria.Session session, int[] draft, int[] batch,
+                                       int pos) {
+        List<LogitPrefilter.Row> edits = new ArrayList<>(batch.length);
+        for (int i = 0; i < batch.length; i++) {
+            edits.add(sampler.prefilterRow(Arrays.copyOf(draft, i)));
+        }
+        RowTopK rows = backend.forwardRowsTopK(batch, pos, sampler.deviceConeWidth(), null,
+                LogitPrefilter.of(edits));
+        if (rows.rows() != batch.length) {
+            throw new IllegalStateException("verification of " + batch.length + " tokens returned " + rows.rows()
+                    + " candidate rows");
+        }
+        return matchVerify(sampler, session, draft, i -> {
+            Sampler.Candidates cur = sampler.applyTopK(rows.ids(i), rows.logits(i), true);
             return cur.id(cur.selected());
         });
     }

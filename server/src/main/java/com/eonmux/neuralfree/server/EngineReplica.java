@@ -293,6 +293,16 @@ final class EngineReplica implements AutoCloseable {
         BatchEngine current = engine;
         return current == null ? 0 : current.maxSequences();
     }
+
+    /**
+     * The sequences the engine runs at once: its slot count, or the configured {@code neuralfree.parallel} while
+     * the batch engine is not built.
+     */
+    int sequenceCapacity() {
+        BatchEngine current = engine;
+        return current == null ? config.memory().parallel() : current.maxSequences();
+    }
+
     /** The built batch engine, or null while no generation ran (the peek, without building it). */
     BatchEngine builtEngine() {
         return engine;
