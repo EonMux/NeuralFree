@@ -1,6 +1,5 @@
 package com.eonmux.neuralfree.gguf;
 
-import com.eonmux.neuralfree.gguf.cpu.numa.NumaPlacement;
 import com.eonmux.neuralfree.utils.LoggingUtil;
 
 import java.io.IOException;
@@ -17,8 +16,10 @@ import java.nio.channels.FileChannel;
  *
  * <p>The region's {@link TensorReadMode} decides how tensors are served: {@link TensorReadMode#MMAP} maps them,
  * {@link TensorReadMode#MLOCK} reads them through the channel and pins the file's mapped pages, and
- * {@link TensorReadMode#MMAP_MLOCK} maps and pins them; the remaining modes read through the channel. When a NUMA
- * strategy is active the mapping is advised {@code POSIX_MADV_RANDOM}, as llama.cpp does on a NUMA host.</p>
+ * {@link TensorReadMode#MMAP_MLOCK} maps and pins them; the remaining modes read through the channel. The mapping
+ * takes the paging advice of {@link TensorAdvice}: by default {@code POSIX_MADV_RANDOM} while a NUMA strategy is
+ * active, as llama.cpp does on a NUMA host, and otherwise {@code POSIX_MADV_WILLNEED}, llama.cpp's prefetch, for data
+ * that fits in RAM.</p>
  *
  * <p>Thread-safe: all reads use absolute-position accessors.</p>
  */
@@ -110,10 +111,12 @@ public class MappedWeightStore implements WeightStore {
             if (pinned) {
                 pinMappings(maps);
             }
-            if (mapped && NumaPlacement.activeIn(System.getProperties())) {
+            final MemoryLock.Advice advice = mapped ? TensorAdvice.forMapping(System.getProperties(), dataLength)
+                    : null;
+            if (advice != null) {
                 for (MappedByteBuffer seg : maps) {
                     if (seg != null) {
-                        MemoryLock.adviseRandom(seg);
+                        MemoryLock.advise(seg, advice);
                     }
                 }
             }

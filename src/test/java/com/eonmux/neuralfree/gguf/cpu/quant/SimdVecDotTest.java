@@ -325,6 +325,64 @@ public class SimdVecDotTest {
         }
     }
 
+    /**
+     * The batched kernels at the largest quant and scale magnitudes the formats hold, against same-signed
+     * activations near the largest quant magnitude: the Q8_0 float tiles' block sums reach {@code 32 * 128 * 127},
+     * below the {@code 2^19} bound that keeps them exact in a float, and the Q4_K and Q6_K int16 tiles' products and
+     * integer sums reach their largest values. The batched product must equal the scalar kernel for every row and
+     * token.
+     */
+    @Test
+    public void batchedKernelsAtTheLargestMagnitudesMatchTheScalarKernels() {
+        Assume.assumeTrue(CpuSimd.available());
+        final int rows = 6;
+        final int cols = 512;
+        final int nTokens = 11;
+        Random rnd = new Random(0xB16);
+        for (GGMLType t : new GGMLType[]{GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K}) {
+            ByteBuffer data = randomRows(t, rows, cols, rnd);
+            byte[] raw = data.array();
+            BlockLayout layout = BlockLayout.of(t);
+            for (int blk = 0; blk < rows * cols / layout.blockElements(); blk++) {
+                int o = blk * layout.blockBytes();
+                if (blk % 5 == 4) {
+                    continue;
+                }
+                if (t == GGMLType.Q8_0) {
+                    Arrays.fill(raw, o + BlockLayout.Q8_0_QS, o + BlockLayout.Q8_0_BYTES, (byte) -128);
+                } else if (t == GGMLType.Q4_K) {
+                    Arrays.fill(raw, o + BlockLayout.Q4_K_SCALES, o + BlockLayout.Q4_K_BYTES, (byte) -1);
+                } else {
+                    Arrays.fill(raw, o + BlockLayout.Q6_K_QH, o + BlockLayout.Q6_K_SCALES, (byte) 0);
+                    Arrays.fill(raw, o + BlockLayout.Q6_K_SCALES, o + BlockLayout.Q6_K_D, (byte) -127);
+                }
+            }
+            CpuTensorRef w = CpuTensorRef.of(t, data, rows, cols);
+            QuantizedActivations[] acts = new QuantizedActivations[nTokens];
+            for (int tok = 0; tok < nTokens; tok++) {
+                float[] x = gaussian(cols, rnd);
+                if (tok < 8) {
+                    float sign = tok % 2 == 0 ? 1f : -1f;
+                    for (int i = 0; i < cols; i++) {
+                        x[i] = sign * (tok < 4 ? 1f : 0.9f + 0.1f * rnd.nextFloat());
+                    }
+                }
+                acts[tok] = CpuActivationQuantizer.quantizeFor(t, x, 0, cols);
+            }
+            float[] y = new float[nTokens * rows];
+            CpuVecDot simd = CpuSimd.vecDot(t);
+            simd.dotTiles(w, 0, rows, acts, nTokens, y, 0, rows);
+            CpuVecDot scalar = scalarFor(t);
+            for (int tok = 0; tok < nTokens; tok++) {
+                float[] expected = new float[rows];
+                scalar.dotRows(w, 0, rows, acts[tok], expected, 0);
+                for (int r = 0; r < rows; r++) {
+                    assertEquals(t + " token " + tok + ", row " + r, expected[r], y[tok * rows + r], 0f);
+                }
+            }
+        }
+    }
+
     @Test
     public void theTiledProductRejectsBadRangesByName() {
         Assume.assumeTrue(CpuSimd.available());
@@ -472,6 +530,53 @@ public class SimdVecDotTest {
     }
 
     @Test
+    public void theWidthGateKeepsTheScalarKernelsOnNarrowVectorHardware() {
+        assertTrue("256-bit hardware runs the engine", CpuSimd.usable(false, 256));
+        assertTrue("512-bit hardware runs the engine", CpuSimd.usable(false, 512));
+        assertTrue("128-bit hardware keeps the scalar kernels", !CpuSimd.usable(false, 128));
+        assertTrue("the forced width runs the engine on 128-bit hardware", CpuSimd.usable(true, 128));
+        Properties p = new Properties();
+        assertTrue("absent width is auto", !CpuSimd.forcedWidth(p));
+        p.setProperty(CpuSimd.PROP_WIDTH, " Auto ");
+        assertTrue(!CpuSimd.forcedWidth(p));
+        p.setProperty(CpuSimd.PROP_WIDTH, "256");
+        assertTrue(CpuSimd.forcedWidth(p));
+        p.setProperty(CpuSimd.PROP_WIDTH, "128");
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () -> CpuSimd.forcedWidth(p));
+        assertTrue(e.getMessage(), e.getMessage().contains(CpuSimd.PROP_WIDTH) && e.getMessage().contains("128"));
+    }
+
+    @Test
+    public void onA128BitVectorJvmTheScalarKernelsRemainUnlessTheWidthIsForced() throws Exception {
+        Assume.assumeTrue("the 256-bit engine runs here", CpuSimd.available());
+        String narrow = probe("--add-modules=jdk.incubator.vector", "-XX:MaxVectorSize=16");
+        assertTrue(narrow, narrow.contains("available=false"));
+        assertTrue(narrow, narrow.contains("describe=scalar"));
+        String forced = probe("--add-modules=jdk.incubator.vector", "-XX:MaxVectorSize=16",
+                "-D" + CpuSimd.PROP_WIDTH + "=256");
+        assertTrue(forced, forced.contains("available=true"));
+        String wide = probe("--add-modules=jdk.incubator.vector");
+        assertTrue(wide, wide.contains("available=true"));
+    }
+
+    /**
+     * Without the hardware fused multiply-add ({@code -XX:-UseFMA}) the Q8_0 float tiles run on separate multiplies
+     * and adds, which give the same exact sums: the product keeps its values and its speed, where
+     * {@code FloatVector.fma} would fall back to {@code Math.fma} per lane, several hundred times slower (seconds for
+     * this product on two cores).
+     */
+    @Test
+    public void theFloatTilesKeepTheirSpeedAndValuesWithoutHardwareFma() throws Exception {
+        Assume.assumeTrue("the 256-bit engine runs here", CpuSimd.available());
+        String out = run(TileFmaProbe.class, "--add-modules=jdk.incubator.vector", "-XX:-UseFMA",
+                "-XX:ActiveProcessorCount=2");
+        assertTrue(out, out.contains("engine=") && !out.contains("engine=scalar"));
+        assertTrue(out, out.contains("equal=true"));
+        long ms = Long.parseLong(out.substring(out.indexOf("ms=") + 3).trim());
+        assertTrue("a 64-token 512 x 4096 Q8_0 product without hardware FMA took " + ms + " ms", ms < 2000);
+    }
+
+    @Test
     public void unsupportedTypesHaveNoVectorKernel() {
         for (GGMLType t : new GGMLType[]{GGMLType.Q8_K, GGMLType.Q8_1, GGMLType.I8, GGMLType.I16,
                 GGMLType.I32, GGMLType.I64, GGMLType.F64, GGMLType.NVFP4,
@@ -521,12 +626,17 @@ public class SimdVecDotTest {
 
     /** Runs {@link SimdFallbackProbe} in a fresh JVM with {@code jvmArgs} before the classpath. */
     private static String probe(String... jvmArgs) throws Exception {
+        return run(SimdFallbackProbe.class, jvmArgs);
+    }
+
+    /** Runs {@code main} in a fresh JVM with {@code jvmArgs} before the classpath and returns its output. */
+    private static String run(Class<?> main, String... jvmArgs) throws Exception {
         List<String> cmd = new ArrayList<>();
         cmd.add(Paths.get(System.getProperty("java.home"), "bin", "java").toString());
         cmd.addAll(Arrays.asList(jvmArgs));
         cmd.add("-cp");
         cmd.add(System.getProperty("java.class.path"));
-        cmd.add(SimdFallbackProbe.class.getName());
+        cmd.add(main.getName());
         ProcessBuilder pb = new ProcessBuilder(cmd).redirectErrorStream(true);
         // a host-level option must not inject the module the test withholds
         pb.environment().remove("JAVA_TOOL_OPTIONS");
@@ -541,7 +651,7 @@ public class SimdVecDotTest {
                 out.append(line).append('\n');
             }
         }
-        assertTrue("probe timed out: " + out, p.waitFor(30, TimeUnit.SECONDS));
+        assertTrue("probe timed out: " + out, p.waitFor(60, TimeUnit.SECONDS));
         assertEquals("probe exit: " + out, 0, p.exitValue());
         return out.toString();
     }

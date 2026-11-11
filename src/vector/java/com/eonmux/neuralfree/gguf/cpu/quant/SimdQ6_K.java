@@ -95,6 +95,15 @@ public final class SimdQ6_K implements CpuVecDot {
         return nTokens == 0 ? null : SimdI8.tokenTiles(x, nTokens);
     }
 
+    /**
+     * Token panels of whole pairs of 8-token tiles: a panel of a wide row (9728 columns) then holds 16 tokens
+     * instead of a single tile, so each weight row a task decodes serves twice the tokens.
+     */
+    @Override
+    public int tilePanelTokens() {
+        return 2 * SimdI8.TILE_TOKENS;
+    }
+
     @Override
     public int tileTokens() {
         return SimdI8.TILE_TOKENS;

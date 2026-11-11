@@ -4,7 +4,6 @@ import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuVecDot.QuantizedActivations;
 import jdk.incubator.vector.ByteVector;
 import jdk.incubator.vector.FloatVector;
-import jdk.incubator.vector.IntVector;
 import jdk.incubator.vector.ShortVector;
 import jdk.incubator.vector.VectorOperators;
 
@@ -22,18 +21,14 @@ import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.fp16At;
  * combination {@code sumi * (d_x * d_y)} per block follows {@code ggml_vec_dot_q8_0_q8_0_generic}, so the
  * kernel returns exactly what {@code Q8VecDot} returns.
  *
- * <p>The batched product ({@link #dotTiles}) multiplies a register tile of two weight rows by eight tokens,
- * so a decoded weight block and a widened activation block are each reused across the tile. Immutable,
- * stateless and thread-safe.</p>
+ * <p>The batched product ({@link #dotTiles}) multiplies a register tile of four weight rows by eight tokens in
+ * exact float lanes ({@link SimdTokenTiles}), so a decoded weight block and an activation block are each reused
+ * across the tile. Immutable, stateless and thread-safe.</p>
  */
 public final class SimdQ8_0 implements CpuVecDot {
 
     /** The Q8_0 vec-dot. */
     public static final SimdQ8_0 INSTANCE = new SimdQ8_0();
-
-    /** Weight rows one register tile of the batched kernel multiplies. */
-    private static final int TILE_ROWS = 2;
-
 
     private SimdQ8_0() {
     }
@@ -81,115 +76,134 @@ public final class SimdQ8_0 implements CpuVecDot {
             return;
         }
         checkTiles(w, rowStart, rowCount, x, nTokens, y, yOff, yStride);
-        dotTiles(w, rowStart, rowCount, SimdI8.tokenTiles(x, nTokens), 0, nTokens, y, yOff, yStride);
+        dotTiles(w, rowStart, rowCount, SimdTokenTiles.layout(x, nTokens), 0, nTokens, y, yOff, yStride);
     }
 
     @Override
     public TileActivations prepareTiles(QuantizedActivations[] x, int nTokens) {
-        SimdI8.checkTileTokens(x, nTokens, GGMLType.Q8_0);
-        return nTokens == 0 ? null : SimdI8.tokenTiles(x, nTokens);
+        SimdTokenTiles.checkTokens(x, nTokens, GGMLType.Q8_0);
+        return nTokens == 0 ? null : SimdTokenTiles.layout(x, nTokens);
     }
 
     @Override
     public int tileTokens() {
-        return SimdI8.TILE_TOKENS;
+        return SimdTokenTiles.TILE_TOKENS;
+    }
+
+    /** The four rows of the float register tile. */
+    @Override
+    public int tileRows() {
+        return SimdTokenTiles.TILE_ROWS;
+    }
+
+    /** The two eight-token tiles of the float register tile. */
+    @Override
+    public int tilePanelTokens() {
+        return SimdTokenTiles.PAIR * SimdTokenTiles.TILE_TOKENS;
+    }
+
+    /** One float lane per laid-out activation element. */
+    @Override
+    public int tileLaneBytes() {
+        return Float.BYTES;
     }
 
     @Override
     public void dotTiles(CpuTensorRef w, long rowStart, int rowCount, TileActivations tiles,
                          QuantizedActivations[] x, int tokenStart, int nTokens, float[] y, int yOff, int yStride) {
-        if (!(tiles instanceof SimdI8.TokenTiles)) {
+        if (!(tiles instanceof SimdTokenTiles.Layout)) {
             CpuVecDot.super.dotTiles(w, rowStart, rowCount, tiles, x, tokenStart, nTokens, y, yOff, yStride);
             return;
         }
-        final SimdI8.TokenTiles tt = (SimdI8.TokenTiles) tiles;
-        SimdI8.checkTileRange(tt, tokenStart, nTokens);
+        final SimdTokenTiles.Layout tt = (SimdTokenTiles.Layout) tiles;
+        SimdTokenTiles.checkRange(tt, tokenStart, nTokens);
         Q8VecDot.requireWeightType(w, GGMLType.Q8_0);
-        SimdI8.checkTileWidth(w, tt);
+        SimdTokenTiles.checkWidth(w, tt);
         CpuVecDotRows.checkOutputs(w, rowStart, rowCount, nTokens, y, yOff, yStride);
         dotTiles(w, rowStart, rowCount, tt, tokenStart, nTokens, y, yOff, yStride);
     }
 
     /**
-     * The batched product over the interleaved token tiles of {@code tiles} ({@link SimdI8.TokenTiles}): each
-     * weight row widens once into int16 element pairs, and per block a pair broadcast over a tile multiplies the
-     * tile's interleaved pair lanes, so every int lane accumulates one token's exact block sum with no horizontal
-     * reduction. The float combination {@code sum += sumi * (d * yd)} then runs lane-wise, one lane per token, in
-     * block order, which is the scalar kernel's arithmetic.
+     * The batched product over the token tiles of {@code tiles} ({@link SimdTokenTiles.Layout}): each weight row
+     * unpacks once into float values, and per 32-element block four rows by one tile form their exact block sums
+     * in float lanes ({@link SimdTokenTiles#sums}), one lane per token. The float combination {@code sum +=
+     * sumi * (d * yd)} then runs lane-wise in block order, which is the scalar kernel's arithmetic.
      */
-    private static void dotTiles(CpuTensorRef w, long rowStart, int rowCount, SimdI8.TokenTiles tiles,
+    private static void dotTiles(CpuTensorRef w, long rowStart, int rowCount, SimdTokenTiles.Layout tiles,
                                  int tokenStart, int nTokens, float[] y, int yOff, int yStride) {
         if (nTokens == 0 || rowCount == 0) {
             return;
         }
         final int nb = tiles.cols / QK8_0;
-        final int[][] pairs = SimdI8.rowPairs(TILE_ROWS, tiles.cols / 2);
-        final float[][] scales = SimdI8.rowScales(TILE_ROWS, nb);
-        final float[] out = SimdI8.tileAccumulators(TILE_ROWS * SimdI8.TILE_TOKENS);
+        final float[][] values = SimdTokenTiles.rowValues(tiles.cols);
+        final float[][] scales = SimdI8.rowScales(SimdTokenTiles.TILE_ROWS, nb);
+        final float[] out = SimdI8.tileAccumulators(SimdTokenTiles.TILE_ROWS * SimdTokenTiles.TILE_TOKENS);
+        final float[] seg = SimdTokenTiles.segmentSums(tiles.cols, QK8_0);
         final byte[] buf = CpuVecDotRows.buffer(w);
         final CpuVecDotRows.RowReader reader = CpuVecDotRows.reader(w);
-        final int firstTile = tokenStart / SimdI8.TILE_TOKENS;
-        final int lastTile = (tokenStart + nTokens - 1) / SimdI8.TILE_TOKENS;
-        for (int r = 0; r < rowCount; r += TILE_ROWS) {
-            final int nr = Math.min(TILE_ROWS, rowCount - r);
-            for (int i = 0; i < TILE_ROWS; i++) {
+        final int firstTile = tokenStart / SimdTokenTiles.TILE_TOKENS;
+        final int lastTile = (tokenStart + nTokens - 1) / SimdTokenTiles.TILE_TOKENS;
+        for (int r = 0; r < rowCount; r += SimdTokenTiles.TILE_ROWS) {
+            final int nr = Math.min(SimdTokenTiles.TILE_ROWS, rowCount - r);
+            for (int i = 0; i < SimdTokenTiles.TILE_ROWS; i++) {
                 reader.copy(rowStart + r + Math.min(i, nr - 1), buf);
-                widenRow(buf, nb, pairs[i], scales[i]);
+                unpackRow(buf, nb, values[i], scales[i]);
             }
-            for (int tile = firstTile; tile <= lastTile; tile++) {
-                dotTile(pairs[0], pairs[1], scales[0], scales[1], tiles, tile, nb, out);
-                final int t0 = tile * SimdI8.TILE_TOKENS - tokenStart;
-                final int n = Math.min(SimdI8.TILE_TOKENS, nTokens - t0);
-                for (int i = 0; i < nr; i++) {
-                    for (int ti = 0; ti < n; ti++) {
-                        y[yOff + r + i + (t0 + ti) * yStride] = out[i * SimdI8.TILE_TOKENS + ti];
-                    }
+            for (int tile = firstTile; tile <= lastTile; ) {
+                final int pair = SimdTokenTiles.sums(values, QK8_0, nb, tiles, tile, lastTile, seg);
+                for (int k = 0; k < pair; k++, tile++) {
+                    combine(scales, tiles, tile, k, nb, seg, out);
+                    final int t0 = tile * SimdTokenTiles.TILE_TOKENS - tokenStart;
+                    SimdTokenTiles.store(out, nr, Math.min(SimdTokenTiles.TILE_TOKENS, nTokens - t0), y, yOff, r,
+                            t0, yStride);
                 }
             }
         }
     }
 
-    /** The quants of one row as int16 element pairs ({@code pairs[ib*16 + k]} packs elements 2k, 2k+1) and its scales. */
-    private static void widenRow(byte[] b, int nb, int[] pairs, float[] d) {
+    /** The quants of one row as float values and its block scales. */
+    private static void unpackRow(byte[] b, int nb, float[] values, float[] d) {
         int o = 0;
         for (int ib = 0; ib < nb; ib++, o += Q8_0_BYTES) {
-            widen(b, o + Q8_0_QS).reinterpretAsInts().intoArray(pairs, ib * 16);
-            widen(b, o + Q8_0_QS + 16).reinterpretAsInts().intoArray(pairs, ib * 16 + 8);
+            for (int k = 0; k < QK8_0; k += 8) {
+                ((FloatVector) ByteVector.fromArray(SimdI8.B8, b, o + Q8_0_QS + k)
+                        .convertShape(VectorOperators.B2F, SimdTokenTiles.F8, 0)).intoArray(values, ib * QK8_0 + k);
+            }
             d[ib] = fp16At(b, o + Q8_0_D);
         }
     }
 
     /**
-     * Two widened weight rows against token tile {@code tile}: {@code out[i * TILE_TOKENS + ti]} receives row
-     * {@code i}'s dot with the tile's token {@code ti}.
+     * The float combination of tile {@code tile}, member {@code k} of the pair whose block sums {@code seg} holds:
+     * {@code out[r * TILE_TOKENS + ti]} receives row {@code r}'s dot with the tile's token {@code ti}.
      */
-    private static void dotTile(int[] w0, int[] w1, float[] d0, float[] d1, SimdI8.TokenTiles tiles, int tile,
-                                int nb, float[] out) {
-        final short[] a = tiles.lanes;
-        final float[] ydT = tiles.scales;
-        final int aBase = tiles.laneBase(tile);
+    private static void combine(float[][] d, SimdTokenTiles.Layout tiles, int tile, int k, int nb, float[] seg,
+                                float[] out) {
         final int yBase = tiles.scaleBase(tile);
-        FloatVector f0 = FloatVector.zero(SimdFp.F8);
-        FloatVector f1 = FloatVector.zero(SimdFp.F8);
+        final float[] d0 = d[0];
+        final float[] d1 = d[1];
+        final float[] d2 = d[2];
+        final float[] d3 = d[3];
+        FloatVector f0 = FloatVector.zero(SimdTokenTiles.F8);
+        FloatVector f1 = f0;
+        FloatVector f2 = f0;
+        FloatVector f3 = f0;
         for (int ib = 0; ib < nb; ib++) {
-            IntVector s0 = SimdI8.zero(SimdI8.I8);
-            IntVector s1 = SimdI8.zero(SimdI8.I8);
-            final int wb = ib * 16;
-            final int ab = aBase + ib * QK8_0 * SimdI8.TILE_TOKENS;
-            for (int k = 0; k < 16; k += 2) {
-                final ShortVector a0 = ShortVector.fromArray(SimdI8.S16, a, ab + k * 16);
-                final ShortVector a1 = ShortVector.fromArray(SimdI8.S16, a, ab + k * 16 + 16);
-                s0 = s0.add(SimdI8.pairs(SimdI8.broadcastPair(w0[wb + k]).mul(a0)
-                        .add(SimdI8.broadcastPair(w0[wb + k + 1]).mul(a1))));
-                s1 = s1.add(SimdI8.pairs(SimdI8.broadcastPair(w1[wb + k]).mul(a0)
-                        .add(SimdI8.broadcastPair(w1[wb + k + 1]).mul(a1))));
-            }
-            final FloatVector yd = FloatVector.fromArray(SimdFp.F8, ydT, yBase + ib * SimdI8.TILE_TOKENS);
-            f0 = f0.add(toFloat(s0).mul(yd.mul(d0[ib])));
-            f1 = f1.add(toFloat(s1).mul(yd.mul(d1[ib])));
+            final FloatVector yd = FloatVector.fromArray(SimdTokenTiles.F8, tiles.scales,
+                    yBase + ib * SimdTokenTiles.TILE_TOKENS);
+            f0 = f0.add(FloatVector.fromArray(SimdTokenTiles.F8, seg, SimdTokenTiles.sumIndex(ib, k, 0))
+                    .mul(yd.mul(d0[ib])));
+            f1 = f1.add(FloatVector.fromArray(SimdTokenTiles.F8, seg, SimdTokenTiles.sumIndex(ib, k, 1))
+                    .mul(yd.mul(d1[ib])));
+            f2 = f2.add(FloatVector.fromArray(SimdTokenTiles.F8, seg, SimdTokenTiles.sumIndex(ib, k, 2))
+                    .mul(yd.mul(d2[ib])));
+            f3 = f3.add(FloatVector.fromArray(SimdTokenTiles.F8, seg, SimdTokenTiles.sumIndex(ib, k, 3))
+                    .mul(yd.mul(d3[ib])));
         }
         f0.intoArray(out, 0);
-        f1.intoArray(out, SimdI8.TILE_TOKENS);
+        f1.intoArray(out, SimdTokenTiles.TILE_TOKENS);
+        f2.intoArray(out, 2 * SimdTokenTiles.TILE_TOKENS);
+        f3.intoArray(out, 3 * SimdTokenTiles.TILE_TOKENS);
     }
 
     private static float dot(byte[] b, int off, QuantizedActivations x, short[] ys) {
@@ -210,10 +224,6 @@ public final class SimdQ8_0 implements CpuVecDot {
 
     private static ShortVector widen(byte[] b, int off) {
         return (ShortVector) ByteVector.fromArray(SimdI8.B16, b, off).convertShape(VectorOperators.B2S, SimdI8.S16, 0);
-    }
-
-    private static FloatVector toFloat(IntVector v) {
-        return (FloatVector) v.convert(VectorOperators.I2F, 0);
     }
 
     @Override

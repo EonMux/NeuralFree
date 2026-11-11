@@ -151,6 +151,43 @@ application {
     applicationDefaultJvmArgs = ['-Xmx4g', '--add-opens=java.base/java.util=ALL-UNNAMED']
 }
 
+// The start scripts resolve jdk.incubator.vector themselves for the commands that run the engine in the launcher's
+// JVM, on a Java 17 or later runtime whose image holds the module (gradle/start-scripts), so the launcher's
+// JvmVectorModule relaunch is left for java -jar and runtimes without a readable release file. The Unix snippet goes
+// after the line that sets DEFAULT_JVM_OPTS, the Windows one before the java command, once JAVA_HOME is unquoted; a
+// script without its anchor line fails the build.
+def vectorModuleSnippets = [file('gradle/start-scripts/vector-module.sh'), file('gradle/start-scripts/vector-module.bat')]
+def injectVectorModule = { CreateStartScripts task ->
+    task.inputs.files(vectorModuleSnippets).withPropertyName('vectorModuleSnippets')
+    task.doLast {
+        def insert = { File script, File snippet, String anchor, boolean after, String eol ->
+            def text = script.text
+            def at = text.indexOf(eol + anchor)
+            if (at < 0) {
+                throw new GradleException("${script.name}: no line starting '${anchor}' to place the vector module by")
+            }
+            def lineStart = at + eol.length()
+            def split = after ? text.indexOf(eol, lineStart) + eol.length() : lineStart
+            def body = snippet.text.normalize().readLines().join(eol) + eol
+            script.text = text.substring(0, split) + (after ? eol + body : body + eol) + text.substring(split)
+        }
+        insert(task.unixScript, vectorModuleSnippets[0], 'DEFAULT_JVM_OPTS=', true, '\n')
+        insert(task.windowsScript, vectorModuleSnippets[1], '@rem Execute ', false, '\r\n')
+    }
+}
+tasks.named('startScripts', CreateStartScripts) { injectVectorModule(it) }
+
+// The same start scripts over an empty class path, for StartScriptVectorModuleTest to run: they need neither the jar
+// nor the GPU kernels its resources hold.
+def testStartScripts = tasks.register('testStartScripts', CreateStartScripts) {
+    outputDir = layout.buildDirectory.dir('test-start-scripts').get().asFile
+    applicationName = application.applicationName
+    mainClass = application.mainClass
+    defaultJvmOpts = application.applicationDefaultJvmArgs
+    classpath = files()
+    injectVectorModule(it)
+}
+
 gradle.projectsEvaluated {
     def quarkusBuild = project(':server').tasks.findByName('quarkusBuild')
     if (quarkusBuild != null) {
@@ -333,6 +370,10 @@ test {
     // the tests forward neuralfree.* system properties (-D) like the JavaExec tasks: the opt-in benchmarks and
     // the GPU selectors take theirs from the command line, since the environment rides the daemon
     systemProperties System.properties.findAll { it.key.startsWith('neuralfree.') }
+
+    // StartScriptVectorModuleTest runs the generated start scripts
+    dependsOn testStartScripts
+    systemProperty 'neuralfree.test.startScripts', layout.buildDirectory.dir('test-start-scripts').get().asFile.absolutePath
 
     // the worker's default 512 MiB heap caps its direct buffers at the same 512 MiB, and the engine's closed
     // models release their buffers on collection only — one benchmark variant's tail outran the default, and the

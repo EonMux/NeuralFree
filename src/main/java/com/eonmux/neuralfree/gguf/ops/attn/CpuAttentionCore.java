@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf.ops.attn;
 import com.eonmux.neuralfree.gguf.BatchInvariance;
 import com.eonmux.neuralfree.gguf.arch.SwaType;
 import com.eonmux.neuralfree.gguf.cpu.ops.CpuParallel;
+import com.eonmux.neuralfree.gguf.cpu.quant.CpuAttnKernels;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants;
 import com.eonmux.neuralfree.gguf.memory.KvWindow;
 import com.eonmux.neuralfree.gguf.memory.cpu.KvAccessor;
@@ -72,10 +73,10 @@ public final class CpuAttentionCore {
     /** Score, bias and mask parameters of one attention layer. Immutable. */
     public static final class Params {
         private final int nHead;
-        private final float scale;
-        private final float softcap;
+        final float scale;
+        final float softcap;
         private final float maxBias;
-        private final KvWindow window;
+        final KvWindow window;
         private final BiasMode biasMode;
         private final int nBuckets;
         private final int maxDistance;
@@ -90,8 +91,8 @@ public final class CpuAttentionCore {
          * unlike the configuration arrays it is not copied (the table is per-step data, not a fixed parameter).
          */
         private final float[] inklingTable;
-        private final float[] kScale;
-        private final float[] vScale;
+        final float[] kScale;
+        final float[] vScale;
         private final float[] slopes;
 
         private Params(Builder b) {
@@ -531,12 +532,28 @@ public final class CpuAttentionCore {
 
     /** Reusable work arrays of one thread, sized for one key block of one head chunk; grows on demand. Not thread-safe. */
     public static final class Scratch {
-        private float[] scores = new float[0];
-        private float[] k = new float[0];
-        private float[] v = new float[0];
-        private float[] acc = new float[0];
-        private float[] max = new float[0];
-        private float[] sum = new float[0];
+        float[] scores = new float[0];
+        float[] v = new float[0];
+        float[] acc = new float[0];
+        float[] max = new float[0];
+        float[] sum = new float[0];
+        /** The query heads of the unit as lanes ({@link CpuAttentionScores#prepare}). */
+        float[] qT = new float[0];
+        /** One key group's K rows, and their dots with every lane. */
+        float[] keys = new float[0];
+        float[] dots = new float[0];
+        /** Per key of a group: its index in the block, position and visible query rows (bit per row). */
+        final int[] keyAt = new int[CpuAttentionScores.KEY_GROUP];
+        final int[] keyPos = new int[CpuAttentionScores.KEY_GROUP];
+        final int[] keyVis = new int[CpuAttentionScores.KEY_GROUP];
+        /** Per query row of the unit: its position and its mask row. */
+        final int[] qPos = new int[QUERY_BLOCK];
+        final int[] qRow = new int[QUERY_BLOCK];
+        int rowsInUnit;
+        int headsInUnit;
+        int lanes;
+        /** The attention kernels of the unit ({@link CpuAttentionScores#prepare}). */
+        CpuAttnKernels kernels;
 
         void ensure(int dK, int dV) {
             ensure(dK, dV, HEAD_CHUNK);
@@ -548,9 +565,6 @@ public final class CpuAttentionCore {
                 scores = new float[heads * KEY_BLOCK];
                 max = new float[heads];
                 sum = new float[heads];
-            }
-            if (k.length < dK) {
-                k = new float[dK];
             }
             if (v.length < dV) {
                 v = new float[dV];
@@ -805,7 +819,7 @@ public final class CpuAttentionCore {
     // ------------------------------------------------------------------ implementation
 
     /** Key rows of one attention call. */
-    private interface Rows {
+    interface Rows {
         int nHeadKv();
 
         int dK();
@@ -814,7 +828,8 @@ public final class CpuAttentionCore {
 
         int pos(int row);
 
-        void readK(int row, int head, float[] dst);
+        /** Reads K head {@code head} of {@code row} into {@code dst[off, off + dK())}. */
+        void readK(int row, int head, float[] dst, int off);
 
         void readV(int row, int head, float[] dst);
 
@@ -848,11 +863,11 @@ public final class CpuAttentionCore {
             @Override public int pos(int row) { return row < n ? row : base.pos(row - n); }
 
             @Override
-            public void readK(int row, int head, float[] dst) {
+            public void readK(int row, int head, float[] dst, int off) {
                 if (row < n) {
-                    System.arraycopy(p.sinkK, (row * heads + head) * dK, dst, 0, dK);
+                    System.arraycopy(p.sinkK, (row * heads + head) * dK, dst, off, dK);
                 } else {
-                    base.readK(row - n, head, dst);
+                    base.readK(row - n, head, dst, off);
                 }
             }
 
@@ -890,7 +905,7 @@ public final class CpuAttentionCore {
             @Override public int dK() { return kv.headDimK(); }
             @Override public int dV() { return kv.headDimV(); }
             @Override public int pos(int row) { return rowPos.applyAsInt(row); }
-            @Override public void readK(int row, int head, float[] dst) { kv.readK(row, head, dst, 0); }
+            @Override public void readK(int row, int head, float[] dst, int off) { kv.readK(row, head, dst, off); }
             @Override public void readV(int row, int head, float[] dst) { kv.readV(row, head, dst, 0); }
         };
     }
@@ -904,8 +919,8 @@ public final class CpuAttentionCore {
             @Override public int pos(int row) { return kv.pos[kv.posOff + row]; }
 
             @Override
-            public void readK(int row, int head, float[] dst) {
-                System.arraycopy(kv.k, kv.kOff + row * kv.kRowStride + head * kv.kHeadStride, dst, 0, kv.dK);
+            public void readK(int row, int head, float[] dst, int off) {
+                System.arraycopy(kv.k, kv.kOff + row * kv.kRowStride + head * kv.kHeadStride, dst, off, kv.dK);
             }
 
             @Override
@@ -931,7 +946,10 @@ public final class CpuAttentionCore {
             @Override public int dK() { return kv.headDimK(); }
             @Override public int dV() { return kv.headDimV(); }
             @Override public int pos(int slot) { return rowPos.applyAsInt(rowOf(slot)); }
-            @Override public void readK(int slot, int head, float[] dst) { kv.readK(rowOf(slot), head, dst, 0); }
+            @Override
+            public void readK(int slot, int head, float[] dst, int off) {
+                kv.readK(rowOf(slot), head, dst, off);
+            }
             @Override public void readV(int slot, int head, float[] dst) { kv.readV(rowOf(slot), head, dst, 0); }
 
             private int rowOf(int slot) {
@@ -1122,45 +1140,16 @@ public final class CpuAttentionCore {
         Arrays.fill(s.max, 0, heads, Float.NEGATIVE_INFINITY);
         Arrays.fill(s.sum, 0, heads, 0.0f);
         Arrays.fill(s.acc, 0, heads * dV, 0.0f);
+        CpuAttentionScores.prepare(s, q, qOff, qStride, nt, qPos, qRow0, h0, gc, rows.dK());
         for (int b = rowStart; b < rowEnd; b += KEY_BLOCK) {
             final int nb = Math.min(KEY_BLOCK, rowEnd - b);
-            scoreBlockRows(p, nt, q, qOff, qStride, qPos, qRow0, rows, b, nb, s, h0, gc, kvh, treeBits, freshStart);
+            CpuAttentionScores.score(p, rows, b, nb, s, h0, kvh, treeBits, freshStart);
             rescaleBlock(s, nb, heads, dV);
-            addValues(p, rows, b, nb, s, heads, kvh, dV);
+            CpuAttentionScores.addValues(p, rows, b, nb, s, heads, kvh, dV);
         }
         for (int t = 0; t < nt; t++) {
             finish(p, s.max, t * gc, s.sum, t * gc, s.acc, t * gc * dV, dV, h0, gc, out, outOff + t * outStride, lse,
                     lse == null ? 0 : lseOff + t * lseStride);
-        }
-    }
-
-    /** {@link #scoreBlock} of the {@code nt} query rows of {@link #attendBlock}, each key row read once. */
-    private static void scoreBlockRows(Params p, int nt, float[] q, int qOff, int qStride, int[] qPos, int qRow0,
-                                       Rows rows, int b, int nb, Scratch s, int h0, int gc, int kvh,
-                                       long[] treeBits, int freshStart) {
-        final int dK = rows.dK();
-        final float[] sc = s.scores;
-        final float[] kbuf = s.k;
-        for (int r = 0; r < nb; r++) {
-            final int row = b + r;
-            final int pk = rows.pos(row);
-            final boolean sink = rows.sink(row);
-            boolean read = false;
-            for (int t = 0; t < nt; t++) {
-                final int qp = qPos[qRow0 + t];
-                if (!visible(p, row, pk, sink, qp, qRow0 + t, treeBits, freshStart)) {
-                    for (int g = 0; g < gc; g++) {
-                        sc[(t * gc + g) * KEY_BLOCK + r] = Float.NEGATIVE_INFINITY;
-                    }
-                    continue;
-                }
-                if (!read) {
-                    readScaledK(p, rows, row, sink, kvh, kbuf, dK);
-                    read = true;
-                }
-                scoreHeads(p, q, qOff + t * qStride, h0, gc, kbuf, dK, sink, qp, pk, qRow0 + t, sc,
-                        t * gc * KEY_BLOCK + r);
-            }
         }
     }
 
@@ -1190,84 +1179,12 @@ public final class CpuAttentionCore {
         Arrays.fill(s.max, 0, gc, Float.NEGATIVE_INFINITY);
         Arrays.fill(s.sum, 0, gc, 0.0f);
         Arrays.fill(s.acc, 0, gc * dV, 0.0f);
+        CpuAttentionScores.prepareRow(s, q, qOff, qPos, qRow, h0, gc, rows.dK());
         for (int b = rowStart; b < rowEnd; b += KEY_BLOCK) {
             final int nb = Math.min(KEY_BLOCK, rowEnd - b);
-            scoreBlock(p, q, qOff, qPos, qRow, rows, b, nb, s, h0, gc, kvh, treeBits, freshStart);
+            CpuAttentionScores.score(p, rows, b, nb, s, h0, kvh, treeBits, freshStart);
             rescaleBlock(s, nb, gc, dV);
-            addValues(p, rows, b, nb, s, gc, kvh, dV);
-        }
-    }
-
-    /**
-     * Scores {@code s.scores[g * KEY_BLOCK + r]} of heads {@code [h0, h0 + gc)} against keys {@code [b, b + nb)};
-     * keys outside the query's window score -INF, and under a tree mask ({@code treeBits}) a fresh key row at or
-     * after {@code freshStart} scores only when the query row's bitmask names it.
-     */
-    private static void scoreBlock(Params p, float[] q, int qOff, int qPos, int qRow, Rows rows, int b, int nb,
-                                   Scratch s, int h0, int gc, int kvh, long[] treeBits, int freshStart) {
-        final int dK = rows.dK();
-        final float[] sc = s.scores;
-        final float[] kbuf = s.k;
-        for (int r = 0; r < nb; r++) {
-            final int row = b + r;
-            final int pk = rows.pos(row);
-            final boolean sink = rows.sink(row);
-            if (!visible(p, row, pk, sink, qPos, qRow, treeBits, freshStart)) {
-                for (int g = 0; g < gc; g++) {
-                    sc[g * KEY_BLOCK + r] = Float.NEGATIVE_INFINITY;
-                }
-                continue;
-            }
-            readScaledK(p, rows, row, sink, kvh, kbuf, dK);
-            scoreHeads(p, q, qOff, h0, gc, kbuf, dK, sink, qPos, pk, qRow, sc, r);
-        }
-    }
-
-    /**
-     * {@code sc[g * KEY_BLOCK + at]} for heads {@code [h0, h0 + gc)} of the query row at {@code q[qOff]}:
-     * the scaled, soft-capped dot with key {@code kbuf} plus the position bias (none for a sink key).
-     */
-    private static void scoreHeads(Params p, float[] q, int qOff, int h0, int gc, float[] kbuf, int dK, boolean sink,
-                                   int qPos, int pk, int qRow, float[] sc, int at) {
-        for (int g = 0; g < gc; g++) {
-            final int h = h0 + g;
-            final int qb = qOff + h * dK;
-            float dot = 0.0f;
-            for (int d = 0; d < dK; d++) {
-                dot += q[qb + d] * kbuf[d];
-            }
-            sc[g * KEY_BLOCK + at] = score(dot, p.scale, p.softcap) + (sink ? 0.0f : p.bias(h, qPos, pk, qRow));
-        }
-    }
-
-    /**
-     * Whether the query row at {@code qPos} (mask row {@code qRow}) sees key row {@code row} at position {@code pk}.
-     * A sink token precedes every cached key: its key index is the query's absolute position plus the sink count,
-     * vLLM's seq_lens + sink_len alignment. Under a tree mask a fresh row's visibility is its mask bit alone:
-     * siblings share one depth position, which the position rules would wrongly make mutually visible.
-     */
-    private static boolean visible(Params p, int row, int pk, boolean sink, int qPos, int qRow, long[] treeBits,
-                                   int freshStart) {
-        if (sink) {
-            return !p.window.causal() || p.window.visible(qPos + p.sinkTokens, pk);
-        }
-        if (treeBits != null && row >= freshStart) {
-            return (treeBits[qRow] >>> (row - freshStart) & 1L) != 0L;
-        }
-        return p.window.visible(qPos, pk);
-    }
-
-    /**
-     * Reads K head {@code kvh} of {@code row} into {@code kbuf} with an FP8 cache's dequant scale; the sink keys
-     * are parameters, not cache rows, so the scale does not apply to them.
-     */
-    private static void readScaledK(Params p, Rows rows, int row, boolean sink, int kvh, float[] kbuf, int dK) {
-        rows.readK(row, kvh, kbuf);
-        if (p.kScale != null && !sink) {
-            final float ks = p.kScale[kvh];
-            for (int d = 0; d < dK; d++) {
-                kbuf[d] *= ks;
-            }
+            CpuAttentionScores.addValues(p, rows, b, nb, s, gc, kvh, dV);
         }
     }
 
@@ -1301,40 +1218,6 @@ public final class CpuAttentionCore {
             }
             sum[g] = sum[g] * alpha + l;
             mx[g] = m;
-        }
-    }
-
-    /** {@code o += p V} over keys {@code [b, b + nb)}; a value row no head weights is not read. */
-    private static void addValues(Params p, Rows rows, int b, int nb, Scratch s, int gc, int kvh, int dV) {
-        final float[] sc = s.scores;
-        final float[] vbuf = s.v;
-        final float[] acc = s.acc;
-        final float[] vScale = p.vScale;
-        for (int r = 0; r < nb; r++) {
-            boolean used = false;
-            for (int g = 0; g < gc && !used; g++) {
-                used = sc[g * KEY_BLOCK + r] != 0.0f;
-            }
-            if (!used) {
-                continue;
-            }
-            rows.readV(b + r, kvh, vbuf);
-            /* The sink values are parameters, not cache rows: an FP8 cache's dequant scale does not apply. */
-            if (vScale != null && !rows.sink(b + r)) {
-                final float vs = vScale[kvh];
-                for (int d = 0; d < dV; d++) {
-                    vbuf[d] *= vs;
-                }
-            }
-            for (int g = 0; g < gc; g++) {
-                final float pr = sc[g * KEY_BLOCK + r];
-                if (pr != 0.0f) {
-                    final int ab = g * dV;
-                    for (int d = 0; d < dV; d++) {
-                        acc[ab + d] += pr * vbuf[d];
-                    }
-                }
-            }
         }
     }
 
@@ -1451,10 +1334,7 @@ public final class CpuAttentionCore {
                     continue;
                 }
                 ll += pl[st] * w;
-                final int pb = st * dV;
-                for (int d = 0; d < dV; d++) {
-                    o[ob + d] += po[pb + d] * w;
-                }
+                CpuAttentionScores.merge(po, st * dV, w, o, ob, dV);
             }
             m[g] = mm;
             l[g] = ll;

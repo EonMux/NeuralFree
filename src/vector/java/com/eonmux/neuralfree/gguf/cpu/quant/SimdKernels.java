@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.cpu.quant;
 
 import com.eonmux.neuralfree.gguf.GGMLType;
+import jdk.incubator.vector.VectorShape;
 
 import java.util.Collections;
 import java.util.EnumMap;
@@ -92,6 +93,18 @@ public final class SimdKernels implements CpuSimd.Engine {
     @Override
     public CpuInt8Kernels int8() {
         return SimdInt8Kernels.INSTANCE;
+    }
+
+    /** The Vector API float primitives of the CPU attention core. */
+    @Override
+    public CpuAttnKernels attention() {
+        return SimdAttnKernels.INSTANCE;
+    }
+
+    /** The preferred vector width of this JVM on this hardware, which {@link CpuSimd} gates the engine on. */
+    @Override
+    public int preferredBits() {
+        return VectorShape.preferredShape().vectorBitSize();
     }
 
     /** The vector width the kernels target, for {@link CpuSimd#describe()}. */

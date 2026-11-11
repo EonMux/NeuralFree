@@ -111,6 +111,46 @@ public class MappedWeightStoreMlockTest {
         }
     }
 
+    /**
+     * The mapped store's segments take the tensor advice: {@code random} marks the model's mapping {@code rr} in the
+     * kernel, {@code sequential} {@code sr}, and {@code none} neither.
+     */
+    @Test
+    public void theMappedSegmentsTakeTheTensorAdvice() throws IOException {
+        Assume.assumeTrue(com.sun.jna.Platform.isLinux());
+        Assume.assumeTrue(MemoryLock.supported());
+        Assume.assumeTrue(Files.isReadable(MappingFlags.SMAPS));
+        String saved = System.getProperty(TensorAdvice.PROP_ADVICE);
+        System.setProperty(TensorReadMode.PROP_READ_MODE, TensorReadMode.MMAP.flagName());
+        try {
+            String[][] cases = {{"random", "rr"}, {"sequential", "sr"}, {"none", null}};
+            for (String[] c : cases) {
+                System.setProperty(TensorAdvice.PROP_ADVICE, c[0]);
+                // a copy per case: a closed store's mapping stays until the collector releases it
+                Path copy = Files.copy(file, file.resolveSibling(file.getFileName() + "." + c[0] + ".gguf"));
+                GGUFFileParser parser = new GGUFFileParser(copy.toString());
+                try (WeightStore store = parser.createMappedStore(StoreUse.RESIDENT_UPLOAD)) {
+                    assertTrue(((MappedWeightStore) store).isMmapAvailable());
+                    java.util.Set<String> flags = MappingFlags.of(copy);
+                    if (c[1] != null) {
+                        assertTrue(c[0] + ": " + flags, flags.contains(c[1]));
+                    } else {
+                        assertFalse("none: " + flags, flags.contains("rr") || flags.contains("sr"));
+                    }
+                } finally {
+                    parser.close();
+                    Files.deleteIfExists(copy);
+                }
+            }
+        } finally {
+            if (saved == null) {
+                System.clearProperty(TensorAdvice.PROP_ADVICE);
+            } else {
+                System.setProperty(TensorAdvice.PROP_ADVICE, saved);
+            }
+        }
+    }
+
     /** The locked kB the kernel reports for the mapping of {@code path}, summed over its blocks. */
     private static long lockedPages(Path smaps, String path) throws IOException {
         long lockedKb = 0;

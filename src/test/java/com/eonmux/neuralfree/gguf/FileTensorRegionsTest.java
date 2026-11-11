@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf;
 
 import com.eonmux.neuralfree.gguf.testutil.GgufTestWriter;
+import org.junit.Assume;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -15,9 +16,11 @@ import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
@@ -82,6 +85,79 @@ public class FileTensorRegionsTest {
                 assertArrayEquals(mode.name(), ramp(4, 8), bytes(r.region(tensor("a", 0, 32), 4, 8)));
                 assertArrayEquals(mode.name(), ramp(100, 24), bytes(r.region(tensor("b", 32, 24), 0, 24)));
                 assertArrayEquals(mode.name(), ramp(112, 8), bytes(r.region(tensor("b", 40, 16), 4, 8)));
+            }
+        }
+    }
+
+    @Test
+    public void mappedRegionsTakeTheTensorAdviceAndReadRegionsNone() throws IOException {
+        List<DataSegment> segments = twoFiles();
+        String saved = System.getProperty(TensorAdvice.PROP_ADVICE);
+        try {
+            System.clearProperty(TensorAdvice.PROP_ADVICE);
+            for (TensorReadMode mode : MODES) {
+                try (FileTensorRegions r = FileTensorRegions.open(segments, mode, "two-file model")) {
+                    assertEquals(mode.name(), mode.usesMmap() ? TensorAdvice.forMapping(System.getProperties(), 56)
+                            : null, r.advice());
+                    assertArrayEquals(mode.name(), ramp(0, 32), bytes(r.region(tensor("a", 0, 32), 0, 32)));
+                }
+            }
+            System.setProperty(TensorAdvice.PROP_ADVICE, "sequential");
+            try (FileTensorRegions r = FileTensorRegions.open(segments, TensorReadMode.MMAP, "two-file model")) {
+                assertEquals(MemoryLock.Advice.SEQUENTIAL, r.advice());
+                assertArrayEquals(ramp(100, 24), bytes(r.region(tensor("b", 32, 24), 0, 24)));
+            }
+            System.setProperty(TensorAdvice.PROP_ADVICE, "none");
+            try (FileTensorRegions r = FileTensorRegions.open(segments, TensorReadMode.MMAP, "two-file model")) {
+                assertEquals(null, r.advice());
+            }
+            System.setProperty(TensorAdvice.PROP_ADVICE, "bogus");
+            assertThrows(IllegalArgumentException.class,
+                    () -> FileTensorRegions.open(segments, TensorReadMode.MMAP, "two-file model"));
+        } finally {
+            if (saved == null) {
+                System.clearProperty(TensorAdvice.PROP_ADVICE);
+            } else {
+                System.setProperty(TensorAdvice.PROP_ADVICE, saved);
+            }
+        }
+    }
+
+    /**
+     * The kernel holds the advice of a mapped region: {@code random} and {@code sequential} show as the mapping's
+     * {@code rr} and {@code sr} flags, {@code none} leaves the mapping without either.
+     */
+    @Test
+    public void theKernelHoldsTheAdviceOfEveryMappedRegion() throws IOException {
+        Assume.assumeTrue(com.sun.jna.Platform.isLinux() && MemoryLock.supported());
+        Assume.assumeTrue(Files.isReadable(MappingFlags.SMAPS));
+        String saved = System.getProperty(TensorAdvice.PROP_ADVICE);
+        try {
+            String[][] cases = {{"random", "rr", "sr"}, {"sequential", "sr", "rr"}, {"none", null, null}};
+            for (int c = 0; c < cases.length; c++) {
+                System.setProperty(TensorAdvice.PROP_ADVICE, cases[c][0]);
+                Path a = file("advised" + c + ".bin", 16, 32, 0);
+                List<DataSegment> segments = Collections.singletonList(new DataSegment(a.toString(), 16, 0, 32));
+                for (TensorReadMode mode : new TensorReadMode[]{TensorReadMode.MMAP, TensorReadMode.MMAP_MLOCK}) {
+                    try (FileTensorRegions r = FileTensorRegions.open(segments, mode, "advised model")) {
+                        ByteBuffer region = r.region(tensor("a", 0, 32), 0, 32);
+                        Set<String> flags = MappingFlags.of(a);
+                        assertTrue(mode + " maps the file: " + flags, flags.contains("rd"));
+                        if (cases[c][1] != null) {
+                            assertTrue(cases[c][0] + " " + mode + ": " + flags, flags.contains(cases[c][1]));
+                            assertFalse(cases[c][0] + " " + mode + ": " + flags, flags.contains(cases[c][2]));
+                        } else {
+                            assertFalse("none " + mode + ": " + flags, flags.contains("rr") || flags.contains("sr"));
+                        }
+                        assertArrayEquals(ramp(0, 32), bytes(region));
+                    }
+                }
+            }
+        } finally {
+            if (saved == null) {
+                System.clearProperty(TensorAdvice.PROP_ADVICE);
+            } else {
+                System.setProperty(TensorAdvice.PROP_ADVICE, saved);
             }
         }
     }

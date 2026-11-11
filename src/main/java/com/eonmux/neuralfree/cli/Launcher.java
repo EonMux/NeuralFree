@@ -143,10 +143,10 @@ public final class Launcher {
                     new ArrayList<>(), true));
 
     /** The flags that act and exit wherever they appear as the first argument, as llama.cpp's common args do. */
-    private static final List<String> VERSION_FLAGS = Arrays.asList("--version");
-    private static final List<String> LIST_DEVICES_FLAGS = Arrays.asList("--list-devices");
-    private static final List<String> CACHE_LIST_FLAGS = Arrays.asList("-cl", "--cache-list");
-    private static final List<String> HELP_FLAGS = Arrays.asList("--help", "-h", "help");
+    static final List<String> VERSION_FLAGS = Arrays.asList("--version");
+    static final List<String> LIST_DEVICES_FLAGS = Arrays.asList("--list-devices");
+    static final List<String> CACHE_LIST_FLAGS = Arrays.asList("-cl", "--cache-list");
+    static final List<String> HELP_FLAGS = Arrays.asList("--help", "-h", "help");
 
     private Launcher() {
     }

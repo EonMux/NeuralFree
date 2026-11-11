@@ -55,32 +55,77 @@ public class CpuMatVecBatchTest {
         return y;
     }
 
+    /** The tiling of the int16 kernels (Q4_K, Q6_K): two rows, panels of 8-token tile pairs, two-byte lanes. */
+    private static final CpuTaskGrid.Tiling INT16 = CpuTaskGrid.Tiling.of(8, 2, 16, 2);
+
+    /** The tiling of the Q8_0 float tiles: four rows by two eight-token tiles of four-byte lanes. */
+    private static final CpuTaskGrid.Tiling FLOAT = CpuTaskGrid.Tiling.of(8, 4, 16, 4);
+
     @Test
     public void theGridCoversEveryOutputOnceWithTileAlignedPanels() {
         int[][] shapes = {{1, 1, 32, 34}, {70, 65, 4096, 4352}, {3, 513, 256, 288}, {1000, 9, 1024, 1088},
                 {151, 300, 8192, 8704}, {2, 2, 32, 34}};
-        for (int[] s : shapes) {
-            for (int workers : new int[]{1, 8, 24}) {
-                CpuTaskGrid g = CpuTaskGrid.of(s[0], s[1], s[2], s[3], 8, workers);
-                int[] seen = new int[s[0] * s[1]];
-                for (int task = 0; task < g.tasks(); task++) {
-                    assertEquals(g + " token start", 0, g.tokenStart(task) % 8);
-                    assertTrue(g + " task " + task + " is empty", g.rows(task) > 0 && g.tokens(task) > 0);
-                    for (int t = g.tokenStart(task); t < g.tokenStart(task) + g.tokens(task); t++) {
-                        for (int r = g.rowStart(task); r < g.rowStart(task) + g.rows(task); r++) {
-                            seen[t * s[0] + r]++;
+        for (CpuTaskGrid.Tiling tiling : new CpuTaskGrid.Tiling[]{INT16, FLOAT, CpuTaskGrid.Tiling.UNPREPARED}) {
+            for (int[] s : shapes) {
+                for (int workers : new int[]{1, 8, 24}) {
+                    CpuTaskGrid g = CpuTaskGrid.of(s[0], s[1], s[2], s[3], tiling, workers);
+                    int[] seen = new int[s[0] * s[1]];
+                    for (int task = 0; task < g.tasks(); task++) {
+                        assertEquals(g + " token start", 0, g.tokenStart(task) % tiling.panelTokens);
+                        assertEquals(g + " row chunks hold whole tiles", 0, g.rowStart(task) % tiling.rows);
+                        assertTrue(g + " task " + task + " is empty", g.rows(task) > 0 && g.tokens(task) > 0);
+                        for (int t = g.tokenStart(task); t < g.tokenStart(task) + g.tokens(task); t++) {
+                            for (int r = g.rowStart(task); r < g.rowStart(task) + g.rows(task); r++) {
+                                seen[t * s[0] + r]++;
+                            }
                         }
                     }
-                }
-                for (int i = 0; i < seen.length; i++) {
-                    assertEquals(g + " output " + i, 1, seen[i]);
+                    for (int i = 0; i < seen.length; i++) {
+                        assertEquals(g + " output " + i, 1, seen[i]);
+                    }
                 }
             }
         }
-        CpuTaskGrid wide = CpuTaskGrid.of(64, 512, 4096, 4352, 8, 8);
-        assertEquals(wide + ": 256 KB of widened activations hold 32 tokens of 4096 columns", 32, wide.tokens(0));
-        assertThrows(IllegalArgumentException.class, () -> CpuTaskGrid.of(0, 1, 32, 34, 1, 1));
-        assertThrows(IllegalArgumentException.class, () -> CpuTaskGrid.of(1, 1, 32, 34, 0, 1));
+        assertThrows(IllegalArgumentException.class, () -> CpuTaskGrid.of(0, 1, 32, 34, INT16, 1));
+        assertThrows(IllegalArgumentException.class, () -> CpuTaskGrid.of(1, 1, 32, 34, INT16, 0));
+        assertThrows(IllegalArgumentException.class, () -> CpuTaskGrid.Tiling.of(8, 0, 8, 2));
+    }
+
+    /**
+     * Panels hold about 128 Ki laid-out elements in whole multiples of the kernel's panel tokens, and slabs 32 MiB of
+     * its lanes: at 9728 columns the 13 tokens that fit round up to one 16-token pair of tiles, without a layout to
+     * one 8-token tile, and the int16 kernels' slabs hold twice the tokens of the Q8_0 float tiles' four-byte lanes.
+     */
+    @Test
+    public void panelsAndSlabsFollowTheKernelsTiling() {
+        assertEquals("128 Ki elements hold 32 tokens of 4096 columns", 32,
+                CpuTaskGrid.of(64, 512, 4096, 4352, INT16, 8).tokens(0));
+        assertEquals(32, CpuTaskGrid.of(64, 512, 4096, 4352, FLOAT, 8).tokens(0));
+        assertEquals("13 tokens fit, a panel holds at least its tile pair", 16,
+                CpuTaskGrid.of(64, 512, 9728, 10336, INT16, 8).tokens(0));
+        assertEquals(16, CpuTaskGrid.of(64, 512, 9728, 10336, FLOAT, 8).tokens(0));
+        assertEquals("without a layout, one 8-token panel", 8,
+                CpuTaskGrid.of(64, 512, 9728, 10336, CpuTaskGrid.Tiling.UNPREPARED, 8).tokens(0));
+        assertEquals((32 << 20) / (2 * 9728) / 16 * 16, CpuTaskGrid.slabTokens(9728, INT16));
+        assertEquals((32 << 20) / (4 * 9728) / 16 * 16, CpuTaskGrid.slabTokens(9728, FLOAT));
+        CpuTaskGrid.Tiling joined = INT16.join(FLOAT);
+        assertEquals("a group satisfies both tiles", 16, joined.panelTokens);
+        assertEquals(4, joined.rows);
+        assertEquals("and bounds the wider layout", 4, joined.laneBytes);
+        Assume.assumeTrue(CpuSimd.available());
+        for (GGMLType type : new GGMLType[]{GGMLType.Q4_K, GGMLType.Q6_K}) {
+            CpuVecDot dot = CpuSimd.vecDot(type);
+            assertEquals(type + " slabs hold 32 MiB of two-byte lanes", (32 << 20) / (2 * 9728) / 16 * 16,
+                    CpuMatVec.tokenSlab(9728, dot));
+            assertEquals(type + " register tile rows", 2, dot.tileRows());
+            assertEquals(type + " panel tokens", 16, dot.tilePanelTokens());
+            assertEquals(type + " lane bytes", 2, dot.tileLaneBytes());
+        }
+        CpuVecDot q8 = CpuSimd.vecDot(GGMLType.Q8_0);
+        assertEquals("Q8_0 float tiles", (32 << 20) / (4 * 9728) / 16 * 16, CpuMatVec.tokenSlab(9728, q8));
+        assertEquals(4, q8.tileRows());
+        assertEquals(16, q8.tilePanelTokens());
+        assertEquals(4, q8.tileLaneBytes());
     }
 
     @Test
@@ -163,7 +208,7 @@ public class CpuMatVecBatchTest {
         int cols = 1 << 16;
         CpuVecDot simd = CpuSimd.vecDot(GGMLType.Q8_0);
         int slab = CpuMatVec.tokenSlab(cols, simd);
-        assertEquals("a slab holds 32 MiB of two-byte lanes", (32 << 20) / (2 * cols), slab);
+        assertEquals("a slab holds 32 MiB of four-byte lanes", (32 << 20) / (4 * cols), slab);
         int n = slab + 9;
         CpuTensorRef a = weight(GGMLType.Q8_0, 3, cols, 71L);
         CpuTensorRef b = weight(GGMLType.Q8_0, 2, cols, 72L);
@@ -222,6 +267,21 @@ public class CpuMatVecBatchTest {
         @Override
         public int tileTokens() {
             return inner.tileTokens();
+        }
+
+        @Override
+        public int tileRows() {
+            return inner.tileRows();
+        }
+
+        @Override
+        public int tilePanelTokens() {
+            return inner.tilePanelTokens();
+        }
+
+        @Override
+        public int tileLaneBytes() {
+            return inner.tileLaneBytes();
         }
 
         @Override

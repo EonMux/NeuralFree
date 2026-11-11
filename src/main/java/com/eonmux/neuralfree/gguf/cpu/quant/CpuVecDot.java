@@ -101,6 +101,31 @@ public interface CpuVecDot {
     }
 
     /**
+     * Weight rows of the register tile a prepared {@link #dotTiles(CpuTensorRef, long, int, TileActivations,
+     * QuantizedActivations[], int, int, float[], int, int)} multiplies: the row chunks of a batched product are whole
+     * multiples of it. 2 by default, the tile of the int16 kernels.
+     */
+    default int tileRows() {
+        return 2;
+    }
+
+    /**
+     * Tokens of the register tile a prepared product multiplies, a multiple of {@link #tileTokens()}: the token
+     * panels of a batched product are whole multiples of it. 8 by default, one tile of the int16 kernels.
+     */
+    default int tilePanelTokens() {
+        return 8;
+    }
+
+    /**
+     * Bytes one activation element takes in the layout {@link #prepareTiles} builds: a batched product sizes its
+     * token slabs by it, so the layout memory stays bounded. 2 by default, the int16 lanes of the widened layouts.
+     */
+    default int tileLaneBytes() {
+        return 2;
+    }
+
+    /**
      * The product of rows {@code [rowStart, rowStart + rowCount)} with tokens {@code [tokenStart, tokenStart +
      * nTokens)} of a batched product, writing token {@code tokenStart + t}'s output row at {@code y[yOff +
      * t*yStride]}: the same values as {@link #dotTiles(CpuTensorRef, long, int, QuantizedActivations[], int,

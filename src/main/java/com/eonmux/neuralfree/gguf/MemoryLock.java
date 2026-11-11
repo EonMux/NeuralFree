@@ -13,9 +13,10 @@ import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Pins mapped or direct memory in RAM with the C library's {@code mlock}, and sets the readahead advice with
- * {@code posix_madvise} (llama.cpp's {@code llama_mlock} and the {@code POSIX_MADV_RANDOM} it applies to a NUMA
- * model, {@code src/llama-mmap.cpp}).
+ * Pins mapped or direct memory in RAM with the C library's {@code mlock}, and advises the kernel how a mapping is
+ * read ({@link Advice}): the readahead advice through {@code posix_madvise} and the huge-page advice through
+ * {@code madvise} (llama.cpp's {@code llama_mlock}, and the {@code POSIX_MADV_WILLNEED} prefetch and
+ * {@code POSIX_MADV_RANDOM} NUMA advice of {@code llama_mmap}, {@code src/llama-mmap.cpp}).
  *
  * <p>A locked region stays in physical RAM, so the kernel neither swaps nor compresses it. The calls are reached
  * through JNA because the JVM exposes neither; a process that does not run on Linux, or whose C library lacks them,
@@ -25,24 +26,51 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public final class MemoryLock {
 
-    /** {@code posix_madvise} advice: no readahead, the pattern a NUMA model's scattered reads want. */
-    private static final int POSIX_MADV_RANDOM = 1;
+    /** How a mapped range is read, as the kernel's paging advice. */
+    public enum Advice {
+        /** {@code POSIX_MADV_RANDOM}: no readahead, the pattern a NUMA model's scattered reads want. */
+        RANDOM(1, false),
+        /** {@code POSIX_MADV_SEQUENTIAL}: aggressive readahead, pages behind the reader may be dropped early. */
+        SEQUENTIAL(2, false),
+        /** {@code POSIX_MADV_WILLNEED}: start reading the range in now, llama.cpp's prefetch of a mapped model. */
+        WILLNEED(3, false),
+        /** {@code madvise(MADV_HUGEPAGE)}: back the range with transparent huge pages where the kernel can. */
+        HUGEPAGE(14, true);
+
+        private final int code;
+        private final boolean linuxMadvise;
+
+        Advice(int code, boolean linuxMadvise) {
+            this.code = code;
+            this.linuxMadvise = linuxMadvise;
+        }
+    }
 
     private static final AtomicBoolean LOCK_FAILED = new AtomicBoolean();
     private static final AtomicBoolean UNSUPPORTED = new AtomicBoolean();
-    private static final AtomicBoolean ADVICE_FAILED = new AtomicBoolean();
+    private static final AtomicBoolean[] ADVICE_FAILED = adviceFlags();
     private static final AtomicBoolean NOT_DIRECT = new AtomicBoolean();
+
+    private static AtomicBoolean[] adviceFlags() {
+        AtomicBoolean[] flags = new AtomicBoolean[Advice.values().length];
+        for (int i = 0; i < flags.length; i++) {
+            flags[i] = new AtomicBoolean();
+        }
+        return flags;
+    }
 
     private static final class Libc {
         static final Function MLOCK;
         static final Function MUNLOCK;
         static final Function POSIX_MADVISE;
+        static final Function MADVISE;
         static final int PAGE_SIZE;
 
         static {
             Function lock = null;
             Function unlock = null;
             Function advise = null;
+            Function madvise = null;
             int page = 4096;
             if (Platform.isLinux()) {
                 NativeLibrary libc = null;
@@ -62,6 +90,11 @@ public final class MemoryLock {
                         advise = null;
                     }
                     try {
+                        madvise = libc.getFunction("madvise");
+                    } catch (Throwable t) {
+                        madvise = null;
+                    }
+                    try {
                         page = libc.getFunction("getpagesize").invokeInt(new Object[0]);
                     } catch (Throwable t) {
                         page = 4096;
@@ -71,6 +104,7 @@ public final class MemoryLock {
             MLOCK = lock;
             MUNLOCK = unlock;
             POSIX_MADVISE = advise;
+            MADVISE = madvise;
             PAGE_SIZE = page > 0 ? page : 4096;
         }
     }
@@ -145,32 +179,53 @@ public final class MemoryLock {
      * @return true when the kernel took the advice
      */
     public static boolean adviseRandom(ByteBuffer buffer) {
+        return advise(buffer, Advice.RANDOM);
+    }
+
+    /**
+     * Gives the kernel {@code advice} for the whole pages of a direct or mapped buffer. A refusal is logged once per
+     * advice; the mapping keeps the kernel's default paging.
+     *
+     * @return true when the kernel took the advice, false for unsupported hosts, heap and empty buffers and refused
+     *         requests
+     */
+    public static boolean advise(ByteBuffer buffer, Advice advice) {
         Objects.requireNonNull(buffer, "buffer");
-        if (Libc.POSIX_MADVISE == null || buffer.capacity() == 0) {
+        Objects.requireNonNull(advice, "advice");
+        Function call = advice.linuxMadvise ? Libc.MADVISE : Libc.POSIX_MADVISE;
+        if (call == null || buffer.capacity() == 0) {
             return false;
         }
         Pointer address = address(buffer);
         if (address == null) {
             return false;
         }
-        // posix_madvise needs a page-aligned range; the buffer's whole pages are the pages it covers
-        long page = Libc.PAGE_SIZE;
-        long start = Pointer.nativeValue(address) & ~(page - 1);
-        long end = (Pointer.nativeValue(address) + buffer.capacity()) & ~(page - 1);
-        if (end <= start) {
-            end = start + page;
-        }
-        int rc = Libc.POSIX_MADVISE.invokeInt(new Object[] {new Pointer(start), sizeT(end - start),
-                Integer.valueOf(POSIX_MADV_RANDOM)});
+        long[] range = pageRange(Pointer.nativeValue(address), buffer.capacity(), Libc.PAGE_SIZE);
+        int rc = call.invokeInt(new Object[] {new Pointer(range[0]), sizeT(range[1]), Integer.valueOf(advice.code)});
         if (rc != 0) {
-            if (ADVICE_FAILED.compareAndSet(false, true)) {
+            // posix_madvise returns the error number, madvise returns -1 and sets errno
+            int error = advice.linuxMadvise ? Native.getLastError() : rc;
+            if (ADVICE_FAILED[advice.ordinal()].compareAndSet(false, true)) {
                 LoggingUtil.getLogger(MemoryLock.class).warn(
-                        "posix_madvise(POSIX_MADV_RANDOM) failed (errno {}); readahead stays as it is",
-                        Native.getLastError());
+                        "{} advice of a mapped tensor range failed (errno {}); its paging stays as it is", advice,
+                        error);
             }
             return false;
         }
         return true;
+    }
+
+    /**
+     * The page-aligned start and length the advice of {@code [address, address + length)} covers: from the page
+     * holding the first byte to the end of the last whole page, or that first page alone when the range ends on it.
+     */
+    static long[] pageRange(long address, long length, long page) {
+        long start = address & ~(page - 1);
+        long end = (address + length) & ~(page - 1);
+        if (end <= start) {
+            end = start + page;
+        }
+        return new long[] {start, end - start};
     }
 
     /** The buffer's native address, or null (logged once) when the JVM does not expose it. */

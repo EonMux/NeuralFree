@@ -14,8 +14,10 @@ import static com.eonmux.neuralfree.gguf.quant.BlockLayout.QK_K;
  * The widening int8 dot primitives of the Vector API vec-dot kernels ({@code SimdKernels} and its
  * {@code Simd*} kernels): int8 bytes widen to 32-bit lanes with {@code B2I}, multiply-add in int lanes, and
  * reduce horizontally. Every lane product and every lane sum is exact, so a block dot returns the same integer
- * as the scalar {@link Q8VecDot#dotI8} in any lane order. The species are fixed at 128-bit and 256-bit, which
- * the JIT splits or widens to whatever the machine has, so one kernel serves AVX, AVX2, AVX-512 and NEON.
+ * as the scalar {@link Q8VecDot#dotI8} in any lane order. The species are fixed at 64, 128 and 256 bits: the JIT
+ * compiles them to single instructions on AVX2 and AVX-512 hardware, while on narrower vector hardware (128-bit
+ * NEON, SSE-only x86) it runs the 256-bit operations as their Java fallback, so {@link CpuSimd} keeps the scalar
+ * kernels there.
  * <p>
  * Vectors load straight from the packed row arrays the row loops hand to the kernels; the int16 product path
  * ({@link #S16}, {@link #pairSum}) widens the sixteen int8 products of a byte vector into short lanes and

@@ -14,6 +14,8 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
+import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
@@ -119,6 +121,77 @@ public class MemoryLockTest {
         Assume.assumeTrue(MemoryLock.supported());
         assertTrue(MemoryLock.adviseRandom(direct(4096)));
         assertFalse("an empty buffer has nothing to advise", MemoryLock.adviseRandom(ByteBuffer.allocateDirect(0)));
+    }
+
+    @Test
+    public void everyReadaheadAdviceIsAcceptedForAMappedFile() throws IOException {
+        Assume.assumeTrue(Platform.isLinux());
+        Assume.assumeTrue(MemoryLock.supported());
+        Path file = Files.createTempFile("memory-advice", ".bin");
+        try {
+            Files.write(file, new byte[3 * 4096 + 100]);
+            try (RandomAccessFile raf = new RandomAccessFile(file.toFile(), "r");
+                 FileChannel channel = raf.getChannel()) {
+                MappedByteBuffer mapped = channel.map(FileChannel.MapMode.READ_ONLY, 100, 3 * 4096);
+                for (MemoryLock.Advice advice : new MemoryLock.Advice[] {MemoryLock.Advice.RANDOM,
+                        MemoryLock.Advice.SEQUENTIAL, MemoryLock.Advice.WILLNEED}) {
+                    assertTrue(advice + " of a mapped range", MemoryLock.advise(mapped, advice));
+                }
+            }
+        } finally {
+            Files.deleteIfExists(file);
+        }
+    }
+
+    /**
+     * The huge-page advice reaches a read-only file mapping, the mapping the tensor advice applies it to: the kernel
+     * marks it {@code hg}. The readahead advice marks it {@code rr} or {@code sr} the same way.
+     */
+    @Test
+    public void theAdviceReachesAReadOnlyFileMapping() throws IOException {
+        Assume.assumeTrue(Platform.isLinux());
+        Assume.assumeTrue(MemoryLock.supported());
+        Assume.assumeTrue(Files.isReadable(MappingFlags.SMAPS));
+        Path thp = Path.of("/sys/kernel/mm/transparent_hugepage/enabled");
+        boolean hugePages = Files.isReadable(thp) && !Files.readString(thp).contains("[never]");
+        Object[][] cases = {{MemoryLock.Advice.HUGEPAGE, "hg"}, {MemoryLock.Advice.RANDOM, "rr"},
+                {MemoryLock.Advice.SEQUENTIAL, "sr"}};
+        for (Object[] c : cases) {
+            MemoryLock.Advice advice = (MemoryLock.Advice) c[0];
+            if (advice == MemoryLock.Advice.HUGEPAGE && !hugePages) {
+                continue;
+            }
+            Path file = Files.createTempFile("memory-advice-" + advice, ".bin");
+            try {
+                Files.write(file, new byte[4 << 20]);
+                try (RandomAccessFile raf = new RandomAccessFile(file.toFile(), "r");
+                     FileChannel channel = raf.getChannel()) {
+                    MappedByteBuffer mapped = channel.map(FileChannel.MapMode.READ_ONLY, 0, 4 << 20);
+                    assertFalse(advice + " is not set before the advice", MappingFlags.of(file).contains(c[1]));
+                    assertTrue(advice + " of a read-only file mapping", MemoryLock.advise(mapped, advice));
+                    assertTrue(advice + ": " + MappingFlags.of(file), MappingFlags.of(file).contains(c[1]));
+                    assertEquals(0, mapped.get(4096));
+                }
+            } finally {
+                Files.deleteIfExists(file);
+            }
+        }
+    }
+
+    @Test
+    public void heapBuffersAndNullsTakeNoAdvice() {
+        assertFalse(MemoryLock.advise(ByteBuffer.allocate(4096), MemoryLock.Advice.WILLNEED));
+        assertThrows(NullPointerException.class, () -> MemoryLock.advise(null, MemoryLock.Advice.WILLNEED));
+        assertThrows(NullPointerException.class, () -> MemoryLock.advise(direct(16), null));
+    }
+
+    @Test
+    public void theAdvisedRangeCoversTheBuffersWholePages() {
+        assertArrayEquals(new long[] {4096, 8192}, MemoryLock.pageRange(4096, 8192, 4096));
+        assertArrayEquals("an unaligned start rounds down, a partial last page is left out",
+                new long[] {4096, 8192}, MemoryLock.pageRange(4196, 8192, 4096));
+        assertArrayEquals("a range inside one page advises that page", new long[] {8192, 4096},
+                MemoryLock.pageRange(8200, 100, 4096));
     }
 
     @Test

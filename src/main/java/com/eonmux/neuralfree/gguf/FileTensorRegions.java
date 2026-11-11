@@ -15,7 +15,8 @@ import java.util.Objects;
  * tensor found by binary search on {@link DataSegment#virtualBase()}, and each region in its
  * {@link TensorReadMode}:
  * <ul>
- *   <li>MMAP: memory-mapped read-only (the page cache backs it);</li>
+ *   <li>MMAP: memory-mapped read-only (the page cache backs it), each mapping given the paging advice of
+ *       {@link TensorAdvice};</li>
  *   <li>READ (llama.cpp {@code --no-mmap}): copied whole into a direct buffer with positional reads;</li>
  *   <li>DIRECT: copied like READ but through sector-aligned channel reads, so nothing is relied on from the
  *       page cache beyond the reads themselves (the JVM form of llama.cpp's direct I/O);</li>
@@ -29,13 +30,15 @@ public final class FileTensorRegions implements TensorRegions {
 
     private final String description;
     private final TensorReadMode mode;
+    private final MemoryLock.Advice advice;
     private final DataSegment[] segments;
     private final FileChannel[] channels;
 
-    private FileTensorRegions(String description, TensorReadMode mode, DataSegment[] segments,
-                              FileChannel[] channels) {
+    private FileTensorRegions(String description, TensorReadMode mode, MemoryLock.Advice advice,
+                              DataSegment[] segments, FileChannel[] channels) {
         this.description = description;
         this.mode = mode;
+        this.advice = advice;
         this.segments = segments;
         this.channels = channels;
     }
@@ -46,7 +49,8 @@ public final class FileTensorRegions implements TensorRegions {
      * @param segments    the segments in increasing, non-overlapping virtual order
      * @param mode        how regions are served ({@linkplain TensorReadMode MMAP}, READ, DIRECT or LAZY)
      * @param description the model the regions belong to, for messages
-     * @throws IllegalArgumentException when there are no segments or they are out of order or overlap
+     * @throws IllegalArgumentException when there are no segments, they are out of order or overlap, or
+     *                                  {@value TensorAdvice#PROP_ADVICE} names no advice
      * @throws IOException              when a file cannot be opened
      */
     public static FileTensorRegions open(List<DataSegment> segments, TensorReadMode mode, String description)
@@ -55,6 +59,12 @@ public final class FileTensorRegions implements TensorRegions {
         Objects.requireNonNull(mode, "mode");
         Objects.requireNonNull(description, "description");
         DataSegment[] segs = segments.toArray(new DataSegment[0]);
+        long mappedBytes = 0;
+        for (DataSegment seg : segs) {
+            mappedBytes += seg == null ? 0 : seg.dataLength();
+        }
+        MemoryLock.Advice advice = mode.usesMmap() ? TensorAdvice.forMapping(System.getProperties(), mappedBytes)
+                : null;
         if (segs.length == 0) {
             throw new IllegalArgumentException("no data segments for " + description);
         }
@@ -74,12 +84,17 @@ public final class FileTensorRegions implements TensorRegions {
             closeAll(channels, e);
             throw e;
         }
-        return new FileTensorRegions(description, mode, segs, channels);
+        return new FileTensorRegions(description, mode, advice, segs, channels);
     }
 
     /** Whether regions are memory-mapped or read into direct buffers. */
     public TensorReadMode mode() {
         return mode;
+    }
+
+    /** The paging advice every mapped region takes ({@link TensorAdvice}), or null for none or unmapped modes. */
+    public MemoryLock.Advice advice() {
+        return advice;
     }
 
     @Override
@@ -109,6 +124,9 @@ public final class FileTensorRegions implements TensorRegions {
             case MMAP:
             case MMAP_MLOCK:
                 buf = ch.map(FileChannel.MapMode.READ_ONLY, filePos, length);
+                if (advice != null) {
+                    MemoryLock.advise(buf, advice);
+                }
                 if (mode.locksMemory()) {
                     MemoryLock.lock(buf);
                 }

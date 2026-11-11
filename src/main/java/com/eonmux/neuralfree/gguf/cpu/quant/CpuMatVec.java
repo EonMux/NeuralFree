@@ -486,7 +486,7 @@ public final class CpuMatVec {
         GGMLType[] actType = new GGMLType[ws.length];
         CpuTensorRef[] views = new CpuTensorRef[ws.length];
         CpuVecDot[] dots = new CpuVecDot[ws.length];
-        int align = 1;
+        CpuTaskGrid.Tiling tiling = null;
         for (int i = 0; i < ws.length; i++) {
             CpuTensorRef w = ws[i];
             int rows = rowCount(w);
@@ -504,9 +504,11 @@ public final class CpuMatVec {
             MatvecPlan plan = kernels != null ? kernels.planOf(w) : null;
             views[i] = plan != null ? plan.weight : w;
             dots[i] = plan != null ? plan.kernel : vecDot(w.type());
-            align = lcm(align, dots[i].tileTokens());
+            CpuTaskGrid.Tiling own = CpuTaskGrid.Tiling.of(dots[i]);
+            tiling = tiling == null ? own : tiling.join(own);
         }
-        int slab = nTokens == 1 ? 1 : CpuTaskGrid.slabTokens(cols, align);
+        int slab = nTokens == 1 ? 1
+                : CpuTaskGrid.slabTokens(cols, tiling != null ? tiling : CpuTaskGrid.Tiling.UNPREPARED);
         for (int t0 = 0; t0 < nTokens; t0 += slab) {
             runGroupSlab(ws, views, dots, actType, acts, ys, t0, Math.min(slab, nTokens - t0));
         }
@@ -553,18 +555,6 @@ public final class CpuMatVec {
                 products[i].run(task - start[i]);
             }
         });
-    }
-
-    /** The least common multiple of two positive token alignments. */
-    private static int lcm(int a, int b) {
-        int x = a;
-        int y = b;
-        while (y != 0) {
-            int r = x % y;
-            x = y;
-            y = r;
-        }
-        return Math.multiplyExact(a / x, b);
     }
 
     // ------------------------------------------------------------------ core
@@ -617,7 +607,7 @@ public final class CpuMatVec {
         int observedExperts = t.experts() > 0 ? t.experts() : nExpert;
         QuantizedActivations[] acts = prepare(w, rowStart, rowCount, observedExperts, nExpert > 0, w.type(),
                 transform, actExpert, x, xOff, xStride, cols, nTokens);
-        int slab = nTokens == 1 ? 1 : CpuTaskGrid.slabTokens(cols, dot.tileTokens());
+        int slab = nTokens == 1 ? 1 : CpuTaskGrid.slabTokens(cols, CpuTaskGrid.Tiling.of(dot));
         for (int t0 = 0; t0 < nTokens; t0 += slab) {
             QuantizedActivations[] part = slice(acts, t0, Math.min(slab, nTokens - t0));
             Product p = new Product(wv, dot, t, perExpert, rowStart, rowCount, part,
@@ -635,12 +625,12 @@ public final class CpuMatVec {
      * Tokens of one slab of a batched product of {@code dot} over {@code cols} columns
      * ({@link CpuTaskGrid#slabTokens}): a caller that prepares {@link CpuVecDot#prepareTiles} layouts for many
      * tokens keeps each to this many, so the layout memory stays bounded. A multiple of {@code dot}'s
-     * {@link CpuVecDot#tileTokens}.
+     * {@link CpuVecDot#tileTokens} and {@link CpuVecDot#tilePanelTokens}.
      *
      * @throws IllegalArgumentException for a non-positive column count
      */
     public static int tokenSlab(int cols, CpuVecDot dot) {
-        return CpuTaskGrid.slabTokens(cols, Objects.requireNonNull(dot, "dot").tileTokens());
+        return CpuTaskGrid.slabTokens(cols, CpuTaskGrid.Tiling.of(Objects.requireNonNull(dot, "dot")));
     }
 
     /** Tokens {@code [from, from + n)} of {@code acts}: the array itself when that is all of it. */
@@ -686,7 +676,8 @@ public final class CpuMatVec {
             this.accumulate = accumulate;
             this.plain = !accumulate && !t.hasScale();
             this.grid = CpuTaskGrid.of(rowCount, acts.length, toInt(wv.cols(), wv), wv.rowBytes(),
-                    tiles == null ? 1 : dot.tileTokens(), CpuParallel.parallelism());
+                    tiles == null ? CpuTaskGrid.Tiling.UNPREPARED : CpuTaskGrid.Tiling.of(dot),
+                    CpuParallel.parallelism());
         }
 
         void run(int task) {
