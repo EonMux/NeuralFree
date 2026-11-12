@@ -43,6 +43,13 @@ public final class MmqConfig {
      *  workgroup), with four-row twins: CUDA sm_80+. */
     public static final MmqConfig INT8_TENSOR = new MmqConfig("int8-tensor", 32, 128, 128, 8, 4);
     /**
+     * The small-token tensor tile of CUDA sm_80+: the {@link #INT8_TENSOR} tile's 128 rows, 32-deep stages,
+     * eight rows per work-item and 256 work-items over 16 tokens, llama.cpp's {@code mmq_x = 16} row at
+     * {@code mmq_y = 128}. Its only kernels are the stream-k form {@code <T>_MatMul_MMQ_StreamK_S} and its fixup
+     * ({@link StreamKGemmPlan#ofSmall}), the decode batches' MMQ form; it is no device tile.
+     */
+    public static final MmqConfig INT8_TENSOR_SMALL = new MmqConfig("int8-tensor-small", 32, 128, 16, 8, 4);
+    /**
      * RDNA3 (gfx1100&ndash;gfx1103): llama.cpp's {@code mmq-config-rdna3.cuh} widest tile, 64 rows x
      * 128 tokens over 16-deep stages. It is the table's non-fallback J=128 row of every int8 MMQ type
      * except Q2_K, whose widest row is 128 rows; the family tile keeps one shape for all types.

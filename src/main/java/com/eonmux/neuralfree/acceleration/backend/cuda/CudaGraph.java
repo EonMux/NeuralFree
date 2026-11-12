@@ -354,7 +354,8 @@ final class CudaGraph implements GpuGraph {
             node.grid = WorkSizes.groupCounts(WorkSizes.pad3(global, 1), node.block);
         }
         Pointer params = node.handle.args().kernelParams();
-        CUDA_KERNEL_NODE_PARAMS nodeParams = nodeParams(node.handle.function(), node.grid, node.block, params);
+        CUDA_KERNEL_NODE_PARAMS nodeParams = nodeParams(node.handle.function(), node.grid, node.block,
+                node.handle.dynamicSharedMemoryBytes(), params);
         CudaErrors.check("cuGraphExecKernelNodeSetParams(" + node.handle.kernelName() + ")",
                 () -> cuGraphExecKernelNodeSetParams(target, node.node, nodeParams));
         node.argVersion = sticky.version();
@@ -421,7 +422,8 @@ final class CudaGraph implements GpuGraph {
         boolean changed = argsChanged(node, sticky, global);
         if (changed || node.lagging == exec) {
             Pointer params = handle.args().kernelParams();
-            CUDA_KERNEL_NODE_PARAMS nodeParams = nodeParams(handle.function(), grid, block, params);
+            CUDA_KERNEL_NODE_PARAMS nodeParams = nodeParams(handle.function(), grid, block,
+                    handle.dynamicSharedMemoryBytes(), params);
             CudaErrors.check("cuGraphExecKernelNodeSetParams(" + name + ")",
                     () -> cuGraphExecKernelNodeSetParams(exec, node.node, nodeParams));
             node.argVersion = sticky.version();
@@ -519,8 +521,9 @@ final class CudaGraph implements GpuGraph {
         launchQueue.graphLaunch(exec, dispatchCount());
     }
 
-    /** The kernel-node parameters of one launch. */
-    static CUDA_KERNEL_NODE_PARAMS nodeParams(CUfunction function, long[] grid, long[] block, Pointer params) {
+    /** The kernel-node parameters of one launch with {@code sharedMemBytes} of dynamic shared memory. */
+    static CUDA_KERNEL_NODE_PARAMS nodeParams(CUfunction function, long[] grid, long[] block, int sharedMemBytes,
+                                              Pointer params) {
         CUDA_KERNEL_NODE_PARAMS p = new CUDA_KERNEL_NODE_PARAMS();
         p.func = function;
         p.gridDimX = (int) grid[0];
@@ -529,7 +532,7 @@ final class CudaGraph implements GpuGraph {
         p.blockDimX = (int) block[0];
         p.blockDimY = block.length > 1 ? (int) block[1] : 1;
         p.blockDimZ = block.length > 2 ? (int) block[2] : 1;
-        p.sharedMemBytes = 0;
+        p.sharedMemBytes = sharedMemBytes;
         p.kernelParams = params;
         p.extra = null;
         return p;

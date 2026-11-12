@@ -263,8 +263,8 @@ final class FastGemmLanes {
     /**
      * Tokens per workgroup tile of a fast GEMM kernel: the small-tile twins' tile width
      * ({@code NF_MMQ_TN} of the {@code _S} / {@code _S64} forms), the device's {@link MmqConfig}
-     * token tile for the int8 MMQ GEMM ({@code NF_MMQ_TN}), {@code NF_MMA_TN} for the MMA and CM
-     * forms.
+     * token tile for the int8 MMQ GEMM ({@code NF_MMQ_TN}), {@code NF_MMAL_TN} for the large-tile MMA form,
+     * {@code NF_MMA_TN} for the MMA and CM forms.
      */
     int fastTileTokens(String fastKernel) {
         int twin = twinTokensOf(fastKernel);
@@ -274,12 +274,15 @@ final class FastGemmLanes {
         if (cm2Fast(fastKernel)) {
             return Cm2GemmPlan.TILE_TOKENS;
         }
+        if (mmaLargeFast(fastKernel)) {
+            return MmaGemmPlan.LARGE_TILE_TOKENS;
+        }
         return stagedFast(fastKernel) ? mmqConfig.tileTokens() : MmaGemmPlan.TILE_TOKENS;
     }
 
     /** Weight rows per workgroup tile of a fast GEMM kernel: the small tiles' row tile
      *  ({@link MmqConfig#smallTile}, the 256-item twin) for the twins, the
-     *  {@link MmqConfig} row tile or {@code NF_MMA_TM}. */
+     *  {@link MmqConfig} row tile, {@code NF_MMAL_TM} for the large-tile MMA form or {@code NF_MMA_TM}. */
     int fastTileRows(String fastKernel) {
         int twin = twinTokensOf(fastKernel);
         if (twin > 0) {
@@ -287,6 +290,9 @@ final class FastGemmLanes {
         }
         if (cm2Fast(fastKernel)) {
             return Cm2GemmPlan.TILE_ROWS;
+        }
+        if (mmaLargeFast(fastKernel)) {
+            return MmaGemmPlan.LARGE_TILE_ROWS;
         }
         return stagedFast(fastKernel) ? mmqConfig.tileRows() : MmaGemmPlan.TILE_ROWS;
     }
@@ -407,6 +413,36 @@ final class FastGemmLanes {
     /** Staged record units between activation rows of the int8 MMQ lane ({@code NF_MMQ_TK} chunks per row). */
     int stagedRowRecords(int cols) {
         return mmqConfig.rowRecords(cols);
+    }
+
+    /** Whether a fast GEMM kernel is the large-tile MMA form ({@code <T>_MatMul_MMA_L}). */
+    static boolean mmaLargeFast(String fastKernel) {
+        return fastKernel.endsWith(GemmKernels.MATMUL_MMA_L_SUFFIX);
+    }
+
+    /**
+     * The large-tile form of an MMA launch ({@code <T>_MatMul_MMA_L}), or null when the launch keeps the
+     * 64 x 32 tile: only for the plain {@code <T>_MatMul_MMA} lane, only for at least
+     * {@link MmaGemmPlan#LARGE_TILE_TOKENS} tokens, only when no shard would run split-K ({@link #splitK}; with
+     * {@code splitAllowed} false, as under batch invariance, none does), and only on a device that has the kernel
+     * (CUDA sm_80+). The two tiles give the same bits, so batch invariance does not constrain the choice.
+     */
+    String largeTileKernel(String fastKernel, GpuWeight w, int cols, int nTokens, boolean splitAllowed) {
+        if (!fastKernel.endsWith(GemmKernels.MATMUL_MMA_SUFFIX) || nTokens < MmaGemmPlan.LARGE_TILE_TOKENS) {
+            return null;
+        }
+        String large = GemmKernels.matmulMmaLarge(w.type());
+        if (!fastUsable(large, MmaGemmPlan.LARGE_TILE_ROWS, MmaGemmPlan.LARGE_TILE_TOKENS,
+                MmaGemmPlan.WORKGROUP_SIZE, w, nTokens)) {
+            return null;
+        }
+        for (int s = 0; splitAllowed && s < w.shardCount(); s++) {
+            int m = (int) w.shardRows(s);
+            if (splitK(fastKernel, w, m, cols, nTokens, 0, 0, m, false) != null) {
+                return null;
+            }
+        }
+        return large;
     }
 
     /** Whether a fast GEMM kernel is an MMA-family kernel: the tensor-core or split-K form. */
@@ -589,6 +625,31 @@ final class FastGemmLanes {
         StreamKGemmPlan plan = StreamKGemmPlan.of(base, kernels.caps().getComputeUnits());
         int workGroup = mmqConfig.workGroupSize();
         return ready(plan, workGroup);
+    }
+
+    /**
+     * The stream-k dispatch of one shard of a 16-token twin launch over the small-token tensor tile
+     * ({@link StreamKGemmPlan#ofSmall}: {@code <T>_MatMul_MMQ_StreamK_S}, 128 rows x 16 tokens, the staged records
+     * of the device tile), or null when the launch keeps the twin: only the {@code <T>_MatMul_MMQ_S} twin of an int8
+     * type on the CUDA tensor tile, only for a launch of at most {@link MmqConfig#TOKEN_LANES} tokens (the decode
+     * batches; the small-K prefill launches of 17 to 48 tokens that {@link MmqConfig#twinTokens} also gives the
+     * 16-token twin keep it), and only when this device has both kernels. The caller keeps the twin under batch
+     * invariance.
+     *
+     * @param qOff    staged record offset of the shard's activation view
+     * @param yStride element stride between output rows
+     */
+    StreamKGemmPlan streamKSmall(String smallKernel, GpuWeight w, int m, int cols, int nTokens, int yOff, int qOff,
+                                 int yStride) {
+        if (smallKernel == null || nTokens > MmqConfig.TOKEN_LANES
+                || !smallKernel.endsWith(GemmKernels.MATMUL_MMQ_S_SUFFIX)
+                || !GemmKernels.isInt8Mmq(w.type()) || !MmqConfig.INT8_TENSOR.equals(mmqConfig)) {
+            return null;
+        }
+        MmqGemmPlan base = MmqGemmPlan.tensorSmallOf(w.type(), m, cols, nTokens, mmqConfig.rowRecords(cols), qOff,
+                yStride, yOff);
+        return ready(StreamKGemmPlan.ofSmall(base, kernels.caps().getComputeUnits()),
+                MmqConfig.INT8_TENSOR_SMALL.workGroupSize());
     }
 
     /** {@code plan}, or null when the device cannot run its stream-k kernel or its fixup. */
@@ -819,6 +880,7 @@ final class FastGemmLanes {
             ops.optionalReady(GemmKernels.matmulCmKSplit(type), workGroup, 1);
         } else {
             ops.optionalReady(GemmKernels.matmulMmaKSplit(type), workGroup, 1);
+            ops.optionalReady(GemmKernels.matmulMmaLarge(type), workGroup, 1);
         }
         ops.optionalReady(GemmKernels.SPLIT_K_REDUCE, local);
     }

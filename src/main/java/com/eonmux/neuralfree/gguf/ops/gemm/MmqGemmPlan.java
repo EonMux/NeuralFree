@@ -126,6 +126,24 @@ public final class MmqGemmPlan {
                 qStride, qOff, yStride, yOff);
     }
 
+    /**
+     * Plans a launch over the small-token tensor tile ({@link MmqConfig#INT8_TENSOR_SMALL}, 128 rows x 16 tokens,
+     * CUDA sm_80+), whose one kernel is the stream-k form {@code <T>_MatMul_MMQ_StreamK_S}: the base launch a
+     * {@link StreamKGemmPlan#ofSmall} plan runs, with the same staged records and validation as {@link #of}.
+     *
+     * @param type weight type; must have an int8 MMQ kernel ({@link GemmKernels#isInt8Mmq})
+     * @throws IllegalArgumentException as {@link #of}, or for a type without the int8 datapath
+     */
+    public static MmqGemmPlan tensorSmallOf(GGMLType type, int m, int k, int n, int qStride, int qOff, int yStride,
+                                            int yOff) {
+        Objects.requireNonNull(type, "type");
+        if (!GemmKernels.isInt8Mmq(type)) {
+            throw new IllegalArgumentException("the small-token tensor tile runs the int8 MMQ types, not " + type);
+        }
+        return plan(MmqConfig.INT8_TENSOR_SMALL, GemmKernels.matmulMmqStreamKSmall(type), type, m, k, n, qStride,
+                qOff, yStride, yOff);
+    }
+
     /** Shared validation and construction of the plain and small-tile forms. */
     private static MmqGemmPlan plan(MmqConfig config, String kernelName, GGMLType type, int m, int k, int n,
                                     int qStride, int qOff, int yStride, int yOff) {

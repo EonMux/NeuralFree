@@ -504,9 +504,14 @@ final class GpuProjections {
          * device has it, so the weight stream fills whole output tiles; its split-K runs the twin
          * tile's _SKSplit / _SKSplit64 (SplitKGemmPlan.ofSmallTiles). */
         String smallFast = fastUsable ? ops.lanes.smallTileKernel(fast, w, nTokens) : null;
-        int launchTileTokens = smallFast == null ? fastTileTokens : ops.lanes.fastTileTokens(smallFast);
-        int launchTileRows = smallFast == null ? fastTileRows : ops.lanes.fastTileRows(smallFast);
-        int launchWorkGroup = smallFast == null ? fastWorkGroup : ops.lanes.fastWorkGroup(smallFast);
+        /* An MMA launch of at least one large tile of tokens that split-K would not split runs the large tile,
+         * which gives the same bits. */
+        String largeFast = fastUsable && smallFast == null
+                ? ops.lanes.largeTileKernel(fast, w, cols, nTokens, !invariant) : null;
+        String launchKernel = smallFast != null ? smallFast : largeFast != null ? largeFast : fast;
+        int launchTileTokens = fastUsable ? ops.lanes.fastTileTokens(launchKernel) : 0;
+        int launchTileRows = fastUsable ? ops.lanes.fastTileRows(launchKernel) : 0;
+        int launchWorkGroup = fastUsable ? ops.lanes.fastWorkGroup(launchKernel) : 0;
         Int8ActStaging int8Staging = fastUsable && fast.endsWith(GemmKernels.MATMUL_MMQ_SUFFIX)
                 ? ops.lanes.int8Staging(w, cols) : null;
         /* A plain MMQ launch on a backend with the subgroup forms (SubgroupRowForms.served: OpenCL or Intel Vulkan)
@@ -540,11 +545,15 @@ final class GpuProjections {
                 int m = (int) w.shardRows(s);
                 int yOff = outOff + (int) w.shardRowStart(s);
                 /* A plain-tile int8 launch whose tile grid would leave the last wave part-empty runs as
-                 * stream-k (an even share of the grid's chunks per resident block); the twins and a
+                 * stream-k (an even share of the grid's chunks per resident block), and a 16-token twin
+                 * launch of at most 16 tokens on the CUDA tensor tile runs the small-token tile's stream-k
+                 * form; the 64-token twins, the small-K prefill launches of 17 to 48 tokens and a
                  * batch-invariant step keep their grids. */
-                StreamKGemmPlan streamK = invariant || smallFast != null ? null
+                StreamKGemmPlan streamK = invariant ? null
+                        : smallFast != null
+                        ? ops.lanes.streamKSmall(smallFast, w, m, cols, nTokens, yOff, activations.off, rows)
                         : ops.lanes.streamK(fast, w, m, cols, nTokens, yOff, activations.off, rows);
-                SplitKGemmPlan split = invariant || streamK != null ? null
+                SplitKGemmPlan split = invariant || streamK != null || largeFast != null ? null
                         : sgFast != null
                         ? ops.lanes.subgroupSplitK(w, m, cols, nTokens, yOff, activations.off, rows)
                         : ops.lanes.splitK(fast, w, m, cols, nTokens, yOff, activations.off, rows,
@@ -562,8 +571,7 @@ final class GpuProjections {
                                 SubgroupMmqGemm.tokenGroups(nTokens), sgGroup, m, cols, nTokens, qStride, qOff, rows,
                                 yOff, w.shard(s), activations.buf, out);
                     } else {
-                        ops.launch2d(smallFast == null ? fast : smallFast,
-                                GpuOps.ceilDiv(m, launchTileRows) * launchWorkGroup,
+                        ops.launch2d(launchKernel, GpuOps.ceilDiv(m, launchTileRows) * launchWorkGroup,
                                 GpuOps.ceilDiv(nTokens, launchTileTokens), launchWorkGroup, m, cols, nTokens, qStride,
                                 qOff, rows, yOff, w.shard(s), activations.buf, out);
                     }

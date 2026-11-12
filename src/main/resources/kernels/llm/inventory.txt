@@ -14,6 +14,7 @@ BF16_GroupedGemmMma	moe_gemm_mma.cl	6	10	i,i,i,i,i,i,i,i,i,i	iiiiiiiiiiBBBBBB
 BF16_GroupedGemmMmaInd	moe_gemm_mma.cl	7	8	i,i,i,i,i,i,i,i	iiiiiiiiBBBBBBB
 BF16_MatMul_MMA	matmul_mma.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 BF16_MatMul_MMA_KSplit	matmul_mma.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
+BF16_MatMul_MMA_L	matmul_mma_large.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 BF16_MatMul_Tiled	matmul_tiled.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 BF16_MatVec	matvec_f16_bf16.cl	3	2	i,i	iiBBB
 BF16_MatVecAdd	matvec_f16_bf16.cl	3	2	i,i	iiBBB
@@ -37,6 +38,7 @@ F16_GroupedGemmMma	moe_gemm_mma.cl	6	10	i,i,i,i,i,i,i,i,i,i	iiiiiiiiiiBBBBBB
 F16_GroupedGemmMmaInd	moe_gemm_mma.cl	7	8	i,i,i,i,i,i,i,i	iiiiiiiiBBBBBBB
 F16_MatMul_MMA	matmul_mma.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 F16_MatMul_MMA_KSplit	matmul_mma.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
+F16_MatMul_MMA_L	matmul_mma_large.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 F16_MatMul_Tiled	matmul_tiled.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 F16_MatVec	matvec_f16_bf16.cl	3	2	i,i	iiBBB
 F16_MatVecAdd	matvec_f16_bf16.cl	3	2	i,i	iiBBB
@@ -244,6 +246,7 @@ I8_B128_MatMul_MMQ_SKSplit	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 I8_B128_MatMul_MMQ_SKSplit64	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 I8_B128_MatMul_MMQ_StreamK	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 I8_B128_MatMul_MMQ_StreamK_GateUp	matmul_mmq_stream.cl	5	7	i,i,i,i,i,i,i	iiiiiiiBBBBB
+I8_B128_MatMul_MMQ_StreamK_S	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 I8_B128_MatMul_Tiled	matmul_tiled.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 I8_B128_MatVec	matvec_extquant.cl	3	2	i,i	iiBBB
 I8_B128_MatVec2	matvec_extquant.cl	3	2	i,i	iiBBB
@@ -318,6 +321,7 @@ IQ1_S_MatMul_MMQ_SKSplit	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 IQ1_S_MatMul_MMQ_SKSplit64	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 IQ1_S_MatMul_MMQ_StreamK	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 IQ1_S_MatMul_MMQ_StreamK_GateUp	matmul_mmq_stream.cl	5	7	i,i,i,i,i,i,i	iiiiiiiBBBBB
+IQ1_S_MatMul_MMQ_StreamK_S	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 IQ1_S_MatMul_Tiled	matmul_tiled.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 IQ1_S_MatVec	matvec_iquant.cl	3	2	i,i	iiBBB
 IQ1_S_MatVec2	matvec_iquant.cl	3	2	i,i	iiBBB
@@ -370,6 +374,7 @@ IQ2_S_MatMul_MMQ_SKSplit	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 IQ2_S_MatMul_MMQ_SKSplit64	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 IQ2_S_MatMul_MMQ_StreamK	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 IQ2_S_MatMul_MMQ_StreamK_GateUp	matmul_mmq_stream.cl	5	7	i,i,i,i,i,i,i	iiiiiiiBBBBB
+IQ2_S_MatMul_MMQ_StreamK_S	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 IQ2_S_MatMul_Tiled	matmul_tiled.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 IQ2_S_MatVec	matvec_iquant.cl	3	2	i,i	iiBBB
 IQ2_S_MatVec2	matvec_iquant.cl	3	2	i,i	iiBBB
@@ -422,6 +427,7 @@ IQ2_XS_MatMul_MMQ_SKSplit	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 IQ2_XS_MatMul_MMQ_SKSplit64	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 IQ2_XS_MatMul_MMQ_StreamK	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 IQ2_XS_MatMul_MMQ_StreamK_GateUp	matmul_mmq_stream.cl	5	7	i,i,i,i,i,i,i	iiiiiiiBBBBB
+IQ2_XS_MatMul_MMQ_StreamK_S	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 IQ2_XS_MatMul_Tiled	matmul_tiled.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 IQ2_XS_MatVec	matvec_iquant.cl	3	2	i,i	iiBBB
 IQ2_XS_MatVec2	matvec_iquant.cl	3	2	i,i	iiBBB
@@ -474,6 +480,7 @@ IQ2_XXS_MatMul_MMQ_SKSplit	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 IQ2_XXS_MatMul_MMQ_SKSplit64	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 IQ2_XXS_MatMul_MMQ_StreamK	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 IQ2_XXS_MatMul_MMQ_StreamK_GateUp	matmul_mmq_stream.cl	5	7	i,i,i,i,i,i,i	iiiiiiiBBBBB
+IQ2_XXS_MatMul_MMQ_StreamK_S	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 IQ2_XXS_MatMul_Tiled	matmul_tiled.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 IQ2_XXS_MatVec	matvec_iquant.cl	3	2	i,i	iiBBB
 IQ2_XXS_MatVec2	matvec_iquant.cl	3	2	i,i	iiBBB
@@ -610,6 +617,7 @@ IQ3_S_MatMul_MMQ_SKSplit	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 IQ3_S_MatMul_MMQ_SKSplit64	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 IQ3_S_MatMul_MMQ_StreamK	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 IQ3_S_MatMul_MMQ_StreamK_GateUp	matmul_mmq_stream.cl	5	7	i,i,i,i,i,i,i	iiiiiiiBBBBB
+IQ3_S_MatMul_MMQ_StreamK_S	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 IQ3_S_MatMul_Tiled	matmul_tiled.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 IQ3_S_MatVec	matvec_iquant.cl	3	2	i,i	iiBBB
 IQ3_S_MatVec2	matvec_iquant.cl	3	2	i,i	iiBBB
@@ -662,6 +670,7 @@ IQ3_XXS_MatMul_MMQ_SKSplit	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 IQ3_XXS_MatMul_MMQ_SKSplit64	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 IQ3_XXS_MatMul_MMQ_StreamK	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 IQ3_XXS_MatMul_MMQ_StreamK_GateUp	matmul_mmq_stream.cl	5	7	i,i,i,i,i,i,i	iiiiiiiBBBBB
+IQ3_XXS_MatMul_MMQ_StreamK_S	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 IQ3_XXS_MatMul_Tiled	matmul_tiled.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 IQ3_XXS_MatVec	matvec_iquant.cl	3	2	i,i	iiBBB
 IQ3_XXS_MatVec2	matvec_iquant.cl	3	2	i,i	iiBBB
@@ -714,6 +723,7 @@ IQ4_NL_MatMul_MMQ_SKSplit	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 IQ4_NL_MatMul_MMQ_SKSplit64	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 IQ4_NL_MatMul_MMQ_StreamK	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 IQ4_NL_MatMul_MMQ_StreamK_GateUp	matmul_mmq_stream.cl	5	7	i,i,i,i,i,i,i	iiiiiiiBBBBB
+IQ4_NL_MatMul_MMQ_StreamK_S	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 IQ4_NL_MatMul_Tiled	matmul_tiled.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 IQ4_NL_MatMul_W4A8	matmul_fp8.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 IQ4_NL_MatMul_W4A8_KSplit	matmul_fp8.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
@@ -772,6 +782,7 @@ IQ4_XS_MatMul_MMQ_SKSplit	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 IQ4_XS_MatMul_MMQ_SKSplit64	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 IQ4_XS_MatMul_MMQ_StreamK	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 IQ4_XS_MatMul_MMQ_StreamK_GateUp	matmul_mmq_stream.cl	5	7	i,i,i,i,i,i,i	iiiiiiiBBBBB
+IQ4_XS_MatMul_MMQ_StreamK_S	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 IQ4_XS_MatMul_Tiled	matmul_tiled.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 IQ4_XS_MatMul_W4A8	matmul_fp8.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 IQ4_XS_MatMul_W4A8_KSplit	matmul_fp8.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
@@ -1119,6 +1130,7 @@ LLM_MLA_SparsePrefill_Q5_1	sparse/sparse_mla.cl	5	9	i,i,i,i,i,f,f,i,i	iiiiiffiiB
 LLM_MLA_SparsePrefill_Q8_0	sparse/sparse_mla.cl	5	9	i,i,i,i,i,f,f,i,i	iiiiiffiiBBBBB
 LLM_MMQ_StreamK_Fixup	matmul_mmq_stream.cl	2	5	i,i,i,i,i	iiiiiBB
 LLM_MMQ_StreamK_Fixup_GateUp	matmul_mmq_stream.cl	2	5	i,i,i,i,i	iiiiiBB
+LLM_MMQ_StreamK_Fixup_S	matmul_mmq_stream.cl	2	5	i,i,i,i,i	iiiiiBB
 LLM_MSA_BlockScore	sparse/msa.cl	5	9	i,i,i,i,i,i,i,i,i	iiiiiiiiiBBBBB
 LLM_MSA_GatherAttn	sparse/msa.cl	7	18	i,i,i,i,i,i,f,i,i,i,i,i,i,i,i,i,i,i	iiiiiifiiiiiiiiiiiBBBBBBB
 LLM_MXFP4_EmbeddingLookup	matvec_mxfp4.cl	2	2	i,i	iiBB
@@ -1510,6 +1522,7 @@ Q2_K_MatMul_MMQ_SKSplit	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 Q2_K_MatMul_MMQ_SKSplit64	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 Q2_K_MatMul_MMQ_StreamK	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 Q2_K_MatMul_MMQ_StreamK_GateUp	matmul_mmq_stream.cl	5	7	i,i,i,i,i,i,i	iiiiiiiBBBBB
+Q2_K_MatMul_MMQ_StreamK_S	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 Q2_K_MatMul_Tiled	matmul_tiled.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 Q2_K_MatVec	matvec_kquant.cl	3	2	i,i	iiBBB
 Q2_K_MatVec2	matvec_kquant.cl	3	2	i,i	iiBBB
@@ -1562,6 +1575,7 @@ Q3_K_MatMul_MMQ_SKSplit	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 Q3_K_MatMul_MMQ_SKSplit64	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 Q3_K_MatMul_MMQ_StreamK	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 Q3_K_MatMul_MMQ_StreamK_GateUp	matmul_mmq_stream.cl	5	7	i,i,i,i,i,i,i	iiiiiiiBBBBB
+Q3_K_MatMul_MMQ_StreamK_S	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 Q3_K_MatMul_Tiled	matmul_tiled.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 Q3_K_MatVec	matvec_kquant.cl	3	2	i,i	iiBBB
 Q3_K_MatVec2	matvec_kquant.cl	3	2	i,i	iiBBB
@@ -1614,6 +1628,7 @@ Q4_0_MatMul_MMQ_SKSplit	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 Q4_0_MatMul_MMQ_SKSplit64	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 Q4_0_MatMul_MMQ_StreamK	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 Q4_0_MatMul_MMQ_StreamK_GateUp	matmul_mmq_stream.cl	5	7	i,i,i,i,i,i,i	iiiiiiiBBBBB
+Q4_0_MatMul_MMQ_StreamK_S	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 Q4_0_MatMul_Tiled	matmul_tiled.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 Q4_0_MatVec	matvec_legacy.cl	3	2	i,i	iiBBB
 Q4_0_MatVec2	matvec_legacy.cl	3	2	i,i	iiBBB
@@ -1682,6 +1697,7 @@ Q4_1_MatMul_MMQ_SKSplit	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 Q4_1_MatMul_MMQ_SKSplit64	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 Q4_1_MatMul_MMQ_StreamK	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 Q4_1_MatMul_MMQ_StreamK_GateUp	matmul_mmq_stream.cl	5	7	i,i,i,i,i,i,i	iiiiiiiBBBBB
+Q4_1_MatMul_MMQ_StreamK_S	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 Q4_1_MatMul_Tiled	matmul_tiled.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 Q4_1_MatVec	matvec_legacy.cl	3	2	i,i	iiBBB
 Q4_1_MatVec2	matvec_legacy.cl	3	2	i,i	iiBBB
@@ -1734,6 +1750,7 @@ Q4_K_MatMul_MMQ_SKSplit	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 Q4_K_MatMul_MMQ_SKSplit64	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 Q4_K_MatMul_MMQ_StreamK	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 Q4_K_MatMul_MMQ_StreamK_GateUp	matmul_mmq_stream.cl	5	7	i,i,i,i,i,i,i	iiiiiiiBBBBB
+Q4_K_MatMul_MMQ_StreamK_S	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 Q4_K_MatMul_Tiled	matmul_tiled.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 Q4_K_MatVec	matvec_kquant.cl	3	2	i,i	iiBBB
 Q4_K_MatVec2	matvec_kquant.cl	3	2	i,i	iiBBB
@@ -1809,6 +1826,7 @@ Q5_0_MatMul_MMQ_SKSplit	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 Q5_0_MatMul_MMQ_SKSplit64	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 Q5_0_MatMul_MMQ_StreamK	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 Q5_0_MatMul_MMQ_StreamK_GateUp	matmul_mmq_stream.cl	5	7	i,i,i,i,i,i,i	iiiiiiiBBBBB
+Q5_0_MatMul_MMQ_StreamK_S	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 Q5_0_MatMul_Tiled	matmul_tiled.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 Q5_0_MatVec	matvec_legacy.cl	3	2	i,i	iiBBB
 Q5_0_MatVec2	matvec_legacy.cl	3	2	i,i	iiBBB
@@ -1861,6 +1879,7 @@ Q5_1_MatMul_MMQ_SKSplit	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 Q5_1_MatMul_MMQ_SKSplit64	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 Q5_1_MatMul_MMQ_StreamK	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 Q5_1_MatMul_MMQ_StreamK_GateUp	matmul_mmq_stream.cl	5	7	i,i,i,i,i,i,i	iiiiiiiBBBBB
+Q5_1_MatMul_MMQ_StreamK_S	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 Q5_1_MatMul_Tiled	matmul_tiled.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 Q5_1_MatVec	matvec_legacy.cl	3	2	i,i	iiBBB
 Q5_1_MatVec2	matvec_legacy.cl	3	2	i,i	iiBBB
@@ -1913,6 +1932,7 @@ Q5_K_MatMul_MMQ_SKSplit	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 Q5_K_MatMul_MMQ_SKSplit64	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 Q5_K_MatMul_MMQ_StreamK	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 Q5_K_MatMul_MMQ_StreamK_GateUp	matmul_mmq_stream.cl	5	7	i,i,i,i,i,i,i	iiiiiiiBBBBB
+Q5_K_MatMul_MMQ_StreamK_S	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 Q5_K_MatMul_Tiled	matmul_tiled.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 Q5_K_MatVec	matvec_kquant.cl	3	2	i,i	iiBBB
 Q5_K_MatVec2	matvec_kquant.cl	3	2	i,i	iiBBB
@@ -1988,6 +2008,7 @@ Q6_K_MatMul_MMQ_SKSplit	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 Q6_K_MatMul_MMQ_SKSplit64	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 Q6_K_MatMul_MMQ_StreamK	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 Q6_K_MatMul_MMQ_StreamK_GateUp	matmul_mmq_stream.cl	5	7	i,i,i,i,i,i,i	iiiiiiiBBBBB
+Q6_K_MatMul_MMQ_StreamK_S	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 Q6_K_MatMul_Tiled	matmul_tiled.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 Q6_K_MatVec	matvec_kquant.cl	3	2	i,i	iiBBB
 Q6_K_MatVec2	matvec_kquant.cl	3	2	i,i	iiBBB
@@ -2057,6 +2078,7 @@ Q8_0_MatMul_MMQ_SKSplit	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 Q8_0_MatMul_MMQ_SKSplit64	matmul_mmq.cl	3	6	i,i,i,i,i,i	iiiiiiBBB
 Q8_0_MatMul_MMQ_StreamK	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 Q8_0_MatMul_MMQ_StreamK_GateUp	matmul_mmq_stream.cl	5	7	i,i,i,i,i,i,i	iiiiiiiBBBBB
+Q8_0_MatMul_MMQ_StreamK_S	matmul_mmq_stream.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 Q8_0_MatMul_Tiled	matmul_tiled.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 Q8_0_MatVec	matvec_q8_0.cl	3	2	i,i	iiBBB
 Q8_0_MatVec2FusedGateUp_Q8	matvec_q8_0.cl	4	2	i,i	iiBBBB

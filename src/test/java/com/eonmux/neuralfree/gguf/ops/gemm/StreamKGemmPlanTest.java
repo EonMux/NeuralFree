@@ -13,7 +13,7 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
- * The stream-k plan of the CUDA tensor tile: which launches leave the plain grid (llama.cpp's 90% wave
+ * The stream-k plan of the CUDA tensor tiles: which launches leave the plain grid (llama.cpp's 90% wave
  * fill), the even partition of the (tile, chunk) sequence the kernels compute, the contributors of a split
  * tile whose planes the fixup adds, and the geometry and arguments of both launches of each form.
  */
@@ -220,6 +220,68 @@ public class StreamKGemmPlanTest {
             fail("an up weight smaller than the gate must be refused");
         } catch (IllegalArgumentException expected) {
             assertTrue(expected.getMessage().contains("less than the gate"));
+        }
+    }
+
+    /**
+     * The small-token tensor tile (128 rows x 16 tokens) plans its own stream-k kernel and fixup over one resident
+     * block per unit ({@link StreamKGemmPlan#SMALL_TILE_BLOCKS_PER_UNIT}: a second block of its kernels does not fit
+     * a multiprocessor's registers), takes one block per tile when the tile grid's waves are full, keeps the twin for
+     * a grid of fewer tiles than a quarter of the units (up to 14 tiles on 60), has no gate/up form, and is never
+     * planned by the device tile's factories.
+     */
+    @Test
+    public void theSmallTokenTilePlansItsOwnKernelsOverItsResidentBlocks() {
+        int resident = UNITS * StreamKGemmPlan.SMALL_TILE_BLOCKS_PER_UNIT;
+        assertEquals("one resident block per unit", UNITS, resident);
+        MmqGemmPlan gate = MmqGemmPlan.tensorSmallOf(GGMLType.Q8_0, 9728, 2560, 16, 80, 0, 9728, 0);
+        assertEquals(MmqConfig.INT8_TENSOR_SMALL, gate.config());
+        assertEquals("Q8_0_MatMul_MMQ_StreamK_S", gate.kernelName());
+        assertEquals(76, gate.rowTiles());
+        assertEquals(1, gate.tokenTiles());
+        StreamKGemmPlan sk = StreamKGemmPlan.ofSmall(gate, UNITS);
+        assertNotNull(sk);
+        assertEquals("Q8_0_MatMul_MMQ_StreamK_S", sk.kernelName());
+        assertEquals(GemmKernels.STREAM_K_FIXUP_SMALL, sk.fixupKernelName());
+        assertEquals(UNITS, sk.blocks());
+        assertTrue(sk.splitsTiles());
+        assertEquals((long) sk.blocks() * 128 * 16, sk.fixupElements());
+        assertEquals("128 x 16 outputs in slices of 4 x 256", 2, sk.fixupGlobalWorkSize()[1]);
+        assertEquals(256, sk.localWorkSize()[0]);
+        MmqGemmPlan wide = MmqGemmPlan.tensorSmallOf(GGMLType.Q4_K, 128 * resident, 1024, 16, 32, 0,
+                128 * resident, 0);
+        StreamKGemmPlan full = StreamKGemmPlan.ofSmall(wide, UNITS);
+        assertEquals("a full wave runs one block per tile", resident, full.blocks());
+        assertFalse(full.splitsTiles());
+        assertNull(StreamKGemmPlan.ofSmall(gate, DeviceCapabilities.UNKNOWN_COMPUTE_UNITS));
+        assertNull("8 tiles on 60 units keep the twin",
+                StreamKGemmPlan.ofSmall(MmqGemmPlan.tensorSmallOf(GGMLType.Q8_0, 1024, 2560, 16, 80, 0, 1024, 0),
+                        UNITS));
+        assertNull("14 tiles on 60 units keep the twin",
+                StreamKGemmPlan.ofSmall(MmqGemmPlan.tensorSmallOf(GGMLType.Q8_0, 1792, 2560, 16, 80, 0, 1792, 0),
+                        UNITS));
+        assertNotNull("15 tiles on 60 units take the stream-k form",
+                StreamKGemmPlan.ofSmall(MmqGemmPlan.tensorSmallOf(GGMLType.Q8_0, 1920, 2560, 16, 80, 0, 1920, 0),
+                        UNITS));
+        assertNull("the device tile's factory plans the device tile only", StreamKGemmPlan.of(gate, UNITS));
+        assertNull("the small tile has no gate/up form", StreamKGemmPlan.ofGateUp(gate, UNITS));
+        try {
+            StreamKGemmPlan.ofGateUpBlocks(gate, 4);
+            fail("the small tile has no gate/up kernel");
+        } catch (IllegalArgumentException expected) {
+            assertTrue(expected.getMessage().contains("gate/up"));
+        }
+        try {
+            StreamKGemmPlan.ofSmall(plain(GGMLType.Q8_0, 9728, 2560, 16), UNITS);
+            fail("ofSmall plans the small tile only");
+        } catch (IllegalArgumentException expected) {
+            assertTrue(expected.getMessage().contains("small-token"));
+        }
+        try {
+            MmqGemmPlan.tensorSmallOf(GGMLType.F8_E4M3, 128, 256, 16, 8, 0, 128, 0);
+            fail("the small tensor tile runs the int8 types");
+        } catch (IllegalArgumentException expected) {
+            assertTrue(expected.getMessage().contains("int8"));
         }
     }
 

@@ -140,6 +140,34 @@ NF_TABLE(float, IQ4_NL_KVALUES, 16) = {
        1.0f,   13.0f,  25.0f,  38.0f,  53.0f,  69.0f,  89.0f, 113.0f
 };
 
+#if defined(__CUDA_ARCH__)
+/*
+ * The codes of four 4-bit indices through a 16-entry int8 table, index k in the low nibble of byte k (its high
+ * nibble zero) and code k in byte k. The table sits in four registers of packed int8 (entries 4i..4i+3 in word ti)
+ * and __byte_perm picks the codes: entries 0-7 and 8-15 by the low three index bits, then each byte's half by bit 3
+ * (llama.cpp get_int_from_table_16). The selector's bit 3 is masked off the first two picks, where it would ask
+ * for sign replication. Four lookups of a table in memory cost four divergent constant-memory reads; this costs
+ * about a dozen integer instructions.
+ */
+NF_INLINE uint nf_tbl16_codes4(uint nibbles, uint t0, uint t1, uint t2, uint t3) {
+    const uint spread = nibbles | (nibbles >> 4);
+    const uint sel = (spread & 0xFFu) | ((spread >> 8) & 0xFF00u);
+    const uint lo = __byte_perm(t0, t1, sel & 0x7777u);
+    const uint hi = __byte_perm(t2, t3, sel & 0x7777u);
+    return __byte_perm(lo, hi, 0x3210u | ((sel & 0x8888u) >> 1));
+}
+
+/* IQ4_NL_KVALUES as int8 codes. */
+NF_INLINE uint nf_iq4nl_codes4(uint nibbles) {
+    return nf_tbl16_codes4(nibbles, 0xBFAD9881u, 0xF6EADDCFu, 0x26190D01u, 0x71594535u);
+}
+
+/* NF_FP4_CODES. */
+NF_INLINE uint nf_fp4_codes4(uint nibbles) {
+    return nf_tbl16_codes4(nibbles, 0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu);
+}
+#endif
+
 /* IQ3_K / IQ3_KS non-linear 3-bit values (ggml iq3nl_values: the base grid of 8, then the same values
  * shifted by one grid position, chosen by a block's grid-select bit; codes 0-7 map to entries 0-7 and
  * codes 8-15 to entries 8-15). */

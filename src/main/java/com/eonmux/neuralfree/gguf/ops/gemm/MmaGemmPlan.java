@@ -21,6 +21,17 @@ import java.util.Objects;
  * dispatch is 2-D and therefore never folded on Vulkan, so {@link #checkDevice} verifies the group
  * counts against {@code maxWorkGroupCount}. The split-K twin of the same kernel family is planned by
  * {@link SplitKGemmPlan}.</p>
+ *
+ * <p>The large tile ({@code <T>_MatMul_MMA_L}, kernels/llm/matmul_mma_large.cl, CUDA sm_80+ only) takes the
+ * same arguments over {@link #LARGE_TILE_ROWS} x {@link #LARGE_TILE_TOKENS} tiles, {@code global =
+ * {ceil(M / 128) * 256, ceil(N / 64)}}: its weight and activation stages load as 16-byte rows into a two-stage
+ * ring with one barrier per 32-deep stage, and the token tiles of a weight row tile run back to back, so a
+ * prefill streams each weight row tile from DRAM once. It adds the same 16-deep chunk products in the same
+ * order as the 64 x 32 tile, so the two agree bit for bit. The dispatch takes it for every launch of at least
+ * {@link #LARGE_TILE_TOKENS} tokens that the split-K heuristic leaves unsplit ({@link SplitKGemmPlan#of}): it
+ * measured 3.3-4.6x faster than the 64 x 32 tile at 512 tokens (43-54 TFLOP/s), 1.3-2.8x at 64 to 256 tokens and
+ * 1.1-1.3x on grids of 8 to 20 tiles, on the RTX 5080 Laptop; a split-K launch (1024 rows over 2560 at 64 tokens: 0.040 ms against
+ * 0.077 ms) keeps the split.</p>
  */
 public final class MmaGemmPlan {
 
@@ -47,6 +58,10 @@ public final class MmaGemmPlan {
      * ({@code NF_MMA_AS}/{@code NF_MMA_BS}) or the cooperative-matrix twin's footprint.
      */
     public static final long TILE_SHARED_BYTES = Math.max(4L * TILE_ELEMENTS, COOPMAT_SHARED_BYTES);
+    /** Weight rows per work-group tile of the large tile ({@code NF_MMAL_TM}). */
+    public static final int LARGE_TILE_ROWS = 128;
+    /** Tokens per work-group tile of the large tile ({@code NF_MMAL_TN}). */
+    public static final int LARGE_TILE_TOKENS = 64;
 
     private final GGMLType type;
     private final String kernelName;

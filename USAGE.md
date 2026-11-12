@@ -570,8 +570,8 @@ for Qwen3 0.6B in Q8_0 (llama.cpp 34100).
 |---|---|---|---|
 | Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, I8_B128 | int8 MMQ GEMM (`<T>_MatMul_MMQ`) | every backend: int8 tensor cores (`mma.m16n8k32` / `m16n8k16` s8) on CUDA sm_80+, dp4a or scalar int dots elsewhere | activations are rounded to 8-bit codes per 32-element (tensor) or 16-element chunk, as in llama.cpp `mmq.cuh`; with an `--act-quant checkpoint` int8 scheme they are the checkpoint's own codes |
 | same types | cooperative-matrix GEMM: `<T>_MatMul_CM2` (workgroup-scope `VK_NV_cooperative_matrix2`, 128x256 tiles, fp16 accumulation saturated at +-65504, as llama.cpp `mul_mm_cm2.comp`; Q4_K and Q5_K decode each tile's block scales into shared memory once per block, fetched a block ahead, as its `fetch_scales` / `store_scales`), otherwise `<T>_MatMul_CM` (`VK_KHR_cooperative_matrix`) | Vulkan devices with the extension (default `auto` mode) | activations staged as fp16 rows; the weights decode to fp16 in the tensor loads |
-| F16 | tensor-core GEMM (`F16_MatMul_MMA`); on Vulkan devices with `VK_NV_cooperative_matrix2` the workgroup-scope `F16_MatMul_CM2` (128x256 tiles over the fp16 weights as stored, for a reduction length that is a multiple of 8; any other keeps the MMA GEMM) | CUDA sm_80+, Vulkan with cooperative matrices | activations rounded to fp16; fp32 accumulation (`F16_MatMul_CM2` too: unlike the quantized CM2 GEMM it stores sums past the fp16 range unclipped, which F16 checkpoints such as pplx-embed-v1 0.6B reach) |
-| BF16 | tensor-core GEMM (`BF16_MatMul_MMA`, bf16 `mma`) | CUDA sm_80+ (Vulkan keeps the tiled GEMM for BF16) | activations rounded to bf16; fp32 accumulation |
+| F16 | tensor-core GEMM (`F16_MatMul_MMA`; on CUDA a launch of 64 or more tokens that split-K leaves unsplit runs its 128 × 64 large tile `F16_MatMul_MMA_L`, which gives the same bits); on Vulkan devices with `VK_NV_cooperative_matrix2` the workgroup-scope `F16_MatMul_CM2` (128x256 tiles over the fp16 weights as stored, for a reduction length that is a multiple of 8; any other keeps the MMA GEMM) | CUDA sm_80+, Vulkan with cooperative matrices | activations rounded to fp16; fp32 accumulation (`F16_MatMul_CM2` too: unlike the quantized CM2 GEMM it stores sums past the fp16 range unclipped, which F16 checkpoints such as pplx-embed-v1 0.6B reach) |
+| BF16 | tensor-core GEMM (`BF16_MatMul_MMA`, bf16 `mma`; the large tile `BF16_MatMul_MMA_L` as for F16) | CUDA sm_80+ (Vulkan keeps the tiled GEMM for BF16) | activations rounded to bf16; fp32 accumulation |
 | F8_E4M3, F8_E4M3_B32, F8_E4M3_B128, MXFP8 | E4M3 GEMM over the checkpoint's own activation codes (`<T>_MatMul_MMQ`) | CUDA sm_89+ (`mma.sync` `e4m3.e4m3.f32`); elsewhere the exact tiled GEMM | activations staged as E4M3 codes with one scale per 32-element chunk; fp32 accumulation |
 | MXFP4, NVFP4, IQ4_NL, IQ4_XS | E4M3 GEMM over E4M3-mapped 4-bit weight codes (`<T>_MatMul_W4A8`) | CUDA sm_89+ | weight codes are E4M3 (exact for the E2M1 codebooks, one E4M3 rounding for the IQ4 codebooks and the NVFP4 per-16 weight scales); activations staged as E4M3 |
 | any quantized type with `INT8_STATIC_ASYM` | int8 MMQ GEMM with the zero-point term | as the int8 MMQ GEMM | the staged codes carry the checkpoint's zero point, which the GEMM subtracts per weight row |
@@ -601,7 +601,16 @@ would fill less than 90% of their last wave of one tile per multiprocessor (llam
 over an even share of the (tile, 32-deep chunk) sequence; a block that stops inside a tile writes its partial
 sums to a scratch plane, and `LLM_MMQ_StreamK_Fixup` adds those planes into the output. Tiles that no block
 splits match the plain kernel bit for bit; a split tile differs only by the fp32 rounding of the added partial
-sums, so batch-invariant runs keep the plain grid. A prefill's SwiGLU gate and up projections of one weight type
+sums, so batch-invariant runs keep the plain grid. A launch of 16 or fewer tokens that takes the MMQ GEMM (a weight
+type whose integer-dot multi-column matvec does not serve that count) would run the 16-token twin
+`<T>_MatMul_MMQ_S`; on the tensor tile it runs `<T>_MatMul_MMQ_StreamK_S` instead, a 128-row × 16-token tensor tile
+over the same staged records, one block per multiprocessor over an even share of its (tile, chunk) sequence (one
+block per tile once the tiles fill 90% of a wave), with `LLM_MMQ_StreamK_Fixup_S` completing split tiles. On the RTX
+5080 Laptop it measured 1.0-1.8x faster than the twin and its split-K on Q5_0, Q4_1, IQ4_NL and Q3_K projections of
+2048 to 9728 rows at 9 and 16 tokens, and 0.9-1.2x on the 151936-row vocabulary head. A grid of fewer tiles than a
+quarter of the multiprocessors (up to 14 tiles, 1792 rows, on 60), where the fixup pass costs about what it saves,
+keeps the twin, as do batch-invariant runs and the prefill launches of 17 to 48 tokens over a reduction shorter than
+2048 that the tile ladder also gives the 16-token twin. A prefill's SwiGLU gate and up projections of one weight type
 and shape run as one `<T>_MatMul_MMQ_StreamK_GateUp` launch, llama.cpp's fused gate/up MMQ: each 64-row output
 tile computes the gate rows and the up rows of the same indices in one 128-row tensor tile and writes
 `silu(gate) * up`, and `LLM_MMQ_StreamK_Fixup_GateUp` completes its split tiles, in place of two GEMMs and

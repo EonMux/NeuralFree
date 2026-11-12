@@ -56,8 +56,14 @@ NF_INLINE float nf_cert_f16_partial(NF_GLOBAL const NF_HALF* NF_RESTRICT w,
     const int lsize = get_local_size(0);
     const int n4 = n & ~3;
     float ps = 0.0f;
-    for (int j = lid * 4; j < n4; j += lsize * 4) {
-        ps += dot(vload_half4(0, w + j), vload4(0, x + j));
+    if (nf_aligned(w, 8) && nf_aligned(x, 16)) {
+        for (int j = lid * 4; j < n4; j += lsize * 4) {
+            ps += dot(nf_vload_half4_aligned(0, w + j), nf_vload4_aligned(0, x + j));
+        }
+    } else {
+        for (int j = lid * 4; j < n4; j += lsize * 4) {
+            ps += dot(vload_half4(0, w + j), vload4(0, x + j));
+        }
     }
     for (int j = n4 + lid; j < n; j += lsize) {
         ps += vload_half(0, w + j) * x[j];
@@ -72,10 +78,18 @@ NF_INLINE float nf_cert_bf16_partial(NF_GLOBAL const ushort* NF_RESTRICT w,
     const int lsize = get_local_size(0);
     const int n4 = n & ~3;
     float ps = 0.0f;
-    for (int j = lid * 4; j < n4; j += lsize * 4) {
-        const ushort4 r = vload4(0, w + j);
-        const float4 wv = NF_F4(bf16_to_f32(r.x), bf16_to_f32(r.y), bf16_to_f32(r.z), bf16_to_f32(r.w));
-        ps += dot(wv, vload4(0, x + j));
+    if (nf_aligned(w, 8) && nf_aligned(x, 16)) {
+        for (int j = lid * 4; j < n4; j += lsize * 4) {
+            const ushort4 r = nf_vload4_aligned(0, w + j);
+            const float4 wv = NF_F4(bf16_to_f32(r.x), bf16_to_f32(r.y), bf16_to_f32(r.z), bf16_to_f32(r.w));
+            ps += dot(wv, nf_vload4_aligned(0, x + j));
+        }
+    } else {
+        for (int j = lid * 4; j < n4; j += lsize * 4) {
+            const ushort4 r = vload4(0, w + j);
+            const float4 wv = NF_F4(bf16_to_f32(r.x), bf16_to_f32(r.y), bf16_to_f32(r.z), bf16_to_f32(r.w));
+            ps += dot(wv, vload4(0, x + j));
+        }
     }
     for (int j = n4 + lid; j < n; j += lsize) {
         ps += bf16_to_f32(w[j]) * x[j];
@@ -132,8 +146,14 @@ NF_KERNEL void LLM_CertScreen(
     const int lsize = get_local_size(0);
     const int n4 = cols & ~3;
     float ps = 0.0f;
-    for (int j = lid * 4; j < n4; j += lsize * 4) {
-        ps += dot(vload4(0, x + j), convert_float4(vload4(0, q + j)));
+    if (nf_aligned(x, 16) && nf_aligned(q, 4)) {
+        for (int j = lid * 4; j < n4; j += lsize * 4) {
+            ps += dot(nf_vload4_aligned(0, x + j), convert_float4(nf_vload4_aligned(0, q + j)));
+        }
+    } else {
+        for (int j = lid * 4; j < n4; j += lsize * 4) {
+            ps += dot(vload4(0, x + j), convert_float4(vload4(0, q + j)));
+        }
     }
     for (int j = n4 + lid; j < cols; j += lsize) {
         ps += x[j] * (float)q[j];

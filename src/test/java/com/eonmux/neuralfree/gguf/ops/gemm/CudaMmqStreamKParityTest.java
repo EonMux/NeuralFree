@@ -23,8 +23,9 @@ import java.util.Collection;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The stream-k form of the int8 MMQ GEMM ({@code <T>_MatMul_MMQ_StreamK} with {@code LLM_MMQ_StreamK_Fixup})
- * against the plain kernel of the same CUDA fatbin on the tensor tile: a partition of whole tiles runs every
+ * The stream-k forms of the int8 MMQ GEMM ({@code <T>_MatMul_MMQ_StreamK} with {@code LLM_MMQ_StreamK_Fixup},
+ * and the small-token tile's {@code <T>_MatMul_MMQ_StreamK_S} with {@code LLM_MMQ_StreamK_Fixup_S}) against the
+ * plain kernel of the same CUDA fatbin on the tensor tile: a partition of whole tiles runs every
  * tile through the plain kernel's chunk pipe, so its outputs equal the plain kernel's bit for bit; partitions
  * that split tiles across blocks add the fixup planes after the launch, which moves only the fp32 rounding of
  * the partial sums and gives the same bits on every run. The shapes cover partial row and token tiles and a
@@ -146,6 +147,46 @@ public class CudaMmqStreamKParityTest {
     }
 
     /**
+     * The small-token tensor tile ({@code <T>_MatMul_MMQ_StreamK_S}, 128 rows x 16 tokens) over decode-batch token
+     * counts: a partition of whole tiles runs each tile through the device tile's chunk pipe with one n8 block per
+     * warp, the same per-output chunk order as the plain kernel, so its outputs equal the plain kernel's bit for
+     * bit; split partitions ({@code LLM_MMQ_StreamK_Fixup_S}) match within the partial sums' fp32 rounding and
+     * give the same bits on every run.
+     */
+    @Test
+    public void smallTokenTileMatchesThePlainKernel() throws InterruptedException {
+        int k = 5 * type.getBlockSize();
+        for (int n : new int[]{2, 9, 16, 37}) {
+            MmqGemmPlan plain = MmqGemmPlan.contiguous(config, type, M, k, n);
+            byte[] weight = OpenClMmqGemmParityTest.buildWeight(type, M, k);
+            float[] x = OpenClMmqGemmParityTest.buildX(n, k);
+            float[] plainOut = new FastGemmParity(backend, kernels).launchMmq(plain, weight, x);
+            MmqGemmPlan small = MmqGemmPlan.tensorSmallOf(type, M, k, n, config.rowRecords(k), 0, M, 0);
+            long tiles = (long) small.rowTiles() * small.tokenTiles();
+            StreamKGemmPlan whole = StreamKGemmPlan.ofBlocks(small, (int) tiles);
+            assertTrue(whole + " splits no tile", !whole.splitsTiles());
+            float[] wholeOut = launchStreamK(whole, weight, x)[0];
+            for (int i = 0; i < plainOut.length; i++) {
+                assertTrue(whole + " n=" + n + " element " + i + ": " + Float.toHexString(wholeOut[i]) + " plain "
+                                + Float.toHexString(plainOut[i]),
+                        Float.floatToRawIntBits(wholeOut[i]) == Float.floatToRawIntBits(plainOut[i]));
+            }
+            long steps = tiles * (k / small.config().stageDepth());
+            for (int blocks : new int[]{2, 7, (int) steps}) {
+                StreamKGemmPlan sk = StreamKGemmPlan.ofBlocks(small, blocks);
+                assertTrue(sk + " splits tiles", sk.splitsTiles());
+                float[][] runs = launchStreamK(sk, weight, x);
+                for (int i = 0; i < plainOut.length; i++) {
+                    assertTrue(sk + " n=" + n + " element " + i + ": " + runs[0][i] + " plain " + plainOut[i],
+                            Math.abs(runs[0][i] - plainOut[i]) <= 5e-3 * (1.0 + Math.abs(plainOut[i])));
+                    assertTrue(sk + " n=" + n + " element " + i + " differs between runs",
+                            Float.floatToRawIntBits(runs[0][i]) == Float.floatToRawIntBits(runs[1][i]));
+                }
+            }
+        }
+    }
+
+    /**
      * The stream-k launch over freshly staged records ({@code LLM_Quant_MMQ_Q8_1}, the launch contract of
      * {@link FastGemmParity#launchMmq}), then the fixup when a tile is split, twice on the same buffers; returns
      * both outputs. The fixup planes start as NaN so a plane the fixup reads but no block wrote shows in the
@@ -155,7 +196,7 @@ public class CudaMmqStreamKParityTest {
         MmqGemmPlan plan = sk.base();
         int k = plan.k();
         int n = plan.n();
-        long records = (long) n * config.rowRecords(k);
+        long records = (long) n * plan.config().rowRecords(k);
         float[] poison = new float[(int) sk.fixupElements()];
         java.util.Arrays.fill(poison, Float.NaN);
         GpuBuffer wbuf = backend.allocateBuffer(weight.length, true);
@@ -167,7 +208,7 @@ public class CudaMmqStreamKParityTest {
             try (GpuEvent wv = queue.enqueueWriteBuffer(wbuf, 0, weight.length, weight);
                  GpuEvent xv = queue.enqueueWriteBuffer(xbuf, 0, (long) x.length * Float.BYTES, x, wv);
                  GpuEvent fv = queue.enqueueWriteBuffer(fbuf, 0, (long) poison.length * Float.BYTES, poison, xv)) {
-                Object[] quantArgs = {n, k, config.stageDepth(), k, 0, xbuf, qbuf};
+                Object[] quantArgs = {n, k, plan.config().stageDepth(), k, 0, xbuf, qbuf};
                 queue.enqueueKernelNoEvent(kernels.get(GemmKernels.QUANT_MMQ_Q8_1),
                         new long[]{(records + 63) / 64 * 64}, new long[]{64}, quantArgs, fv);
                 float[][] outs = new float[2][(int) plan.yElementsRequired()];

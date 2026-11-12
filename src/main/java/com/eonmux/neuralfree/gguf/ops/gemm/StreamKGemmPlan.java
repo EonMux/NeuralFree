@@ -40,6 +40,12 @@ import java.util.Objects;
  * a tile in planes of its own ({@link #planesPerBlock}), and {@code LLM_MMQ_StreamK_Fixup_GateUp} activates their
  * sums.</p>
  *
+ * <p>The small-token form ({@link #ofSmall}, {@code <T>_MatMul_MMQ_StreamK_S} and {@code LLM_MMQ_StreamK_Fixup_S})
+ * runs the same decomposition over the {@link MmqConfig#INT8_TENSOR_SMALL} tile of 128 rows by 16 tokens, the form
+ * of the decode batches of up to 16 tokens (llama.cpp's stream-k {@code mul_mat_q} at {@code mmq_x = 16}), over
+ * {@link #SMALL_TILE_BLOCKS_PER_UNIT} block per compute unit. The tile has no plain kernel: a grid whose waves are
+ * full enough runs the stream-k kernel with one block per tile, each running its tile whole, and no fixup.</p>
+ *
  * <p>Geometry: stream-k {@code global = {blocks * WG, 1}}, {@code local = {WG, 1}}; the fixup
  * {@code global = {blocks * WG, outputs / (WG * }{@link #FIXUP_ELEMENTS_PER_WORK_ITEM}{@code )}} over the same
  * block count, one work-group per slice of the {@code TM x TN} (gate/up: {@code TM / 2 x TN}) outputs of the
@@ -53,6 +59,22 @@ public final class StreamKGemmPlan {
     /** Resident blocks per compute unit of the tensor tile's kernels: 256 work-items at 166-248 registers
      *  (sm_120 build) leave room for one block of 65536 registers. */
     public static final int TENSOR_TILE_BLOCKS_PER_UNIT = 1;
+    /**
+     * Resident blocks per compute unit the small-token tile's stream-k launch plans with ({@link #ofSmall}): one,
+     * as for the device tile. Its kernels hold their working set in 123-152 registers per work-item on sm_120 and
+     * 110-170 on sm_80 and sm_86, past the 128 a second block of 256 work-items leaves for most types, and capping
+     * them at 128 spills the IQ1_S and IQ3_S kernels on sm_120 and the IQ2_XXS, IQ3_S, Q5_0 or Q5_1 kernels on
+     * sm_80 and sm_86.
+     */
+    public static final int SMALL_TILE_BLOCKS_PER_UNIT = 1;
+    /**
+     * Compute units per output tile below which the small-token tile keeps the 16-token twin ({@link #ofSmall}): a
+     * grid of fewer tiles than a quarter of the compute units (at most 14 tiles, 1792 rows, on 60 units) splits each
+     * tile over several blocks, and its fixup pass then costs about what it saves; at 8 tiles (1024 rows) the
+     * twin's split-K measured as fast as the stream-k form on the RTX 5080 Laptop, and from 16 tiles (2048 rows) up
+     * the stream-k form measured 1.1-1.8x faster than the twin.
+     */
+    public static final int SMALL_TILE_MAX_UNITS_PER_TILE = 4;
 
     /** Tile outputs one fixup work-item adds ({@code NF_MMQ_SK_FIX_E}): a tile's outputs spread over
      *  {@code outputs / (WG * 4)} work-groups, so each split tile's planes are read with four loads in flight per
@@ -92,6 +114,7 @@ public final class StreamKGemmPlan {
     private StreamKGemmPlan(MmqGemmPlan base, int blocks, boolean gateUp) {
         this.base = base;
         this.kernelName = gateUp ? GemmKernels.matmulMmqStreamKGateUp(base.type())
+                : small(base) ? GemmKernels.matmulMmqStreamKSmall(base.type())
                 : GemmKernels.matmulMmqStreamK(base.type());
         this.blocks = blocks;
         this.gateUp = gateUp;
@@ -110,12 +133,42 @@ public final class StreamKGemmPlan {
      */
     public static StreamKGemmPlan of(MmqGemmPlan base, int computeUnits) {
         Objects.requireNonNull(base, "base");
-        if (!resident(base, computeUnits)) {
+        if (small(base) || !resident(base, computeUnits)) {
             return null;
         }
         long resident = (long) computeUnits * TENSOR_TILE_BLOCKS_PER_UNIT;
         if (waveFillPercent((long) base.rowTiles() * base.tokenTiles(), resident) >= PLAIN_GRID_EFFICIENCY_PERCENT) {
             return null;
+        }
+        return overResident(base, resident, false);
+    }
+
+    /**
+     * The stream-k plan of a launch over the small-token tensor tile ({@link MmqGemmPlan#tensorSmallOf}): the
+     * tile's steps over {@link #SMALL_TILE_BLOCKS_PER_UNIT} resident blocks per compute unit, or one block per tile
+     * when the tile grid's waves are at least {@link #PLAIN_GRID_EFFICIENCY_PERCENT} percent full (each block then
+     * runs its tile whole and no fixup follows). Null when the device does not report its compute units, and when the
+     * grid has fewer tiles than a {@link #SMALL_TILE_MAX_UNITS_PER_TILE}th of them.
+     *
+     * @throws IllegalArgumentException when {@code base} is not a small-token tensor tile launch, or
+     *                                  {@code computeUnits} is negative
+     */
+    public static StreamKGemmPlan ofSmall(MmqGemmPlan base, int computeUnits) {
+        Objects.requireNonNull(base, "base");
+        if (!small(base)) {
+            throw new IllegalArgumentException("the small-token stream-k plan runs the " + MmqConfig.INT8_TENSOR_SMALL
+                    + " tile, not " + base.config());
+        }
+        if (!resident(base, computeUnits)) {
+            return null;
+        }
+        long resident = (long) computeUnits * SMALL_TILE_BLOCKS_PER_UNIT;
+        long tiles = (long) base.rowTiles() * base.tokenTiles();
+        if (tiles * SMALL_TILE_MAX_UNITS_PER_TILE < computeUnits) {
+            return null;
+        }
+        if (waveFillPercent(tiles, resident) >= PLAIN_GRID_EFFICIENCY_PERCENT) {
+            return tiles > Integer.MAX_VALUE ? null : new StreamKGemmPlan(base, (int) tiles, false);
         }
         return overResident(base, resident, false);
     }
@@ -129,7 +182,7 @@ public final class StreamKGemmPlan {
      */
     public static StreamKGemmPlan ofGateUp(MmqGemmPlan base, int computeUnits) {
         Objects.requireNonNull(base, "base");
-        if (!resident(base, computeUnits)) {
+        if (small(base) || !resident(base, computeUnits)) {
             return null;
         }
         return overResident(base, (long) computeUnits * TENSOR_TILE_BLOCKS_PER_UNIT, true);
@@ -143,7 +196,12 @@ public final class StreamKGemmPlan {
                     + computeUnits);
         }
         return computeUnits != DeviceCapabilities.UNKNOWN_COMPUTE_UNITS
-                && MmqConfig.INT8_TENSOR.equals(base.config()) && GemmKernels.isInt8Mmq(base.type());
+                && (MmqConfig.INT8_TENSOR.equals(base.config()) || small(base)) && GemmKernels.isInt8Mmq(base.type());
+    }
+
+    /** Whether {@code base} runs the small-token tensor tile ({@link #ofSmall}). */
+    private static boolean small(MmqGemmPlan base) {
+        return MmqConfig.INT8_TENSOR_SMALL.equals(base.config());
     }
 
     /** The launch over {@code min(resident, steps)} blocks, or null when its steps overflow an int. */
@@ -173,9 +231,10 @@ public final class StreamKGemmPlan {
 
     private static StreamKGemmPlan ofBlocks(MmqGemmPlan base, int blocks, boolean gateUp) {
         Objects.requireNonNull(base, "base");
-        if (!MmqConfig.INT8_TENSOR.equals(base.config()) || !GemmKernels.isInt8Mmq(base.type())) {
-            throw new IllegalArgumentException("stream-k runs the int8 tensor tile, not " + base.config() + " over "
-                    + base.type());
+        if (!(MmqConfig.INT8_TENSOR.equals(base.config()) || (small(base) && !gateUp))
+                || !GemmKernels.isInt8Mmq(base.type())) {
+            throw new IllegalArgumentException((gateUp ? "the gate/up stream-k form runs the int8 tensor device tile"
+                    : "stream-k runs the int8 tensor tiles") + ", not " + base.config() + " over " + base.type());
         }
         long steps = tiles(base, gateUp) * (base.k() / base.config().stageDepth());
         if (blocks < 1 || blocks > steps || steps > Integer.MAX_VALUE) {
@@ -212,7 +271,8 @@ public final class StreamKGemmPlan {
         return base;
     }
 
-    /** {@code <T>_MatMul_MMQ_StreamK}, or {@code <T>_MatMul_MMQ_StreamK_GateUp} for the gate/up form. */
+    /** {@code <T>_MatMul_MMQ_StreamK}, {@code <T>_MatMul_MMQ_StreamK_GateUp} for the gate/up form, or
+     *  {@code <T>_MatMul_MMQ_StreamK_S} over the small-token tile. */
     public String kernelName() {
         return kernelName;
     }
@@ -302,9 +362,11 @@ public final class StreamKGemmPlan {
         return (long) blocks * planesPerBlock() * base.config().tileRows() * base.config().tileTokens();
     }
 
-    /** {@code LLM_MMQ_StreamK_Fixup}, or {@code LLM_MMQ_StreamK_Fixup_GateUp} for the gate/up form. */
+    /** {@code LLM_MMQ_StreamK_Fixup}, {@code LLM_MMQ_StreamK_Fixup_GateUp} for the gate/up form, or
+     *  {@code LLM_MMQ_StreamK_Fixup_S} over the small-token tile. */
     public String fixupKernelName() {
-        return gateUp ? GemmKernels.STREAM_K_FIXUP_GATE_UP : GemmKernels.STREAM_K_FIXUP;
+        return gateUp ? GemmKernels.STREAM_K_FIXUP_GATE_UP
+                : small(base) ? GemmKernels.STREAM_K_FIXUP_SMALL : GemmKernels.STREAM_K_FIXUP;
     }
 
     /** {@code {blocks * WG, 1}}: the global work size of the stream-k launch. */

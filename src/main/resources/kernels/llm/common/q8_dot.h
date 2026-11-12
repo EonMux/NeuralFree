@@ -44,10 +44,14 @@ NF_INLINE int nf_q8_pack4(int a, int b, int c, int d) {
 
 /* Four FP4 codes packed as int8, nibble k in byte k: the doubled E2M1 values both MXFP4 and NVFP4 use. */
 NF_INLINE int nf_q8_fp4_word(uint nibbles) {
+#if defined(__CUDA_ARCH__)
+    return (int)nf_fp4_codes4(nibbles);
+#else
     return nf_q8_pack4((int)NF_FP4_CODES[nibbles & 0xFu],
                        (int)NF_FP4_CODES[(nibbles >> 8) & 0xFu],
                        (int)NF_FP4_CODES[(nibbles >> 16) & 0xFu],
                        (int)NF_FP4_CODES[(nibbles >> 24) & 0xFu]);
+#endif
 }
 
 /* Four unsigned magnitude bytes (byte k at bits 8k) with sign bit k applied, packed as int8 codes. */

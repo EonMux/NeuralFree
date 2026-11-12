@@ -6,6 +6,7 @@ import jcuda.driver.CUfunction;
 import jcuda.driver.CUfunction_attribute;
 
 import static jcuda.driver.JCudaDriver.cuFuncGetAttribute;
+import static jcuda.driver.JCudaDriver.cuFuncSetAttribute;
 
 /**
  * One CUDA kernel function plus its sticky launch arguments.
@@ -21,7 +22,10 @@ import static jcuda.driver.JCudaDriver.cuFuncGetAttribute;
  * </ul>
  * The function attributes the queue validates launches against are read once. A handle loaded
  * from a kernel library carries the kernel's build-time {@link KernelSignature}, which every
- * launch's arguments are checked against ({@link CudaArgState}); clones share it.
+ * launch's arguments are checked against ({@link CudaArgState}); clones share it. The dynamic shared memory
+ * the function reserved ({@link #reserveDynamicSharedMemory}) is shared with its clones too, since the
+ * driver's opt-in attribute belongs to the function: direct launches, captured kernel nodes and their
+ * replays all pass it.
  */
 public final class CudaKernelHandle implements KernelHandle {
 
@@ -33,6 +37,7 @@ public final class CudaKernelHandle implements KernelHandle {
     private final int staticSharedMemoryBytes;
     private final KernelSignature signature;
     private final CudaArgState args;
+    private final DynamicSharedReservation dynamicShared;
     private volatile boolean closed;
 
     /**
@@ -63,6 +68,7 @@ public final class CudaKernelHandle implements KernelHandle {
                 kernelName);
         this.signature = signature;
         this.args = new CudaArgState(backend, kernelName, signature);
+        this.dynamicShared = new DynamicSharedReservation();
     }
 
     /** A caller-owned clone of {@code template}: same function and attributes, fresh arguments. */
@@ -75,6 +81,7 @@ public final class CudaKernelHandle implements KernelHandle {
         this.staticSharedMemoryBytes = template.staticSharedMemoryBytes;
         this.signature = template.signature;
         this.args = new CudaArgState(template.backend, template.kernelName, template.signature);
+        this.dynamicShared = template.dynamicShared;
     }
 
     /** A caller-owned handle sharing this handle's function, with no arguments set. */
@@ -123,6 +130,58 @@ public final class CudaKernelHandle implements KernelHandle {
         return staticSharedMemoryBytes;
     }
 
+    /** Dynamic shared memory every launch of the function passes ({@link #reserveDynamicSharedMemory}), 0 when none
+     *  was reserved. */
+    public int dynamicSharedMemoryBytes() {
+        return dynamicShared.bytes;
+    }
+
+    /**
+     * Reserves {@code bytes} of dynamic shared memory for every launch of the function, once: a size above the
+     * default per-block limit ({@link CudaCapabilitiesBuilder#STATIC_SHARED_MEMORY_BYTES}, static and dynamic
+     * together) opts the function in through {@code CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES}. Asking again
+     * for the reserved size does nothing. The check, the attribute update and the recording run under one lock that
+     * the handle shares with its clones, and launches read the size only once it is recorded, so concurrent
+     * reservations of two sizes leave the attribute at the recorded one and the other fails. The backend's context
+     * must be current.
+     *
+     * @param optInLimitBytes the device's per-block opt-in limit
+     *                        ({@code CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN})
+     * @throws IllegalArgumentException when {@code bytes} is negative or the function's static shared memory plus
+     *                                  {@code bytes} exceeds {@code optInLimitBytes}
+     * @throws IllegalStateException    when another size is already reserved, or the handle is unusable
+     * @throws RuntimeException         the translated driver failure of the attribute update; nothing is reserved
+     */
+    void reserveDynamicSharedMemory(int bytes, long optInLimitBytes) {
+        ensureUsable();
+        if (bytes < 0) {
+            throw new IllegalArgumentException("CUDA kernel " + kernelName + ": dynamic shared memory must be >= 0"
+                    + " bytes, got " + bytes);
+        }
+        synchronized (dynamicShared) {
+            int reserved = dynamicShared.bytes;
+            if (reserved == bytes) {
+                return;
+            }
+            if (reserved != 0) {
+                throw new IllegalStateException("CUDA kernel " + kernelName + " already reserved " + reserved
+                        + " bytes of dynamic shared memory; it cannot launch with " + bytes);
+            }
+            long total = (long) staticSharedMemoryBytes + bytes;
+            if (total > optInLimitBytes) {
+                throw new IllegalArgumentException("CUDA kernel " + kernelName + " needs " + staticSharedMemoryBytes
+                        + " static + " + bytes + " dynamic bytes of shared memory per block; the device allows "
+                        + optInLimitBytes);
+            }
+            if (total > CudaCapabilitiesBuilder.STATIC_SHARED_MEMORY_BYTES) {
+                CudaErrors.check("cuFuncSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, " + kernelName
+                        + ")", () -> cuFuncSetAttribute(function,
+                        CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes));
+            }
+            dynamicShared.bytes = bytes;
+        }
+    }
+
     /** True for cached handles released by the backend, false for caller-owned clones. */
     public boolean isBackendOwned() {
         return backendOwned;
@@ -163,5 +222,11 @@ public final class CudaKernelHandle implements KernelHandle {
         CudaErrors.check("cuFuncGetAttribute(" + CUfunction_attribute.stringFor(attribute) + ", " + kernelName + ")",
                 () -> cuFuncGetAttribute(value, attribute, function));
         return value[0];
+    }
+
+    /** The dynamic shared memory a function reserved, shared by its handle and the handle's clones and guarding
+     *  their reservations ({@link #reserveDynamicSharedMemory}). */
+    private static final class DynamicSharedReservation {
+        private volatile int bytes;
     }
 }

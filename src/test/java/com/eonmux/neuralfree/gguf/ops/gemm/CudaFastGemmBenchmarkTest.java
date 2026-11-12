@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf.ops.gemm;
 import com.eonmux.neuralfree.acceleration.HWAcceleration;
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
+import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
 import com.eonmux.neuralfree.acceleration.backend.cuda.CudaComputeBackend;
 import com.eonmux.neuralfree.acceleration.cuda.CUDevice;
 import com.eonmux.neuralfree.acceleration.kernels.Availability;
@@ -14,6 +15,7 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.util.Locale;
+import java.util.Random;
 
 /**
  * Opt-in timing of the fast GEMM kernels against the tiled GEMM on the CUDA device (environment
@@ -121,6 +123,71 @@ public class CudaFastGemmBenchmarkTest {
             System.out.println(String.format(Locale.ROOT,
                     "Q4_0 %s: split-K x%d %.3f ms vs plain MMQ %.3f ms (%.2fx)",
                     shape(s), split.splits(), splitMs, plainMs, plainMs / splitMs));
+        }
+    }
+
+    /**
+     * The large MMA tile against the 64 x 32 tile (and its split-K form where the heuristic splits) over the
+     * projection shapes of a 4B model (hidden 2560, attention 4096, FFN 9728) and a 7B one, at prefill token counts,
+     * over weights and activations of random values (zero operands let the tensor units run cooler and faster).
+     */
+    @Test
+    public void largeMmaTileAgainstTheSmallTile() throws Exception {
+        int units = backend.capabilities().getComputeUnits();
+        int[][] shapes = {{4096, 2560, 512}, {9728, 2560, 512}, {2560, 9728, 512}, {2560, 4096, 512},
+                {14336, 4096, 512}, {4096, 14336, 512}, {2560, 9728, 256}, {9728, 2560, 128}, {2560, 9728, 128},
+                {2560, 4096, 128}, {1024, 2560, 128}, {9728, 2560, 64}, {2560, 9728, 64}, {2560, 2560, 64},
+                {1024, 2560, 64}, {1024, 1024, 64}};
+        for (int[] s : shapes) {
+            for (GGMLType type : new GGMLType[]{GGMLType.F16, GGMLType.BF16}) {
+                MmaGemmPlan plain = MmaGemmPlan.contiguous(type, s[0], s[1], s[2]);
+                SplitKGemmPlan split = SplitKGemmPlan.of(plain, units, 256);
+                String large = GemmKernels.matmulMmaLarge(type);
+                long[] largeGlobal = {(long) ((s[0] + MmaGemmPlan.LARGE_TILE_ROWS - 1) / MmaGemmPlan.LARGE_TILE_ROWS)
+                        * MmaGemmPlan.WORKGROUP_SIZE, (s[2] + MmaGemmPlan.LARGE_TILE_TOKENS - 1)
+                        / MmaGemmPlan.LARGE_TILE_TOKENS};
+                double largeMs = timeFilled(large, largeGlobal, plain.localWorkSize(), plain.weightBytes(), s);
+                double plainMs = timeFilled(plain.kernelName(), plain.globalWorkSize(), plain.localWorkSize(),
+                        plain.weightBytes(), s);
+                double flop = 2.0 * s[0] * s[1] * s[2];
+                System.out.println(String.format(Locale.ROOT,
+                        "%s %s: large %.3f ms (%.1f TFLOP/s) vs plain %.3f ms (%.1f TFLOP/s)%s, %.2fx",
+                        type, shape(s), largeMs, flop / largeMs / 1e9, plainMs, flop / plainMs / 1e9,
+                        split == null ? "" : String.format(Locale.ROOT, ", split-K x%d %.3f ms", split.splits(),
+                                timeSplit(split, s)),
+                        plainMs / largeMs));
+            }
+        }
+    }
+
+    /** {@link #time} over a weight of random 16-bit values and random activations. */
+    private double timeFilled(String kernel, long[] global, long[] local, long weightBytes, int[] s)
+            throws InterruptedException {
+        Random rnd = new Random(weightBytes);
+        byte[] wb = new byte[(int) weightBytes];
+        for (int i = 0; i < wb.length; i += 2) {
+            short h = CudaMmaGemmParityTest.floatToHalfBits((float) (rnd.nextGaussian() * 0.25));
+            wb[i] = (byte) h;
+            wb[i + 1] = (byte) (h >> 8);
+        }
+        float[] xs = new float[s[1] * s[2]];
+        for (int i = 0; i < xs.length; i++) {
+            xs[i] = (float) rnd.nextGaussian();
+        }
+        GpuBuffer w = backend.allocateBuffer(weightBytes, true);
+        GpuBuffer x = backend.allocateBuffer((long) xs.length * Float.BYTES, true);
+        GpuBuffer y = backend.allocateBuffer((long) s[0] * s[2] * Float.BYTES);
+        try {
+            try (GpuEvent wv = queue.enqueueWriteBuffer(w, 0, wb.length, wb);
+                 GpuEvent xv = queue.enqueueWriteBuffer(x, 0, (long) xs.length * Float.BYTES, xs, wv)) {
+                xv.awaitCompletion();
+            }
+            Object[] args = {s[0], s[1], s[2], s[1], 0, s[0], 0, w, x, y};
+            return timed(() -> queue.enqueueKernelNoEvent(kernels.get(kernel), global, local, args));
+        } finally {
+            w.close();
+            x.close();
+            y.close();
         }
     }
 

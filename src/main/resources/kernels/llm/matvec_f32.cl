@@ -16,8 +16,14 @@ NF_INLINE float nf_mvf32_partial(NF_GLOBAL const float* NF_RESTRICT w,
     const int lsize = get_local_size(0);
     const int n4 = n & ~3;
     float ps = 0.0f;
-    for (int j = lid * 4; j < n4; j += lsize * 4) {
-        ps += dot(vload4(0, w + j), vload4(0, x + j));
+    if (nf_aligned(w, 16) && nf_aligned(x, 16)) {
+        for (int j = lid * 4; j < n4; j += lsize * 4) {
+            ps += dot(nf_vload4_aligned(0, w + j), nf_vload4_aligned(0, x + j));
+        }
+    } else {
+        for (int j = lid * 4; j < n4; j += lsize * 4) {
+            ps += dot(vload4(0, w + j), vload4(0, x + j));
+        }
     }
     for (int j = n4 + lid; j < n; j += lsize) {
         ps += w[j] * x[j];
@@ -35,10 +41,18 @@ NF_INLINE void nf_mvf32_partial_dual(NF_GLOBAL const float* NF_RESTRICT g,
     const int n4 = n & ~3;
     float ga = 0.0f;
     float ua = 0.0f;
-    for (int j = lid * 4; j < n4; j += lsize * 4) {
-        const float4 xv = vload4(0, x + j);
-        ga += dot(vload4(0, g + j), xv);
-        ua += dot(vload4(0, u + j), xv);
+    if (nf_aligned(g, 16) && nf_aligned(u, 16) && nf_aligned(x, 16)) {
+        for (int j = lid * 4; j < n4; j += lsize * 4) {
+            const float4 xv = nf_vload4_aligned(0, x + j);
+            ga += dot(nf_vload4_aligned(0, g + j), xv);
+            ua += dot(nf_vload4_aligned(0, u + j), xv);
+        }
+    } else {
+        for (int j = lid * 4; j < n4; j += lsize * 4) {
+            const float4 xv = vload4(0, x + j);
+            ga += dot(vload4(0, g + j), xv);
+            ua += dot(vload4(0, u + j), xv);
+        }
     }
     for (int j = n4 + lid; j < n; j += lsize) {
         const float xv = x[j];

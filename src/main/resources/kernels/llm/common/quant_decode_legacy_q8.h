@@ -97,10 +97,14 @@ NF_INLINE float MXFP4_decode_q8(NF_GLOBAL const uchar* bp, NF_GLOBAL const uchar
 
 /* Four kvalues_iq4nl codes packed as int8, nibble k in byte k. */
 NF_INLINE int nf_q8_iq4nl_word(uint nibbles) {
+#if defined(__CUDA_ARCH__)
+    return (int)nf_iq4nl_codes4(nibbles);
+#else
     return nf_q8_pack4((int)IQ4_NL_KVALUES[nibbles & 0xFu],
                        (int)IQ4_NL_KVALUES[(nibbles >> 8) & 0xFu],
                        (int)IQ4_NL_KVALUES[(nibbles >> 16) & 0xFu],
                        (int)IQ4_NL_KVALUES[(nibbles >> 24) & 0xFu]);
+#endif
 }
 
 /* ---- IQ4_NL: one 32-element block is one Q8_1 block; work-item ltid owns qs bytes 4*ltid .. +3. ---- */

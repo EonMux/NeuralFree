@@ -245,6 +245,18 @@ NF_INLINE float4 vload_half4(size_t i, const NF_HALF *p) { p += 4 * i; return ma
 NF_INLINE void   vstore_half(float v, size_t i, NF_HALF *p) { p[i] = __half_as_ushort(__float2half_rn(v)); }
 NF_INLINE void   vstore_half2(float2 v, size_t i, NF_HALF *p) { p += 2 * i; vstore_half(v.x, 0, p); vstore_half(v.y, 1, p); }
 NF_INLINE void   vstore_half4(float4 v, size_t i, NF_HALF *p) { p += 4 * i; vstore_half(v.x, 0, p); vstore_half(v.y, 1, p); vstore_half(v.z, 2, p); vstore_half(v.w, 3, p); }
+/* Vector loads of four elements at a vector-aligned address (p + 4 * i aligned to 16 bytes for floats, to 8 bytes
+ * for 16-bit and 4 bytes for 8-bit elements; nf_aligned checks a pointer): one vector load where vload4 /
+ * vload_half4 take four element loads. The values equal the element loads'. */
+#define nf_aligned(p, bytes) ((((size_t)(p)) & ((size_t)(bytes) - 1)) == 0)
+NF_INLINE float4  nf_vload4_aligned(size_t i, const float *p)  { return ((const float4 *)p)[i]; }
+NF_INLINE ushort4 nf_vload4_aligned(size_t i, const ushort *p) { return ((const ushort4 *)p)[i]; }
+NF_INLINE char4   nf_vload4_aligned(size_t i, const nf_i8 *p)  { return ((const char4 *)p)[i]; }
+NF_INLINE float4  nf_vload_half4_aligned(size_t i, const NF_HALF *p) {
+    const ushort4 h = ((const ushort4 *)p)[i];
+    return make_float4(__half2float(__ushort_as_half(h.x)), __half2float(__ushort_as_half(h.y)),
+                       __half2float(__ushort_as_half(h.z)), __half2float(__ushort_as_half(h.w)));
+}
 
 /* ---- 32-bit atomics on global or shared memory (OpenCL 1.2 core names) ---- */
 NF_INLINE int  atomic_add(volatile int *p, int v)    { return atomicAdd((int *)p, v); }
@@ -319,6 +331,10 @@ typedef ulong nf_u64;
 #endif
 /* Round to nearest even, as CUDA __float2int_rn (quantized code points of MMQ). */
 #define nf_rint_i(x) ((int)convert_int_rte(x))
+/* The aligned vector loads of the CUDA dialect: OpenCL's vload4 / vload_half4 already load the vector. */
+#define nf_aligned(p, bytes) ((((size_t)(p)) & ((size_t)(bytes) - 1)) == 0)
+#define nf_vload4_aligned vload4
+#define nf_vload_half4_aligned vload_half4
 NF_INLINE float nf_flip_sign(const float x)  { return as_float(as_uint(x) ^ 0x80000000u); }
 NF_INLINE float nf_clear_sign(const float x) { return as_float(as_uint(x) & 0x7fffffffu); }
 /* Four signed-byte products of the packed words a and b added to c (dp4a). A compiler that reports

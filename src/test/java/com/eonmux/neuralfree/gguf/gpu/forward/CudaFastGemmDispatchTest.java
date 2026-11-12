@@ -27,8 +27,9 @@ import static org.junit.Assert.assertTrue;
 /**
  * {@link GpuOps#matmul} through the fast GEMM lanes on the CUDA device against the batched matvec of
  * the same projection: the int8 MMQ GEMM under the device's tile config, the F16 MMA GEMM, its
- * split-K form on a tall-skinny launch, and {@code neuralfree.gemm.mmq=off}, which keeps the exact
- * tiled GEMM. Every comparison allows the rounding of the lane taken.
+ * split-K form on a tall-skinny launch, its large tile on a launch of 64 tokens, and
+ * {@code neuralfree.gemm.mmq=off}, which keeps the exact tiled GEMM. Every comparison allows the rounding of the
+ * lane taken.
  */
 public class CudaFastGemmDispatchTest {
 
@@ -141,9 +142,10 @@ public class CudaFastGemmDispatchTest {
     }
 
     @Test
-    public void mmaAndSplitKLanesMatchTheBatchedMatvecWithinFp16Rounding() throws Exception {
+    public void mmaSplitKAndLargeTileLanesMatchTheBatchedMatvecWithinFp16Rounding() throws Exception {
         openOps();
-        int[][] shapes = {{200, 512, 45}, {128, 4096, 8}};   /* plain grid; split-K tall-skinny grid */
+        /* plain grid; split-K tall-skinny grid; one token tile of the large tile (F16_MatMul_MMA_L) */
+        int[][] shapes = {{200, 512, 45}, {128, 4096, 8}, {200, 520, 64}};
         for (int[] s : shapes) {
             float[] w = denseValues(s[0] * s[1], 0x51ED);
             float[] x = denseValues(s[2] * s[1], 0xC0DE);

@@ -57,6 +57,7 @@ matmul_mmq.cl
 [cuda] matmul_mmq_stream.cl
 [cuda] matmul_fp8.cl
 matmul_mma.cl
+[cuda] matmul_mma_large.cl
 matmul_cm.cl
 split_k_reduce.cl
 [cuda] moe_gemm_mma.cl

@@ -195,6 +195,30 @@ public interface ComputeBackend extends AutoCloseable {
     }
 
     /**
+     * Reserves {@code bytes} of dynamic shared (local) memory for every launch of {@code kernel}, on top of its
+     * statically declared shared memory: the size a kernel declaring its buffer {@code extern __shared__} sizes it
+     * with. The reservation belongs to the kernel function, so every handle of it (the cached handle and its
+     * clones) launches, captures and replays with it; it is set once, and a later call must name the same size.
+     * Only CUDA launches with dynamic shared memory; the default accepts nothing but 0.
+     *
+     * @throws IllegalArgumentException      when {@code bytes} is negative, the handle is not this backend's, or
+     *                                       the static and dynamic sizes together exceed the device's per-block
+     *                                       opt-in limit
+     * @throws IllegalStateException         when the kernel already reserved another size
+     * @throws UnsupportedOperationException when {@code bytes} is positive on a backend without dynamic shared
+     *                                       memory
+     */
+    default void reserveDynamicSharedMemory(KernelHandle kernel, int bytes) {
+        if (bytes < 0) {
+            throw new IllegalArgumentException("dynamic shared memory must be >= 0 bytes, got " + bytes);
+        }
+        if (bytes > 0) {
+            throw new UnsupportedOperationException(backendType() + " backend launches no dynamic shared memory; "
+                    + (kernel == null ? "a kernel" : kernel.kernelName()) + " asked for " + bytes + " bytes");
+        }
+    }
+
+    /**
      * Optional warm-up for a kernel that will be dispatched with this local size: Vulkan
      * creates the pipeline now instead of at the first dispatch. The default does nothing.
      */

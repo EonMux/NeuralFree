@@ -40,6 +40,9 @@ import java.util.Set;
  *       {@code GpuBuffer weight_up}, the fused gate/up SwiGLU form: {@code y = silu(weight . x) * (weight_up . x)}
  *       over two weights of one type and shape ({@link StreamKGemmPlan#ofGateUp}), and
  *       {@code LLM_MMQ_StreamK_Fixup_GateUp}, the fixup's arguments, which activates its split tiles.</li>
+ *   <li>{@code <T>_MatMul_MMQ_StreamK_S(...)} and {@code LLM_MMQ_StreamK_Fixup_S(...)}: the stream-k kernel and
+ *       fixup over the small-token tensor tile ({@link MmqConfig#INT8_TENSOR_SMALL}, 128 rows x 16 tokens), the
+ *       stream-k arguments; the decode batches' form ({@link StreamKGemmPlan#ofSmall}).</li>
  *   <li>{@code <T>_MatMul_W4A8(int M, int K, int N, int q_stride, int q_off, int y_stride, int y_off,
  *       GpuBuffer weight, GpuBuffer q8, GpuBuffer y)}: the E4M3 GEMM of a 4-bit weight type, same argument
  *       list and staged records as the MMQ form ({@link #MATMUL_W4A8_SUFFIX}).</li>
@@ -90,6 +93,8 @@ public final class GemmKernels {
     public static final String MATMUL_MMQ_STREAMK_SUFFIX = "_MatMul_MMQ_StreamK";
     /** Name suffix of the fused gate/up SwiGLU stream-k kernels, {@code <T>_MatMul_MMQ_StreamK_GateUp}. */
     public static final String MATMUL_MMQ_STREAMK_GATE_UP_SUFFIX = "_MatMul_MMQ_StreamK_GateUp";
+    /** Name suffix of the stream-k kernels of the small-token tensor tile, {@code <T>_MatMul_MMQ_StreamK_S}. */
+    public static final String MATMUL_MMQ_STREAMK_S_SUFFIX = "_MatMul_MMQ_StreamK_S";
     /** Name suffix of the small-token-tile twins of the int8 MMQ GEMM kernels, {@code <T>_MatMul_MMQ_S}. */
     public static final String MATMUL_MMQ_S_SUFFIX = "_MatMul_MMQ_S";
     /** Name suffix of the 64-token small-token-tile twins, {@code <T>_MatMul_MMQ_S64}. */
@@ -129,6 +134,8 @@ public final class GemmKernels {
     public static final String MATMUL_MMA_SUFFIX = "_MatMul_MMA";
     /** Name suffix of the split-K twins of the MMA GEMM kernels, {@code <T>_MatMul_MMA_KSplit}. */
     public static final String MATMUL_MMA_KSPLIT_SUFFIX = "_MatMul_MMA_KSplit";
+    /** Name suffix of the large-tile MMA GEMM kernels, {@code <T>_MatMul_MMA_L} (CUDA sm_80+ only). */
+    public static final String MATMUL_MMA_L_SUFFIX = "_MatMul_MMA_L";
     /**
      * The MMQ activation staging ({@code kernels/llm/quant_mmq_q8_1.cl}, llama.cpp
      * {@code quantize_mmq_q8_1}): quantizes every token row of a projection once, per stage-depth
@@ -179,6 +186,8 @@ public final class GemmKernels {
     public static final String SPLIT_K_REDUCE = "LLM_SplitK_Reduce";
     /** The stream-k fixup: adds the partial sums of the tiles a stream-k MMQ launch split into their outputs. */
     public static final String STREAM_K_FIXUP = "LLM_MMQ_StreamK_Fixup";
+    /** The stream-k fixup of the small-token tensor tile ({@code <T>_MatMul_MMQ_StreamK_S}). */
+    public static final String STREAM_K_FIXUP_SMALL = "LLM_MMQ_StreamK_Fixup_S";
     /** The gate/up stream-k fixup: writes {@code silu(gate) * up} of the summed partials of the split tiles of a
      *  {@code <T>_MatMul_MMQ_StreamK_GateUp} launch. */
     public static final String STREAM_K_FIXUP_GATE_UP = "LLM_MMQ_StreamK_Fixup_GateUp";
@@ -421,6 +430,17 @@ public final class GemmKernels {
     }
 
     /**
+     * Name of the stream-k kernel of the small-token tensor tile of a weight type
+     * ({@code <T>_MatMul_MMQ_StreamK_S}, {@link MmqConfig#INT8_TENSOR_SMALL}): CUDA sm_80+ only, like
+     * {@link #matmulMmqStreamK}.
+     *
+     * @throws IllegalArgumentException when the type has no int8 MMQ GEMM kernel
+     */
+    public static String matmulMmqStreamKSmall(GGMLType type) {
+        return matmulMmqStreamK(type).replace(MATMUL_MMQ_STREAMK_SUFFIX, MATMUL_MMQ_STREAMK_S_SUFFIX);
+    }
+
+    /**
      * Name of the fused gate/up SwiGLU stream-k kernel of a weight type ({@code <T>_MatMul_MMQ_StreamK_GateUp}):
      * CUDA sm_80+ only, like {@link #matmulMmqStreamK}.
      *
@@ -581,6 +601,21 @@ public final class GemmKernels {
                     + "; supported: " + MMA_TYPES);
         }
         return type.name() + MATMUL_MMA_KSPLIT_SUFFIX;
+    }
+
+    /**
+     * Name of the large-tile form of the MMA GEMM kernel of a dense 16-bit weight type ({@code <T>_MatMul_MMA_L},
+     * {@link MmaGemmPlan#LARGE_TILE_ROWS} x {@link MmaGemmPlan#LARGE_TILE_TOKENS}): CUDA sm_80+ only, with the
+     * arguments and the results of {@link #matmulMma}.
+     *
+     * @throws IllegalArgumentException when the type has no MMA GEMM kernel
+     */
+    public static String matmulMmaLarge(GGMLType type) {
+        if (!hasMma(type)) {
+            throw new IllegalArgumentException("no large-tile MMA GEMM kernel for weight type " + type
+                    + "; supported: " + MMA_TYPES);
+        }
+        return type.name() + MATMUL_MMA_L_SUFFIX;
     }
 
     /**

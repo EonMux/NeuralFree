@@ -274,9 +274,14 @@ NF_INLINE int nf_mmq_iq2xxs_code(NF_GLOBAL const uchar* bp, int e) {
     return NF_MMQ_SM_CODE(word, j, signs);
 }
 #define IQ2_XXS_MMQ_CODE(bp, e) nf_mmq_iq2xxs_code(bp, e)
-#define IQ2_XXS_MMQ_CODE4(bp, e0) \
-    NF_MMQ_CODE4_PACK(IQ2_XXS_MMQ_CODE((bp), (e0)), IQ2_XXS_MMQ_CODE((bp), (e0) + 1), \
-        IQ2_XXS_MMQ_CODE((bp), (e0) + 2), IQ2_XXS_MMQ_CODE((bp), (e0) + 3))
+/* The four codes of e0 (a multiple of 4) share one half of the group's grid word and four bits of its sign byte. */
+NF_INLINE uint nf_mmq_iq2xxs_code4(NF_GLOBAL const uchar* bp, int e0) {
+    const int sb = e0 >> 5, grp = (e0 >> 3) & 3, h = (e0 >> 2) & 1;
+    const nf_u64 word = IQ2XXS_GRID_CL[bp[2 + 8 * sb + grp]];
+    const uint signs = (uint)KSIGNS_IQ2XS_CL[(read_u32_le(bp + 2 + 8 * sb + 4) >> (7u * grp)) & 0x7Fu];
+    return NF_MMQ_SIGNED4((uint)(word >> (32 * h)), (signs >> (4 * h)) & 0xFu);
+}
+#define IQ2_XXS_MMQ_CODE4(bp, e0) nf_mmq_iq2xxs_code4(bp, e0)
 #define IQ2_XXS_MMQ_SCALE(bp, k0) (nf_ql_half(bp, 0) \
     * (0.5f + (float)(read_u32_le((bp) + 2 + (((k0) % 256) >> 5) * 8 + 4) >> 28)) * 0.25f)
 #define IQ2_XXS_MMQ_OFF(bp, k0) 0.0f
@@ -297,9 +302,16 @@ NF_INLINE int nf_mmq_iq2xs_code(NF_GLOBAL const uchar* bp, int e) {
     return NF_MMQ_SM_CODE(word, e & 7, signs);
 }
 #define IQ2_XS_MMQ_CODE(bp, e) nf_mmq_iq2xs_code(bp, e)
-#define IQ2_XS_MMQ_CODE4(bp, e0) \
-    NF_MMQ_CODE4_PACK(IQ2_XS_MMQ_CODE((bp), (e0)), IQ2_XS_MMQ_CODE((bp), (e0) + 1), \
-        IQ2_XS_MMQ_CODE((bp), (e0) + 2), IQ2_XS_MMQ_CODE((bp), (e0) + 3))
+/* The four codes of e0 (a multiple of 4) share the group's index word: one half of its grid word and four bits
+ * of its sign byte. */
+NF_INLINE uint nf_mmq_iq2xs_code4(NF_GLOBAL const uchar* bp, int e0) {
+    const int h = (e0 >> 2) & 1;
+    const uint qv = nf_mmq_iq2xs_qv(bp, e0);
+    const nf_u64 word = IQ2XS_GRID_CL[qv & 511u];
+    const uint signs = (uint)KSIGNS_IQ2XS_CL[qv >> 9];
+    return NF_MMQ_SIGNED4((uint)(word >> (32 * h)), (signs >> (4 * h)) & 0xFu);
+}
+#define IQ2_XS_MMQ_CODE4(bp, e0) nf_mmq_iq2xs_code4(bp, e0)
 #define IQ2_XS_MMQ_SCALE(bp, k0) (nf_ql_half(bp, 0) * (0.5f \
     + (float)((((k0) % 256) & 16u) != 0u ? ((uint)(bp)[66 + (((k0) % 256) >> 5)] >> 4) \
                                          : ((uint)(bp)[66 + (((k0) % 256) >> 5)] & 0xFu))) * 0.25f)
@@ -318,9 +330,16 @@ NF_INLINE int nf_mmq_iq2s_code(NF_GLOBAL const uchar* bp, int e) {
     return NF_MMQ_SM_CODE(word, j, bp[34 + 4 * sb + grp]);
 }
 #define IQ2_S_MMQ_CODE(bp, e) nf_mmq_iq2s_code(bp, e)
-#define IQ2_S_MMQ_CODE4(bp, e0) \
-    NF_MMQ_CODE4_PACK(IQ2_S_MMQ_CODE((bp), (e0)), IQ2_S_MMQ_CODE((bp), (e0) + 1), \
-        IQ2_S_MMQ_CODE((bp), (e0) + 2), IQ2_S_MMQ_CODE((bp), (e0) + 3))
+/* The four codes of e0 (a multiple of 4) share one grid index (with its qh bits), one half of its grid word and
+ * four bits of the group's sign byte. */
+NF_INLINE uint nf_mmq_iq2s_code4(NF_GLOBAL const uchar* bp, int e0) {
+    const int sb = e0 >> 5, grp = (e0 >> 3) & 3, h = (e0 >> 2) & 1;
+    const uint qh = bp[66 + sb];
+    const uint idx = (uint)bp[2 + 4 * sb + grp] | ((qh << (8u - 2u * grp)) & 0x300u);
+    const nf_u64 word = IQ2S_GRID_CL[idx];
+    return NF_MMQ_SIGNED4((uint)(word >> (32 * h)), ((uint)bp[34 + 4 * sb + grp] >> (4 * h)) & 0xFu);
+}
+#define IQ2_S_MMQ_CODE4(bp, e0) nf_mmq_iq2s_code4(bp, e0)
 #define IQ2_S_MMQ_SCALE(bp, k0) (nf_ql_half(bp, 0) * (0.5f \
     + (float)((((k0) % 256) & 16u) != 0u ? ((uint)(bp)[74 + (((k0) % 256) >> 5)] >> 4) \
                                          : ((uint)(bp)[74 + (((k0) % 256) >> 5)] & 0xFu))) * 0.25f)
@@ -343,9 +362,15 @@ NF_INLINE int nf_mmq_iq1s_code(NF_GLOBAL const uchar* bp, int e) {
     return (int)NF_MMQ_BYTE(word, j) - (int)(((word >> (8u * j)) & 0x80u) << 1);
 }
 #define IQ1_S_MMQ_CODE(bp, e) nf_mmq_iq1s_code(bp, e)
-#define IQ1_S_MMQ_CODE4(bp, e0) \
-    NF_MMQ_CODE4_PACK(IQ1_S_MMQ_CODE((bp), (e0)), IQ1_S_MMQ_CODE((bp), (e0) + 1), \
-        IQ1_S_MMQ_CODE((bp), (e0) + 2), IQ1_S_MMQ_CODE((bp), (e0) + 3))
+/* The four codes of e0 (a multiple of 4) are one half of the group's grid word, whose bytes already hold the
+ * ternary values as int8. */
+NF_INLINE uint nf_mmq_iq1s_code4(NF_GLOBAL const uchar* bp, int e0) {
+    const int sb = e0 >> 5, grp = (e0 >> 3) & 3, h = (e0 >> 2) & 1;
+    const uint qh = nf_mmq_iq1s_qh(bp, sb);
+    const uint idx = (uint)bp[2 + 4 * sb + grp] | (((qh >> (3u * grp)) & 7u) << 8);
+    return (uint)(IQ1S_GRID_CL[idx] >> (32 * h));
+}
+#define IQ1_S_MMQ_CODE4(bp, e0) nf_mmq_iq1s_code4(bp, e0)
 #define IQ1_S_MMQ_DL(bp, k0) (nf_ql_half(bp, 0) \
     * (float)(2u * ((nf_mmq_iq1s_qh((bp), ((k0) % 256) >> 5) >> 12) & 7u) + 1u))
 #define IQ1_S_MMQ_SCALE(bp, k0) IQ1_S_MMQ_DL(bp, k0)
@@ -363,10 +388,14 @@ NF_INLINE int nf_mmq_iq1s_code(NF_GLOBAL const uchar* bp, int e) {
 NF_INLINE uint nf_mmq_iq4nl_code4(NF_GLOBAL const uchar* bp, int e0) {
     const uint word = nf_read_u32_u16(bp + 2 + (e0 & 15));
     const int shift = (e0 & 16) ? 4 : 0;
+#if defined(__CUDA_ARCH__)
+    return nf_iq4nl_codes4(NF_MMQ_CODE4_NIBBLES(word, shift));
+#else
     return NF_MMQ_CODE4_PACK(IQ4_NL_KVALUES[(word >> shift) & 0xFu],
         IQ4_NL_KVALUES[(word >> (8 + shift)) & 0xFu],
         IQ4_NL_KVALUES[(word >> (16 + shift)) & 0xFu],
         IQ4_NL_KVALUES[(word >> (24 + shift)) & 0xFu]);
+#endif
 }
 #define IQ4_NL_MMQ_CODE4(bp, e0) nf_mmq_iq4nl_code4((bp), (e0))
 #define IQ4_NL_MMQ_SCALE(bp, k0) nf_ql_half(bp, 0)
@@ -386,10 +415,14 @@ NF_INLINE uint nf_mmq_iq4xs_code4(NF_GLOBAL const uchar* bp, int e0) {
     const uint word = nf_read_u32(bp + IQ4_XS_HEADER_BYTES
         + (e0 >> 5) * IQ4_XS_SUB_BLOCK_QUANT_BYTES + (e0 & 15));
     const int shift = ((e0 % 32) < 16) ? 0 : 4;
+#if defined(__CUDA_ARCH__)
+    return nf_iq4nl_codes4(NF_MMQ_CODE4_NIBBLES(word, shift));
+#else
     return NF_MMQ_CODE4_PACK(IQ4_NL_KVALUES[(word >> shift) & 0xFu],
         IQ4_NL_KVALUES[(word >> (8 + shift)) & 0xFu],
         IQ4_NL_KVALUES[(word >> (16 + shift)) & 0xFu],
         IQ4_NL_KVALUES[(word >> (24 + shift)) & 0xFu]);
+#endif
 }
 #define IQ4_XS_MMQ_CODE4(bp, e0) nf_mmq_iq4xs_code4((bp), (e0))
 #define IQ4_XS_MMQ_SCALE(bp, k0) iq4xs_sub_scale((bp), ((k0) % 256) >> 5)

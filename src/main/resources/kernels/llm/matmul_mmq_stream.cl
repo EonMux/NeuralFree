@@ -1,6 +1,7 @@
 /* matmul_mmq_stream.cl - T_MatMul_MMQ_StreamK, the stream-k form of the MMQ GEMM's tensor-core tile,
- * T_MatMul_MMQ_StreamK_GateUp, its fused gate/up SwiGLU form, and LLM_MMQ_StreamK_Fixup and
- * LLM_MMQ_StreamK_Fixup_GateUp, which complete their split tiles ([cuda]: CUDA sm_80+ only).
+ * T_MatMul_MMQ_StreamK_GateUp, its fused gate/up SwiGLU form, T_MatMul_MMQ_StreamK_S, the stream-k form of the
+ * small-token tensor tile, and LLM_MMQ_StreamK_Fixup, LLM_MMQ_StreamK_Fixup_GateUp and LLM_MMQ_StreamK_Fixup_S,
+ * which complete their split tiles ([cuda]: CUDA sm_80+ only).
  * Requires: common/dialect.h, common/config.h, common/math.h, common/quant_blocks.h, common/iq_tables.h, common/quant_decode_legacy.h, common/quant_decode_k.h, common/matmul_mmq_config.h, common/matmul_mmq_family.h, common/matmul_mmq_types.h */
 /*
  * The stream-k kernels run the plain T_MatMul_MMQ tile of every MMQ weight type (kernels/llm/matmul_mmq.cl)
@@ -43,7 +44,8 @@ NF_INLINE int nf_mmq_streamk_owner(int s, int nb, int total) {
  * stopping one in its tail plane 2b + 1, and LLM_MMQ_StreamK_Fixup_GateUp activates the sums. A block's other
  * segments are whole tiles.
  */
-#define NF_MMQ_SK_PLANE(p) ((nf_i64)(p) * NF_MMQ_TM * NF_MMQ_TN)
+#define NF_MMQ_SK_PLANE_OF(p, TN) ((nf_i64)(p) * NF_MMQ_TM * (TN))
+#define NF_MMQ_SK_PLANE(p) NF_MMQ_SK_PLANE_OF(p, NF_MMQ_TN)
 
 /*
  * The gate/up form's store of a tile its block ran whole. The products of a gate row and of its up row sit
@@ -96,7 +98,7 @@ NF_INLINE void nf_mmq_gate_up_store(NF_LOCAL_PTR float* xch, NF_GLOBAL float* NF
 /* Stores of a tile run whole: the plain form's straight from the accumulators, the gate/up form's through
  * the pairing exchange. */
 #define NF_MMQ_SK_WHOLE(m0, n0) \
-    nf_mmq_tc_store(y, M, N, y_stride, (nf_i64)y_off, m0, n0, lane, wrow0, wtok0, acc);
+    nf_mmq_tc_store<NF_MMQ_TC_NB_OF(tc_tn)>(y, M, N, y_stride, (nf_i64)y_off, m0, n0, lane, wrow0, wtok0, acc);
 #define NF_MMQ_SK_WHOLE_GATE_UP(m0, n0) \
     nf_mmq_gate_up_store((NF_LOCAL_PTR float*)tc_xr, y, M, N, y_stride, (nf_i64)y_off, m0, n0, lid, lane, \
                          wrow0, wtok0, acc);
@@ -104,13 +106,14 @@ NF_INLINE void nf_mmq_gate_up_store(NF_LOCAL_PTR float* xch, NF_GLOBAL float* NF
 /* Stores of a segment of a split tile into the block's plane (NF_MMQ_SK_PLANE), HEAD when it runs the tile's
  * last chunk: the plain form stores that segment through WHOLE (HEAD_IN_Y) and only its tails here. */
 #define NF_MMQ_SK_SPLIT(m0, n0, HEAD) \
-    nf_mmq_tc_store(fixup, NF_MMQ_TM, NF_MMQ_TN, NF_MMQ_TM, NF_MMQ_SK_PLANE(b), 0, 0, lane, wrow0, wtok0, acc);
+    nf_mmq_tc_store<NF_MMQ_TC_NB_OF(tc_tn)>(fixup, NF_MMQ_TM, tc_tn, NF_MMQ_TM, NF_MMQ_SK_PLANE_OF(b, tc_tn), 0, \
+                                            0, lane, wrow0, wtok0, acc);
 #define NF_MMQ_SK_SPLIT_GATE_UP(m0, n0, HEAD) \
-    nf_mmq_tc_store(fixup, NF_MMQ_TM, NF_MMQ_TN, NF_MMQ_TM, NF_MMQ_SK_PLANE((HEAD) ? 2 * b : 2 * b + 1), 0, 0, \
-                    lane, wrow0, wtok0, acc);
+    nf_mmq_tc_store<NF_MMQ_TC_NB>(fixup, NF_MMQ_TM, NF_MMQ_TN, NF_MMQ_TM, \
+                                  NF_MMQ_SK_PLANE((HEAD) ? 2 * b : 2 * b + 1), 0, 0, lane, wrow0, wtok0, acc);
 
 /*
- * The body of a stream-k kernel over output tiles of RT rows: segment s of tile t runs tile rows
+ * The body of a stream-k kernel over output tiles of RT rows and TN tokens: segment s of tile t runs tile rows
  * [m0, m0 + NF_MMQ_TM) of the weight, m0 = t / ntj * RT, through the plain kernel's chunk pipe, the tile
  * rows mapping to weight rows as NF_MMQ_TC_SLOTS describes (RMASK its tc_rmask, WUP the up weight's base).
  * A block stores the tiles it runs whole through WHOLE, and with HEAD_IN_Y also the segment that finishes a
@@ -119,28 +122,28 @@ NF_INLINE void nf_mmq_gate_up_store(NF_LOCAL_PTR float* xch, NF_GLOBAL float* NF
  * these two store sites: a third raises the register count of the larger IQ types past the point where they
  * spill.
  */
-#define NF_MMQ_TC_STREAMK_BODY(PIPE, BS, BB, SG, HAS_OFF, CODE, SCALE, OFF, RT, WUP, RMASK, WHOLE, HEAD_IN_Y, \
-                               SPLIT) \
-    NF_MMQ_TC_TILE_DECLS((BS), (BB), (SG)) \
+#define NF_MMQ_TC_STREAMK_BODY(PIPE, BS, BB, SG, HAS_OFF, CODE, SCALE, OFF, RT, TN, WUP, RMASK, WHOLE, \
+                               HEAD_IN_Y, SPLIT) \
+    NF_MMQ_TC_TILE_DECLS((BS), (BB), (SG), (TN)) \
     { \
         const int kc = K / NF_MMQ_TK; \
-        const int ntj = (N + NF_MMQ_TN - 1) / NF_MMQ_TN; \
+        const int ntj = (N + (TN) - 1) / (TN); \
         const int total = (M + (RT) - 1) / (RT) * ntj * kc; \
         const int b = (int)get_group_id(0); \
         const int nb = (int)get_num_groups(0); \
         const int kstop = nf_mmq_streamk_start(b + 1, nb, total); \
         for (int kbc = nf_mmq_streamk_start(b, nb, total); kbc < kstop;) { \
-            NF_MMQ_TC_GEOMETRY(nf_mmq_tc_fresh_lid()) \
+            NF_MMQ_TC_GEOMETRY(nf_mmq_tc_fresh_lid(), (TN)) \
             const int tile = kbc / kc; \
             const int kb = kbc - tile * kc; \
             const int ke = min(kc, kb + (kstop - kbc)); \
             const int m0 = tile / ntj * (RT); \
-            const int n0 = tile % ntj * NF_MMQ_TN; \
+            const int n0 = tile % ntj * (TN); \
             const NF_GLOBAL uchar* wtile = weight + (nf_i64)m0 * row_bytes; \
             const NF_GLOBAL uchar* wtile_u = (WUP) + (nf_i64)m0 * row_bytes; \
             const int tc_rmask = (RMASK); \
             const NF_GLOBAL uint* xtile = q8 + (nf_i64)q_off + (nf_i64)n0 * q_stride * NF_MMQ_RC; \
-            for (int i = 0; i < NF_MMQ_TC_ACC; i++) \
+            for (int i = 0; i < NF_MMQ_TC_ACC_OF(TN); i++) \
                 acc[i] = 0.0f; \
             PIPE(kb * NF_MMQ_TK, ke * NF_MMQ_TK, (SG), (HAS_OFF), (BS), (BB), CODE, SCALE, OFF) \
             if (ke == kc && ((HEAD_IN_Y) || kb == 0)) { \
@@ -168,8 +171,30 @@ NF_KERNEL __launch_bounds__(NF_MMQ_WG) void NAME( \
     NF_GLOBAL const uint* NF_RESTRICT q8, \
     NF_GLOBAL float* NF_RESTRICT y, \
     NF_GLOBAL float* NF_RESTRICT fixup) { \
-    NF_MMQ_TC_STREAMK_BODY(PIPE, BS, BB, SG, HAS_OFF, CODE, SCALE, OFF, NF_MMQ_TM, weight, NF_MMQ_TM - 1, \
-                           NF_MMQ_SK_WHOLE, 1, NF_MMQ_SK_SPLIT) \
+    NF_MMQ_TC_STREAMK_BODY(PIPE, BS, BB, SG, HAS_OFF, CODE, SCALE, OFF, NF_MMQ_TM, NF_MMQ_TN, weight, \
+                           NF_MMQ_TM - 1, NF_MMQ_SK_WHOLE, 1, NF_MMQ_SK_SPLIT) \
+}
+
+/*
+ * The stream-k kernel of the small-token tensor tile: T_MatMul_MMQ_StreamK over NF_MMQ_TM x NF_MMQ_TC_STN
+ * output tiles (fixup planes of that size, completed by LLM_MMQ_StreamK_Fixup_S), the form of the decode batches
+ * of up to 16 tokens - llama.cpp runs those through its stream-k mmq at mmq_x = 16. Each output takes the plain
+ * tile's per-chunk terms in chunk order, so a tile one block runs whole equals T_MatMul_MMQ's output bit for bit.
+ * The launch bound names one resident block, and the host plans one block per multiprocessor
+ * (StreamKGemmPlan.SMALL_TILE_BLOCKS_PER_UNIT): every type then keeps its working set in 123-152 registers on
+ * sm_120 and 110-170 on sm_80 and sm_86 without spilling, while a bound of two blocks (128 registers) spills the
+ * IQ1_S and IQ3_S kernels on sm_120 and the IQ2_XXS, IQ3_S, Q5_0 or Q5_1 kernels on sm_80 and sm_86.
+ */
+#define NF_MMQ_TC_STREAMK_S_NAMED(NAME, PIPE, BS, BB, SG, HAS_OFF, CODE, SCALE, OFF) \
+NF_KERNEL __launch_bounds__(NF_MMQ_WG, 1) void NAME( \
+    const int M, const int K, const int N, \
+    const int q_stride, const int q_off, const int y_stride, const int y_off, \
+    NF_GLOBAL const uchar* NF_RESTRICT weight, \
+    NF_GLOBAL const uint* NF_RESTRICT q8, \
+    NF_GLOBAL float* NF_RESTRICT y, \
+    NF_GLOBAL float* NF_RESTRICT fixup) { \
+    NF_MMQ_TC_STREAMK_BODY(PIPE, BS, BB, SG, HAS_OFF, CODE, SCALE, OFF, NF_MMQ_TM, NF_MMQ_TC_STN, weight, \
+                           NF_MMQ_TM - 1, NF_MMQ_SK_WHOLE, 1, NF_MMQ_SK_SPLIT) \
 }
 
 /*
@@ -193,7 +218,7 @@ NF_KERNEL __launch_bounds__(NF_MMQ_WG) void NAME( \
     NF_GLOBAL float* NF_RESTRICT y, \
     NF_GLOBAL float* NF_RESTRICT fixup, \
     NF_GLOBAL const uchar* NF_RESTRICT weight_up) { \
-    NF_MMQ_TC_STREAMK_BODY(PIPE, BS, BB, SG, HAS_OFF, CODE, SCALE, OFF, NF_MMQ_TM / 2, weight_up, \
+    NF_MMQ_TC_STREAMK_BODY(PIPE, BS, BB, SG, HAS_OFF, CODE, SCALE, OFF, NF_MMQ_TM / 2, NF_MMQ_TN, weight_up, \
                            NF_MMQ_TM / 2 - 1, NF_MMQ_SK_WHOLE_GATE_UP, 0, NF_MMQ_SK_SPLIT_GATE_UP) \
 }
 
@@ -201,7 +226,9 @@ NF_KERNEL __launch_bounds__(NF_MMQ_WG) void NAME( \
     NF_MMQ_TC_STREAMK_NAMED(T##_MatMul_MMQ_StreamK, NF_MMQ_TC_PIPE, BS, BB, SG, T##_MMQ_HAS_OFF, CODE, SCALE, \
                             OFF) \
     NF_MMQ_TC_STREAMK_GATE_UP_NAMED(T##_MatMul_MMQ_StreamK_GateUp, NF_MMQ_TC_PIPE, BS, BB, SG, T##_MMQ_HAS_OFF, \
-                                    CODE, SCALE, OFF)
+                                    CODE, SCALE, OFF) \
+    NF_MMQ_TC_STREAMK_S_NAMED(T##_MatMul_MMQ_StreamK_S, NF_MMQ_TC_PIPE, BS, BB, SG, T##_MMQ_HAS_OFF, CODE, SCALE, \
+                              OFF)
 
 NF_MMQ_GEMM_STREAMK(Q4_0, Q4_0_BLOCK_SIZE, Q4_0_BLOCK_BYTES, 32, Q4_0_MMQ_CODE, Q4_0_MMQ_SCALE, Q4_0_MMQ_OFF)
 NF_MMQ_GEMM_STREAMK(Q4_1, Q4_1_BLOCK_SIZE, Q4_1_BLOCK_BYTES, 32, Q4_1_MMQ_CODE, Q4_1_MMQ_SCALE, Q4_1_MMQ_OFF)
@@ -223,14 +250,15 @@ NF_MMQ_GEMM_STREAMK(IQ1_S, IQ1_S_BLOCK_SIZE, IQ1_S_BLOCK_BYTES, 32, IQ1_S_MMQ_CO
 NF_MMQ_GEMM_STREAMK(IQ4_NL, IQ4_NL_BLOCK_SIZE, IQ4_NL_BLOCK_BYTES, 32, IQ4_NL_MMQ_CODE, IQ4_NL_MMQ_SCALE, IQ4_NL_MMQ_OFF)
 NF_MMQ_GEMM_STREAMK(IQ4_XS, IQ4_XS_BLOCK_SIZE, IQ4_XS_BLOCK_BYTES, 32, IQ4_XS_MMQ_CODE, IQ4_XS_MMQ_SCALE, IQ4_XS_MMQ_OFF)
 /* Outputs of a tile one work-item of a fixup adds: a tile's outputs split into slices of
- * NF_MMQ_SK_FIX_E * NF_MMQ_WG contiguous plane elements, one work-group each (NF_MMQ_SK_FIX_SLICES of the
- * plain tile, NF_MMQ_SK_FIX_GU_SLICES of the gate/up tile's NF_MMQ_TM / 2 rows), so a split tile's planes are
- * read with that many loads in flight per work-item rather than as one work-group's long dependent chain. */
+ * NF_MMQ_SK_FIX_E * NF_MMQ_WG contiguous plane elements, one work-group each (NF_MMQ_SK_FIX_SLICES(TN) of the
+ * plain TN-token tile, NF_MMQ_SK_FIX_GU_SLICES of the gate/up tile's NF_MMQ_TM / 2 rows), so a split tile's planes
+ * are read with that many loads in flight per work-item rather than as one work-group's long dependent chain. */
 #define NF_MMQ_SK_FIX_E 4
-#define NF_MMQ_SK_FIX_SLICES (NF_MMQ_TM * NF_MMQ_TN / (NF_MMQ_WG * NF_MMQ_SK_FIX_E))
+#define NF_MMQ_SK_FIX_SLICES(TN) (NF_MMQ_TM * (TN) / (NF_MMQ_WG * NF_MMQ_SK_FIX_E))
 #define NF_MMQ_SK_FIX_GU_SLICES (NF_MMQ_TM / 2 * NF_MMQ_TN / (NF_MMQ_WG * NF_MMQ_SK_FIX_E))
-#if NF_MMQ_TM / 2 * NF_MMQ_TN % (NF_MMQ_WG * NF_MMQ_SK_FIX_E) != 0
-#error "the stream-k fixup slices must tile the gate/up output tile"
+#if NF_MMQ_TM / 2 * NF_MMQ_TN % (NF_MMQ_WG * NF_MMQ_SK_FIX_E) != 0 \
+    || NF_MMQ_TM * NF_MMQ_TC_STN % (NF_MMQ_WG * NF_MMQ_SK_FIX_E) != 0
+#error "the stream-k fixup slices must tile the gate/up and the small-token output tiles"
 #endif
 
 /*
@@ -246,48 +274,53 @@ NF_INLINE int nf_mmq_streamk_finished(int b, int nb, int total, int kc) {
 }
 
 /*
- * The stream-k fixup: global {nb * NF_MMQ_WG, NF_MMQ_SK_FIX_SLICES}, local {NF_MMQ_WG, 1} over the nb blocks
- * of the T_MatMul_MMQ_StreamK launch with the same M, K, N and output view. Work-group (b, s) acts when block
- * b finished a tile (nf_mmq_streamk_finished): it sums slice s of the planes of the blocks before it that ran
- * the rest of the tile, nearest first from +0 (each one's last segment lies in the tile), and adds the sum
+ * The stream-k fixup of a TN-token tile: global {nb * NF_MMQ_WG, NF_MMQ_SK_FIX_SLICES(TN)}, local {NF_MMQ_WG, 1}
+ * over the nb blocks of the stream-k launch with the same M, K, N and output view (LLM_MMQ_StreamK_Fixup after
+ * T_MatMul_MMQ_StreamK, LLM_MMQ_StreamK_Fixup_S after T_MatMul_MMQ_StreamK_S). Work-group (b, s) acts when
+ * block b finished a tile (nf_mmq_streamk_finished): it sums slice s of the planes of the blocks before it that
+ * ran the rest of the tile, nearest first from +0 (each one's last segment lies in the tile), and adds the sum
  * onto the partial block b stored in y; the work-groups of the other blocks return at once.
  */
-NF_KERNEL __launch_bounds__(NF_MMQ_WG) void LLM_MMQ_StreamK_Fixup(
-    const int M, const int K, const int N, const int y_stride, const int y_off,
-    NF_GLOBAL const float* NF_RESTRICT fixup,
-    NF_GLOBAL float* NF_RESTRICT y) {
-    const int kc = K / NF_MMQ_TK;
-    const int ntj = (N + NF_MMQ_TN - 1) / NF_MMQ_TN;
-    const int total = (M + NF_MMQ_TM - 1) / NF_MMQ_TM * ntj * kc;
-    const int b = (int)get_group_id(0);
-    const int nb = (int)get_num_groups(0);
-    const int tile = nf_mmq_streamk_finished(b, nb, total, kc);
-    if (tile < 0) {
-        return;
-    }
-    const int f0 = nf_mmq_streamk_owner(tile * kc, nb, total);
-    const int e0 = (int)get_group_id(1) * NF_MMQ_SK_FIX_E * NF_MMQ_WG + (int)get_local_id(0);
-    float sum[NF_MMQ_SK_FIX_E];
-    for (int i = 0; i < NF_MMQ_SK_FIX_E; i++) {
-        sum[i] = 0.0f;
-    }
-    for (int p = b - 1; p >= f0; p--) {
-        const NF_GLOBAL float* plane = fixup + NF_MMQ_SK_PLANE(p) + e0;
-        for (int i = 0; i < NF_MMQ_SK_FIX_E; i++) {
-            sum[i] += plane[i * NF_MMQ_WG];
-        }
-    }
-    const int m0 = tile / ntj * NF_MMQ_TM;
-    const int n0 = tile % ntj * NF_MMQ_TN;
-    for (int i = 0; i < NF_MMQ_SK_FIX_E; i++) {
-        const int e = e0 + i * NF_MMQ_WG;
-        const int r = m0 + e % NF_MMQ_TM;
-        const int c = n0 + e / NF_MMQ_TM;
-        if (r < M && c < N) {
-            y[(nf_i64)y_off + (nf_i64)c * y_stride + r] += sum[i];
-        }
-    }
+#define NF_MMQ_SK_FIXUP_NAMED(NAME, TN) \
+NF_KERNEL __launch_bounds__(NF_MMQ_WG) void NAME( \
+    const int M, const int K, const int N, const int y_stride, const int y_off, \
+    NF_GLOBAL const float* NF_RESTRICT fixup, \
+    NF_GLOBAL float* NF_RESTRICT y) { \
+    const int kc = K / NF_MMQ_TK; \
+    const int ntj = (N + (TN) - 1) / (TN); \
+    const int total = (M + NF_MMQ_TM - 1) / NF_MMQ_TM * ntj * kc; \
+    const int b = (int)get_group_id(0); \
+    const int nb = (int)get_num_groups(0); \
+    const int tile = nf_mmq_streamk_finished(b, nb, total, kc); \
+    if (tile < 0) { \
+        return; \
+    } \
+    const int f0 = nf_mmq_streamk_owner(tile * kc, nb, total); \
+    const int e0 = (int)get_group_id(1) * NF_MMQ_SK_FIX_E * NF_MMQ_WG + (int)get_local_id(0); \
+    float sum[NF_MMQ_SK_FIX_E]; \
+    for (int i = 0; i < NF_MMQ_SK_FIX_E; i++) { \
+        sum[i] = 0.0f; \
+    } \
+    for (int p = b - 1; p >= f0; p--) { \
+        const NF_GLOBAL float* plane = fixup + NF_MMQ_SK_PLANE_OF(p, (TN)) + e0; \
+        for (int i = 0; i < NF_MMQ_SK_FIX_E; i++) { \
+            sum[i] += plane[i * NF_MMQ_WG]; \
+        } \
+    } \
+    const int m0 = tile / ntj * NF_MMQ_TM; \
+    const int n0 = tile % ntj * (TN); \
+    for (int i = 0; i < NF_MMQ_SK_FIX_E; i++) { \
+        const int e = e0 + i * NF_MMQ_WG; \
+        const int r = m0 + e % NF_MMQ_TM; \
+        const int c = n0 + e / NF_MMQ_TM; \
+        if (r < M && c < N) { \
+            y[(nf_i64)y_off + (nf_i64)c * y_stride + r] += sum[i]; \
+        } \
+    } \
 }
+
+NF_MMQ_SK_FIXUP_NAMED(LLM_MMQ_StreamK_Fixup, NF_MMQ_TN)
+NF_MMQ_SK_FIXUP_NAMED(LLM_MMQ_StreamK_Fixup_S, NF_MMQ_TC_STN)
 
 /*
  * The gate/up form's fixup: global {nb * NF_MMQ_WG, NF_MMQ_SK_FIX_GU_SLICES}, local {NF_MMQ_WG, 1} over the

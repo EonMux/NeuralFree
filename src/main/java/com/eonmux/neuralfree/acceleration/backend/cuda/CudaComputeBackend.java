@@ -18,6 +18,7 @@ import com.eonmux.neuralfree.acceleration.cache.CacheKey;
 import com.eonmux.neuralfree.acceleration.cache.KernelCache;
 import com.eonmux.neuralfree.acceleration.cuda.CUDevice;
 import com.eonmux.neuralfree.utils.LoggingUtil;
+import jcuda.Pointer;
 import jcuda.driver.CUdeviceptr;
 import jcuda.driver.CUfunction;
 import jcuda.driver.CUmodule;
@@ -35,7 +36,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArraySet;
 
 import static jcuda.driver.JCudaDriver.cuMemGetInfo;
+import static jcuda.driver.JCudaDriver.cuMemcpyDtoH;
 import static jcuda.driver.JCudaDriver.cuModuleGetFunction;
+import static jcuda.driver.JCudaDriver.cuModuleGetGlobal;
 import static jcuda.driver.JCudaDriver.cuStreamCreate;
 
 /**
@@ -79,6 +82,14 @@ import static jcuda.driver.JCudaDriver.cuStreamCreate;
         + "cache are safe from several threads; every entry point makes the primary context current "
         + "on the calling thread.")
 public final class CudaComputeBackend implements ComputeBackend {
+
+    /**
+     * Suffix of the {@code __constant__ int} through which a kernel module declares a kernel's dynamic shared memory:
+     * a kernel {@code K} whose shared buffers are {@code extern __shared__} defines {@code K_dynamic_shared} with
+     * the bytes its launches need, and loading the kernel reserves them
+     * ({@link CudaKernelHandle#reserveDynamicSharedMemory}), so every launch, capture and replay passes them.
+     */
+    public static final String DYNAMIC_SHARED_SUFFIX = "_dynamic_shared";
 
     private static final Logger LOGGER = LoggingUtil.getLogger(CudaComputeBackend.class);
 
@@ -306,6 +317,16 @@ public final class CudaComputeBackend implements ComputeBackend {
             return;
         }
         WorkSizes.validateLocal(localWorkSize, handle.maxThreadsPerBlock(), handle.kernelName());
+    }
+
+    /**
+     * Reserves dynamic shared memory for every launch of the kernel's function, up to the device's per-block
+     * opt-in limit ({@link CudaKernelHandle#reserveDynamicSharedMemory}).
+     */
+    @Override
+    public void reserveDynamicSharedMemory(KernelHandle kernel, int bytes) {
+        enter();
+        ownHandle(kernel).reserveDynamicSharedMemory(bytes, capabilities().getMaxLocalMemoryBytes());
     }
 
     /**
@@ -594,7 +615,48 @@ public final class CudaComputeBackend implements ComputeBackend {
         } catch (UnsupportedKernelException e) {
             throw new UnsupportedKernelException("CUDA kernel " + kernelName + " is not in " + origin, e);
         }
-        return new CudaKernelHandle(this, function, kernelName, signature);
+        CudaKernelHandle handle = new CudaKernelHandle(this, function, kernelName, signature);
+        int dynamicShared = declaredDynamicSharedBytes(module, kernelName, origin);
+        if (dynamicShared != 0) {
+            try {
+                handle.reserveDynamicSharedMemory(dynamicShared, capabilities().getMaxLocalMemoryBytes());
+            } catch (IllegalArgumentException e) {
+                throw new UnsupportedKernelException("CUDA kernel " + kernelName + " of " + origin + " cannot run on "
+                        + capabilities().getDeviceName() + ": " + e.getMessage(), e);
+            }
+        }
+        return handle;
+    }
+
+    /**
+     * The dynamic shared memory a module declares for one of its kernels: the value of the {@code __constant__ int}
+     * named {@code <kernel>}{@value #DYNAMIC_SHARED_SUFFIX} that a kernel sizing its shared buffers from the
+     * launch's dynamic shared memory defines beside it, or 0 when the module has no such symbol.
+     *
+     * @throws UnsupportedKernelException when the symbol is not a 4-byte int or holds a negative size
+     */
+    private static int declaredDynamicSharedBytes(CUmodule module, String kernelName, String origin) {
+        String symbol = kernelName + DYNAMIC_SHARED_SUFFIX;
+        CUdeviceptr address = new CUdeviceptr();
+        long[] size = new long[1];
+        try {
+            CudaErrors.check("cuModuleGetGlobal(" + symbol + ")", () -> cuModuleGetGlobal(address, size, module,
+                    symbol));
+        } catch (UnsupportedKernelException absent) {
+            return 0;
+        }
+        if (size[0] != Integer.BYTES) {
+            throw new UnsupportedKernelException("CUDA kernel " + kernelName + " of " + origin + ": " + symbol
+                    + " holds " + size[0] + " bytes, not one int");
+        }
+        int[] value = new int[1];
+        CudaErrors.check("cuMemcpyDtoH(" + symbol + ")",
+                () -> cuMemcpyDtoH(Pointer.to(value), address, Integer.BYTES));
+        if (value[0] < 0) {
+            throw new UnsupportedKernelException("CUDA kernel " + kernelName + " of " + origin + " declares "
+                    + value[0] + " bytes of dynamic shared memory");
+        }
+        return value[0];
     }
 
     private CudaKernelHandle ownHandle(KernelHandle kernel) {

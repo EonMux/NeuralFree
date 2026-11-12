@@ -13,6 +13,12 @@ NF_INLINE float4 nf_mvbf16_load4(NF_GLOBAL const ushort* p) {
     return NF_F4(bf16_to_f32(r.x), bf16_to_f32(r.y), bf16_to_f32(r.z), bf16_to_f32(r.w));
 }
 
+/* nf_mvbf16_load4 at an 8-byte aligned p: one vector load. */
+NF_INLINE float4 nf_mvbf16_load4_aligned(NF_GLOBAL const ushort* p) {
+    const ushort4 r = nf_vload4_aligned(0, p);
+    return NF_F4(bf16_to_f32(r.x), bf16_to_f32(r.y), bf16_to_f32(r.z), bf16_to_f32(r.w));
+}
+
 /* This work-item's share of dot(w[0..n), x[0..n)) for F16 w: float4 strides lid*4, lid*4 + L*4, ...
  * over the multiple-of-4 prefix and a scalar tail. */
 NF_INLINE float nf_mvf16_partial(NF_GLOBAL const NF_HALF* NF_RESTRICT w,
@@ -21,8 +27,14 @@ NF_INLINE float nf_mvf16_partial(NF_GLOBAL const NF_HALF* NF_RESTRICT w,
     const int lsize = get_local_size(0);
     const int n4 = n & ~3;
     float ps = 0.0f;
-    for (int j = lid * 4; j < n4; j += lsize * 4) {
-        ps += dot(vload_half4(0, w + j), vload4(0, x + j));
+    if (nf_aligned(w, 8) && nf_aligned(x, 16)) {
+        for (int j = lid * 4; j < n4; j += lsize * 4) {
+            ps += dot(nf_vload_half4_aligned(0, w + j), nf_vload4_aligned(0, x + j));
+        }
+    } else {
+        for (int j = lid * 4; j < n4; j += lsize * 4) {
+            ps += dot(vload_half4(0, w + j), vload4(0, x + j));
+        }
     }
     for (int j = n4 + lid; j < n; j += lsize) {
         ps += vload_half(0, w + j) * x[j];
@@ -40,10 +52,18 @@ NF_INLINE void nf_mvf16_partial_dual(NF_GLOBAL const NF_HALF* NF_RESTRICT g,
     const int n4 = n & ~3;
     float ga = 0.0f;
     float ua = 0.0f;
-    for (int j = lid * 4; j < n4; j += lsize * 4) {
-        const float4 xv = vload4(0, x + j);
-        ga += dot(vload_half4(0, g + j), xv);
-        ua += dot(vload_half4(0, u + j), xv);
+    if (nf_aligned(g, 8) && nf_aligned(u, 8) && nf_aligned(x, 16)) {
+        for (int j = lid * 4; j < n4; j += lsize * 4) {
+            const float4 xv = nf_vload4_aligned(0, x + j);
+            ga += dot(nf_vload_half4_aligned(0, g + j), xv);
+            ua += dot(nf_vload_half4_aligned(0, u + j), xv);
+        }
+    } else {
+        for (int j = lid * 4; j < n4; j += lsize * 4) {
+            const float4 xv = vload4(0, x + j);
+            ga += dot(vload_half4(0, g + j), xv);
+            ua += dot(vload_half4(0, u + j), xv);
+        }
     }
     for (int j = n4 + lid; j < n; j += lsize) {
         const float xv = x[j];
@@ -61,8 +81,14 @@ NF_INLINE float nf_mvbf16_partial(NF_GLOBAL const ushort* NF_RESTRICT w,
     const int lsize = get_local_size(0);
     const int n4 = n & ~3;
     float ps = 0.0f;
-    for (int j = lid * 4; j < n4; j += lsize * 4) {
-        ps += dot(nf_mvbf16_load4(w + j), vload4(0, x + j));
+    if (nf_aligned(w, 8) && nf_aligned(x, 16)) {
+        for (int j = lid * 4; j < n4; j += lsize * 4) {
+            ps += dot(nf_mvbf16_load4_aligned(w + j), nf_vload4_aligned(0, x + j));
+        }
+    } else {
+        for (int j = lid * 4; j < n4; j += lsize * 4) {
+            ps += dot(nf_mvbf16_load4(w + j), vload4(0, x + j));
+        }
     }
     for (int j = n4 + lid; j < n; j += lsize) {
         ps += bf16_to_f32(w[j]) * x[j];
@@ -80,10 +106,18 @@ NF_INLINE void nf_mvbf16_partial_dual(NF_GLOBAL const ushort* NF_RESTRICT g,
     const int n4 = n & ~3;
     float ga = 0.0f;
     float ua = 0.0f;
-    for (int j = lid * 4; j < n4; j += lsize * 4) {
-        const float4 xv = vload4(0, x + j);
-        ga += dot(nf_mvbf16_load4(g + j), xv);
-        ua += dot(nf_mvbf16_load4(u + j), xv);
+    if (nf_aligned(g, 8) && nf_aligned(u, 8) && nf_aligned(x, 16)) {
+        for (int j = lid * 4; j < n4; j += lsize * 4) {
+            const float4 xv = nf_vload4_aligned(0, x + j);
+            ga += dot(nf_mvbf16_load4_aligned(g + j), xv);
+            ua += dot(nf_mvbf16_load4_aligned(u + j), xv);
+        }
+    } else {
+        for (int j = lid * 4; j < n4; j += lsize * 4) {
+            const float4 xv = vload4(0, x + j);
+            ga += dot(nf_mvbf16_load4(g + j), xv);
+            ua += dot(nf_mvbf16_load4(u + j), xv);
+        }
     }
     for (int j = n4 + lid; j < n; j += lsize) {
         const float xv = x[j];

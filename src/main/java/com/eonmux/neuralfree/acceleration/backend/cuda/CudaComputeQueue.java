@@ -836,7 +836,8 @@ public final class CudaComputeQueue implements ComputeQueue {
                         + (withEvent ? "returns an event" : "waits on events") + " cannot be captured: enqueue it"
                         + " before beginCapture, or return no event and wait on this queue's order");
             }
-            CUDA_KERNEL_NODE_PARAMS nodeParams = CudaGraph.nodeParams(function, grid, block, params);
+            CUDA_KERNEL_NODE_PARAMS nodeParams = CudaGraph.nodeParams(function, grid, block,
+                    handle.dynamicSharedMemoryBytes(), params);
             CUgraphNode node = addNode("cuGraphAddKernelNode(" + name + ")",
                     (n, deps, depCount) -> cuGraphAddKernelNode(n, captureGraph, deps, depCount, nodeParams));
             captureNodes.add(CudaGraph.Node.kernel(node, captureKernelOrdinal++, handle, global.clone(),
@@ -849,7 +850,8 @@ public final class CudaComputeQueue implements ComputeQueue {
         int result;
         try {
             result = cuLaunchKernel(handle.function(), (int) grid[0], (int) grid[1], (int) grid[2],
-                    (int) block[0], (int) block[1], (int) block[2], 0, stream, params, null);
+                    (int) block[0], (int) block[1], (int) block[2], handle.dynamicSharedMemoryBytes(), stream,
+                    params, null);
         } catch (CudaException e) {
             cancelTiming(timedStart);
             throw CudaErrors.translate(e, "cuLaunchKernel(" + handle.kernelName() + ")", -1);
