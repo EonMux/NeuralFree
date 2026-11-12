@@ -49,9 +49,9 @@ public final class SimdAttnKernels implements CpuAttnKernels {
             for (int l = 0; l < width; l += LANE_QUANTUM) {
                 FloatVector a = FloatVector.zero(F8);
                 for (int d = 0; d < dK; d++) {
-                    a = a.add(FloatVector.fromArray(F8, qT, d * lanes + l).mul(k[kb + d]));
+                    a = FloatVector.fromArray(F8, qT, d * lanes + l).mul(k[kb + d]).add(a);
                 }
-                a.intoArray(out, outOff + j * lanes + l);
+                ((FloatVector) a.check(F8)).intoArray(out, outOff + j * lanes + l);
             }
         }
     }
@@ -71,26 +71,26 @@ public final class SimdAttnKernels implements CpuAttnKernels {
             final FloatVector x = FloatVector.fromArray(F8, qT, d * lanes + l);
             final FloatVector y = FloatVector.fromArray(F8, qT, d * lanes + l + LANE_QUANTUM);
             final float k0 = k[kb + d];
-            a0 = a0.add(x.mul(k0));
-            b0 = b0.add(y.mul(k0));
+            a0 = x.mul(k0).add(a0);
+            b0 = y.mul(k0).add(b0);
             final float k1 = k[kb + kStride + d];
-            a1 = a1.add(x.mul(k1));
-            b1 = b1.add(y.mul(k1));
+            a1 = x.mul(k1).add(a1);
+            b1 = y.mul(k1).add(b1);
             final float k2 = k[kb + 2 * kStride + d];
-            a2 = a2.add(x.mul(k2));
-            b2 = b2.add(y.mul(k2));
+            a2 = x.mul(k2).add(a2);
+            b2 = y.mul(k2).add(b2);
             final float k3 = k[kb + 3 * kStride + d];
-            a3 = a3.add(x.mul(k3));
-            b3 = b3.add(y.mul(k3));
+            a3 = x.mul(k3).add(a3);
+            b3 = y.mul(k3).add(b3);
         }
-        a0.intoArray(out, ob + l);
-        b0.intoArray(out, ob + l + LANE_QUANTUM);
-        a1.intoArray(out, ob + lanes + l);
-        b1.intoArray(out, ob + lanes + l + LANE_QUANTUM);
-        a2.intoArray(out, ob + 2 * lanes + l);
-        b2.intoArray(out, ob + 2 * lanes + l + LANE_QUANTUM);
-        a3.intoArray(out, ob + 3 * lanes + l);
-        b3.intoArray(out, ob + 3 * lanes + l + LANE_QUANTUM);
+        ((FloatVector) a0.check(F8)).intoArray(out, ob + l);
+        ((FloatVector) b0.check(F8)).intoArray(out, ob + l + LANE_QUANTUM);
+        ((FloatVector) a1.check(F8)).intoArray(out, ob + lanes + l);
+        ((FloatVector) b1.check(F8)).intoArray(out, ob + lanes + l + LANE_QUANTUM);
+        ((FloatVector) a2.check(F8)).intoArray(out, ob + 2 * lanes + l);
+        ((FloatVector) b2.check(F8)).intoArray(out, ob + 2 * lanes + l + LANE_QUANTUM);
+        ((FloatVector) a3.check(F8)).intoArray(out, ob + 3 * lanes + l);
+        ((FloatVector) b3.check(F8)).intoArray(out, ob + 3 * lanes + l + LANE_QUANTUM);
     }
 
     /** Lanes {@code [l, l + 8)} of four keys: four chains. */
@@ -102,15 +102,15 @@ public final class SimdAttnKernels implements CpuAttnKernels {
         FloatVector a3 = a0;
         for (int d = 0; d < dK; d++) {
             final FloatVector x = FloatVector.fromArray(F8, qT, d * lanes + l);
-            a0 = a0.add(x.mul(k[kb + d]));
-            a1 = a1.add(x.mul(k[kb + kStride + d]));
-            a2 = a2.add(x.mul(k[kb + 2 * kStride + d]));
-            a3 = a3.add(x.mul(k[kb + 3 * kStride + d]));
+            a0 = x.mul(k[kb + d]).add(a0);
+            a1 = x.mul(k[kb + kStride + d]).add(a1);
+            a2 = x.mul(k[kb + 2 * kStride + d]).add(a2);
+            a3 = x.mul(k[kb + 3 * kStride + d]).add(a3);
         }
-        a0.intoArray(out, ob + l);
-        a1.intoArray(out, ob + lanes + l);
-        a2.intoArray(out, ob + 2 * lanes + l);
-        a3.intoArray(out, ob + 3 * lanes + l);
+        ((FloatVector) a0.check(F8)).intoArray(out, ob + l);
+        ((FloatVector) a1.check(F8)).intoArray(out, ob + lanes + l);
+        ((FloatVector) a2.check(F8)).intoArray(out, ob + 2 * lanes + l);
+        ((FloatVector) a3.check(F8)).intoArray(out, ob + 3 * lanes + l);
     }
 
     @Override

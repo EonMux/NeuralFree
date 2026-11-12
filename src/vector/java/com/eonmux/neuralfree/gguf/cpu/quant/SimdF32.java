@@ -58,12 +58,14 @@ public final class SimdF32 implements CpuVecDot {
         }
         checkTiles(w, rowStart, rowCount, x, nTokens, y, yOff, yStride);
         final byte[] row = CpuVecDotRows.buffer(w);
+        final CpuVecDotRows.RowReader rows = CpuVecDotRows.reader(w);
+        final float[] lanes = new float[SimdFp.TOKENS * SimdFp.F8.length()];
         final int n = x[0].n;
         for (int r = 0; r < rowCount; r++) {
-            CpuVecDotRows.copyRow(w, rowStart + r, row);
+            rows.copy(rowStart + r, row);
             int t0 = 0;
             for (; t0 + SimdFp.TOKENS <= nTokens; t0 += SimdFp.TOKENS) {
-                dotTile8(row, 0, x, t0, n, y, yOff + r, yStride);
+                dotTile8(row, 0, x, t0, n, lanes, y, yOff + r, yStride);
             }
             for (; t0 < nTokens; t0++) {
                 y[yOff + r + t0 * yStride] = dot(row, 0, x[t0].f32, n);
@@ -74,9 +76,10 @@ public final class SimdF32 implements CpuVecDot {
     /**
      * Eight tokens of one weight row: eight lane accumulators, one per token, so the row's float lanes load
      * once for the whole tile.
+     * The accumulators reduce from the caller's scratch {@code lanes} ({@link SimdFp#pairwise(float[], int)}).
      */
-    private static void dotTile8(byte[] b, int off, QuantizedActivations[] x, int t0, int n, float[] y,
-                                 int y0, int yStride) {
+    private static void dotTile8(byte[] b, int off, QuantizedActivations[] x, int t0, int n, float[] lanes,
+                                 float[] y, int y0, int yStride) {
         FloatVector a0 = FloatVector.zero(SimdFp.F8);
         FloatVector a1 = FloatVector.zero(SimdFp.F8);
         FloatVector a2 = FloatVector.zero(SimdFp.F8);
@@ -89,23 +92,27 @@ public final class SimdF32 implements CpuVecDot {
         for (int p = off; i + 8 <= n; i += 8, p += 32) {
             final FloatVector w = (FloatVector) ByteVector.fromArray(SimdFp.B32, b, p)
                     .reinterpretShape(SimdFp.F8, 0);
-            a0 = a0.add(w.mul(FloatVector.fromArray(SimdFp.F8, x[t0].f32, i)));
-            a1 = a1.add(w.mul(FloatVector.fromArray(SimdFp.F8, x[t0 + 1].f32, i)));
-            a2 = a2.add(w.mul(FloatVector.fromArray(SimdFp.F8, x[t0 + 2].f32, i)));
-            a3 = a3.add(w.mul(FloatVector.fromArray(SimdFp.F8, x[t0 + 3].f32, i)));
-            a4 = a4.add(w.mul(FloatVector.fromArray(SimdFp.F8, x[t0 + 4].f32, i)));
-            a5 = a5.add(w.mul(FloatVector.fromArray(SimdFp.F8, x[t0 + 5].f32, i)));
-            a6 = a6.add(w.mul(FloatVector.fromArray(SimdFp.F8, x[t0 + 6].f32, i)));
-            a7 = a7.add(w.mul(FloatVector.fromArray(SimdFp.F8, x[t0 + 7].f32, i)));
+            a0 = w.mul(FloatVector.fromArray(SimdFp.F8, x[t0].f32, i)).add(a0);
+            a1 = w.mul(FloatVector.fromArray(SimdFp.F8, x[t0 + 1].f32, i)).add(a1);
+            a2 = w.mul(FloatVector.fromArray(SimdFp.F8, x[t0 + 2].f32, i)).add(a2);
+            a3 = w.mul(FloatVector.fromArray(SimdFp.F8, x[t0 + 3].f32, i)).add(a3);
+            a4 = w.mul(FloatVector.fromArray(SimdFp.F8, x[t0 + 4].f32, i)).add(a4);
+            a5 = w.mul(FloatVector.fromArray(SimdFp.F8, x[t0 + 5].f32, i)).add(a5);
+            a6 = w.mul(FloatVector.fromArray(SimdFp.F8, x[t0 + 6].f32, i)).add(a6);
+            a7 = w.mul(FloatVector.fromArray(SimdFp.F8, x[t0 + 7].f32, i)).add(a7);
         }
-        y[y0 + t0 * yStride] = tail(SimdFp.pairwise(a0), b, off, x[t0].f32, i, n);
-        y[y0 + (t0 + 1) * yStride] = tail(SimdFp.pairwise(a1), b, off, x[t0 + 1].f32, i, n);
-        y[y0 + (t0 + 2) * yStride] = tail(SimdFp.pairwise(a2), b, off, x[t0 + 2].f32, i, n);
-        y[y0 + (t0 + 3) * yStride] = tail(SimdFp.pairwise(a3), b, off, x[t0 + 3].f32, i, n);
-        y[y0 + (t0 + 4) * yStride] = tail(SimdFp.pairwise(a4), b, off, x[t0 + 4].f32, i, n);
-        y[y0 + (t0 + 5) * yStride] = tail(SimdFp.pairwise(a5), b, off, x[t0 + 5].f32, i, n);
-        y[y0 + (t0 + 6) * yStride] = tail(SimdFp.pairwise(a6), b, off, x[t0 + 6].f32, i, n);
-        y[y0 + (t0 + 7) * yStride] = tail(SimdFp.pairwise(a7), b, off, x[t0 + 7].f32, i, n);
+        final int l = SimdFp.F8.length();
+        ((FloatVector) a0.check(SimdFp.F8)).intoArray(lanes, 0);
+        ((FloatVector) a1.check(SimdFp.F8)).intoArray(lanes, l);
+        ((FloatVector) a2.check(SimdFp.F8)).intoArray(lanes, 2 * l);
+        ((FloatVector) a3.check(SimdFp.F8)).intoArray(lanes, 3 * l);
+        ((FloatVector) a4.check(SimdFp.F8)).intoArray(lanes, 4 * l);
+        ((FloatVector) a5.check(SimdFp.F8)).intoArray(lanes, 5 * l);
+        ((FloatVector) a6.check(SimdFp.F8)).intoArray(lanes, 6 * l);
+        ((FloatVector) a7.check(SimdFp.F8)).intoArray(lanes, 7 * l);
+        for (int t = 0; t < SimdFp.TOKENS; t++) {
+            y[y0 + (t0 + t) * yStride] = tail(SimdFp.pairwise(lanes, t * l), b, off, x[t0 + t].f32, i, n);
+        }
     }
 
     /** The elements past the last full group of eight, added one product at a time. */
@@ -125,9 +132,9 @@ public final class SimdF32 implements CpuVecDot {
             // instead of decoding element by element into a buffer the vector then reloads
             final FloatVector w = (FloatVector) ByteVector.fromArray(SimdFp.B32, b, p)
                     .reinterpretShape(SimdFp.F8, 0);
-            acc = acc.add(w.mul(FloatVector.fromArray(SimdFp.F8, x, i)));
+            acc = w.mul(FloatVector.fromArray(SimdFp.F8, x, i)).add(acc);
         }
-        float sum = SimdFp.pairwise(acc);
+        float sum = SimdFp.pairwise((FloatVector) acc.check(SimdFp.F8));
         for (; i < n; i++) {
             sum += floatAt(b, off + 4 * i) * x[i];
         }

@@ -9,10 +9,10 @@ import jdk.incubator.vector.VectorSpecies;
 import java.lang.management.ManagementFactory;
 
 /**
- * The batched (prefill) form of the integer-dot kernel {@link SimdQ8_0}: activations laid out once per product as
- * tiles of {@link #TILE_TOKENS} tokens of float lanes ({@link Layout}), weight rows unpacked once per task into float
- * values ({@link #rowValues}), and the integer sums of the 32-element blocks of {@link #TILE_ROWS} rows by up to
- * {@link #PAIR} tiles computed with multiply-adds ({@link #sums}).
+ * The batched (prefill) form of the 32-element block kernels ({@link SimdBlockTiles}): activations laid out once per
+ * product as tiles of {@link #TILE_TOKENS} tokens of float lanes ({@link Layout}), weight rows unpacked once per
+ * task into float values ({@link #rowValues}), and the integer sums of the 32-element blocks of {@link #TILE_ROWS}
+ * rows by up to {@link #PAIR} tiles computed with multiply-adds ({@link #sums}).
  * <p>
  * The float lanes compute the integer sums of the scalar kernel. Every operand is an integer, and {@link #sums}
  * accumulates each (row, token) block sum in one chain whose partial sums are integers of magnitude at most
@@ -62,35 +62,36 @@ final class SimdTokenTiles {
         }
     }
 
-    /** {@code a * b + c} of exact operands: one fused multiply-add where the hardware has it. */
-    private static FloatVector madd(FloatVector a, FloatVector b, FloatVector c) {
-        return HARDWARE_FMA ? a.fma(b, c) : a.mul(b).add(c);
-    }
-
     /**
      * The activations of one batched product as tiles of {@link #TILE_TOKENS} tokens: in tile {@code t}, element
      * {@code e} of token {@code ti} sits at {@code values[t * tileValues + 8e + ti]}, so one 8-lane load holds
      * element {@code e} of every token of the tile and a weight value broadcast over it multiplies all eight at
-     * once. {@code scales[t * tileScales + 8b + ti]} is token {@code ti}'s block-{@code b} scale {@code d}. Tokens
-     * past the last pad with zero quants and zero scales. Immutable once built.
+     * once. {@code scales[t * tileScales + 8b + ti]} is token {@code ti}'s block-{@code b} scale {@code d}, and
+     * {@code sums} holds the Q8_1 block sum terms {@code s} at the same places (empty for other activations).
+     * Tokens past the last pad with zero quants, scales and sums. Immutable once built.
      */
     static final class Layout implements CpuVecDot.TileActivations {
         final float[] values;
         final float[] scales;
+        final float[] sums;
         final int tokens;
         final int count;
         final int cols;
+        /** Elements per activation block: 32 for Q8_0 and Q8_1, 256 for Q8_K. */
+        final int blockElements;
         final int tileValues;
         final int tileScales;
 
-        private Layout(int tokens, int cols, int blocks) {
+        private Layout(int tokens, int cols, int blocks, boolean withSums) {
             this.tokens = tokens;
             this.cols = cols;
+            this.blockElements = cols / blocks;
             this.count = (tokens + TILE_TOKENS - 1) / TILE_TOKENS;
             this.tileValues = cols * TILE_TOKENS;
             this.tileScales = blocks * TILE_TOKENS;
             this.values = new float[Math.multiplyExact(count, tileValues)];
             this.scales = new float[Math.multiplyExact(count, tileScales)];
+            this.sums = new float[withSums ? scales.length : 0];
         }
 
         @Override
@@ -109,6 +110,12 @@ final class SimdTokenTiles {
             final float[] d = x.d;
             for (int b = 0; b < d.length; b++) {
                 scales[sBase + TILE_TOKENS * b] = d[b];
+            }
+            if (sums.length != 0) {
+                final float[] s = x.s;
+                for (int b = 0; b < s.length; b++) {
+                    sums[sBase + TILE_TOKENS * b] = s[b];
+                }
             }
         }
 
@@ -129,7 +136,7 @@ final class SimdTokenTiles {
      * eight tokens of a tile share cache lines, so one worker writes all of them.
      */
     static Layout layout(CpuVecDot.QuantizedActivations[] x, int nTokens) {
-        final Layout tiles = new Layout(nTokens, x[0].n, x[0].d.length);
+        final Layout tiles = new Layout(nTokens, x[0].n, x[0].d.length, x[0].s != null);
         final int grain = Math.max(1, (1 << 16) / Math.max(1, x[0].n * TILE_TOKENS));
         CpuParallel.parallelFor(tiles.count, grain, (from, to) -> {
             for (int t = from * TILE_TOKENS, end = Math.min(nTokens, to * TILE_TOKENS); t < end; t++) {
@@ -219,9 +226,9 @@ final class SimdTokenTiles {
      * The segment sums of the four rows {@code w[0..3]} over the {@code count} segments of {@code len} elements from
      * element 0, with token tile {@code tile} of {@code tiles} and, when {@code tile < lastTile}, with the next tile
      * as well: {@code out[sumIndex(sg, k, r) + ti] = sum_j w[r][len * sg + j] * a_k[len * sg + j][ti]}, {@code a_k}
-     * the elements of tile {@code tile + k}. Each (row, tile) pair accumulates its own chain of {@link #madd}, one
-     * segment long, which the class comment's bound keeps exact. One call covers a whole row, so the loop over
-     * segments stays inside one compiled method.
+     * the elements of tile {@code tile + k}. Each (row, tile) pair accumulates its own chain of multiply-adds (fused
+     * where {@link #HARDWARE_FMA}), one segment long, which the class comment's bound keeps exact. One call covers a
+     * whole row, so the loop over segments stays inside one compiled method.
      *
      * @return the tiles covered: 2, or 1 for the last tile
      */
@@ -257,26 +264,26 @@ final class SimdTokenTiles {
                 final FloatVector x = FloatVector.fromArray(F8, a, aOff0 + TILE_TOKENS * i);
                 final FloatVector y = FloatVector.fromArray(F8, a, aOff1 + TILE_TOKENS * i);
                 final FloatVector b0 = FloatVector.broadcast(F8, w0[i]);
-                s0 = madd(b0, x, s0);
-                t0 = madd(b0, y, t0);
+                s0 = HARDWARE_FMA ? b0.fma(x, s0) : b0.mul(x).add(s0);
+                t0 = HARDWARE_FMA ? b0.fma(y, t0) : b0.mul(y).add(t0);
                 final FloatVector b1 = FloatVector.broadcast(F8, w1[i]);
-                s1 = madd(b1, x, s1);
-                t1 = madd(b1, y, t1);
+                s1 = HARDWARE_FMA ? b1.fma(x, s1) : b1.mul(x).add(s1);
+                t1 = HARDWARE_FMA ? b1.fma(y, t1) : b1.mul(y).add(t1);
                 final FloatVector b2 = FloatVector.broadcast(F8, w2[i]);
-                s2 = madd(b2, x, s2);
-                t2 = madd(b2, y, t2);
+                s2 = HARDWARE_FMA ? b2.fma(x, s2) : b2.mul(x).add(s2);
+                t2 = HARDWARE_FMA ? b2.fma(y, t2) : b2.mul(y).add(t2);
                 final FloatVector b3 = FloatVector.broadcast(F8, w3[i]);
-                s3 = madd(b3, x, s3);
-                t3 = madd(b3, y, t3);
+                s3 = HARDWARE_FMA ? b3.fma(x, s3) : b3.mul(x).add(s3);
+                t3 = HARDWARE_FMA ? b3.fma(y, t3) : b3.mul(y).add(t3);
             }
-            s0.intoArray(out, sumIndex(sg, 0, 0));
-            s1.intoArray(out, sumIndex(sg, 0, 1));
-            s2.intoArray(out, sumIndex(sg, 0, 2));
-            s3.intoArray(out, sumIndex(sg, 0, 3));
-            t0.intoArray(out, sumIndex(sg, 1, 0));
-            t1.intoArray(out, sumIndex(sg, 1, 1));
-            t2.intoArray(out, sumIndex(sg, 1, 2));
-            t3.intoArray(out, sumIndex(sg, 1, 3));
+            ((FloatVector) s0.check(F8)).intoArray(out, sumIndex(sg, 0, 0));
+            ((FloatVector) s1.check(F8)).intoArray(out, sumIndex(sg, 0, 1));
+            ((FloatVector) s2.check(F8)).intoArray(out, sumIndex(sg, 0, 2));
+            ((FloatVector) s3.check(F8)).intoArray(out, sumIndex(sg, 0, 3));
+            ((FloatVector) t0.check(F8)).intoArray(out, sumIndex(sg, 1, 0));
+            ((FloatVector) t1.check(F8)).intoArray(out, sumIndex(sg, 1, 1));
+            ((FloatVector) t2.check(F8)).intoArray(out, sumIndex(sg, 1, 2));
+            ((FloatVector) t3.check(F8)).intoArray(out, sumIndex(sg, 1, 3));
         }
     }
 
@@ -294,15 +301,19 @@ final class SimdTokenTiles {
             final int e0 = sg * len;
             for (int i = e0; i < e0 + len; i++) {
                 final FloatVector x = FloatVector.fromArray(F8, a, aOff + TILE_TOKENS * i);
-                s0 = madd(FloatVector.broadcast(F8, w0[i]), x, s0);
-                s1 = madd(FloatVector.broadcast(F8, w1[i]), x, s1);
-                s2 = madd(FloatVector.broadcast(F8, w2[i]), x, s2);
-                s3 = madd(FloatVector.broadcast(F8, w3[i]), x, s3);
+                final FloatVector b0 = FloatVector.broadcast(F8, w0[i]);
+                s0 = HARDWARE_FMA ? b0.fma(x, s0) : b0.mul(x).add(s0);
+                final FloatVector b1 = FloatVector.broadcast(F8, w1[i]);
+                s1 = HARDWARE_FMA ? b1.fma(x, s1) : b1.mul(x).add(s1);
+                final FloatVector b2 = FloatVector.broadcast(F8, w2[i]);
+                s2 = HARDWARE_FMA ? b2.fma(x, s2) : b2.mul(x).add(s2);
+                final FloatVector b3 = FloatVector.broadcast(F8, w3[i]);
+                s3 = HARDWARE_FMA ? b3.fma(x, s3) : b3.mul(x).add(s3);
             }
-            s0.intoArray(out, sumIndex(sg, 0, 0));
-            s1.intoArray(out, sumIndex(sg, 0, 1));
-            s2.intoArray(out, sumIndex(sg, 0, 2));
-            s3.intoArray(out, sumIndex(sg, 0, 3));
+            ((FloatVector) s0.check(F8)).intoArray(out, sumIndex(sg, 0, 0));
+            ((FloatVector) s1.check(F8)).intoArray(out, sumIndex(sg, 0, 1));
+            ((FloatVector) s2.check(F8)).intoArray(out, sumIndex(sg, 0, 2));
+            ((FloatVector) s3.check(F8)).intoArray(out, sumIndex(sg, 0, 3));
         }
     }
 

@@ -32,6 +32,7 @@ import com.eonmux.neuralfree.gguf.spec.resolve.NormResolver;
 import com.eonmux.neuralfree.utils.Closeables;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
@@ -623,6 +624,78 @@ public final class CpuLayerExecutor implements AutoCloseable {
             e.beforeBlock(pos0, n, x);
         }
         mixerBlockKV(pos0, n, x);
+    }
+
+    /**
+     * Whether the layer may run its post-attention part over a subset of a step's rows ({@link #forwardRows}): every
+     * step after the mixer residual acts on each row alone and nothing reads the other rows afterwards. Parallel and
+     * hyper-connection residuals carry more than the stream row, a discarded output and an FFN that reads the
+     * attention norm read full-step buffers, the extras, the T5 self attention and the adaptive norm take step-wide
+     * inputs, and an FFN that is not {@link CpuFfnBlock#rowLocal() row-local} must see every row.
+     */
+    public boolean rowsPrunable() {
+        return extras.isEmpty() && !parallel && res.kind() != ResidualKind.HYPER_CONNECTIONS && selfAttention == null
+                && !res.discardLayerOutput() && !ffnReadsAttnNorm && ada == null && (ffn == null || ffn.rowLocal());
+    }
+
+    /**
+     * Runs the layer over {@code n} tokens at positions {@code pos0 ..} whose output is read at the step-local
+     * {@code rows} only, a strictly ascending set of fewer than {@code n} rows ({@link CpuOutputRows}): the norm and
+     * the attention part run over every row, whose K/V rows and keys every query needs, then the read rows move to
+     * the front of {@code x} ({@code rows[i]} to row {@code i}) and the FFN part and the output steps run over them.
+     * With no row read the layer runs its cache writes alone ({@link #forwardKV}) and leaves {@code x} mid-layer.
+     * Every step after the move acts on each row alone, and the CPU products give a row the same bits at any row
+     * count, so the read rows come out as {@link #forward} leaves them.
+     *
+     * @throws IllegalArgumentException as {@link #forward(int, int, float[])}, or when {@code rows} is not such a set
+     * @throws IllegalStateException    when the layer is not {@link #rowsPrunable()}
+     */
+    public void forwardRows(int pos0, int n, float[] x, int[] rows) {
+        Objects.requireNonNull(x, "x");
+        Objects.requireNonNull(rows, "rows");
+        checkOpen();
+        if (!rowsPrunable()) {
+            throw new IllegalStateException(describe() + ": the layer runs every row of a step");
+        }
+        if (!CpuOutputRows.subset(n, rows)) {
+            throw new IllegalArgumentException(describe() + ": read rows " + Arrays.toString(rows)
+                    + " are not a strictly ascending subset of the step's " + n + " rows");
+        }
+        if (rows.length == 0) {
+            forwardKV(pos0, n, x);
+            return;
+        }
+        int ubatch = ctx.scratch().ubatch();
+        if (n > ubatch) {
+            throw new IllegalArgumentException(describe() + ": step of " + n + " tokens outside [1, " + ubatch + "]");
+        }
+        if ((long) n * streamWidth > x.length) {
+            throw new IllegalArgumentException(describe() + ": residual stream holds " + x.length + " floats, need "
+                    + (long) n * streamWidth);
+        }
+        if (layerIn != null) {
+            System.arraycopy(x, 0, layerIn, 0, n * streamWidth);
+        }
+        if (attnNorm != null) {
+            attnNorm.apply(x, normed, n, width);
+        }
+        if (mixer != null) {
+            mixerBlock(pos0, n, x);
+        }
+        CpuOutputRows.compact(x, streamWidth, rows);
+        int k = rows.length;
+        if (ffn != null) {
+            ffnBlock(pos0, k, x, false);
+        }
+        if (postLnLayer != null) {
+            postLnLayer.apply(x, x, k, width);
+        }
+        if (layerOutScale != null) {
+            scaleRows(k, x);
+        }
+        if (res.blockOutputScale() != 1.0f) {
+            CpuOps.scale(x, 0, k * streamWidth, res.blockOutputScale());
+        }
     }
 
     /**

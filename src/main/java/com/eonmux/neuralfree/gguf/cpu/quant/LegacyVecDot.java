@@ -152,6 +152,41 @@ public final class LegacyVecDot implements CpuVecDot {
     }
 
     /**
+     * The 32 quants of the {@code type} block at {@code b[off..)} in element order at {@code aux[0..32)}, the
+     * values ggml's kernel multiplies: Q4_0 {@code -8..7}, Q4_1 {@code 0..15}, Q5_0 {@code -16..15}, Q5_1
+     * {@code 0..31}. The batched Vector API kernels unpack each weight row once with it.
+     *
+     * @throws IllegalArgumentException when {@code type} is not one of the types {@link #supports} accepts
+     */
+    static void unpackBlock(GGMLType type, byte[] b, int off, byte[] aux) {
+        switch (type) {
+            case Q4_0:
+                unpackNibbles(longAt(b, off + Q4_0_QS), longAt(b, off + Q4_0_QS + 8), 0, 0, 0, 0, BIAS_8, true,
+                        aux);
+                return;
+            case Q4_1:
+                unpackNibbles(longAt(b, off + Q4_1_QS), longAt(b, off + Q4_1_QS + 8), 0, 0, 0, 0, 0, false, aux);
+                return;
+            case Q5_0:
+                unpackFifth(b, off + Q5_0_QH, off + Q5_0_QS, BIAS_16, true, aux);
+                return;
+            case Q5_1:
+                unpackFifth(b, off + Q5_1_QH, off + Q5_1_QS, 0, false, aux);
+                return;
+            default:
+                throw new IllegalArgumentException("LegacyVecDot unpacks Q4_0, Q4_1, Q5_0 and Q5_1 blocks, not "
+                        + type);
+        }
+    }
+
+    /** {@link #unpackNibbles} of a Q5_x block whose {@code qh} word and {@code qs} field start at the offsets. */
+    private static void unpackFifth(byte[] b, int qhAt, int qsAt, long biasComplement, boolean signed, byte[] aux) {
+        final int qh = intAt(b, qhAt);
+        unpackNibbles(longAt(b, qsAt), longAt(b, qsAt + 8), QH_SPREAD[qh & 0xFF], QH_SPREAD[(qh >>> 8) & 0xFF],
+                QH_SPREAD[(qh >>> 16) & 0xFF], QH_SPREAD[qh >>> 24], biasComplement, signed, aux);
+    }
+
+    /**
      * Writes the 32 nibbles of a split-nibble {@code qs} field, given as its two little-endian halves, to
      * {@code aux[0 .. 32)} in element order. {@code h0}, {@code h8}, {@code h16} and {@code h24} hold the
      * fifth bits ({@code 0x10} per byte, or zero) of elements {@code 0-7}, {@code 8-15}, {@code 16-23} and

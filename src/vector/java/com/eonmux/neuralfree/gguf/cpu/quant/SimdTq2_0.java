@@ -72,14 +72,15 @@ public final class SimdTq2_0 implements CpuVecDot {
                     final IntVector v2 = (IntVector) raw.convertShape(VectorOperators.B2I, SimdI8.I8, 1);
                     for (int l = 0; l < 4; l++) {
                         final int at = y0 + 32 * l + 16 * h;
-                        acc = acc.add(v.lanewise(VectorOperators.LSHR, 2 * l).and(3)
-                                        .mul(IntVector.fromArray(SimdI8.I8, yw, at)))
+                        acc = v.lanewise(VectorOperators.LSHR, 2 * l).and(3)
+                                .mul(IntVector.fromArray(SimdI8.I8, yw, at))
                                 .add(v2.lanewise(VectorOperators.LSHR, 2 * l).and(3)
-                                        .mul(IntVector.fromArray(SimdI8.I8, yw, at + 8)));
+                                        .mul(IntVector.fromArray(SimdI8.I8, yw, at + 8)))
+                                .add(acc);
                     }
                 }
             }
-            final int sumi = SimdI8.sum(acc) - blockSum(bsums, i);
+            final int sumi = ((IntVector) acc.check(SimdI8.I8)).reduceLanes(VectorOperators.ADD) - blockSum(bsums, i);
             final float d = yd[i] * fp16At(b, off + TQ2_0_D);
             sumf += (float) sumi * d;
         }

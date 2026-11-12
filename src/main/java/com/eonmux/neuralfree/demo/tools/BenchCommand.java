@@ -7,6 +7,7 @@ import com.eonmux.neuralfree.gguf.GGUFTokenizer;
 import com.eonmux.neuralfree.gguf.arch.SupportClass;
 import com.eonmux.neuralfree.gguf.cpu.numa.NumaStrategy;
 import com.eonmux.neuralfree.gguf.cpu.ops.CpuParallel;
+import com.eonmux.neuralfree.gguf.cpu.quant.CpuSimd;
 import com.eonmux.neuralfree.gguf.engine.ContextFullException;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
 import com.eonmux.neuralfree.gguf.engine.EngineModel;
@@ -155,6 +156,20 @@ final class BenchCommand {
     }
 
     /**
+     * The CPU kernels this JVM selects with the reason ({@link CpuSimd#status()}), the line the Markdown header and
+     * the progress name.
+     *
+     * @throws UsageException naming the property when a CPU kernel property has an invalid value
+     */
+    static String cpuKernels() throws UsageException {
+        try {
+            return CpuSimd.status();
+        } catch (IllegalArgumentException e) {
+            throw new UsageException(e.getMessage());
+        }
+    }
+
+    /**
      * Parses the flags, sweeps the grid and writes every format the run selected; {@code --help} prints the
      * usage and returns without a run.
      *
@@ -167,13 +182,17 @@ final class BenchCommand {
             return;
         }
         List<BenchInstance> instances = grid.instances();
-        BenchPrinters.BenchPrinter p = BenchPrinters.create(grid.output, out, grid);
-        BenchPrinters.BenchPrinter pErr = BenchPrinters.create(grid.outputErr, err, grid);
+        String cpuKernels = cpuKernels();
+        BenchPrinters.BenchPrinter p = BenchPrinters.create(grid.output, out, grid, cpuKernels);
+        BenchPrinters.BenchPrinter pErr = BenchPrinters.create(grid.outputErr, err, grid, cpuKernels);
         if (p != null) {
             p.printHeader(grid);
         }
         if (pErr != null) {
             pErr.printHeader(grid);
+        }
+        if (grid.progress) {
+            progress(err, "CPU kernels: %s", cpuKernels);
         }
         int count = instances.size();
         int idx = 0;

@@ -21,7 +21,7 @@ import static org.junit.Assert.assertTrue;
 
 /**
  * The expert-ranking cycle end to end over a loaded model: the ranking beside the synthetic qwen3next file
- * preloads at open, a real generation's routed rows count through the MoE blocks, and the close of the model
+ * preloads at open, the rows a real generation routes count through the MoE blocks, and the close of the model
  * writes the version 2 ranking with the counted rows added to the preloaded heats — the
  * {@code GGML_CUDA_MOE_CACHE_PROFILE_SAVE} cycle of the reference, with the preload reading a shipped ranking.
  */
@@ -58,9 +58,10 @@ public class MoeCacheRankingModelTest {
             }
             assertTrue("the preloaded heat is kept and added to", preloaded >= 100);
             assertTrue("the chain ran at most the requested steps", generated <= N_NEW);
-            assertEquals("every forwarded token's routed rows counted once: the prefill and every generated token"
-                            + " but the last one goes through the layer, " + config.nExpertUsed() + " experts each",
-                    100L + (N_PROMPT + Math.max(generated, 1) - 1) * config.nExpertUsed(), routed);
+            assertEquals("every routed row counted once: the layer is the last one, so the prefill routes only the"
+                            + " prompt row that is read, and every generated token but the last goes through it, "
+                            + config.nExpertUsed() + " experts each",
+                    100L + Math.max(generated, 1) * config.nExpertUsed(), routed);
             assertEquals("the ranking stays hottest first", MoeRankingFile.sorted(saved), saved);
         } finally {
             Files.walk(dir)

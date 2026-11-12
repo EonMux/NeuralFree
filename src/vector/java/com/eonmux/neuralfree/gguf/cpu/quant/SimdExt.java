@@ -196,16 +196,16 @@ public final class SimdExt implements CpuVecDot {
                 for (int k = 0; k < 8; k++) {
                     values[k] = code[b[qs + j + k] & 0x0F];
                 }
-                accLo = accLo.add(FloatVector.fromArray(SimdFp.F8, values, 0)
-                        .mul(FloatVector.fromArray(SimdFp.F8, yf, lo + j)));
+                accLo = FloatVector.fromArray(SimdFp.F8, values, 0)
+                        .mul(FloatVector.fromArray(SimdFp.F8, yf, lo + j)).add(accLo);
                 for (int k = 0; k < 8; k++) {
                     values[k] = code[(b[qs + j + k] & 0xFF) >>> 4];
                 }
-                accHi = accHi.add(FloatVector.fromArray(SimdFp.F8, values, 0)
-                        .mul(FloatVector.fromArray(SimdFp.F8, yf, hi + j)));
+                accHi = FloatVector.fromArray(SimdFp.F8, values, 0)
+                        .mul(FloatVector.fromArray(SimdFp.F8, yf, hi + j)).add(accHi);
             }
-            sumf += (absmax * yd[2 * ib]) * SimdFp.pairwise(accLo);
-            sumf += (absmax * yd[2 * ib + 1]) * SimdFp.pairwise(accHi);
+            sumf += (absmax * yd[2 * ib]) * SimdFp.pairwise((FloatVector) accLo.check(SimdFp.F8));
+            sumf += (absmax * yd[2 * ib + 1]) * SimdFp.pairwise((FloatVector) accHi.check(SimdFp.F8));
         }
         return sumf;
     }

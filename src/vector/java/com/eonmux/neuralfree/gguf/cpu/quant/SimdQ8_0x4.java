@@ -66,10 +66,10 @@ public final class SimdQ8_0x4 implements CpuVecDot {
             IntVector a3 = IntVector.zero(SimdI8.I4);
             for (int c = 0; c < 8; c++) {
                 final int slice = qs + c * 16;
-                a0 = a0.add(widen(b, slice, 0).mul(IntVector.fromArray(SimdI8.I4, yw, xo + c * 4)));
-                a1 = a1.add(widen(b, slice, 1).mul(IntVector.fromArray(SimdI8.I4, yw, xo + 32 + c * 4)));
-                a2 = a2.add(widen(b, slice, 2).mul(IntVector.fromArray(SimdI8.I4, yw, xo + 64 + c * 4)));
-                a3 = a3.add(widen(b, slice, 3).mul(IntVector.fromArray(SimdI8.I4, yw, xo + 96 + c * 4)));
+                a0 = widen(b, slice, 0).mul(IntVector.fromArray(SimdI8.I4, yw, xo + c * 4)).add(a0);
+                a1 = widen(b, slice, 1).mul(IntVector.fromArray(SimdI8.I4, yw, xo + 32 + c * 4)).add(a1);
+                a2 = widen(b, slice, 2).mul(IntVector.fromArray(SimdI8.I4, yw, xo + 64 + c * 4)).add(a2);
+                a3 = widen(b, slice, 3).mul(IntVector.fromArray(SimdI8.I4, yw, xo + 96 + c * 4)).add(a3);
             }
             final int ib = g * Q8_0x4.BLOCKS;
             final int d = off + Q8_0x4.D;

@@ -23,6 +23,42 @@ import static com.eonmux.neuralfree.gguf.quant.BlockLayout.QK_K;
  * ({@link #S16}, {@link #pairSum}) widens the sixteen int8 products of a byte vector into short lanes and
  * folds them pairwise into the int accumulator. Shifts run through {@code lanewise} of {@code SHL}, {@code
  * LSHR} and {@code ASHR}.
+ * <p>
+ * <b>Compiling the same whatever ran first.</b> C2 replaces a Vector API operation with its instruction only when
+ * the receiver's exact vector class and the target species are compile-time constants. A vector that comes from
+ * an operation with a constant species ({@code fromArray}, {@code broadcast}, {@code zero} of a static species, or
+ * any lane-wise operation on such a vector) has an exact class; a loop-carried variable (a loop phi), a parameter
+ * or a return value has only its declared type, and the operation then dispatches through the type profile of the
+ * JDK's shared library code, which every other Vector API caller in the JVM also writes. Once other code (the
+ * {@code FloatVector} tiles and attention, other kernels' shapes) has made such a profile polymorphic, C2 inlines
+ * both targets behind guards, the method outgrows the inlining budget, the intrinsics fail and every operation
+ * runs its allocating Java fallback for the life of the JVM, 2 to 15 times slower. The K-quant kernels
+ * ({@code SimdQ2_K} to {@code SimdQ6_K}, {@link SimdKTiles}), the grid-coded i-quants ({@link SimdIqGrid}), the
+ * block kernels ({@code SimdQ8_0}, {@code SimdQ4_0}, {@code SimdQ4_1}, {@code SimdQ5_0}, {@code SimdQ5_1},
+ * {@code SimdIq4Nl}, {@code SimdIq4Xs}) and their float tiles ({@link SimdBlockTiles}, {@link SimdTokenTiles})
+ * therefore keep four rules, which make their compiled form independent of the JVM's history:
+ * <ol>
+ *   <li>A loop-carried vector is only ever the argument of an operation whose receiver is exact
+ *       ({@code acc = term.add(acc)}): the library's own species check on the argument ({@code that.check(this)})
+ *       then proves its class. Where it must be the receiver (a store, a reduction, a conversion, a subtraction),
+ *       {@code v.check(SPECIES)} proves it first; the check costs nothing once compiled.</li>
+ *   <li>Every shape change names its target species ({@code convertShape(op, SPECIES, 0)},
+ *       {@code reinterpretShape(SPECIES, 0)}), never {@code convert(op, part)} or {@code reinterpretAsInts()},
+ *       whose species lookup folds only when a JDK cache entry happens to be filled.</li>
+ *   <li>No method of these kernels takes or returns a vector; their helpers take arrays and return scalars, so a
+ *       call the JIT does not inline never boxes a vector. The vector-valued helpers below ({@link #pairSum},
+ *       {@link #mulAdd}, {@link #widen}, {@link #zero}, {@link #sum}) serve the less common kernels (MXFP4, the
+ *       ternary and extension types, the repacked layouts), which {@code JitOrderProbeTest} does not cover.</li>
+ *   <li>Every kernel method stays clear of C2's inlining node cutoff. C2 parses each Vector API call into a few
+ *       hundred nodes before it intrinsifies it and stops inlining once a compilation passes the cutoff; which
+ *       calls lie past it depends on what the profile let the compilation inline first, so a method near the
+ *       cutoff loses intrinsics in some JVMs only. A loop body therefore holds one or two product paths (a shift
+ *       selects the nibble or bit pair) rather than every sub-block of a group written out, and the float tiles
+ *       reduce their accumulators from memory rather than by lane extraction.</li>
+ * </ol>
+ * {@code JitOrderProbeTest} runs each group of the covered kernels after the other vector code in child JVMs, bounds
+ * their allocation and rate against the cold order, and reads the compilation log for any kernel method that
+ * reached the node cutoff.
  */
 final class SimdI8 {
 
@@ -37,14 +73,11 @@ final class SimdI8 {
     /** 16 short lanes: the widening partner of {@link #B16} used by the int16 product path. */
     static final VectorSpecies<Short> S16 = ShortVector.SPECIES_256;
 
-    /** Lanes {@code 0..7}, the bit positions of one 8-byte Q5 group. */
+    /** Lanes {@code 0..7}: the bit positions of an 8-bit group. */
     static final IntVector RAMP8 = IntVector.fromArray(I8, new int[]{0, 1, 2, 3, 4, 5, 6, 7}, 0);
 
-    /** Lane {@code j} tests bit {@code j} of an 8-bit group: {@code 1 << j}. */
-    private static final IntVector BIT8 = IntVector.fromArray(I8, new int[]{1, 2, 4, 8, 16, 32, 64, 128}, 0);
-
-    /** Broadcast {@code 1}, the saturating numerator of {@link #fifthBits}. */
-    private static final IntVector ONE = IntVector.broadcast(I8, 1);
+    /** Lane {@code j} tests bit {@code j} of an 8-bit group: {@code 1 << j}; the fifth-bit mask of the Q5 kernels. */
+    static final IntVector BIT8 = IntVector.fromArray(I8, new int[]{1, 2, 4, 8, 16, 32, 64, 128}, 0);
 
     /** Tokens one interleaved activation tile ({@link TokenTiles}) holds: one int lane per token. */
     static final int TILE_TOKENS = 8;
@@ -139,24 +172,26 @@ final class SimdI8 {
         final IntVector m = (IntVector) ByteVector.fromArray(B8, sm, 8).convertShape(VectorOperators.B2I, I8, 0);
         final IntVector p = (IntVector) ShortVector.fromArray(ShortVector.SPECIES_128, pairs, po)
                 .convertShape(VectorOperators.S2I, I8, 0);
-        return sum(m.mul(p));
+        return m.mul(p).reduceLanes(VectorOperators.ADD);
     }
 
     /**
-     * The activations of one batched product as tiles of {@link #TILE_TOKENS} tokens interleaved by element pairs:
-     * in tile {@code t}, pair {@code k} (elements {@code 2k, 2k+1}) of token {@code ti} sits at
-     * {@code lanes[t * tileLanes + 16k + 2ti + j]}, so one 16-lane short load holds one element pair of every token
-     * of the tile and a weight pair broadcast over it ({@link #broadcastPair}) multiplies all eight tokens at
-     * once; after {@link #pairs} lane {@code ti} carries token {@code ti}'s products. {@code scales[t * tileScales
-     * + 8b + ti]} is token {@code ti}'s block-{@code b} scale {@code d}; for Q8_K activations {@code
-     * groupPairs[t * tilePairs + 8j + ti]} is token {@code ti}'s sum of the 16-quant group sums {@code 2j} and
-     * {@code 2j + 1} ({@link #bsumPairs}), eight per super-block. Tokens past the last pad with zero quants, zero
-     * scales and zero sums. Immutable once built.
+     * The activations of one batched product as tiles of {@link #TILE_TOKENS} tokens interleaved by element pairs: in
+     * tile {@code t}, pair {@code k} (elements {@code 2k, 2k+1}) of token {@code ti} sits at {@code lanes[t * tileLanes
+     * + 16k + 2ti + j]}, so one 16-lane short load holds one element pair of every token of the tile and a weight pair
+     * broadcast over it multiplies all eight tokens at once; once the sign-extended low and high halves of each int
+     * lane are added, lane {@code ti} carries token {@code ti}'s products. {@code scales[t * tileScales + 8b + ti]} is
+     * token {@code ti}'s block-{@code b} scale {@code d}; for Q8_K activations {@code groupSums[t * tilePairs + 8j +
+     * ti]} is token {@code ti}'s sum over its {@code j}-th group of {@code groupSpan} quants: with a span of 32 the sum
+     * of the 16-quant group sums {@code 2j} and {@code 2j + 1} ({@link #bsumPairs}), eight per super-block, with a span
+     * of 16 the 16-quant group sum {@code j} itself, sixteen per super-block. Tokens past the last pad with zero
+     * quants, zero scales and zero sums. Immutable once built.
      */
     static final class TokenTiles implements CpuVecDot.TileActivations {
         final short[] lanes;
         final float[] scales;
-        final int[] groupPairs;
+        final int[] groupSums;
+        final int groupSpan;
         final int tokens;
         final int count;
         final int cols;
@@ -164,16 +199,17 @@ final class SimdI8 {
         final int tileScales;
         final int tilePairs;
 
-        private TokenTiles(int tokens, int cols, int blocks, boolean groups) {
+        private TokenTiles(int tokens, int cols, int blocks, int groupSpan) {
             this.tokens = tokens;
             this.cols = cols;
+            this.groupSpan = groupSpan;
             this.count = (tokens + TILE_TOKENS - 1) / TILE_TOKENS;
             this.tileLanes = cols * TILE_TOKENS;
             this.tileScales = blocks * TILE_TOKENS;
-            this.tilePairs = groups ? (cols / 32) * TILE_TOKENS : 0;
+            this.tilePairs = groupSpan > 0 ? (cols / groupSpan) * TILE_TOKENS : 0;
             this.lanes = new short[Math.multiplyExact(count, tileLanes)];
             this.scales = new float[Math.multiplyExact(count, tileScales)];
-            this.groupPairs = groups ? new int[Math.multiplyExact(count, tilePairs)] : null;
+            this.groupSums = groupSpan > 0 ? new int[Math.multiplyExact(count, tilePairs)] : null;
         }
 
         @Override
@@ -194,16 +230,22 @@ final class SimdI8 {
             for (int b = 0; b < d.length; b++) {
                 scales[sBase + TILE_TOKENS * b] = d[b];
             }
-            if (groupPairs != null) {
+            if (groupSums != null) {
                 final short[] bs = x.bsums;
                 final int pBase = (t / TILE_TOKENS) * tilePairs + t % TILE_TOKENS;
-                for (int j = 0; j < bs.length / 2; j++) {
-                    groupPairs[pBase + TILE_TOKENS * j] = bs[2 * j] + bs[2 * j + 1];
+                if (groupSpan == 16) {
+                    for (int j = 0; j < bs.length; j++) {
+                        groupSums[pBase + TILE_TOKENS * j] = bs[j];
+                    }
+                } else {
+                    for (int j = 0; j < bs.length / 2; j++) {
+                        groupSums[pBase + TILE_TOKENS * j] = bs[2 * j] + bs[2 * j + 1];
+                    }
                 }
             }
         }
 
-        /** The first group pair of tile {@code tile}. */
+        /** The first group sum of tile {@code tile}. */
         int pairBase(int tile) {
             return tile * tilePairs;
         }
@@ -220,11 +262,15 @@ final class SimdI8 {
     }
 
     /**
-     * The {@link TokenTiles} of the {@code nTokens} tokens of {@code x}, one token per {@link CpuParallel} index
-     * (each writes only its own lanes).
+     * The {@link TokenTiles} of the {@code nTokens} tokens of {@code x}, with group sums over {@code groupSpan}
+     * quants (32, 16, or 0 for none; Q8_K activations only), one token per {@link CpuParallel} index (each writes
+     * only its own lanes).
      */
-    static TokenTiles tokenTiles(CpuVecDot.QuantizedActivations[] x, int nTokens) {
-        final TokenTiles tiles = new TokenTiles(nTokens, x[0].n, x[0].d.length, x[0].bsums != null);
+    static TokenTiles tokenTiles(CpuVecDot.QuantizedActivations[] x, int nTokens, int groupSpan) {
+        if ((groupSpan != 0 && groupSpan != 16 && groupSpan != 32) || (groupSpan != 0 && x[0].bsums == null)) {
+            throw new IllegalArgumentException("group sums over " + groupSpan + " quants of " + x[0].type);
+        }
+        final TokenTiles tiles = new TokenTiles(nTokens, x[0].n, x[0].d.length, groupSpan);
         CpuParallel.parallelFor(nTokens, Math.max(1, (1 << 16) / Math.max(1, x[0].n)), (from, to) -> {
             for (int t = from; t < to; t++) {
                 tiles.put(t, x[t]);
@@ -248,14 +294,6 @@ final class SimdI8 {
             throw new IllegalArgumentException("token start " + tokenStart + " is not a multiple of the "
                     + TILE_TOKENS + "-token tile");
         }
-    }
-
-    /**
-     * The int16 element pair {@code pair} (low half: the even element) broadcast to every int lane, as sixteen
-     * short lanes: the weight operand of the token-tile kernels.
-     */
-    static ShortVector broadcastPair(int pair) {
-        return IntVector.broadcast(I8, pair).reinterpretAsShorts();
     }
 
     /** The calling thread's {@code rows} widened weight rows of {@code pairs} int16 element pairs each. */
@@ -434,13 +472,6 @@ final class SimdI8 {
         return buf;
     }
 
-    /** The pairwise sums of the sixteen int16 products of {@code p} in eight int lanes ({@link #pairSum} of 0). */
-    static IntVector pairs(ShortVector p) {
-        final IntVector lanes = (IntVector) p.reinterpretShape(I8, 0);
-        return lanes.lanewise(VectorOperators.LSHL, 16).lanewise(VectorOperators.ASHR, 16)
-                .add(lanes.lanewise(VectorOperators.ASHR, 16));
-    }
-
     /**
      * {@code acc} plus the pairwise sums of the sixteen int16 products of {@code p}: the products live in the
      * low and high halves of the eight int lanes after the bitcast, so the sign-extended halves are the pairs
@@ -488,22 +519,5 @@ final class SimdI8 {
     /** Horizontal int sum of one accumulator vector. */
     static int sum(IntVector acc) {
         return acc.reduceLanes(VectorOperators.ADD);
-    }
-
-    /**
-     * The fifth bits of a Q5 block, as {@code 0} or {@code 16} per lane, from the 32-bit {@code qh} word
-     * broadcast over every lane: lane {@code j} of group {@code p} tests bit {@code 8p + j}, so the group
-     * shifts {@code qh} by the constant {@code 8p} and masks with {@link #BIT8}, saturates the masked power
-     * of two to one and scales it to the fifth bit's place.
-     * <p>
-     * Every operand here is a constant or a lane-wise arithmetic, the forms the JIT intrinsifies. A shift by
-     * a vector of per-lane counts ({@code lanewise(LSHR, ramp.add(8p))}), which reads more directly, is not:
-     * it ran the allocating template, 5120 bytes per 2560-element row.
-     */
-    static IntVector fifthBits(IntVector qh, int p) {
-        return qh.lanewise(VectorOperators.LSHR, 8 * p)
-                .and(BIT8)
-                .lanewise(VectorOperators.MIN, ONE)
-                .lanewise(VectorOperators.LSHL, 4);
     }
 }

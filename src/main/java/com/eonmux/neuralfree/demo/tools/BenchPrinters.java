@@ -37,9 +37,10 @@ final class BenchPrinters {
 
     /**
      * The printer of a format writing to {@code out}; {@code none} returns null like the reference's
-     * {@code create_printer}.
+     * {@code create_printer}. {@code cpuKernels} is the CPU kernel line the Markdown header names above its table
+     * ({@code CpuSimd.status()}); the machine formats keep the reference's records.
      */
-    static BenchPrinter create(BenchOutput format, Appendable out, BenchGrid grid) {
+    static BenchPrinter create(BenchOutput format, Appendable out, BenchGrid grid, String cpuKernels) {
         switch (format) {
             case NONE:
                 return null;
@@ -50,7 +51,7 @@ final class BenchPrinters {
             case JSONL:
                 return new JsonlPrinter(out);
             case MARKDOWN:
-                return new MarkdownPrinter(out, grid);
+                return new MarkdownPrinter(out, grid, cpuKernels);
             case SQL:
                 return new SqlPrinter(out);
             default:
@@ -197,11 +198,13 @@ final class BenchPrinters {
 
         private final Appendable out;
         private final BenchGrid grid;
+        private final String cpuKernels;
         private final List<String> columns;
 
-        MarkdownPrinter(Appendable out, BenchGrid grid) {
+        MarkdownPrinter(Appendable out, BenchGrid grid, String cpuKernels) {
             this.out = out;
             this.grid = grid;
+            this.cpuKernels = java.util.Objects.requireNonNull(cpuKernels, "cpuKernels");
             this.columns = columns();
         }
 
@@ -426,8 +429,10 @@ final class BenchPrinters {
             return String.format(java.util.Locale.ROOT, "%.2f B", n / 1e9);
         }
 
+        /** The CPU kernel line, then a blank line and the table's column names and alignment row. */
         @Override
         public void printHeader(BenchGrid g) throws IOException {
+            out.append("CPU kernels: ").append(cpuKernels).append("\n\n");
             out.append("|");
             for (String field : columns) {
                 out.append(" ").append(pad(displayName(field), width(field))).append(" |");

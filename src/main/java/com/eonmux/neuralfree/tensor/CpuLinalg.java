@@ -1,5 +1,7 @@
 package com.eonmux.neuralfree.tensor;
 
+import com.eonmux.neuralfree.gguf.cpu.ops.CpuParallel;
+
 import java.util.Arrays;
 
 /**
@@ -8,6 +10,9 @@ import java.util.Arrays;
  * FLOAT64 operands are multiplied by {@link CpuFloat64}.
  */
 final class CpuLinalg {
+
+    /** Multiply-adds one parallel range of output rows covers at least: below it the pool's hand-off dominates. */
+    static final long ROW_GRAIN_MACS = 1L << 16;
 
     private CpuLinalg() {
     }
@@ -179,18 +184,32 @@ final class CpuLinalg {
         return CpuShapeOps.floats(a.backend(), Shape.matrix(m, n), result, false);
     }
 
-    /** Row-major {@code [m, k] @ [k, n]} at the given element offsets into {@code c}. */
+    /**
+     * Row-major {@code [m, k] @ [k, n]} at the given element offsets into {@code c}, whose output rows must hold
+     * zeros. Each output row adds the products of {@code a}'s row with the rows of {@code b} in ascending {@code k}
+     * (the i-k-j order, so the inner loop streams a row of {@code b} and a row of {@code c} with unit stride); every
+     * element still receives its K products one rounded add at a time in ascending {@code k} from {@code 0.0f}, the
+     * values of the dot-product order. Rows are spread over the CPU pool in ranges of about
+     * {@value #ROW_GRAIN_MACS} multiply-adds, and a row is written by one thread only, so the result does not
+     * depend on the thread count.
+     */
     private static void multiply(float[] a, int offsetA, float[] b, int offsetB, float[] c, int offsetC,
                                  int m, int n, int k) {
-        for (int i = 0; i < m; i++) {
-            for (int j = 0; j < n; j++) {
-                float sum = 0.0f;
+        final long rowMacs = Math.max(1L, (long) n * k);
+        final int grain = (int) Math.max(1L, Math.min(m, ROW_GRAIN_MACS / rowMacs));
+        CpuParallel.parallelFor(m, grain, (from, to) -> {
+            for (int i = from; i < to; i++) {
+                final int ci = offsetC + i * n;
+                final int ai = offsetA + i * k;
                 for (int kk = 0; kk < k; kk++) {
-                    sum += a[offsetA + i * k + kk] * b[offsetB + kk * n + j];
+                    final float aik = a[ai + kk];
+                    final int bk = offsetB + kk * n;
+                    for (int j = 0; j < n; j++) {
+                        c[ci + j] += aik * b[bk + j];
+                    }
                 }
-                c[offsetC + i * n + j] = sum;
             }
-        }
+        });
     }
 
     static int[] getBatchDims(Shape shape) {

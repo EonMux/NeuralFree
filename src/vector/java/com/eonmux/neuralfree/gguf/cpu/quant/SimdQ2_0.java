@@ -71,9 +71,9 @@ public final class SimdQ2_0 implements CpuVecDot {
                     final int chunk = (int) (codes >>> (16 * h)) & 0xFFFF;
                     final IntVector code = IntVector.broadcast(SimdI8.I8, chunk)
                             .lanewise(VectorOperators.LSHR, SHIFTS).and(3).sub(1);
-                    acc = acc.add(IntVector.fromArray(SimdI8.I8, yw, o + 8 * h).mul(code));
+                    acc = IntVector.fromArray(SimdI8.I8, yw, o + 8 * h).mul(code).add(acc);
                 }
-                sumi += yd[q8Block] * SimdI8.sum(acc);
+                sumi += yd[q8Block] * ((IntVector) acc.check(SimdI8.I8)).reduceLanes(VectorOperators.ADD);
             }
             sumf += d0 * sumi;
         }

@@ -2,11 +2,12 @@
 # linked without it. For a command that runs the engine in this JVM the module is resolved at start-up, so the
 # launcher need not relaunch itself to add it: when the runtime's release file ($JAVA_HOME/release, or the one two
 # directories above the resolved java executable) names Java 17 or later and, where it lists the image's modules,
-# names jdk.incubator.vector among them. The other commands (serve, run-batch, chat, complete, version, help,
-# cache-list, collect-env, --list-devices) never load the CPU kernels here and start without it.
+# names jdk.incubator.vector among them. collect-env resolves it too, since it reports the CPU kernels the engine
+# commands select. The other commands (serve, run-batch, chat, complete, version, help, cache-list, --list-devices)
+# never load the CPU kernels here and start without it.
 case ${1-} in
     ''|serve|--serve|server|--server|run-batch|--run-batch|chat|--chat|complete|--complete|version|--version|\
-    help|--help|-h|cache-list|--cache-list|-cl|collect-env|--collect-env|--list-devices)
+    help|--help|-h|cache-list|--cache-list|-cl|--list-devices)
         NEURALFREE_VECTOR_COMMAND= ;;
     *)
         NEURALFREE_VECTOR_COMMAND=1 ;;

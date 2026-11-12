@@ -4,9 +4,9 @@ package com.eonmux.neuralfree.gguf.cpu.quant;
  * The float primitives of the CPU attention core ({@code CpuAttentionCore}): the query-key dot products of a group
  * of keys against the query heads of a work unit laid out as lanes, and the weighted accumulation of a value row.
  *
- * <p>{@link ScalarAttnKernels} is the reference implementation, and the kernels the engine runs by default.
- * {@link CpuSimd#attention()} serves the Vector API kernels of {@code SimdAttnKernels} instead when
- * {@value CpuSimd#PROP_ATTENTION} is {@code true} and the JVM offers them. Every kernel returns exactly the scalar
+ * <p>{@link ScalarAttnKernels} is the reference implementation. {@link CpuSimd#attention()} serves the Vector API
+ * kernels of {@code SimdAttnKernels} instead wherever the JVM offers them, unless {@value CpuSimd#PROP_ATTENTION} is
+ * {@code false}. Every kernel returns exactly the scalar
  * result, so selection changes speed only: each lane of a dot is its own sum over the head dimension in ascending
  * order, a rounded product then a rounded add per step, which is the scalar loop {@code dot += q[d] * k[d]}; the
  * vector form runs lanes (query heads) and keys side by side, never reassociating one lane's sum.</p>

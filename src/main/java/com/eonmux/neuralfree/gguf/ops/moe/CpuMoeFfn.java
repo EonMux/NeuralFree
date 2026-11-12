@@ -317,6 +317,20 @@ public final class CpuMoeFfn implements CpuFfnBlock {
 
     // ================================================================== forward
 
+    /**
+     * Routing, the expert products and the weighted sum act on each token row alone (a router or expert input read
+     * from the residual stream reads the same row of it), unless the layer routes by a step-wide table or reads the
+     * layer input kept before the attention: hash routing reads the step's token ids and media routing its
+     * embedding-row flags by step row ({@link MoeSpec#mediaRouting()}), and the kept layer input holds every row of
+     * the step in step order, so a subset of the rows would route or norm with the inputs of other rows. False
+     * before {@link #bind}.
+     */
+    @Override
+    public boolean rowLocal() {
+        return wiring != null && !spec.mediaRouting() && wiring.router != MoeBlocks.RouterInput.LAYER_INPUT
+                && wiring.experts != MoeBlocks.ExpertInput.NORM_EXPS_OF_LAYER_INPUT;
+    }
+
     @Override
     public void forward(int n, float[] in, float[] out) {
         if (ctx == null) {

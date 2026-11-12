@@ -18,20 +18,21 @@ import java.util.concurrent.atomic.AtomicInteger;
  * threads are daemons named {@code nf-cpu-N}.
  * Loops called from a pool worker run on the same pool (work stealing), so nesting does not deadlock.
  *
- * <p>A loop called from outside the pool runs on a {@link SpinTeam} of the same size, whose workers spin up to
- * {@value #SPIN_PROPERTY} microseconds for the next loop before they park (default {@value #DEFAULT_SPIN_US}; 0,
- * which leaves every loop to the fork/join pool, for a pool larger than the available processors): a decode step is
- * hundreds of short loops, and each fork/join entry would otherwise wake parked workers. The caller works as one of
- * its members, except under NUMA placement, where every member is a pinned worker. Callers on several threads share
- * the team: two loops run on its threads at once, and a further caller waits for one. A loop nested in a team loop
- * runs inline when the outer loop already has a chunk for every member, and on the fork/join pool otherwise. The team
- * runs the same index ranges as the fork/join form; {@code neuralfree.cpu.spin.us=0} keeps every loop on the
- * fork/join pool.
+ * <p>A loop called from outside the pool runs on a {@link SpinTeam} of the same size, whose workers spin up to {@value
+ * #SPIN_PROPERTY} microseconds for the next loop before they park (default {@value #DEFAULT_SPIN_US}; 0, which leaves
+ * every loop to the fork/join pool, for a pool larger than the available processors): a decode step is hundreds of
+ * short loops, and each fork/join entry would otherwise wake parked workers. The caller works as one of its members,
+ * except under an active placement (NUMA or a pinned CPU set), where every member is a pinned worker. Callers on
+ * several threads share the team: two loops run on its threads at once, and a further caller waits for one. A loop
+ * nested in a team loop runs inline when the outer loop already has a chunk for every member, and on the fork/join pool
+ * otherwise. The team runs the same index ranges as the fork/join form; {@code neuralfree.cpu.spin.us=0} keeps every
+ * loop on the fork/join pool.
  *
  * <p>When {@value com.eonmux.neuralfree.gguf.cpu.numa.NumaStrategy#PROPERTY} selects a NUMA strategy and
  * the host has more than one node, worker {@code N} pins itself to its node's CPUs when it starts
- * ({@link NumaPlacement}); the pool is created on first use, so the strategy must be set before that, as
- * the demos and the server do before they open a model.
+ * ({@link NumaPlacement}); otherwise {@value com.eonmux.neuralfree.gguf.cpu.numa.NumaPlacement#PIN_PROPERTY}
+ * restricts every worker to one CPU set. The pool is created on first use, so the properties must be set before
+ * that, as the demos and the server do before they open a model.
  */
 public final class CpuParallel {
 
@@ -198,7 +199,7 @@ public final class CpuParallel {
         return new ForkJoinPool(threads, factory, null, false);
     }
 
-    /** A pool worker that pins itself to its NUMA node's CPUs once the pool starts it. */
+    /** A pool worker that pins itself to its placement's CPUs once the pool starts it. */
     private static final class NumaWorkerThread extends ForkJoinWorkerThread {
         private final NumaPlacement placement;
         private final int workerIndex;

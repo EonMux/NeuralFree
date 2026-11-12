@@ -15,6 +15,8 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertEquals;
@@ -30,7 +32,8 @@ import static org.junit.Assert.assertTrue;
  * the module itself. Otherwise the options stay as they are: on an older or unknown runtime the option would be an
  * error, and on an image linked without the module the JVM would not start. The generated start script
  * ({@code testStartScripts}, the build's {@code startScripts} over an empty class path) is run end to end with a stub
- * {@code java}, so the snippet's place in it is checked too.
+ * {@code java}, so the snippet's place in it is checked too. The Windows snippet ({@code vector-module.bat}) cannot run
+ * here; its list of the arguments that start without the module is checked against the same rule.
  */
 public class StartScriptVectorModuleTest {
 
@@ -44,14 +47,52 @@ public class StartScriptVectorModuleTest {
     public final TemporaryFolder tmp = new TemporaryFolder();
 
     private static Path snippet() {
+        return snippet("vector-module.sh");
+    }
+
+    /** The start-script snippet {@code gradle/start-scripts/<name>} of the source tree above the working directory. */
+    private static Path snippet(String name) {
         Path dir = Paths.get(System.getProperty("user.dir")).toAbsolutePath();
         for (Path d = dir; d != null; d = d.getParent()) {
-            Path file = d.resolve("gradle/start-scripts/vector-module.sh");
+            Path file = d.resolve("gradle/start-scripts/" + name);
             if (Files.isRegularFile(file)) {
                 return file;
             }
         }
-        throw new IllegalStateException("gradle/start-scripts/vector-module.sh not found above " + dir);
+        throw new IllegalStateException("gradle/start-scripts/" + name + " not found above " + dir);
+    }
+
+    /**
+     * Every first argument the launcher routes whose JVM starts without the module: the spellings (name, aliases and
+     * their {@code --} forms) of the commands that do not run the engine in the launcher's JVM, the flags that act
+     * and exit, and no argument at all.
+     */
+    private static Set<String> argumentsWithoutTheModule() {
+        Set<String> without = new TreeSet<>();
+        for (Launcher.Command c : Launcher.COMMANDS) {
+            if (!Launcher.runsEngineInProcess(c)) {
+                for (String s : spellings(c)) {
+                    without.add(s);
+                }
+            }
+        }
+        without.addAll(Launcher.VERSION_FLAGS);
+        without.addAll(Launcher.LIST_DEVICES_FLAGS);
+        without.addAll(Launcher.CACHE_LIST_FLAGS);
+        without.addAll(Launcher.HELP_FLAGS);
+        without.add("");
+        return without;
+    }
+
+    /** A command's name and aliases, each also with a {@code --} prefix. */
+    private static List<String> spellings(Launcher.Command c) {
+        List<String> spellings = new ArrayList<>();
+        spellings.add(c.name());
+        spellings.addAll(c.aliases());
+        for (String s : new ArrayList<>(spellings)) {
+            spellings.add("--" + s);
+        }
+        return spellings;
     }
 
     /**
@@ -162,14 +203,8 @@ public class StartScriptVectorModuleTest {
         Path home = jdk("jdk21", "\"21\"");
         String java = home.resolve("bin/java").toString();
         for (Launcher.Command c : Launcher.COMMANDS) {
-            List<String> spellings = new ArrayList<>();
-            spellings.add(c.name());
-            spellings.addAll(c.aliases());
-            for (String s : new ArrayList<>(spellings)) {
-                spellings.add("--" + s);
-            }
             String expected = Launcher.runsEngineInProcess(c) ? WITH_MODULE : OPTS;
-            for (String s : spellings) {
+            for (String s : spellings(c)) {
                 assertEquals(s, expected, run(home, java, s, "--model", "m.gguf"));
             }
         }
@@ -182,6 +217,42 @@ public class StartScriptVectorModuleTest {
             assertEquals(flag, OPTS, run(home, java, flag));
         }
         assertEquals("no argument runs the help", OPTS, run(home, java));
+    }
+
+    /**
+     * {@code collect-env} reports the CPU kernels the engine commands select, so it starts with the module as they do;
+     * started without it, it could only ever report the scalar kernels.
+     */
+    @Test
+    public void collectEnvResolvesTheModuleLikeTheEngineCommands() throws Exception {
+        Assume.assumeTrue(Platform.isLinux() || Platform.isMac());
+        Path home = jdk("jdk21", "\"21\"");
+        String java = home.resolve("bin/java").toString();
+        assertEquals(WITH_MODULE, run(home, java, "collect-env"));
+        assertEquals(WITH_MODULE, run(home, java, "--collect-env"));
+        assertEquals(OPTS, run(home, java, "version"));
+    }
+
+    /**
+     * The Windows snippet ({@code vector-module.bat}) starts without the module exactly the first arguments the Unix
+     * snippet and the launcher start without it: its one list of such arguments names them all and nothing else.
+     */
+    @Test
+    public void theWindowsSnippetListsExactlyTheArgumentsThatStartWithoutTheModule() throws Exception {
+        List<String> lines = Files.readAllLines(snippet("vector-module.bat"), StandardCharsets.US_ASCII);
+        List<String> lists = new ArrayList<>();
+        for (String line : lines) {
+            if (line.startsWith("for %%c in (") && line.contains("NEURALFREE_VECTOR_COMMAND=")) {
+                lists.add(line.substring("for %%c in (".length(), line.indexOf(") do ")));
+            }
+        }
+        assertEquals("one argument list: " + lines, 1, lists.size());
+        Set<String> listed = new TreeSet<>();
+        for (String word : lists.get(0).trim().split(" +")) {
+            listed.add(word.equals("\"\"") ? "" : word);
+        }
+        assertEquals(argumentsWithoutTheModule(), listed);
+        assertFalse("collect-env reports the engine's kernels", listed.contains("collect-env"));
     }
 
     /** The generated Unix start script, or a skipped test outside the Gradle build that generates it. */
@@ -223,6 +294,8 @@ public class StartScriptVectorModuleTest {
                 bench.indexOf(JvmVectorModule.OPTION) < bench.indexOf("-classpath"));
         assertTrue(bench.toString(), bench.contains("-Xmx4g"));
         assertFalse("version starts without it", launch(script, home, null, "version")
+                .contains(JvmVectorModule.OPTION));
+        assertTrue("collect-env starts with it", launch(script, home, null, "collect-env")
                 .contains(JvmVectorModule.OPTION));
         Path linked = runtime("jlinked", "JAVA_VERSION=\"21.0.2\"", "MODULES=\"java.base java.logging\"");
         assertFalse("an image without the module", launch(script, linked, null, "bench")

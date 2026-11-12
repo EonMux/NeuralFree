@@ -26,7 +26,9 @@ import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.longAt;
  * the mins sum over {@code bsums} and the float combination follow {@code ggml_vec_dot_q5_K_q8_K_generic}, so
  * the kernel returns what {@link KQuantVecDot#Q5_K} returns.
  *
- * <p>The batched product ({@link #dotTiles}) serves eight tokens from one unpack of the super-block.
+ * <p>The batched product ({@link SimdKTiles}, form {@link SimdKTiles.Form#MINS_32_FOLD_8}) unpacks each weight row
+ * once and multiplies it with interleaved tiles of eight tokens, one int lane per token. The vector code keeps the
+ * rules of {@link SimdI8}.
  * Immutable, stateless and thread-safe.</p>
  */
 public final class SimdQ5_K implements CpuVecDot {
@@ -34,14 +36,11 @@ public final class SimdQ5_K implements CpuVecDot {
     /** The Q5_K vec-dot. */
     public static final SimdQ5_K INSTANCE = new SimdQ5_K();
 
-    /** Tokens one pass of the batched kernel decodes a weight super-block for. */
-    private static final int TOKENS = 8;
+    /** The sub-block structure of the token-tile product. */
+    private static final SimdKTiles.Form FORM = SimdKTiles.Form.MINS_32_FOLD_8;
 
     /** {@code 0x01} in every byte. */
     private static final long BYTE_ONES = 0x0101010101010101L;
-
-    /** Number of {@code bsums} entries per Q8_K block (one per 16 quants). */
-    private static final int BSUMS_PER_BLOCK = QK_K / 16;
 
     private SimdQ5_K() {
     }
@@ -60,7 +59,15 @@ public final class SimdQ5_K implements CpuVecDot {
     @Override
     public void dotRows(CpuTensorRef w, long rowStart, int rowCount, QuantizedActivations x, float[] y, int yOff) {
         check(w, x);
-        CpuVecDotRows.forEachRowBytes(w, rowStart, rowCount, this, x, y, yOff);
+        CpuVecDotRows.check(w, rowStart, rowCount, y, yOff);
+        final short[] ys = SimdI8.activationsShort(x);
+        final short[] pairs = SimdI8.bsumPairs(x);
+        final byte[] buf = CpuVecDotRows.buffer(w);
+        final CpuVecDotRows.RowReader rows = CpuVecDotRows.reader(w);
+        for (int r = 0; r < rowCount; r++) {
+            rows.copy(rowStart + r, buf);
+            y[yOff + r] = dot(buf, 0, x, ys, pairs);
+        }
     }
 
     private static void check(CpuTensorRef w, QuantizedActivations x) {
@@ -81,61 +88,71 @@ public final class SimdQ5_K implements CpuVecDot {
             return;
         }
         checkTiles(w, rowStart, rowCount, x, nTokens, y, yOff, yStride);
-        final short[][] ys = SimdI8.activationsAllShort(x, nTokens);
-        final short[][] pairs = SimdI8.bsumPairs(x, nTokens);
-        final byte[] row = CpuVecDotRows.buffer(w);
-        final float[] acc = SimdI8.tileAccumulators(2 * TOKENS);
-        final int nb = x[0].n / QK_K;
-        for (int r = 0; r < rowCount; r++) {
-            CpuVecDotRows.copyRow(w, rowStart + r, row);
-            dotRowTokens(row, x, nTokens, ys, pairs, nb, y, yOff + r, yStride, acc);
-        }
+        SimdKTiles.product(w, rowStart, rowCount, SimdI8.tokenTiles(x, nTokens, SimdKTiles.groupSpan(FORM)), 0,
+                nTokens, y, yOff, yStride, FORM, SimdQ5_K::unpackRow);
     }
 
-    /** One weight row against {@code nTokens} activation rows, {@link #TOKENS} tokens at a time. */
-    private static void dotRowTokens(byte[] b, QuantizedActivations[] x, int nTokens, short[][] ys,
-                                     short[][] pairs, int nb, float[] y, int y0, int yStride, float[] acc) {
+    @Override
+    public TileActivations prepareTiles(QuantizedActivations[] x, int nTokens) {
+        SimdI8.checkTileTokens(x, nTokens, GGMLType.Q8_K);
+        return nTokens == 0 ? null : SimdI8.tokenTiles(x, nTokens, SimdKTiles.groupSpan(FORM));
+    }
+
+    /**
+     * Token panels of whole pairs of 8-token tiles: a panel of a wide row (9728 columns) then holds 16 tokens
+     * instead of a single tile, so each weight row a task decodes serves twice the tokens.
+     */
+    @Override
+    public int tilePanelTokens() {
+        return 2 * SimdI8.TILE_TOKENS;
+    }
+
+    @Override
+    public int tileTokens() {
+        return SimdI8.TILE_TOKENS;
+    }
+
+    @Override
+    public void dotTiles(CpuTensorRef w, long rowStart, int rowCount, TileActivations tiles,
+                         QuantizedActivations[] x, int tokenStart, int nTokens, float[] y, int yOff, int yStride) {
+        if (!(tiles instanceof SimdI8.TokenTiles)) {
+            CpuVecDot.super.dotTiles(w, rowStart, rowCount, tiles, x, tokenStart, nTokens, y, yOff, yStride);
+            return;
+        }
+        SimdKTiles.checkedProduct(w, GGMLType.Q5_K, rowStart, rowCount, (SimdI8.TokenTiles) tiles, tokenStart,
+                nTokens, y, yOff, yStride, FORM, SimdQ5_K::unpackRow);
+    }
+
+    /**
+     * One row's quants as int16 element pairs, its 6-bit sub-block scales and mins, and {@code d} / {@code dmin}
+     * ({@link SimdKTiles.Rows}).
+     */
+    private static void unpackRow(byte[] b, int nb, int[] pairs, int[] scales, int[] mins, float[] d) {
         final byte[] sm = Q8VecDot.scratch().scales;
         final byte[] q = Q8VecDot.scratch().quants;
-        for (int t0 = 0; t0 < nTokens; t0 += TOKENS) {
-            final int n = Math.min(TOKENS, nTokens - t0);
-            java.util.Arrays.fill(acc, 0, 2 * TOKENS, 0.0f);
-            int o = 0;
-            for (int i = 0; i < nb; i++, o += Q5_K_BYTES) {
-                unpack(b, o, q);
-                KQuantVecDot.unpackScalesMins(b, o + Q5_K_SCALES, sm);
-                final int xo = i * QK_K;
-                final float d = fp16At(b, o + Q5_K_D);
-                final float dmin = fp16At(b, o + Q5_K_DMIN);
-                for (int ti = 0; ti < n; ti++) {
-                    final short[] a = ys[t0 + ti];
-                    IntVector sum = SimdI8.zero(SimdI8.I8);
-                    for (int g = 0; g < QK_K / 32; g++) {
-                        final ShortVector lo = (ShortVector) ByteVector.fromArray(SimdI8.B16, q, 32 * g)
-                                .convertShape(VectorOperators.B2S, SimdI8.S16, 0);
-                        final ShortVector hi = (ShortVector) ByteVector.fromArray(SimdI8.B16, q, 32 * g + 16)
-                                .convertShape(VectorOperators.B2S, SimdI8.S16, 0);
-                        final int yo = xo + 32 * g;
-                        sum = sum.add(SimdI8.pairSum(lo.mul(ShortVector.fromArray(SimdI8.S16, a, yo))
-                                .add(hi.mul(ShortVector.fromArray(SimdI8.S16, a, yo + 16))),
-                                SimdI8.zero(SimdI8.I8)).mul(sm[g]));
-                    }
-                    final float yd = x[t0 + ti].d[i];
-                    acc[ti] += (d * yd) * SimdI8.sum(sum);
-                    acc[TOKENS + ti] -= (dmin * yd) * SimdI8.minsDot(pairs[t0 + ti], i * (QK_K / 32), sm);
-                }
+        int o = 0;
+        for (int i = 0; i < nb; i++, o += Q5_K_BYTES) {
+            unpack(b, o, q);
+            KQuantVecDot.unpackScalesMins(b, o + Q5_K_SCALES, sm);
+            SimdKTiles.packPairs(q, pairs, i * (QK_K / 2));
+            for (int g = 0; g < 8; g++) {
+                scales[8 * i + g] = sm[g];
+                mins[8 * i + g] = sm[8 + g];
             }
-            for (int ti = 0; ti < n; ti++) {
-                y[y0 + (t0 + ti) * yStride] = acc[TOKENS + ti] + acc[ti];
-            }
+            d[2 * i] = fp16At(b, o + Q5_K_D);
+            d[2 * i + 1] = fp16At(b, o + Q5_K_DMIN);
         }
     }
 
     private static float dot(byte[] b, int off, QuantizedActivations x, short[] ys) {
+        return dot(b, off, x, ys, SimdI8.bsumPairs(x));
+    }
+
+    /** One row against {@code x} with its short lanes {@code ys} and group-sum pairs {@code pairs}. */
+    private static float dot(byte[] b, int off, QuantizedActivations x, short[] ys, short[] pairs) {
         final byte[] sm = Q8VecDot.scratch().scales;
         final byte[] q = Q8VecDot.scratch().quants;
         final float[] yd = x.d;
-        final short[] pairs = SimdI8.bsumPairs(x);
         final int nb = x.n / QK_K;
         float sumf = 0;
         float sums = 0;
@@ -143,19 +160,21 @@ public final class SimdQ5_K implements CpuVecDot {
             unpack(b, off, q);
             KQuantVecDot.unpackScalesMins(b, off + Q5_K_SCALES, sm);
             final int xo = i * QK_K;
-            IntVector acc = SimdI8.zero(SimdI8.I8);
+            IntVector acc = IntVector.zero(SimdI8.I8);
             for (int g = 0; g < QK_K / 32; g++) {
+                final int yo = xo + 32 * g;
                 final ShortVector lo = (ShortVector) ByteVector.fromArray(SimdI8.B16, q, 32 * g)
                         .convertShape(VectorOperators.B2S, SimdI8.S16, 0);
                 final ShortVector hi = (ShortVector) ByteVector.fromArray(SimdI8.B16, q, 32 * g + 16)
                         .convertShape(VectorOperators.B2S, SimdI8.S16, 0);
-                final int yo = xo + 32 * g;
-                acc = acc.add(SimdI8.pairSum(lo.mul(ShortVector.fromArray(SimdI8.S16, ys, yo))
-                        .add(hi.mul(ShortVector.fromArray(SimdI8.S16, ys, yo + 16))),
-                        SimdI8.zero(SimdI8.I8)).mul(sm[g]));
+                final IntVector lanes = (IntVector) lo.mul(ShortVector.fromArray(SimdI8.S16, ys, yo))
+                        .add(hi.mul(ShortVector.fromArray(SimdI8.S16, ys, yo + 16)))
+                        .reinterpretShape(SimdI8.I8, 0);
+                acc = lanes.lanewise(VectorOperators.LSHL, 16).lanewise(VectorOperators.ASHR, 16)
+                        .add(lanes.lanewise(VectorOperators.ASHR, 16)).mul(sm[g]).add(acc);
             }
             final float d = fp16At(b, off + Q5_K_D) * yd[i];
-            sums += d * SimdI8.sum(acc);
+            sums += d * ((IntVector) acc.check(SimdI8.I8)).reduceLanes(VectorOperators.ADD);
             final float dmin = fp16At(b, off + Q5_K_DMIN) * yd[i];
             sumf -= dmin * SimdI8.minsDot(pairs, i * (QK_K / 32), sm);
         }

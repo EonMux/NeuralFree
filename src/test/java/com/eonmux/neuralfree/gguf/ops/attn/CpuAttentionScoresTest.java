@@ -230,26 +230,30 @@ public class CpuAttentionScoresTest {
     }
 
     /**
-     * The core runs the scalar kernels unless {@value CpuSimd#PROP_ATTENTION} is {@code true}, which selects the
-     * Vector API kernels where the engine is available; either way its query-block and single-row outputs are those
-     * of the one-pair loop, bit for bit.
+     * The core runs the Vector API kernels wherever the engine is available unless {@value CpuSimd#PROP_ATTENTION}
+     * is {@code false}, and the scalar kernels without the engine; either way its query-block and single-row outputs
+     * are those of the one-pair loop, bit for bit.
      */
     @Test
-    public void theVectorKernelsServeTheCoreOnlyWhenSelectedWithTheSameBits() throws Exception {
+    public void theVectorKernelsServeTheCoreByDefaultWithTheSameBits() throws Exception {
         AttentionKernelProbe.GqaCase c = new AttentionKernelProbe.GqaCase();
         final int want = AttentionKernelProbe.bitsHash(onePairReference(c.q, c.k, c.v, c.nHead, c.nHeadKv, c.dK,
                 c.dV, c.keys, c.nt, c.first, c.scale));
-        String byDefault = AttentionKernelProbe.run();
-        assertTrue(byDefault, byDefault.contains("kernels=" + ScalarAttnKernels.INSTANCE.describe() + "\n"));
-        for (String opt : new String[]{"false", " TRUE "}) {
-            String out = AttentionKernelProbe.run("-D" + CpuSimd.PROP_ATTENTION + "=" + opt);
-            final boolean vector = opt.trim().equalsIgnoreCase("true") && CpuSimd.available();
-            assertEquals(out, vector, out.contains("kernels=vector/"));
+        final String[][] cases = {
+                {},
+                {"-D" + CpuSimd.PROP_ATTENTION + "=false"},
+                {"-D" + CpuSimd.PROP_ATTENTION + "= TRUE "},
+                {"-D" + CpuSimd.PROP_SIMD + "=false"},
+        };
+        final boolean[] vector = {true, false, true, false};
+        for (int i = 0; i < cases.length; i++) {
+            String out = AttentionKernelProbe.run(cases[i]);
+            assertEquals(out, vector[i] && CpuSimd.available(), out.contains("kernels=vector/"));
+            assertEquals(out, !(vector[i] && CpuSimd.available()),
+                    out.contains("kernels=" + ScalarAttnKernels.INSTANCE.describe() + "\n"));
             assertTrue(out, out.contains("blocks=" + want + "\n"));
             assertTrue(out, out.contains("single=" + want + "\n"));
         }
-        assertTrue(byDefault, byDefault.contains("blocks=" + want + "\n"));
-        assertTrue(byDefault, byDefault.contains("single=" + want + "\n"));
     }
 
     /**

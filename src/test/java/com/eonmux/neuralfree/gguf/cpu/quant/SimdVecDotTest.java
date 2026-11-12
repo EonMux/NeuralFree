@@ -36,12 +36,23 @@ import static org.junit.Assert.fail;
  */
 public class SimdVecDotTest {
 
+    /** The kernels with a prepared token-tile layout. */
+    private static final GGMLType[] TILE_TYPES = {
+            GGMLType.Q8_0, GGMLType.Q4_0, GGMLType.Q4_1, GGMLType.Q5_0, GGMLType.Q5_1, GGMLType.IQ4_NL,
+            GGMLType.IQ4_XS, GGMLType.Q2_K, GGMLType.Q3_K, GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.Q6_K,
+            GGMLType.IQ2_XXS, GGMLType.IQ2_XS, GGMLType.IQ2_S, GGMLType.IQ3_XXS, GGMLType.IQ3_S};
+
+    /** The grid-coded i-quants, whose largest magnitudes {@code SimdIqGridTest} covers. */
+    private static final List<GGMLType> GRID_TYPES = Arrays.asList(GGMLType.IQ2_XXS, GGMLType.IQ2_XS,
+            GGMLType.IQ2_S, GGMLType.IQ3_XXS, GGMLType.IQ3_S);
+
     private static final GGMLType[] SIMD_TYPES = {
             GGMLType.Q4_0, GGMLType.Q4_1, GGMLType.Q5_0, GGMLType.Q5_1, GGMLType.Q8_0,
             GGMLType.Q2_K, GGMLType.Q3_K, GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.Q6_K,
             GGMLType.F32, GGMLType.F16, GGMLType.BF16, GGMLType.IQ4_NL, GGMLType.IQ4_XS,
             GGMLType.TQ1_0, GGMLType.TQ2_0, GGMLType.Q1_0, GGMLType.Q2_0, GGMLType.MXFP4,
-            GGMLType.I8_B128, GGMLType.NF4, GGMLType.FP4_BNB,
+            GGMLType.I8_B128, GGMLType.NF4, GGMLType.FP4_BNB, GGMLType.IQ2_XXS, GGMLType.IQ2_XS, GGMLType.IQ2_S,
+            GGMLType.IQ3_XXS, GGMLType.IQ3_S,
     };
 
     /** The scalar kernel of {@code t}, the reference the Vector API kernel must match exactly. */
@@ -100,6 +111,16 @@ public class SimdVecDotTest {
                 return new int[]{BlockLayout.IQ4_NL_D};
             case IQ4_XS:
                 return new int[]{BlockLayout.IQ4_XS_D};
+            case IQ2_XXS:
+                return new int[]{BlockLayout.IQ2_XXS_D};
+            case IQ2_XS:
+                return new int[]{BlockLayout.IQ2_XS_D};
+            case IQ2_S:
+                return new int[]{BlockLayout.IQ2_S_D};
+            case IQ3_XXS:
+                return new int[]{BlockLayout.IQ3_XXS_D};
+            case IQ3_S:
+                return new int[]{BlockLayout.IQ3_S_D};
             case MXFP4:
                 return new int[0];
             case TQ1_0:
@@ -234,6 +255,40 @@ public class SimdVecDotTest {
         }
     }
 
+    /**
+     * The float types' token tiles (in registers for one tile, from a widened float row for two or more) return the
+     * single-token kernel's bits over rows whose length leaves a tail past the last group of eight, at every tile
+     * count either side of the switch.
+     */
+    @Test
+    public void floatTilesMatchTheRowLoopOverRowTailsAndBothTileForms() {
+        Assume.assumeTrue(CpuSimd.available());
+        Random rnd = new Random(0xF7A1);
+        final int rows = 3;
+        for (GGMLType t : new GGMLType[]{GGMLType.F32, GGMLType.F16, GGMLType.BF16}) {
+            CpuVecDot simd = CpuSimd.vecDot(t);
+            for (int cols : new int[]{7, 13, 523}) {
+                CpuTensorRef w = CpuTensorRef.of(t, randomRows(t, rows, cols, rnd), rows, cols);
+                for (int nTokens : new int[]{8, 9, 15, 16, 17, 24}) {
+                    QuantizedActivations[] acts = new QuantizedActivations[nTokens];
+                    float[][] expected = new float[nTokens][rows];
+                    for (int tok = 0; tok < nTokens; tok++) {
+                        acts[tok] = CpuActivationQuantizer.quantizeFor(t, gaussian(cols, rnd), 0, cols);
+                        simd.dotRows(w, 0, rows, acts[tok], expected[tok], 0);
+                    }
+                    float[] y = new float[nTokens * rows];
+                    simd.dotTiles(w, 0, rows, acts, nTokens, y, 0, rows);
+                    for (int tok = 0; tok < nTokens; tok++) {
+                        for (int r = 0; r < rows; r++) {
+                            assertEquals(t + " " + cols + " columns, " + nTokens + " tokens, token " + tok + ", row "
+                                    + r, expected[tok][r], y[tok * rows + r], 0f);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     @Test
     public void tiledProductMatchesTheRowLoopOverRemainderRowsAndTokenTiles() {
         Assume.assumeTrue(CpuSimd.available());
@@ -267,9 +322,9 @@ public class SimdVecDotTest {
     }
 
     /**
-     * The prepared layout of the token-tile kernels (Q8_0, Q4_K, Q6_K) is built once and serves every tile-aligned
-     * token range and every row range with the row loop's values, a null layout falls back to the activation rows,
-     * and misaligned starts or a layout of another width are rejected by name.
+     * The prepared layout of the token-tile kernels (the 32-element block types, IQ4_XS and the K-quants) is built once
+     * and serves every tile-aligned token range and every row range with the row loop's values, a null layout falls
+     * back to the activation rows, and misaligned starts or a layout of another width are rejected by name.
      */
     @Test
     public void preparedTilesServeEveryTileStartWithTheRowLoopsValues() {
@@ -278,7 +333,7 @@ public class SimdVecDotTest {
         final int rows = 5;
         final int cols = 512;
         final int nTokens = 21;
-        for (GGMLType t : new GGMLType[]{GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K}) {
+        for (GGMLType t : TILE_TYPES) {
             CpuTensorRef w = CpuTensorRef.of(t, randomRows(t, rows, cols, rnd), rows, cols);
             CpuVecDot simd = CpuSimd.vecDot(t);
             QuantizedActivations[] acts = new QuantizedActivations[nTokens];
@@ -327,10 +382,14 @@ public class SimdVecDotTest {
 
     /**
      * The batched kernels at the largest quant and scale magnitudes the formats hold, against same-signed
-     * activations near the largest quant magnitude: the Q8_0 float tiles' block sums reach {@code 32 * 128 * 127},
-     * below the {@code 2^19} bound that keeps them exact in a float, and the Q4_K and Q6_K int16 tiles' products and
-     * integer sums reach their largest values. The batched product must equal the scalar kernel for every row and
-     * token.
+     * activations near the largest quant magnitude: the float tiles' block sums reach {@code 32 * 128 * 127} for
+     * Q8_0 and {@code 32 * 127 * 128} for the IQ4 codebook value -127, below the {@code 2^19} bound that keeps them
+     * exact in a float (Q4_0 -8, Q4_1 15, Q5_0 -16, Q5_1 31 and IQ4_XS's sub-block scale -32 with them), and the
+     * K-quant int16 tiles' products and short lane sums reach their largest values (Q4_K sixteen products of 15,
+     * Q5_K eight of 31, Q6_K four of -32, Q3_K four of -4 with the scale -32, Q2_K four of 3 with the 4-bit scale
+     * and min 15). The single-token kernels' int16 lanes meet the same quants: two products of a 5-bit quant and an
+     * int8 activation share a short lane in Q5_0 and Q5_1. The batched product and the single-token row loop must
+     * equal the scalar kernel for every row and token.
      */
     @Test
     public void batchedKernelsAtTheLargestMagnitudesMatchTheScalarKernels() {
@@ -339,7 +398,10 @@ public class SimdVecDotTest {
         final int cols = 512;
         final int nTokens = 11;
         Random rnd = new Random(0xB16);
-        for (GGMLType t : new GGMLType[]{GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K}) {
+        for (GGMLType t : TILE_TYPES) {
+            if (GRID_TYPES.contains(t)) {
+                continue;
+            }
             ByteBuffer data = randomRows(t, rows, cols, rnd);
             byte[] raw = data.array();
             BlockLayout layout = BlockLayout.of(t);
@@ -350,8 +412,26 @@ public class SimdVecDotTest {
                 }
                 if (t == GGMLType.Q8_0) {
                     Arrays.fill(raw, o + BlockLayout.Q8_0_QS, o + BlockLayout.Q8_0_BYTES, (byte) -128);
+                } else if (t == GGMLType.Q4_0) {
+                    Arrays.fill(raw, o + BlockLayout.Q4_0_QS, o + BlockLayout.Q4_0_BYTES, (byte) 0);
+                } else if (t == GGMLType.Q4_1) {
+                    Arrays.fill(raw, o + BlockLayout.Q4_1_QS, o + BlockLayout.Q4_1_BYTES, (byte) -1);
+                } else if (t == GGMLType.Q5_0) {
+                    Arrays.fill(raw, o + BlockLayout.Q5_0_QH, o + BlockLayout.Q5_0_BYTES, (byte) 0);
+                } else if (t == GGMLType.Q5_1) {
+                    Arrays.fill(raw, o + BlockLayout.Q5_1_QH, o + BlockLayout.Q5_1_BYTES, (byte) -1);
+                } else if (t == GGMLType.IQ4_NL) {
+                    Arrays.fill(raw, o + BlockLayout.IQ4_NL_QS, o + BlockLayout.IQ4_NL_BYTES, (byte) 0);
+                } else if (t == GGMLType.IQ4_XS) {
+                    Arrays.fill(raw, o + BlockLayout.IQ4_XS_SCALES_H, o + BlockLayout.IQ4_XS_BYTES, (byte) 0);
                 } else if (t == GGMLType.Q4_K) {
                     Arrays.fill(raw, o + BlockLayout.Q4_K_SCALES, o + BlockLayout.Q4_K_BYTES, (byte) -1);
+                } else if (t == GGMLType.Q5_K) {
+                    Arrays.fill(raw, o + BlockLayout.Q5_K_SCALES, o + BlockLayout.Q5_K_BYTES, (byte) -1);
+                } else if (t == GGMLType.Q3_K) {
+                    Arrays.fill(raw, o + BlockLayout.Q3_K_HMASK, o + BlockLayout.Q3_K_D, (byte) 0);
+                } else if (t == GGMLType.Q2_K) {
+                    Arrays.fill(raw, o + BlockLayout.Q2_K_SCALES, o + BlockLayout.Q2_K_D, (byte) -1);
                 } else {
                     Arrays.fill(raw, o + BlockLayout.Q6_K_QH, o + BlockLayout.Q6_K_SCALES, (byte) 0);
                     Arrays.fill(raw, o + BlockLayout.Q6_K_SCALES, o + BlockLayout.Q6_K_D, (byte) -127);
@@ -379,6 +459,9 @@ public class SimdVecDotTest {
                 for (int r = 0; r < rows; r++) {
                     assertEquals(t + " token " + tok + ", row " + r, expected[r], y[tok * rows + r], 0f);
                 }
+                float[] single = new float[rows];
+                simd.dotRows(w, 0, rows, acts[tok], single, 0);
+                assertArrayEquals(t + " token " + tok + ": the single-token row loop", expected, single);
             }
         }
     }
@@ -459,8 +542,10 @@ public class SimdVecDotTest {
     }
 
     /**
-     * The prepared token-tile products read rows on both sides of a shard boundary, the boundary inside a two-row
-     * register tile included, with the values of the unsharded tensor.
+     * The token-tile products read rows on both sides of a shard boundary, the boundary inside a two-row register
+     * tile included, with the values of the unsharded tensor: the prepared int16 and float tiles, the float types'
+     * eight-token tiles and a kernel whose batched rows go through {@code CpuVecDotRows.forEachRow}, each of which
+     * walks its rows with one {@code CpuVecDotRows.RowReader}.
      */
     @Test
     public void preparedTilesDotRowsAcrossShardsLikeOneBuffer() {
@@ -469,7 +554,8 @@ public class SimdVecDotTest {
         final int cols = 512;
         final int nTokens = 19;
         Random rnd = new Random(0x5AD);
-        for (GGMLType t : new GGMLType[]{GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K}) {
+        for (GGMLType t : new GGMLType[]{GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K, GGMLType.F16, GGMLType.BF16,
+                GGMLType.F32, GGMLType.MXFP4}) {
             ByteBuffer whole = randomRows(t, rows, cols, rnd);
             long rowBytes = BlockLayout.of(t).rowBytes(cols);
             ByteBuffer first = slice(whole, 0, (int) (3 * rowBytes));
@@ -552,11 +638,16 @@ public class SimdVecDotTest {
         String narrow = probe("--add-modules=jdk.incubator.vector", "-XX:MaxVectorSize=16");
         assertTrue(narrow, narrow.contains("available=false"));
         assertTrue(narrow, narrow.contains("describe=scalar"));
+        assertTrue("the reason names the width gate and its override: " + narrow,
+                narrow.contains("reason=the preferred vector is 128 bits")
+                        && narrow.contains(CpuSimd.PROP_WIDTH + "=256 forces them"));
         String forced = probe("--add-modules=jdk.incubator.vector", "-XX:MaxVectorSize=16",
                 "-D" + CpuSimd.PROP_WIDTH + "=256");
         assertTrue(forced, forced.contains("available=true"));
+        assertTrue(forced, forced.contains("reason=" + CpuSimd.PROP_WIDTH + "=256 forces the kernels over a 128-bit"));
         String wide = probe("--add-modules=jdk.incubator.vector");
         assertTrue(wide, wide.contains("available=true"));
+        assertTrue(wide, wide.contains("reason=jdk.incubator.vector on a "));
     }
 
     /**
@@ -582,7 +673,6 @@ public class SimdVecDotTest {
                 GGMLType.I32, GGMLType.I64, GGMLType.F64, GGMLType.NVFP4,
                 GGMLType.F8_E4M3, GGMLType.F8_E5M2, GGMLType.F8_E4M3_B128, GGMLType.F8_E4M3_B32,
                 GGMLType.F8_E4M3FN, GGMLType.MXFP8, GGMLType.MXFP6_E3M2, GGMLType.MXFP6_E2M3,
-                GGMLType.IQ2_XXS, GGMLType.IQ2_XS, GGMLType.IQ2_S, GGMLType.IQ3_XXS, GGMLType.IQ3_S,
                 GGMLType.IQ3_K, GGMLType.IQ3_KS, GGMLType.IQ1_S, GGMLType.IQ1_M}) {
             assertTrue(t + " has no Vector API kernel here", !CpuSimd.supports(t));
         }
@@ -593,6 +683,8 @@ public class SimdVecDotTest {
         String out = probe();
         assertTrue(out, out.contains("available=false"));
         assertTrue(out, out.contains("describe=scalar"));
+        assertTrue(out, out.contains(Runtime.version().feature() >= 17
+                ? "reason=jdk.incubator.vector is not resolved in this JVM" : "has no jdk.incubator.vector module"));
         assertTrue(out, out.contains("q4_0=LegacyVecDot{Q4_0 x Q8_0}"));
         assertTrue(out, out.contains("q4_1=LegacyVecDot{Q4_1 x Q8_1}"));
         assertTrue(out, out.contains("q2_K=KQuantVecDot{Q2_K x Q8_K}"));
@@ -608,6 +700,7 @@ public class SimdVecDotTest {
         String out = probe("--add-modules=jdk.incubator.vector", "-D" + CpuSimd.PROP_SIMD + "=false");
         assertTrue(out, out.contains("available=false"));
         assertTrue(out, out.contains("describe=scalar"));
+        assertTrue(out, out.contains("reason=" + CpuSimd.PROP_SIMD + "=false keeps the scalar kernels"));
         assertTrue(out, out.contains("q4_0=LegacyVecDot{Q4_0 x Q8_0}"));
         assertTrue(out, out.contains("q4_1=LegacyVecDot{Q4_1 x Q8_1}"));
         assertTrue(out, out.contains("q2_K=KQuantVecDot{Q2_K x Q8_K}"));
@@ -630,7 +723,7 @@ public class SimdVecDotTest {
     }
 
     /** Runs {@code main} in a fresh JVM with {@code jvmArgs} before the classpath and returns its output. */
-    private static String run(Class<?> main, String... jvmArgs) throws Exception {
+    static String run(Class<?> main, String... jvmArgs) throws Exception {
         List<String> cmd = new ArrayList<>();
         cmd.add(Paths.get(System.getProperty("java.home"), "bin", "java").toString());
         cmd.addAll(Arrays.asList(jvmArgs));

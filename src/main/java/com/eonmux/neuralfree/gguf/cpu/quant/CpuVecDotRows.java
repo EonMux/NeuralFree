@@ -127,8 +127,12 @@ final class CpuVecDotRows {
         }
     }
 
-    /** Copies {@code row} of {@code w} into {@code dst} at index 0. */
-    static void copyRow(CpuTensorRef w, long row, byte[] dst) {
+    /**
+     * Copies {@code row} of {@code w} into {@code dst} at index 0 through the thread's cursor, resolving the row's
+     * shard by a search: the single-row form ({@link #copyRow(CpuTensorRef, long)}). A loop over rows reads them
+     * through a {@link #reader}.
+     */
+    private static void copyRow(CpuTensorRef w, long row, byte[] dst) {
         int s = w.shardIndex(row);
         ByteBuffer shard = w.rowBuffer(row);
         Cursor c = CURSORS.get();
@@ -199,8 +203,9 @@ final class CpuVecDotRows {
      */
     static void forEachRow(CpuTensorRef w, long rowStart, int rowCount, IndexedRowDot dot) {
         final byte[] buf = buffer(w);
+        final RowReader rows = reader(w);
         for (int r = 0; r < rowCount; r++) {
-            copyRow(w, rowStart + r, buf);
+            rows.copy(rowStart + r, buf);
             dot.dot(buf, 0, r);
         }
     }
@@ -255,8 +260,9 @@ final class CpuVecDotRows {
                                 CpuVecDot.QuantizedActivations x, float[] y, int yOff) {
         check(w, rowStart, rowCount, y, yOff);
         final byte[] buf = buffer(w);
+        final RowReader rows = reader(w);
         for (int r = 0; r < rowCount; r++) {
-            copyRow(w, rowStart + r, buf);
+            rows.copy(rowStart + r, buf);
             y[yOff + r] = kernel.dotRowBytes(buf, 0, x);
         }
     }
@@ -291,8 +297,9 @@ final class CpuVecDotRows {
             check(w, rowStart, rowCount, y, (int) base);
         }
         final byte[] buf = buffer(w);
+        final RowReader rows = reader(w);
         for (int r = 0; r < rowCount; r++) {
-            copyRow(w, rowStart + r, buf);
+            rows.copy(rowStart + r, buf);
             for (int t = 0; t < nTokens; t++) {
                 y[yOff + t * yStride + r] = kernel.dotRowBytes(buf, 0, x[t]);
             }

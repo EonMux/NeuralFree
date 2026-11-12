@@ -79,14 +79,14 @@ public final class SimdQ4_Kx8 implements CpuVecDot {
                                 b, off + Q4_Kx8.QS + (4 * jp + e) * 64 + j * 8),
                                 0, SimdI8.I8);
                         final int at = xo + 64 * jp + 8 * e;
-                        acc = acc.add(v.and(0x0F)
-                                        .mul(IntVector.fromArray(SimdI8.I8, yw, at)).mul(scales[2 * jp]))
+                        acc = v.and(0x0F).mul(IntVector.fromArray(SimdI8.I8, yw, at)).mul(scales[2 * jp])
                                 .add(v.lanewise(VectorOperators.LSHR, 4).and(0x0F)
                                         .mul(IntVector.fromArray(SimdI8.I8, yw, at + 32))
-                                        .mul(scales[2 * jp + 1]));
+                                        .mul(scales[2 * jp + 1]))
+                                .add(acc);
                     }
                 }
-                final int isum = SimdI8.sum(acc);
+                final int isum = ((IntVector) acc.check(SimdI8.I8)).reduceLanes(VectorOperators.ADD);
                 int minTerm = 0;
                 final int bo = ib * BSUMS_PER_BLOCK;
                 for (int sb = 0; sb < 8; sb++) {

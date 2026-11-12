@@ -2,10 +2,11 @@
 @rem linked without it. For a command that runs the engine in this JVM the module is resolved at start-up, so the
 @rem launcher need not relaunch itself to add it: when the runtime's release file (%JAVA_HOME%\release, or the one
 @rem two directories above the first java.exe on the PATH) names Java 17 or later and, where it lists the image's
-@rem modules, names jdk.incubator.vector among them. The other commands (serve, run-batch, chat, complete, version,
-@rem help, cache-list, collect-env, --list-devices) never load the CPU kernels here and start without it.
+@rem modules, names jdk.incubator.vector among them. collect-env resolves it too, since it reports the CPU kernels the
+@rem engine commands select. The other commands (serve, run-batch, chat, complete, version, help, cache-list,
+@rem --list-devices) never load the CPU kernels here and start without it.
 set "NEURALFREE_VECTOR_COMMAND=1"
-for %%c in ("" serve --serve server --server run-batch --run-batch chat --chat complete --complete version --version help --help -h cache-list --cache-list -cl collect-env --collect-env --list-devices) do if "%~1"=="%%~c" set "NEURALFREE_VECTOR_COMMAND="
+for %%c in ("" serve --serve server --server run-batch --run-batch chat --chat complete --complete version --version help --help -h cache-list --cache-list -cl --list-devices) do if "%~1"=="%%~c" set "NEURALFREE_VECTOR_COMMAND="
 if not defined NEURALFREE_VECTOR_COMMAND goto neuralfreeVectorModuleDone
 set "NEURALFREE_JAVA_RELEASE_FILE="
 if defined JAVA_HOME set "NEURALFREE_JAVA_RELEASE_FILE=%JAVA_HOME%\release"

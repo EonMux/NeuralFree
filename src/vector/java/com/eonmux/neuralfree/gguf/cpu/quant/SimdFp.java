@@ -50,4 +50,15 @@ final class SimdFp {
         return ((acc.lane(0) + acc.lane(1)) + (acc.lane(2) + acc.lane(3)))
                 + ((acc.lane(4) + acc.lane(5)) + (acc.lane(6) + acc.lane(7)));
     }
+
+    /**
+     * {@link #pairwise(FloatVector)} of eight accumulator lanes stored at {@code lanes[off .. off + 8)}. The token
+     * tiles store their eight accumulators and reduce them from memory: eight lane extractions per accumulator
+     * would put 64 Vector API calls after the tile loop, whose parsed nodes push the method past C2's inlining node
+     * cutoff.
+     */
+    static float pairwise(float[] lanes, int off) {
+        return ((lanes[off] + lanes[off + 1]) + (lanes[off + 2] + lanes[off + 3]))
+                + ((lanes[off + 4] + lanes[off + 5]) + (lanes[off + 6] + lanes[off + 7]));
+    }
 }

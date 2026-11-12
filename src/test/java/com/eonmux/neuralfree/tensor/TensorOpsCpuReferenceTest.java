@@ -417,6 +417,63 @@ public class TensorOpsCpuReferenceTest {
 
     // ------------------------------------------------------------------ products and flags
 
+    /**
+     * Products large enough to spread their output rows over the CPU pool give each element the sum of its K
+     * products added one at a time in ascending k from {@code 0.0f}, bit for bit: 2-D, batched and broadcast,
+     * with signed zeros, infinities and NaN among the operands.
+     */
+    @Test
+    public void largeProductsKeepTheDotProductOrderBitForBit() {
+        final int m = 67;
+        final int k = 301;
+        final int n = 45;
+        assertTrue("the rows split over the pool", (long) m * k * n > 4 * CpuLinalg.ROW_GRAIN_MACS);
+        float[] a = TrainParity.uniform(21, 3 * m * k, -3f, 3f);
+        float[] b = TrainParity.uniform(22, 3 * k * n, -3f, 3f);
+        a[5] = -0f;
+        a[k + 7] = Float.POSITIVE_INFINITY;
+        b[3 * n + 2] = Float.NaN;
+        b[k * n + 9] = -0f;
+        try (ComputationGraph.NoGradScope off = ComputationGraph.noGrad()) {
+            float[] plain = keep(TensorOps.matmul(floats(Arrays.copyOf(a, m * k), m, k),
+                    floats(Arrays.copyOf(b, k * n), k, n))).toFloatArray();
+            assertBitsEqual("matmul", reference(a, 0, b, 0, 1, m, k, n), plain);
+            float[] batched = keep(TensorOps.bmm(floats(a, 3, m, k), floats(b, 3, k, n))).toFloatArray();
+            assertBitsEqual("bmm", reference(a, m * k, b, k * n, 3, m, k, n), batched);
+            float[] broadcast = keep(TensorOps.matmul(floats(a, 3, m, k), floats(Arrays.copyOf(b, k * n), k, n)))
+                    .toFloatArray();
+            assertBitsEqual("broadcast matmul", reference(a, m * k, b, 0, 3, m, k, n), broadcast);
+        }
+    }
+
+    /** {@code batches} products {@code [m, k] @ [k, n]}, each element summed in ascending k from 0. */
+    private static float[] reference(float[] a, int strideA, float[] b, int strideB, int batches, int m, int k,
+                                     int n) {
+        float[] out = new float[batches * m * n];
+        for (int z = 0; z < batches; z++) {
+            for (int i = 0; i < m; i++) {
+                for (int j = 0; j < n; j++) {
+                    float sum = 0f;
+                    for (int kk = 0; kk < k; kk++) {
+                        sum += a[z * strideA + i * k + kk] * b[z * strideB + kk * n + j];
+                    }
+                    out[(z * m + i) * n + j] = sum;
+                }
+            }
+        }
+        return out;
+    }
+
+    private static void assertBitsEqual(String what, float[] want, float[] got) {
+        assertEquals(what + ": length", want.length, got.length);
+        for (int i = 0; i < want.length; i++) {
+            if (Float.floatToRawIntBits(want[i]) != Float.floatToRawIntBits(got[i])
+                    && !(Float.isNaN(want[i]) && Float.isNaN(got[i]))) {
+                throw new AssertionError(what + " [" + i + "]: want " + want[i] + ", got " + got[i]);
+            }
+        }
+    }
+
     @Test
     public void bmmAndMatmulRecordUnderGrad() {
         float[] a = TrainParity.uniform(10, 2 * 2 * 3, -1f, 1f);

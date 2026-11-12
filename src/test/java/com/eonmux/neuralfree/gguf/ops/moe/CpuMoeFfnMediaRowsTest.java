@@ -45,13 +45,26 @@ public class CpuMoeFfnMediaRowsTest {
         final int nEmbd;
 
         Fixture() throws IOException {
-            this.path = SyntheticRoutedModels.deepseek4(SyntheticRoutedModels.deepseek4Config(), 1, true)
+            this(true);
+        }
+
+        /** The model with block 0 hash-routed, with or without the vision routing bias. */
+        Fixture(boolean visionBias) throws IOException {
+            this.path = SyntheticRoutedModels.deepseek4(SyntheticRoutedModels.deepseek4Config(), 1, visionBias)
                     .writeTempFile();
             this.parser = new GGUFFileParser(path.toString());
             this.spec = ModelSpecBuilder.build(GgufKv.of(parser), TensorCatalog.of(parser), MemoryConfig.defaults());
             this.weights = CpuWeights.open(parser);
             this.ctx = CpuForwardContext.builder(spec, weights, CpuScratch.forModel(spec, UBATCH)).build();
             this.nEmbd = spec.hparams().nEmbd();
+        }
+
+        /** Whether the bound block of layer {@code il} may run over a subset of a step's rows. */
+        boolean rowLocal(int il) {
+            LayerSpec layer = spec.layer(il);
+            CpuFfnBlock block = new CpuMoeFfn(layer.ffnKind(), layer);
+            block.bind(ctx, layer);
+            return block.rowLocal();
         }
 
         /** The block of layer {@code il} over {@code rows} of {@code in} with step tokens {@code tokens}. */
@@ -131,6 +144,23 @@ public class CpuMoeFfnMediaRowsTest {
             assertTrue(f.spec.layer(0).moe().mediaProbBias());
             assertFalse(f.spec.layer(1).moe().hashRouting());
             assertTrue(f.spec.layer(1).moe().mediaProbBias());
+        }
+    }
+
+    /**
+     * Hash routing reads the step's token ids by step row and the vision bias its embedding-row flags, so neither
+     * layer may run over a subset of the rows (the last layer's output-row pruning); a biased layer without the
+     * vision bias routes each row by its own logits and may.
+     */
+    @Test
+    public void onlyALayerThatRoutesEachRowByItsOwnInputsIsRowLocal() throws IOException {
+        try (Fixture f = new Fixture(false)) {
+            assertTrue(f.spec.layer(0).moe().hashRouting());
+            assertFalse("a hash-routed layer reads the step's token ids", f.rowLocal(0));
+            assertTrue("a biased layer routes each row alone", f.rowLocal(1));
+        }
+        try (Fixture f = new Fixture()) {
+            assertFalse("a media-routed layer reads the step's embedding-row flags", f.rowLocal(1));
         }
     }
 

@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.demo.tools;
 
 import com.eonmux.neuralfree.acceleration.backend.KernelTiming;
+import com.eonmux.neuralfree.gguf.cpu.quant.CpuSimd;
 import com.eonmux.neuralfree.gguf.gpu.forward.DecodeStepBreakdown;
 import com.eonmux.neuralfree.gguf.testutil.SyntheticModels;
 import org.junit.Rule;
@@ -40,7 +41,7 @@ public class BenchCommandTest {
         ByteArrayOutputStream errBytes = new ByteArrayOutputStream();
         BenchCommand.bench(args(model, "-ngl", "0", "-p", "8", "-n", "4", "-r", "2", "-o", "md"),
                 print(outBytes), print(errBytes));
-        List<String> lines = Arrays.asList(outBytes.toString(StandardCharsets.UTF_8).split("\n"));
+        List<String> lines = table(outBytes);
         assertEquals("two shapes, two rows", 4, lines.size());
         assertTrue("the header carries the fixed columns: " + lines.get(0),
                 lines.get(0).contains(" model ") && lines.get(0).contains(" size ")
@@ -54,13 +55,24 @@ public class BenchCommandTest {
         assertTrue("the run itself stays silent: stderr holds " + errBytes.size(), errBytes.size() == 0);
     }
 
+    /**
+     * The table lines of a Markdown run, after the header's first line, which names the CPU kernels this JVM runs
+     * and why ({@link CpuSimd#status()}), and the blank line below it.
+     */
+    private static List<String> table(ByteArrayOutputStream out) {
+        List<String> lines = Arrays.asList(out.toString(StandardCharsets.UTF_8).split("\n"));
+        assertEquals("the header names the CPU kernels: " + lines, "CPU kernels: " + CpuSimd.status(), lines.get(0));
+        assertEquals("a blank line separates the table: " + lines, "", lines.get(1));
+        return lines.subList(2, lines.size());
+    }
+
     @Test
     public void theDepthPrefillsBeforeTheTimedRun() throws Exception {
         Path model = SyntheticModels.llama().writeTempFile();
         ByteArrayOutputStream outBytes = new ByteArrayOutputStream();
         BenchCommand.bench(args(model, "-ngl", "0", "-p", "0", "-n", "0", "-pg", "4,2", "-d", "2", "-r", "1",
                 "-o", "md"), print(outBytes), print(new ByteArrayOutputStream()));
-        List<String> lines = Arrays.asList(outBytes.toString(StandardCharsets.UTF_8).split("\n"));
+        List<String> lines = table(outBytes);
         assertEquals(3, lines.size());
         assertTrue("the pair shape names its depth: " + lines.get(2), lines.get(2).contains(" pp4+tg2 @ d2 "));
     }
@@ -164,6 +176,8 @@ public class BenchCommandTest {
         String err = errBytes.toString(StandardCharsets.UTF_8);
         assertTrue("only the run announces itself: " + err, err.contains(": run 1/1"));
         assertTrue("no warmup line: " + err, !err.contains("warmup"));
+        assertTrue("the CPU kernel choice and its reason lead the progress: " + err,
+                err.startsWith("nftool bench: CPU kernels: " + CpuSimd.status() + "\n"));
     }
 
     @Test
@@ -214,7 +228,7 @@ public class BenchCommandTest {
         ByteArrayOutputStream outBytes = new ByteArrayOutputStream();
         BenchCommand.bench(args(model, "-ngl", "0", "-p", "8", "-n", "0", "-nkvo", "0,1", "-r", "1", "-o", "md"),
                 print(outBytes), print(new ByteArrayOutputStream()));
-        List<String> lines = Arrays.asList(outBytes.toString(StandardCharsets.UTF_8).split("\n"));
+        List<String> lines = table(outBytes);
         assertEquals("two KV-offload values, two rows", 4, lines.size());
         assertTrue("the varying KV offload gains a column: " + lines.get(0), lines.get(0).contains(" nkvo |"));
     }
@@ -280,7 +294,7 @@ public class BenchCommandTest {
         ByteArrayOutputStream outBytes = new ByteArrayOutputStream();
         BenchCommand.bench(args(model, "-ngl", "0", "-embd", "1", "-p", "8", "-n", "0", "-r", "2", "-o", "md"),
                 print(outBytes), print(new ByteArrayOutputStream()));
-        List<String> lines = Arrays.asList(outBytes.toString(StandardCharsets.UTF_8).split("\n"));
+        List<String> lines = table(outBytes);
         assertEquals("header, rule and one run", 3, lines.size());
         assertTrue("the embedding mode gains its column: " + lines.get(0), lines.get(0).contains(" embd |"));
         assertTrue("the run names its shape: " + lines.get(2), lines.get(2).contains(" pp8 "));
@@ -394,7 +408,7 @@ public class BenchCommandTest {
             ByteArrayOutputStream errBytes = new ByteArrayOutputStream();
             BenchCommand.bench(args(model, "-ngl", "0", "-p", "0", "-n", "4", "-r", "1", "-o", "md",
                     "--host-breakdown", "--kernels=step", "--tg-readout", readout), print(outBytes), print(errBytes));
-            List<String> lines = Arrays.asList(outBytes.toString(StandardCharsets.UTF_8).split("\n"));
+            List<String> lines = table(outBytes);
             assertEquals(readout + ": one generation row", 3, lines.size());
             assertTrue(lines.get(2), lines.get(2).contains(" tg4 "));
             assertEquals(readout + ": the table names a readout other than llama-bench's", !readout.equals("logits"),

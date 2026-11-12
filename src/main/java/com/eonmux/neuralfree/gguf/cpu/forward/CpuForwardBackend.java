@@ -8,6 +8,7 @@ import com.eonmux.neuralfree.gguf.cpu.head.CpuEmbeddingStage;
 import com.eonmux.neuralfree.gguf.cpu.head.CpuHeadPreprocessor;
 import com.eonmux.neuralfree.gguf.cpu.head.CpuLogitsHead;
 import com.eonmux.neuralfree.gguf.cpu.ops.CpuOps;
+import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
 import com.eonmux.neuralfree.gguf.engine.BatchSegments;
 import com.eonmux.neuralfree.gguf.engine.ContextFullException;
 import com.eonmux.neuralfree.gguf.engine.EmbeddingRowSupport;
@@ -197,10 +198,12 @@ public final class CpuForwardBackend implements ForwardBackend {
         float[] logits = null;
         for (int off = 0; off < tokens.length; ) {
             int n = mem.plan().stepTokens(tokens.length - off, ubatch);
-            step(tokens, null, off, n, pos0 + off, mem, taps);
+            boolean last = off + n == tokens.length;
+            int[] read = last ? new int[]{n - 1} : CpuOutputRows.NONE;
+            boolean pruned = step(tokens, null, off, n, pos0 + off, mem, taps, read);
             off += n;
-            if (off == tokens.length) {
-                logits = lastRowLogits(n);
+            if (last) {
+                logits = lastRowLogits(pruned ? 0 : n - 1);
             }
         }
         deliver(taps);
@@ -231,10 +234,12 @@ public final class CpuForwardBackend implements ForwardBackend {
         float[] logits = null;
         for (int off = 0; off < rows.length; ) {
             int n = mem.plan().stepTokens(rows.length - off, ubatch);
-            stepRows(rows, off, n, pos0 + off, mem, taps);
+            boolean last = off + n == rows.length;
+            boolean pruned = stepRows(rows, off, n, pos0 + off, mem, taps,
+                    last ? new int[]{n - 1} : CpuOutputRows.NONE);
             off += n;
-            if (off == rows.length) {
-                logits = lastRowLogits(n);
+            if (last) {
+                logits = lastRowLogits(pruned ? 0 : n - 1);
             }
         }
         deliver(taps);
@@ -249,7 +254,7 @@ public final class CpuForwardBackend implements ForwardBackend {
         prepareCausal(mem, singleToken, pos, true);
         CpuTapRows taps = CpuTapRows.open(tap, 1, spec.nLayer());
         step(singleToken, null, 0, 1, pos, mem, taps);
-        float[] logits = lastRowLogits(1);
+        float[] logits = lastRowLogits(0);
         deliver(taps);
         return logits;
     }
@@ -294,8 +299,9 @@ public final class CpuForwardBackend implements ForwardBackend {
         int[] ids = new int[rows.length];
         for (int off = 0; off < tokens.length; ) {
             int n = mem.plan().stepTokens(tokens.length - off, ubatch);
-            step(tokens, null, off, n, pos0 + off, mem, taps);
-            emitIds(rows, off, n, ids);
+            int[] read = CpuOutputRows.read(rows, off, n);
+            boolean pruned = step(tokens, null, off, n, pos0 + off, mem, taps, read);
+            emitIds(rows, off, n, ids, pruned ? read : null);
             off += n;
         }
         deliver(taps);
@@ -312,8 +318,9 @@ public final class CpuForwardBackend implements ForwardBackend {
         float[][] out = new float[rows.length][];
         for (int off = 0; off < tokens.length; ) {
             int n = mem.plan().stepTokens(tokens.length - off, ubatch);
-            step(tokens, null, off, n, pos0 + off, mem, taps);
-            emitRows(rows, off, n, out, true);
+            int[] read = CpuOutputRows.read(rows, off, n);
+            boolean pruned = step(tokens, null, off, n, pos0 + off, mem, taps, read);
+            emitRows(rows, off, n, out, true, pruned ? read : null);
             off += n;
         }
         deliver(taps);
@@ -710,7 +717,7 @@ public final class CpuForwardBackend implements ForwardBackend {
         PagedStep step = mem.openPagedStep(u.layout(), u.positions());
         boolean nonCausal = batch.nonCausal();
         long[] treeBits = batch.treeMask();
-        long[] ubatchTree = treeBits == null ? null : gather(treeBits, u.batchRows());
+        long[] ubatchTree = treeBits == null ? null : CpuUbatchRows.gather(treeBits, u.batchRows());
         AdapterRows adapterRows = ctx.projectionDeltas().rows();
         ubatchSlots = AdapterRows.ofRows(batch.adapterSlots(), u.batchRows());
         adapterRows.set(ubatchSlots);
@@ -725,7 +732,7 @@ public final class CpuForwardBackend implements ForwardBackend {
                 requireTreeRound(ubatchTree);
             }
             runSlotsBatched(u.layout(), x, taps, u.batchRows());
-            appendRows(paged, step, tokens, u.positions(), embeddingRowToken);
+            CpuUbatchRows.appendRows(paged, step, tokens, u.positions(), embeddingRowToken);
             paged.finish(step);
             float[][] rows = new float[u.layout().outputRows().length][];
             emitRows(u.layout().outputRows(), 0, tokens.length, rows, logits);
@@ -744,26 +751,6 @@ public final class CpuForwardBackend implements ForwardBackend {
         }
     }
 
-    /** The {@code rows}' entries named by {@code at}, in {@code at}'s order. */
-    private static long[] gather(long[] rows, int[] at) {
-        long[] out = new long[at.length];
-        for (int i = 0; i < at.length; i++) {
-            out[i] = rows[at[i]];
-        }
-        return out;
-    }
-
-    /**
-     * Extends each of the step's sequences' token record with its segment's rows (ubatch row order): their ids
-     * ({@code embeddingToken} for an embedding row) and stored positions.
-     */
-    private static void appendRows(com.eonmux.neuralfree.gguf.memory.paged.PagedSequences paged, PagedStep step,
-                                   int[] tokens, int[] positions, int embeddingToken) {
-        for (int s = 0; s < step.nSeg(); s++) {
-            paged.appendRows(step.segSeq(s), tokens, positions, step.segStart(s), step.segLen(s), embeddingToken);
-        }
-    }
-
     /**
      * Writes the ubatch's rows into the residual stream: media rows through the embedding stage's media path (with
      * the batch's explicit rope sections when it carries them), token rows through the batched lookup (with the
@@ -773,7 +760,7 @@ public final class CpuForwardBackend implements ForwardBackend {
      * @param embd the batch's embedding rows ({@code ForwardBatch.embeddings()}), or null for a token batch
      */
     private void embedUbatch(ForwardBatch batch, float[][] embd, UBatch u, int[] tokens, float[] x) {
-        int[][] sections = sliceSections(batch.ropePositions(), u);
+        int[][] sections = CpuUbatchRows.sliceSections(batch.ropePositions(), u);
         if (embd == null) {
             embedding.embedBatched(tokens, u.positions(), sections, x);
             return;
@@ -794,22 +781,6 @@ public final class CpuForwardBackend implements ForwardBackend {
         } else {
             embedding.embedMixedRows(tokens, ubatchRows, u.positions(), sections, x);
         }
-    }
-
-    /** The batch's rope sections restricted to the ubatch's rows, or null when the batch carries none. */
-    private static int[][] sliceSections(int[][] sections, UBatch u) {
-        if (sections == null) {
-            return null;
-        }
-        int[] rows = u.batchRows();
-        int[][] out = new int[sections.length][];
-        for (int s = 0; s < sections.length; s++) {
-            out[s] = new int[rows.length];
-            for (int r = 0; r < rows.length; r++) {
-                out[s][r] = sections[s][rows[r]];
-            }
-        }
-        return out;
     }
 
     /**
@@ -1154,30 +1125,63 @@ public final class CpuForwardBackend implements ForwardBackend {
      * sequence bookkeeping.
      */
     private void step(int[] tokens, int[] tokenTypes, int off, int n, int pos0, CpuMemory mem, CpuTapRows taps) {
+        step(tokens, tokenTypes, off, n, pos0, mem, taps, null);
+    }
+
+    /**
+     * {@link #step} whose stack output is read at the step-local rows {@code read} only (null: every row); true when
+     * the last layer ran for those rows alone ({@link #prunes}), which the stack output then holds at rows
+     * {@code 0 .. read.length - 1}.
+     */
+    private boolean step(int[] tokens, int[] tokenTypes, int off, int n, int pos0, CpuMemory mem, CpuTapRows taps,
+                         int[] read) {
         float[] x = scratch.slot(CpuScratch.X);
         embedding.embed(tokens, tokenTypes, off, n, pos0, x);
         if (mem != null) {
             mem.beginStep(pos0, n);
         }
-        runSlots(pos0, off, n, x, taps);
+        boolean pruned = runSlots(pos0, off, n, x, taps, read);
         if (mem != null) {
             mem.sequence().append(tokens, off, n);
         }
+        return pruned;
     }
 
     /**
      * One step of {@code n} embedding rows: the row embedding, the memory's step rows, every slot, sequence
      * bookkeeping (the rows record {@link #embeddingRowToken}).
      */
-    private void stepRows(float[][] rows, int off, int n, int pos0, CpuMemory mem, CpuTapRows taps) {
+    private boolean stepRows(float[][] rows, int off, int n, int pos0, CpuMemory mem, CpuTapRows taps, int[] read) {
         float[] x = scratch.slot(CpuScratch.X);
         embedding.embedRows(rows, off, n, pos0, x);
         mem.beginStep(pos0, n);
-        runSlots(pos0, off, n, x, taps);
+        boolean pruned = runSlots(pos0, off, n, x, taps, read);
         mem.sequence().appendEmbeddings(n, embeddingRowToken);
+        return pruned;
     }
 
     private void runSlots(int pos0, int off, int n, float[] x, CpuTapRows taps) {
+        runSlots(pos0, off, n, x, taps, null);
+    }
+
+    /**
+     * Whether a step of {@code n} rows whose stack output is read at the step-local rows {@code read} runs its last
+     * layer for those rows only ({@link CpuLayerExecutor#forwardRows}): a causal step over the memory of a linear
+     * layer stack, read at a strictly ascending subset of its rows, with no stack-output tap, no matmul observer
+     * ({@code nftool imatrix} records every row of every product), no adapter slots per row and no tree round, whose
+     * last layer is {@link CpuLayerExecutor#rowsPrunable() prunable}.
+     */
+    boolean prunes(int n, CpuTapRows taps, int[] read) {
+        return read != null && memory != null && CpuOutputRows.subset(n, read)
+                && spec.schedule().kind() == LayerSchedule.Kind.LINEAR
+                && (taps == null || !taps.wants(layers.size())) && CpuMatVec.globalObserver() == null
+                && ubatchSlots == null && ctx.stepTreeRound() == null
+                && layers.get(layers.size() - 1).rowsPrunable();
+    }
+
+    /** The layer loop of a step; true when the last layer ran for the rows {@code read} only ({@link #prunes}). */
+    private boolean runSlots(int pos0, int off, int n, float[] x, CpuTapRows taps, int[] read) {
+        boolean pruned = prunes(n, taps, read);
         LayerSchedule schedule = spec.schedule();
         boolean hrm = schedule.kind() == LayerSchedule.Kind.HRM;
         int hrmLen = hrm ? n * zLInit.length : 0;
@@ -1196,7 +1200,11 @@ public final class CpuForwardBackend implements ForwardBackend {
             if (taps != null && taps.wants(il)) {
                 taps.capture(il, x, off, n, e.streamWidth());
             }
-            e.forward(pos0, n, x);
+            if (pruned && il == layers.size() - 1) {
+                e.forwardRows(pos0, n, x, read);
+            } else {
+                e.forward(pos0, n, x);
+            }
             repeat.afterSlot(schedule, il, n, x);
             if (hrm && schedule.passEnd(il)) {
                 CpuOps.norm(NormKind.RMS, spec.hparams().normRmsEps(), x, 0, x, 0, n, zLInit.length, null, null);
@@ -1210,11 +1218,12 @@ public final class CpuForwardBackend implements ForwardBackend {
         if (taps != null && taps.wants(layers.size())) {
             taps.capture(layers.size(), x, off, n, finalWidth);
         }
+        return pruned;
     }
 
-    /** Logits of the last row of the step just run, copied to the reused result row. */
-    private float[] lastRowLogits(int n) {
-        rowIdx[0] = n - 1;
+    /** Logits of stack-output row {@code row} of the step just run, copied to the reused result row. */
+    private float[] lastRowLogits(int row) {
+        rowIdx[0] = row;
         head.hidden(scratch.slot(CpuScratch.X), finalWidth, rowIdx, 1);
         float[] logits = head.logits(1);
         int vocab = head.vocabRows();
@@ -1230,6 +1239,14 @@ public final class CpuForwardBackend implements ForwardBackend {
      * rows after the output norm, batched through the head.
      */
     private void emitRows(int[] rows, int off, int n, float[][] out, boolean logits) {
+        emitRows(rows, off, n, out, logits, null);
+    }
+
+    /**
+     * {@link #emitRows} after a step whose stack output holds the step-local rows {@code read} at rows
+     * {@code 0 ..} ({@link CpuOutputRows#stackRow}); null when it holds every row of the step.
+     */
+    private void emitRows(int[] rows, int off, int n, float[][] out, boolean logits, int[] read) {
         int max = head.maxRows();
         int count = 0;
         for (int i = 0; i < rows.length; i++) {
@@ -1237,7 +1254,7 @@ public final class CpuForwardBackend implements ForwardBackend {
             if (r < off || r >= off + n) {
                 continue;
             }
-            rowIdx[count] = r - off;
+            rowIdx[count] = CpuOutputRows.stackRow(read, r - off);
             outputIdx[count] = i;
             count++;
             if (count == max) {
@@ -1282,7 +1299,7 @@ public final class CpuForwardBackend implements ForwardBackend {
     }
 
     /** The {@link #emitRows} of {@link #forwardRowsGreedy}: the certified ids of the step's requested rows. */
-    private void emitIds(int[] rows, int off, int n, int[] ids) {
+    private void emitIds(int[] rows, int off, int n, int[] ids, int[] read) {
         int max = head.maxRows();
         int count = 0;
         for (int i = 0; i < rows.length; i++) {
@@ -1290,7 +1307,7 @@ public final class CpuForwardBackend implements ForwardBackend {
             if (r < off || r >= off + n) {
                 continue;
             }
-            rowIdx[count] = r - off;
+            rowIdx[count] = CpuOutputRows.stackRow(read, r - off);
             outputIdx[count] = i;
             count++;
             if (count == max) {

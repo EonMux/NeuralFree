@@ -139,7 +139,7 @@ public class LauncherTest {
     @Test
     public void theInProcessEngineCommandsAreMarkedForTheVectorModuleRelaunch() {
         for (String name : new String[]{"cli", "bench", "quantize", "perplexity", "imatrix", "cvector",
-                "export", "train", "download"}) {
+                "export", "train", "download", "collect-env", "--collect-env"}) {
             assertTrue(name, Launcher.runsEngineInProcess(Launcher.commandOf(name)));
         }
     }
@@ -147,7 +147,7 @@ public class LauncherTest {
     @Test
     public void theServerClientAndSelfDescribingCommandsDoNotRelaunchInProcess() {
         for (String name : new String[]{"serve", "run-batch", "chat", "complete", "version", "help",
-                "cache-list", "collect-env"}) {
+                "cache-list"}) {
             assertFalse(name, Launcher.runsEngineInProcess(Launcher.commandOf(name)));
         }
     }

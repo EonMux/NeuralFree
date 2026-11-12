@@ -14,7 +14,8 @@ import java.util.Set;
  * ({@link SimdQ4_0}, {@link SimdQ4_1}, {@link SimdQ5_0}, {@link SimdQ5_1}), Q8_0, the K-quant super-blocks
  * ({@link SimdQ2_K}, {@link SimdQ3_K}, {@link SimdQ4_K}, {@link SimdQ5_K}, {@link SimdQ6_K}), the float types
  * ({@link SimdF32}, {@link SimdF16}, {@link SimdBf16}), the codebook types whose 16-entry table fits byte lanes
- * ({@link SimdIq4Nl}, {@link SimdIq4Xs}, {@link SimdMxfp4}), the ternary types ({@link SimdTq1_0},
+ * ({@link SimdIq4Nl}, {@link SimdIq4Xs}, {@link SimdMxfp4}), the grid-coded 2- and 3-bit i-quants
+ * ({@link SimdIqGrid}), the ternary types ({@link SimdTq1_0},
  * {@link SimdTq2_0}), the new low-bit types ({@link SimdQ1_0}, {@link SimdQ2_0}) and the extension block types
  * whose vector form measured faster than the scalar kernel ({@link SimdExt}), plus the repacked-layout kernels
  * of {@link #repacked}. Every kernel returns exactly what its scalar counterpart returns, so selection changes
@@ -46,6 +47,10 @@ public final class SimdKernels implements CpuSimd.Engine {
         m.put(GGMLType.BF16, SimdBf16.INSTANCE);
         m.put(GGMLType.IQ4_NL, SimdIq4Nl.INSTANCE);
         m.put(GGMLType.IQ4_XS, SimdIq4Xs.INSTANCE);
+        for (GGMLType t : new GGMLType[]{GGMLType.IQ2_XXS, GGMLType.IQ2_XS, GGMLType.IQ2_S, GGMLType.IQ3_XXS,
+                GGMLType.IQ3_S}) {
+            m.put(t, SimdIqGrid.forType(t));
+        }
         m.put(GGMLType.MXFP4, SimdMxfp4.INSTANCE);
         m.put(GGMLType.TQ1_0, SimdTq1_0.INSTANCE);
         m.put(GGMLType.TQ2_0, SimdTq2_0.INSTANCE);
@@ -69,6 +74,12 @@ public final class SimdKernels implements CpuSimd.Engine {
     @Override
     public CpuVecDot vecDot(GGMLType type) {
         return type == null ? null : KERNELS.get(type);
+    }
+
+    /** The fast-order form of {@code type}'s vec-dot ({@code CpuSimd.PROP_ORDER}), or null: Q8_0 has one. */
+    @Override
+    public CpuVecDot fastOrder(GGMLType type) {
+        return type == GGMLType.Q8_0 ? SimdQ8_0.FAST : null;
     }
 
     /** Every weight type with a Vector API kernel (unmodifiable). */

@@ -15,9 +15,10 @@ import java.util.concurrent.locks.LockSupport;
  * loops the workers spin for a bounded time ({@code spinNanos}) before they park, so the many short loops of one
  * decode step start without a wake-up each, while an idle engine costs no CPU once the spin runs out.
  *
- * <p>Without NUMA placement a caller works on its own loop, so a team of {@code n} members starts {@code n - 1}
- * workers. Under an active {@link NumaPlacement} the team starts {@code n} workers, worker {@code i} pinned as
- * fork/join worker {@code i} would be, and the caller only waits, so every share of a loop runs on its node. A
+ * <p>Without placement a caller works on its own loop, so a team of {@code n} members starts {@code n - 1}
+ * workers. Under an active {@link NumaPlacement} (NUMA nodes or a pinned CPU set) the team starts {@code n}
+ * workers, worker {@code i} pinned as fork/join worker {@code i} would be, and the caller only waits, so every share
+ * of a loop runs on the placement's CPUs. A
  * working caller that finds no chunk left spins for the same bounded time, then parks until the last chunk finishes;
  * a caller that only waits parks at once, so the unpinned caller takes no time slices from the pinned workers. A
  * caller whose interrupt status is set still parks, and keeps that status.

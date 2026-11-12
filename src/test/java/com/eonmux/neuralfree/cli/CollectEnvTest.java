@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.cli;
 
 import com.eonmux.neuralfree.gguf.engine.kvtransfer.KvTransferConfig;
+import org.junit.Assume;
 import org.junit.Test;
 
 import java.util.Arrays;
@@ -32,7 +33,7 @@ public class CollectEnvTest {
         os.put("arch", "amd64");
         return new CollectEnv.Snapshot("9.9.9-test", java, os,
                 Arrays.asList(new DeviceListing.Entry("OpenCL", 0, "Test GPU", 1024L * 1024L)),
-                "/tmp/hub", 2, "/opt/neuralfree/server/server.jar", env);
+                "/tmp/hub", 2, "/opt/neuralfree/server/server.jar", "scalar (test reason)", env);
     }
 
     private static Map<String, String> env(String... pairs) {
@@ -53,6 +54,7 @@ public class CollectEnvTest {
         assertTrue(report, report.contains("OS arch: amd64\n"));
         assertTrue(report, report.contains("Available devices:\n"));
         assertTrue(report, report.contains("  OpenCL 0: Test GPU (1 MiB)\n"));
+        assertTrue(report, report.contains("CPU kernels: scalar (test reason)\n"));
         assertTrue(report, report.contains("Hub cache: /tmp/hub (2 models)\n"));
         assertTrue(report, report.contains("Server jar: /opt/neuralfree/server/server.jar\n"));
         assertTrue(report, report.contains("Environment:\n"));
@@ -61,14 +63,14 @@ public class CollectEnvTest {
     @Test
     public void aMissingServerJarSaysSoInsteadOfPrintingNull() {
         CollectEnv.Snapshot none = new CollectEnv.Snapshot("1.0", new LinkedHashMap<>(),
-                new LinkedHashMap<>(), Collections.emptyList(), "/tmp/hub", 0, null, env());
+                new LinkedHashMap<>(), Collections.emptyList(), "/tmp/hub", 0, null, "scalar", env());
         assertTrue(CollectEnv.report(none), CollectEnv.report(none).contains("Server jar: <not found>"));
     }
 
     @Test
     public void anEmptyDeviceListPrintsTheNoneLine() {
         CollectEnv.Snapshot none = new CollectEnv.Snapshot("1.0", new LinkedHashMap<>(),
-                new LinkedHashMap<>(), Collections.emptyList(), "/tmp/hub", 0, null, env());
+                new LinkedHashMap<>(), Collections.emptyList(), "/tmp/hub", 0, null, "scalar", env());
         assertTrue(CollectEnv.report(none), CollectEnv.report(none).contains("  (none)\n"));
     }
 
@@ -127,6 +129,35 @@ public class CollectEnvTest {
         assertTrue(CollectEnv.ENV_VARS.contains("HF_HUB_CACHE"));
     }
 
+    /**
+     * The CPU kernel line names the choice this JVM's facts dictate, derived here from the facts themselves: the
+     * module resolved in the boot layer and the preferred vector width, read through the Vector API by reflection.
+     */
+    @Test
+    public void theCpuKernelLineNamesTheChoiceTheJvmsFactsDictate() throws ReflectiveOperationException {
+        for (String property : new String[]{"neuralfree.cpu.simd", "neuralfree.cpu.simd.width",
+                "neuralfree.cpu.simd.order"}) {
+            Assume.assumeTrue(property + " is set", System.getProperty(property) == null);
+        }
+        String line = CollectEnv.cpuKernels();
+        if (Runtime.version().feature() < 17) {
+            assertTrue(line, line.startsWith("scalar (Java " + Runtime.version().feature() + " has no"));
+        } else if (!ModuleLayer.boot().findModule("jdk.incubator.vector").isPresent()) {
+            assertTrue(line, line.startsWith("scalar (jdk.incubator.vector is not resolved in this JVM"));
+        } else {
+            Object species = Class.forName("jdk.incubator.vector.FloatVector").getField("SPECIES_PREFERRED")
+                    .get(null);
+            int bits = (Integer) Class.forName("jdk.incubator.vector.VectorSpecies").getMethod("vectorBitSize")
+                    .invoke(species);
+            if (bits >= 256) {
+                assertEquals("vector/256b (jdk.incubator.vector) (jdk.incubator.vector on a " + bits
+                        + "-bit preferred vector)", line);
+            } else {
+                assertTrue(line, line.startsWith("scalar (the preferred vector is " + bits + " bits"));
+            }
+        }
+    }
+
     @Test
     public void theSnapshotExposesItsParts() {
         CollectEnv.Snapshot s = snapshot(env("NEURALFREE_MODEL", "/models"));
@@ -135,6 +166,7 @@ public class CollectEnvTest {
         assertEquals("Linux", s.os().get("name"));
         assertEquals(1, s.devices().size());
         assertEquals("/tmp/hub", s.cacheRoot());
+        assertEquals("scalar (test reason)", s.cpuKernels());
         assertEquals(2, s.cachedModels());
         assertEquals("/opt/neuralfree/server/server.jar", s.serverJar());
         assertEquals("/models", s.env().get("NEURALFREE_MODEL"));

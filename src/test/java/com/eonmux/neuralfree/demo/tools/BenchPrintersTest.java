@@ -15,10 +15,13 @@ import static org.junit.Assert.assertTrue;
  * The printers of {@code nftool bench} against llama.cpp's five formats: the all-quoted CSV rows, the JSON
  * array with the raw samples, the JSONL objects, the Markdown table whose columns are only the parameters
  * that vary and whose cells carry the {@code pp}/{@code tg} names and the {@code avg ± stddev} t/s, and the
- * SQL DDL plus INSERTs. One finished {@link BenchTest} feeds them all; its samples {1 ms, 3 ms} over 64
- * tokens average 42666.67 t/s with a 30169.89 spread.
+ * SQL DDL plus INSERTs; the Markdown header names the CPU kernels above its table. One finished {@link BenchTest}
+ * feeds them all; its samples {1 ms, 3 ms} over 64 tokens average 42666.67 t/s with a 30169.89 spread.
  */
 public class BenchPrintersTest {
+
+    /** The CPU kernel line the printers are handed. */
+    private static final String CPU_KERNELS = "vector/256b (jdk.incubator.vector) (test reason)";
 
     private static BenchGrid grid(String... flags) throws BenchCommand.UsageException {
         return BenchCommand.parse(flags);
@@ -34,7 +37,7 @@ public class BenchPrintersTest {
     public void csvQuotesEveryValueAndNamesEveryField() throws Exception {
         StringBuilder out = new StringBuilder();
         BenchGrid g = grid("-m", "m.gguf");
-        BenchPrinters.BenchPrinter p = BenchPrinters.create(BenchOutput.CSV, out, g);
+        BenchPrinters.BenchPrinter p = BenchPrinters.create(BenchOutput.CSV, out, g, CPU_KERNELS);
         p.printHeader(g);
         p.printTest(test());
         List<String> lines = lines(out);
@@ -62,7 +65,7 @@ public class BenchPrintersTest {
     public void jsonGathersTheTestsWithTheirSamples() throws Exception {
         StringBuilder out = new StringBuilder();
         BenchGrid g = grid("-m", "m.gguf");
-        BenchPrinters.BenchPrinter p = BenchPrinters.create(BenchOutput.JSON, out, g);
+        BenchPrinters.BenchPrinter p = BenchPrinters.create(BenchOutput.JSON, out, g, CPU_KERNELS);
         p.printHeader(g);
         p.printTest(test());
         p.printTest(test());
@@ -86,7 +89,8 @@ public class BenchPrintersTest {
     @Test
     public void jsonlWritesOneObjectPerLine() throws Exception {
         StringBuilder out = new StringBuilder();
-        BenchPrinters.BenchPrinter p = BenchPrinters.create(BenchOutput.JSONL, out, grid("-m", "m.gguf"));
+        BenchPrinters.BenchPrinter p = BenchPrinters.create(BenchOutput.JSONL, out, grid("-m", "m.gguf"),
+                CPU_KERNELS);
         p.printHeader(grid("-m", "m.gguf"));
         p.printTest(test());
         List<String> lines = lines(out);
@@ -103,16 +107,16 @@ public class BenchPrintersTest {
     public void markdownPrintsOnlyTheColumnsThatVary() throws Exception {
         StringBuilder out = new StringBuilder();
         BenchGrid g = grid("-m", "m.gguf", "-ctk", "q8_0");
-        BenchPrinters.BenchPrinter p = BenchPrinters.create(BenchOutput.MARKDOWN, out, g);
+        BenchPrinters.BenchPrinter p = BenchPrinters.create(BenchOutput.MARKDOWN, out, g, CPU_KERNELS);
         p.printHeader(g);
         p.printTest(test());
-        String header = lines(out).get(0);
+        String header = table(out).get(0);
         assertTrue("the varying cache type gains a column: " + header, header.contains(" type_k |"));
         assertTrue("the depth lives in the test cell, not a column: " + header, !header.contains(" n_depth "));
         assertTrue(header.contains(" test |"));
         assertTrue(header.contains(" t/s |"));
         assertTrue("the model column leads, left-aligned: " + header, header.startsWith("| model"));
-        String row = lines(out).get(2);
+        String row = table(out).get(2);
         assertTrue("the test cell names the shape and depth: " + row, row.contains(" pp64 @ d8 "));
         assertTrue("the t/s cell carries avg ± stddev: " + row, row.contains("42666.67 ± 30169.89"));
     }
@@ -121,9 +125,9 @@ public class BenchPrintersTest {
     public void markdownKeepsTheDefaultSweepLean() throws Exception {
         StringBuilder out = new StringBuilder();
         BenchGrid g = grid("-m", "m.gguf", "-ngl", "0");
-        BenchPrinters.BenchPrinter p = BenchPrinters.create(BenchOutput.MARKDOWN, out, g);
+        BenchPrinters.BenchPrinter p = BenchPrinters.create(BenchOutput.MARKDOWN, out, g, CPU_KERNELS);
         p.printHeader(g);
-        String header = lines(out).get(0);
+        String header = table(out).get(0);
         for (String column : new String[]{"ngl", "n_batch", "n_ubatch", "type_k", "type_v"}) {
             assertTrue("the default " + column + " is no column: " + header, !header.contains(" " + column + " |"));
         }
@@ -133,7 +137,7 @@ public class BenchPrintersTest {
     public void markdownShowsTheSweptSplitAndKvOffloadColumns() throws Exception {
         StringBuilder out = new StringBuilder();
         BenchGrid g = grid("-m", "m.gguf", "-sm", "none,layer", "-mg", "0,1", "-ts", "3/1", "-nkvo", "0,1");
-        BenchPrinters.BenchPrinter p = BenchPrinters.create(BenchOutput.MARKDOWN, out, g);
+        BenchPrinters.BenchPrinter p = BenchPrinters.create(BenchOutput.MARKDOWN, out, g, CPU_KERNELS);
         p.printHeader(g);
         com.eonmux.neuralfree.gguf.engine.EngineConfig.SplitMode layer =
                 com.eonmux.neuralfree.gguf.engine.EngineConfig.SplitMode.LAYER;
@@ -141,7 +145,7 @@ public class BenchPrintersTest {
                 true, layer, 1, new double[]{3.0, 1.0});
         p.printTest(new BenchTest(inst, "llama tiny", 1024, 128, "CPU", 64, BenchReadout.LOGITS,
                 new long[]{1_000_000L}));
-        List<String> lines = lines(out);
+        List<String> lines = table(out);
         String header = lines.get(0);
         assertTrue("the main GPU gains a column: " + header, header.contains(" main_gpu |"));
         assertTrue("the split mode gains its abbreviation: " + header, header.contains(" sm |"));
@@ -159,9 +163,9 @@ public class BenchPrintersTest {
         StringBuilder out = new StringBuilder();
         BenchGrid g = grid("-m", "m.gguf", "-t", "4", "-ncmoe", "0,2", "-dev", "CUDA0,none",
                 "-ot", "a=CPU", "-lm", "none", "-embd", "1");
-        BenchPrinters.BenchPrinter p = BenchPrinters.create(BenchOutput.MARKDOWN, out, g);
+        BenchPrinters.BenchPrinter p = BenchPrinters.create(BenchOutput.MARKDOWN, out, g, CPU_KERNELS);
         p.printHeader(g);
-        String header = lines(out).get(0);
+        String header = table(out).get(0);
         for (String column : new String[]{" threads |", " n_cpu_moe |", " dev ", " ot ", " lm |", " embd |"}) {
             assertTrue("the swept parameter gains its column: " + header, header.contains(column));
         }
@@ -170,7 +174,8 @@ public class BenchPrintersTest {
     @Test
     public void sqlCreatesTheTableAndInsertsTheRows() throws Exception {
         StringBuilder out = new StringBuilder();
-        BenchPrinters.BenchPrinter p = BenchPrinters.create(BenchOutput.SQL, out, grid("-m", "m.gguf"));
+        BenchPrinters.BenchPrinter p = BenchPrinters.create(BenchOutput.SQL, out, grid("-m", "m.gguf"),
+                CPU_KERNELS);
         p.printHeader(grid("-m", "m.gguf"));
         p.printTest(test());
         List<String> lines = lines(out);
@@ -198,7 +203,8 @@ public class BenchPrintersTest {
 
     @Test
     public void noneHasNoPrinterAndJsonEscapesItsStrings() throws Exception {
-        assertNull(BenchPrinters.create(BenchOutput.NONE, new StringBuilder(), grid("-m", "m.gguf")));
+        assertNull(BenchPrinters.create(BenchOutput.NONE, new StringBuilder(), grid("-m", "m.gguf"),
+                CPU_KERNELS));
         assertEquals("say \\\"hi\\\"", BenchPrinters.escapeJson("say \"hi\""));
         assertEquals("tab \\u0009 here", BenchPrinters.escapeJson("tab \t here"));
         assertEquals("\"f16\"", BenchPrinters.jsonValue("type_k", "f16"));
@@ -208,5 +214,13 @@ public class BenchPrintersTest {
     /** The output's lines, without the empty artifact of the trailing newline. */
     private static List<String> lines(StringBuilder out) {
         return Arrays.asList(out.toString().split("\n"));
+    }
+
+    /** The table lines of Markdown output, after the header's CPU kernel line and the blank line below it. */
+    private static List<String> table(StringBuilder out) {
+        List<String> lines = lines(out);
+        assertEquals("the header names the CPU kernels first: " + out, "CPU kernels: " + CPU_KERNELS, lines.get(0));
+        assertEquals("a blank line separates the table: " + out, "", lines.get(1));
+        return lines.subList(2, lines.size());
     }
 }

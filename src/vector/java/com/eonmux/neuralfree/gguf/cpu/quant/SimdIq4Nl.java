@@ -20,25 +20,19 @@ import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.fp16At;
  * nibbles (elements {@code 16..31}), each selects its lane out of the {@code kvalues_iq4nl} table with
  * {@code selectFrom}, and the selected int8 values dot the pre-widened short activation lanes in
  * {@code vpmullw}, the two product vectors adding in short lanes before one pairwise fold into int lanes
- * ({@link SimdI8#pairSum}). Two int8 codebook values sum without wrapping a short, and so do their products
- * with an int8 activation. The float combination {@code d_x * d_y * sumi} per block follows
+ * (the sign-extended halves of each int lane). Two int8 codebook values sum without wrapping a short, and so do
+ * their products with an int8 activation. The float combination {@code d_x * d_y * sumi} per block follows
  * {@code ggml_vec_dot_iq4_nl_q8_0_generic}, so the kernel returns exactly what {@link IQuantVecDot#IQ4_NL}
  * returns.
  *
- * <p>The batched product ({@link #dotTiles}) multiplies a register tile of two weight rows by eight tokens, so
- * the codebook lookup and the activation lanes of a block are each reused across the tile. Immutable,
- * stateless and thread-safe.</p>
+ * <p>The batched product ({@link #dotTiles}) looks each weight row up once per task into float values and
+ * multiplies four rows by two eight-token tiles in exact float lanes ({@link SimdBlockTiles}, form
+ * {@link SimdBlockTiles.Form#DOT}). Immutable, stateless and thread-safe.</p>
  */
-public final class SimdIq4Nl implements CpuVecDot {
+public final class SimdIq4Nl implements SimdBlockTiles.Kernel {
 
     /** The IQ4_NL vec-dot. */
     public static final SimdIq4Nl INSTANCE = new SimdIq4Nl();
-
-    /** Tokens one pass of the batched kernel decodes a weight block for. */
-    private static final int TOKENS = 8;
-
-    /** Weight rows one register tile of the batched kernel multiplies. */
-    private static final int TILE_ROWS = 2;
 
     /** {@code kvalues_iq4nl} as sixteen byte lanes: the source of {@code selectFrom}. */
     private static final ByteVector TABLE = table();
@@ -69,7 +63,14 @@ public final class SimdIq4Nl implements CpuVecDot {
     @Override
     public void dotRows(CpuTensorRef w, long rowStart, int rowCount, QuantizedActivations x, float[] y, int yOff) {
         check(w, x);
-        CpuVecDotRows.forEachRowBytes(w, rowStart, rowCount, this, x, y, yOff);
+        CpuVecDotRows.check(w, rowStart, rowCount, y, yOff);
+        final short[] ys = SimdI8.activationsShort(x);
+        final byte[] buf = CpuVecDotRows.buffer(w);
+        final CpuVecDotRows.RowReader rows = CpuVecDotRows.reader(w);
+        for (int r = 0; r < rowCount; r++) {
+            rows.copy(rowStart + r, buf);
+            y[yOff + r] = dot(buf, 0, x, ys);
+        }
     }
 
     private static void check(CpuTensorRef w, QuantizedActivations x) {
@@ -78,100 +79,32 @@ public final class SimdIq4Nl implements CpuVecDot {
     }
 
     @Override
-    public void dotRows(CpuTensorRef w, long rowStart, int rowCount, QuantizedActivations[] x, int nTokens,
-                        float[] y, int yOff, int yStride) {
-        dotTiles(w, rowStart, rowCount, x, nTokens, y, yOff, yStride);
+    public GGMLType weightType() {
+        return GGMLType.IQ4_NL;
     }
 
     @Override
-    public void dotTiles(CpuTensorRef w, long rowStart, int rowCount, QuantizedActivations[] x, int nTokens,
-                         float[] y, int yOff, int yStride) {
-        if (nTokens == 0) {
-            return;
-        }
-        checkTiles(w, rowStart, rowCount, x, nTokens, y, yOff, yStride);
-        final short[][] ys = SimdI8.activationsAllShort(x, nTokens);
-        final byte[][] rows = CpuVecDotRows.buffers(w, TILE_ROWS);
-        final float[] acc = SimdI8.tileAccumulators(TILE_ROWS * TOKENS);
-        final int nb = x[0].n / QK4_NL;
-        int r = 0;
-        for (; r + TILE_ROWS <= rowCount; r += TILE_ROWS) {
-            CpuVecDotRows.copyRow(w, rowStart + r, rows[0]);
-            CpuVecDotRows.copyRow(w, rowStart + r + 1, rows[1]);
-            dotTile2(rows[0], rows[1], x, nTokens, ys, nb, y, yOff + r, yStride, acc);
-        }
-        for (; r < rowCount; r++) {
-            CpuVecDotRows.copyRow(w, rowStart + r, rows[0]);
-            dotRowTokens(rows[0], x, nTokens, ys, nb, y, yOff + r, yStride, acc);
+    public SimdBlockTiles.Form form() {
+        return SimdBlockTiles.Form.DOT;
+    }
+
+    /** The codebook values of one row as floats and its block scales ({@link SimdBlockTiles.Rows}). */
+    @Override
+    public void unpackRow(byte[] b, int nb, float[] values, float[] d, float[] m) {
+        final byte[] q = SimdBlockTiles.quants();
+        int o = 0;
+        for (int ib = 0; ib < nb; ib++, o += IQ4_NL_BYTES) {
+            lookup(b, o + IQ4_NL_QS, q);
+            SimdBlockTiles.widen(q, values, ib * QK4_NL);
+            d[ib] = fp16At(b, o + IQ4_NL_D);
         }
     }
 
-    /** Two weight rows against {@code nTokens} activation rows, {@link #TOKENS} tokens at a time. */
-    private static void dotTile2(byte[] b0, byte[] b1, QuantizedActivations[] x, int nTokens, short[][] ys,
-                                 int nb, float[] y, int y0, int yStride, float[] sum) {
-        for (int t0 = 0; t0 < nTokens; t0 += TOKENS) {
-            final int n = Math.min(TOKENS, nTokens - t0);
-            java.util.Arrays.fill(sum, 0, TILE_ROWS * TOKENS, 0.0f);
-            int o = 0;
-            for (int ib = 0; ib < nb; ib++, o += IQ4_NL_BYTES) {
-                final ByteVector q0 = ByteVector.fromArray(SimdI8.B16, b0, o + IQ4_NL_QS);
-                final ShortVector lo0 = (ShortVector) q0.and((byte) 0x0F).selectFrom(TABLE)
-                        .convertShape(VectorOperators.B2S, SimdI8.S16, 0);
-                final ShortVector hi0 = (ShortVector) q0.lanewise(VectorOperators.LSHR, 4).selectFrom(TABLE)
-                        .convertShape(VectorOperators.B2S, SimdI8.S16, 0);
-                final ByteVector q1 = ByteVector.fromArray(SimdI8.B16, b1, o + IQ4_NL_QS);
-                final ShortVector lo1 = (ShortVector) q1.and((byte) 0x0F).selectFrom(TABLE)
-                        .convertShape(VectorOperators.B2S, SimdI8.S16, 0);
-                final ShortVector hi1 = (ShortVector) q1.lanewise(VectorOperators.LSHR, 4).selectFrom(TABLE)
-                        .convertShape(VectorOperators.B2S, SimdI8.S16, 0);
-                final int yb = ib * QK4_NL;
-                final float d0 = fp16At(b0, o + IQ4_NL_D);
-                final float d1 = fp16At(b1, o + IQ4_NL_D);
-                for (int ti = 0; ti < n; ti++) {
-                    final short[] a = ys[t0 + ti];
-                    final ShortVector av = ShortVector.fromArray(SimdI8.S16, a, yb);
-                    final ShortVector avh = ShortVector.fromArray(SimdI8.S16, a, yb + 16);
-                    final int base = ti * TILE_ROWS;
-                    sum[base] += (d0 * x[t0 + ti].d[ib]) * SimdI8.sum(SimdI8.pairSum(lo0.mul(av)
-                            .add(hi0.mul(avh)), SimdI8.zero(SimdI8.I8)));
-                    sum[base + 1] += (d1 * x[t0 + ti].d[ib]) * SimdI8.sum(SimdI8.pairSum(lo1.mul(av)
-                            .add(hi1.mul(avh)), SimdI8.zero(SimdI8.I8)));
-                }
-            }
-            for (int ti = 0; ti < n; ti++) {
-                y[y0 + (ti + t0) * yStride] = sum[ti * TILE_ROWS];
-                y[y0 + 1 + (ti + t0) * yStride] = sum[ti * TILE_ROWS + 1];
-            }
-        }
-    }
-
-    /** One weight row against {@code nTokens} activation rows, {@link #TOKENS} tokens at a time. */
-    private static void dotRowTokens(byte[] b, QuantizedActivations[] x, int nTokens, short[][] ys, int nb,
-                                     float[] y, int y0, int yStride, float[] sum) {
-        for (int t0 = 0; t0 < nTokens; t0 += TOKENS) {
-            final int n = Math.min(TOKENS, nTokens - t0);
-            java.util.Arrays.fill(sum, 0, n, 0.0f);
-            int o = 0;
-            for (int ib = 0; ib < nb; ib++, o += IQ4_NL_BYTES) {
-                final ByteVector q = ByteVector.fromArray(SimdI8.B16, b, o + IQ4_NL_QS);
-                final ShortVector lo = (ShortVector) q.and((byte) 0x0F).selectFrom(TABLE)
-                        .convertShape(VectorOperators.B2S, SimdI8.S16, 0);
-                final ShortVector hi = (ShortVector) q.lanewise(VectorOperators.LSHR, 4).selectFrom(TABLE)
-                        .convertShape(VectorOperators.B2S, SimdI8.S16, 0);
-                final int yb = ib * QK4_NL;
-                final float d = fp16At(b, o + IQ4_NL_D);
-                for (int ti = 0; ti < n; ti++) {
-                    final short[] a = ys[t0 + ti];
-                    sum[ti] += (d * x[t0 + ti].d[ib]) * SimdI8.sum(SimdI8.pairSum(
-                            lo.mul(ShortVector.fromArray(SimdI8.S16, a, yb))
-                                    .add(hi.mul(ShortVector.fromArray(SimdI8.S16, a, yb + 16))),
-                            SimdI8.zero(SimdI8.I8)));
-                }
-            }
-            for (int ti = 0; ti < n; ti++) {
-                y[y0 + (t0 + ti) * yStride] = sum[ti];
-            }
-        }
+    /** The 32 codebook values of the sixteen quant bytes at {@code b[qs..)} in element order at {@code q[0..32)}. */
+    static void lookup(byte[] b, int qs, byte[] q) {
+        final ByteVector v = ByteVector.fromArray(SimdI8.B16, b, qs);
+        v.and((byte) 0x0F).selectFrom(TABLE).intoArray(q, 0);
+        v.lanewise(VectorOperators.LSHR, 4).selectFrom(TABLE).intoArray(q, QK4_NL / 2);
     }
 
     private static float dot(byte[] b, int off, QuantizedActivations x, short[] ys) {
@@ -180,22 +113,23 @@ public final class SimdIq4Nl implements CpuVecDot {
         float sumf = 0;
         for (int ib = 0; ib < nb; ib++, off += IQ4_NL_BYTES) {
             final int y = ib * QK4_NL;
-            final int sumi = SimdI8.sum(subDot(b, off + IQ4_NL_QS, ys, y));
+            final int sumi = subDot(b, off + IQ4_NL_QS, ys, y);
             sumf += (fp16At(b, off + IQ4_NL_D) * yd[ib]) * sumi;
         }
         return sumf;
     }
 
     /** The 32 codebook values of the sixteen quant bytes dot the thirty-two activation lanes at {@code y}. */
-    private static IntVector subDot(byte[] b, int qs, short[] ys, int y) {
+    private static int subDot(byte[] b, int qs, short[] ys, int y) {
         final ByteVector q = ByteVector.fromArray(SimdI8.B16, b, qs);
         final ShortVector lo = (ShortVector) q.and((byte) 0x0F).selectFrom(TABLE)
                 .convertShape(VectorOperators.B2S, SimdI8.S16, 0);
         final ShortVector hi = (ShortVector) q.lanewise(VectorOperators.LSHR, 4).selectFrom(TABLE)
                 .convertShape(VectorOperators.B2S, SimdI8.S16, 0);
-        return SimdI8.pairSum(lo.mul(ShortVector.fromArray(SimdI8.S16, ys, y))
-                        .add(hi.mul(ShortVector.fromArray(SimdI8.S16, ys, y + QK4_NL / 2))),
-                SimdI8.zero(SimdI8.I8));
+        final IntVector p = (IntVector) lo.mul(ShortVector.fromArray(SimdI8.S16, ys, y))
+                .add(hi.mul(ShortVector.fromArray(SimdI8.S16, ys, y + QK4_NL / 2))).reinterpretShape(SimdI8.I8, 0);
+        return p.lanewise(VectorOperators.LSHL, 16).lanewise(VectorOperators.ASHR, 16)
+                .add(p.lanewise(VectorOperators.ASHR, 16)).reduceLanes(VectorOperators.ADD);
     }
 
     @Override

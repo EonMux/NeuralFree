@@ -4,6 +4,7 @@ import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuVecDot.QuantizedActivations;
 import com.eonmux.neuralfree.gguf.quant.QuantTables;
 import jdk.incubator.vector.ByteVector;
+import jdk.incubator.vector.IntVector;
 import jdk.incubator.vector.ShortVector;
 import jdk.incubator.vector.VectorOperators;
 
@@ -28,16 +29,14 @@ import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.shortAt;
  *
  * <p>Keeping the codebook lookup and the activation lanes of a sub-block in a method of their own is what makes
  * the lookup intrinsic: written inside the super-block loop, the same source fell back to the allocating
- * template. The batched product ({@link #dotTiles}) serves eight tokens from one lookup of each sub-block.
- * Immutable, stateless and thread-safe.</p>
+ * template. The batched product ({@link #dotTiles}) looks each weight row up once per task into float values and
+ * multiplies four rows by two eight-token tiles in exact float lanes ({@link SimdBlockTiles}, form
+ * {@link SimdBlockTiles.Form#SUB_SCALED}). Immutable, stateless and thread-safe.</p>
  */
-public final class SimdIq4Xs implements CpuVecDot {
+public final class SimdIq4Xs implements SimdBlockTiles.Kernel {
 
     /** The IQ4_XS vec-dot. */
     public static final SimdIq4Xs INSTANCE = new SimdIq4Xs();
-
-    /** Tokens one pass of the batched kernel decodes a weight super-block for. */
-    private static final int TOKENS = 8;
 
     /** Elements of one sub-block, i.e. of the activation run one lookup dots. */
     private static final int SUB = 32;
@@ -71,7 +70,14 @@ public final class SimdIq4Xs implements CpuVecDot {
     @Override
     public void dotRows(CpuTensorRef w, long rowStart, int rowCount, QuantizedActivations x, float[] y, int yOff) {
         check(w, x);
-        CpuVecDotRows.forEachRowBytes(w, rowStart, rowCount, this, x, y, yOff);
+        CpuVecDotRows.check(w, rowStart, rowCount, y, yOff);
+        final short[] ys = SimdI8.activationsShort(x);
+        final byte[] buf = CpuVecDotRows.buffer(w);
+        final CpuVecDotRows.RowReader rows = CpuVecDotRows.reader(w);
+        for (int r = 0; r < rowCount; r++) {
+            rows.copy(rowStart + r, buf);
+            y[yOff + r] = dot(buf, 0, x, ys);
+        }
     }
 
     private static void check(CpuTensorRef w, QuantizedActivations x) {
@@ -80,59 +86,37 @@ public final class SimdIq4Xs implements CpuVecDot {
     }
 
     @Override
-    public void dotRows(CpuTensorRef w, long rowStart, int rowCount, QuantizedActivations[] x, int nTokens,
-                        float[] y, int yOff, int yStride) {
-        dotTiles(w, rowStart, rowCount, x, nTokens, y, yOff, yStride);
+    public GGMLType weightType() {
+        return GGMLType.IQ4_XS;
     }
 
     @Override
-    public void dotTiles(CpuTensorRef w, long rowStart, int rowCount, QuantizedActivations[] x, int nTokens,
-                         float[] y, int yOff, int yStride) {
-        if (nTokens == 0) {
-            return;
-        }
-        checkTiles(w, rowStart, rowCount, x, nTokens, y, yOff, yStride);
-        final short[][] ys = SimdI8.activationsAllShort(x, nTokens);
-        final byte[] row = CpuVecDotRows.buffer(w);
-        final float[] acc = SimdI8.tileAccumulators(TOKENS);
-        final int nb = x[0].n / QK_K;
-        for (int r = 0; r < rowCount; r++) {
-            CpuVecDotRows.copyRow(w, rowStart + r, row);
-            dotRowTokens(row, x, nTokens, ys, nb, y, yOff + r, yStride, acc);
-        }
+    public SimdBlockTiles.Form form() {
+        return SimdBlockTiles.Form.SUB_SCALED;
     }
 
     /**
-     * One weight row against {@code nTokens} activation rows, {@link #TOKENS} tokens at a time: each 32-element
-     * sub-block is looked up once and dotted with every token of the tile.
+     * The codebook values of one row as floats, each 32-element sub-block's {@code ls - 32} in {@code d} and its
+     * super-block's {@code d_x} in {@code m} ({@link SimdBlockTiles.Rows}).
      */
-    private static void dotRowTokens(byte[] b, QuantizedActivations[] x, int nTokens, short[][] ys, int nb,
-                                     float[] y, int y0, int yStride, float[] sum) {
-        for (int t0 = 0; t0 < nTokens; t0 += TOKENS) {
-            final int n = Math.min(TOKENS, nTokens - t0);
-            java.util.Arrays.fill(sum, 0, n, 0.0f);
-            int o = 0;
-            for (int ibl = 0; ibl < nb; ibl++, o += IQ4_XS_BYTES) {
-                final float d = fp16At(b, o + IQ4_XS_D);
-                int h = shortAt(b, o + IQ4_XS_SCALES_H) & 0xFFFF;
-                int qs = o + IQ4_XS_QS;
-                final int xo = ibl * QK_K;
-                for (int sub = 0; sub < QK_K / SUB; sub += 2) {
-                    final int sl = b[o + IQ4_XS_SCALES_L + sub / 2] & 0xFF;
-                    final int ls1 = (sl & 0x0F) | ((h << 4) & 0x30);
-                    final int ls2 = (sl >>> 4) | ((h << 2) & 0x30);
-                    h >>>= 4;
-                    for (int ti = 0; ti < n; ti++) {
-                        final short[] a = ys[t0 + ti];
-                        final float d4d8 = d * x[t0 + ti].d[ibl];
-                        sum[ti] += (d4d8 * (ls1 - 32)) * subDot(b, qs, a, xo + sub * SUB);
-                        sum[ti] += (d4d8 * (ls2 - 32)) * subDot(b, qs + 16, a, xo + (sub + 1) * SUB);
-                    }
-                    qs += 32;
-                }
-            }
-            for (int ti = 0; ti < n; ti++) {
-                y[y0 + (t0 + ti) * yStride] = sum[ti];
+    @Override
+    public void unpackRow(byte[] b, int nb, float[] values, float[] d, float[] m) {
+        final byte[] q = SimdBlockTiles.quants();
+        int o = 0;
+        for (int ib = 0; ib < nb; o += IQ4_XS_BYTES) {
+            final float dx = fp16At(b, o + IQ4_XS_D);
+            int h = shortAt(b, o + IQ4_XS_SCALES_H) & 0xFFFF;
+            for (int sub = 0; sub < QK_K / SUB; sub += 2, ib += 2) {
+                final int sl = b[o + IQ4_XS_SCALES_L + sub / 2] & 0xFF;
+                d[ib] = ((sl & 0x0F) | ((h << 4) & 0x30)) - 32;
+                d[ib + 1] = ((sl >>> 4) | ((h << 2) & 0x30)) - 32;
+                m[ib] = dx;
+                m[ib + 1] = dx;
+                h >>>= 4;
+                SimdIq4Nl.lookup(b, o + IQ4_XS_QS + 16 * sub, q);
+                SimdBlockTiles.widen(q, values, ib * SUB);
+                SimdIq4Nl.lookup(b, o + IQ4_XS_QS + 16 * sub + 16, q);
+                SimdBlockTiles.widen(q, values, (ib + 1) * SUB);
             }
         }
     }
@@ -143,17 +127,12 @@ public final class SimdIq4Xs implements CpuVecDot {
         float sumf = 0;
         for (int ibl = 0; ibl < nb; ibl++, off += IQ4_XS_BYTES) {
             final float d4d8 = fp16At(b, off + IQ4_XS_D) * yd[ibl];
-            int h = shortAt(b, off + IQ4_XS_SCALES_H) & 0xFFFF;
-            int qs = off + IQ4_XS_QS;
+            final int h = shortAt(b, off + IQ4_XS_SCALES_H) & 0xFFFF;
             final int o = ibl * QK_K;
-            for (int sub = 0; sub < QK_K / SUB; sub += 2) {
+            for (int sub = 0; sub < QK_K / SUB; sub++) {
                 final int sl = b[off + IQ4_XS_SCALES_L + sub / 2] & 0xFF;
-                final int ls1 = (sl & 0x0F) | ((h << 4) & 0x30);
-                final int ls2 = (sl >>> 4) | ((h << 2) & 0x30);
-                h >>>= 4;
-                sumf += (d4d8 * (ls1 - 32)) * subDot(b, qs, ys, o + sub * SUB);
-                sumf += (d4d8 * (ls2 - 32)) * subDot(b, qs + 16, ys, o + (sub + 1) * SUB);
-                qs += 32;
+                final int ls = ((sub & 1) == 0 ? sl & 0x0F : sl >>> 4) | (((h >>> (2 * sub)) & 3) << 4);
+                sumf += (d4d8 * (ls - 32)) * subDot(b, off + IQ4_XS_QS + 16 * sub, ys, o + sub * SUB);
             }
         }
         return sumf;
@@ -162,7 +141,9 @@ public final class SimdIq4Xs implements CpuVecDot {
     /**
      * The 32 codebook values of one sub-block's sixteen quant bytes, dotted with the activation lanes at
      * {@code y}: the lookup and the two 16-lane products of {@link SimdIq4Nl} in a method small enough for the
-     * JIT to keep the {@code selectFrom} intrinsic.
+     * JIT to keep the {@code selectFrom} intrinsic. The row loop calls it once per iteration, as {@code SimdIq4Nl}
+     * does: two calls per iteration let C2 inline both copies into the row loop, and in a share of the JVMs that ran
+     * other vector code first the copies' shape changes then compile to calls into the library's Java fallback.
      */
     private static int subDot(byte[] b, int qs, short[] ys, int y) {
         final ByteVector q = ByteVector.fromArray(SimdI8.B16, b, qs);
@@ -170,9 +151,10 @@ public final class SimdIq4Xs implements CpuVecDot {
                 .convertShape(VectorOperators.B2S, SimdI8.S16, 0);
         final ShortVector hi = (ShortVector) q.lanewise(VectorOperators.LSHR, 4).selectFrom(TABLE)
                 .convertShape(VectorOperators.B2S, SimdI8.S16, 0);
-        return SimdI8.sum(SimdI8.pairSum(lo.mul(ShortVector.fromArray(SimdI8.S16, ys, y))
-                        .add(hi.mul(ShortVector.fromArray(SimdI8.S16, ys, y + 16))),
-                SimdI8.zero(SimdI8.I8)));
+        final IntVector p0 = (IntVector) lo.mul(ShortVector.fromArray(SimdI8.S16, ys, y))
+                .add(hi.mul(ShortVector.fromArray(SimdI8.S16, ys, y + 16))).reinterpretShape(SimdI8.I8, 0);
+        return p0.lanewise(VectorOperators.LSHL, 16).lanewise(VectorOperators.ASHR, 16)
+                .add(p0.lanewise(VectorOperators.ASHR, 16)).reduceLanes(VectorOperators.ADD);
     }
 
     @Override

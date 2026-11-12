@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.cli;
 
+import com.eonmux.neuralfree.gguf.cpu.quant.CpuSimd;
 import com.eonmux.neuralfree.gguf.engine.kvtransfer.KvTransferConfig;
 import com.eonmux.neuralfree.gguf.engine.watermark.WatermarkConfig;
 import com.eonmux.neuralfree.gguf.hub.HubCache;
@@ -14,15 +15,14 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * The {@code collect-env} command, vLLM's {@code vllm collect-env} ({@code
- * vllm/entrypoints/cli/collect_env.py} over {@code vllm/collect_env.py}): the environment facts a
- * bug report needs — the NeuralFree version, the Java runtime, the operating system, the GPU devices
- * each API enumerates, the hub cache with its model count, the server jar the serve command resolves
- * and the engine's environment variables. Secret variables ({@code HF_TOKEN}, {@code
- * NEURALFREE_API_KEY}, {@code NEURALFREE_WATERMARK_KEY}, {@code NEURALFREE_KV_TRANSFER_TOKEN}, {@code
- * NEURALFREE_RPC_KEY}) report only whether they
- * are set, never their value; everything printed is read through the same accessors the engine itself uses. The
- * report goes to standard output; the command never writes a file and never touches the network.
+ * The {@code collect-env} command, vLLM's {@code vllm collect-env} ({@code vllm/entrypoints/cli/collect_env.py} over
+ * {@code vllm/collect_env.py}): the environment facts a bug report needs — the NeuralFree version, the Java runtime,
+ * the operating system, the GPU devices each API enumerates, the CPU kernels the engine selects with the reason, the
+ * hub cache with its model count, the server jar the serve command resolves and the engine's environment variables.
+ * Secret variables ({@code HF_TOKEN}, {@code NEURALFREE_API_KEY}, {@code NEURALFREE_WATERMARK_KEY}, {@code
+ * NEURALFREE_KV_TRANSFER_TOKEN}, {@code NEURALFREE_RPC_KEY}) report only whether they are set, never their value;
+ * everything printed is read through the same accessors the engine itself uses. The report goes to standard output; the
+ * command never writes a file and never touches the network.
  */
 public final class CollectEnv {
 
@@ -36,12 +36,13 @@ public final class CollectEnv {
         private final String cacheRoot;
         private final int cachedModels;
         private final String serverJar;
+        private final String cpuKernels;
         private final Map<String, String> env;
 
         /** A snapshot of the given observations; the maps are copied, so a snapshot never changes. */
         public Snapshot(String version, Map<String, String> java, Map<String, String> os,
                         List<DeviceListing.Entry> devices, String cacheRoot, int cachedModels,
-                        String serverJar, Map<String, String> env) {
+                        String serverJar, String cpuKernels, Map<String, String> env) {
             this.version = version;
             this.java = new LinkedHashMap<>(java);
             this.os = new LinkedHashMap<>(os);
@@ -49,6 +50,7 @@ public final class CollectEnv {
             this.cacheRoot = cacheRoot;
             this.cachedModels = cachedModels;
             this.serverJar = serverJar;
+            this.cpuKernels = cpuKernels;
             this.env = new LinkedHashMap<>(env);
         }
 
@@ -87,6 +89,11 @@ public final class CollectEnv {
             return serverJar;
         }
 
+        /** The CPU kernels this JVM selects and why ({@link CpuSimd#status()}), or why the query failed. */
+        public String cpuKernels() {
+            return cpuKernels;
+        }
+
         /** The environment variables by name, with their raw values; {@link #mask} hides the secrets. */
         public Map<String, String> env() {
             return env;
@@ -111,7 +118,20 @@ public final class CollectEnv {
     /** The snapshot of this machine; a failed cache read counts zero models, not a failed command. */
     public static Snapshot snapshot() {
         return new Snapshot(Version.current(), java(), os(), DeviceListing.available(), cacheRoot(),
-                cachedModels(), serverJar(), env());
+                cachedModels(), serverJar(), cpuKernels(), env());
+    }
+
+    /**
+     * The CPU kernel choice of this JVM with its reason. The launcher starts {@code collect-env} with the vector
+     * module as it starts the engine commands, so this is the choice they make on this machine; an invalid kernel
+     * property is reported by its message rather than failing the report.
+     */
+    static String cpuKernels() {
+        try {
+            return CpuSimd.status();
+        } catch (IllegalArgumentException e) {
+            return "invalid: " + e.getMessage();
+        }
     }
 
     /** The Java runtime facts. */
@@ -186,6 +206,7 @@ public final class CollectEnv {
         for (Map.Entry<String, String> e : s.os().entrySet()) {
             sb.append("OS ").append(e.getKey()).append(": ").append(e.getValue()).append('\n');
         }
+        sb.append("CPU kernels: ").append(s.cpuKernels()).append('\n');
         sb.append(DeviceListing.lines(s.devices()));
         sb.append("Hub cache: ").append(s.cacheRoot()).append(" (").append(s.cachedModels())
                 .append(" models)\n");

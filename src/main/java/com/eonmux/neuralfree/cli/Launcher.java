@@ -23,10 +23,11 @@ import java.util.List;
  * {@code --list-devices}, {@code --cache-list}). Aliases follow the
  * references ({@code server} for {@code serve}, {@code client} for {@code cli}, {@code get} for
  * {@code download}); a command may also be spelled as a {@code --flag}. An unknown command is
- * refused with the surface, never guessed. The commands that run the engine in this JVM relaunch it
- * once with {@code --add-modules=jdk.incubator.vector} when the start-up JVM did not resolve the
- * module ({@link JvmVectorModule}), so the packaged start scripts, {@code java -jar} and the Gradle
- * run tasks all get the vector CPU kernels on Java 17 or later.
+ * refused with the surface, never guessed. The commands that run the engine in this JVM, and
+ * {@code collect-env}, which reports the CPU kernels this JVM selects, relaunch it once with
+ * {@code --add-modules=jdk.incubator.vector} when the start-up JVM did not resolve the module
+ * ({@link JvmVectorModule}), so the packaged start scripts, {@code java -jar} and the Gradle run tasks
+ * all get the vector CPU kernels on Java 17 or later.
  */
 public final class Launcher {
 
@@ -192,9 +193,10 @@ public final class Launcher {
 
     /**
      * Whether the command runs the engine in this JVM, so it needs the Vector API module resolved here.
-     * The server commands ({@code serve}, {@code run-batch}) start their own JVM with the module, the OpenAI
-     * client commands ({@code chat}, {@code complete}) talk HTTP to another process, and the self-describing
-     * commands never load the CPU kernels.
+     * {@code collect-env} counts as one: it reports the CPU kernels this JVM selects, which are the engine
+     * commands' only when the module is resolved alike. The server commands ({@code serve}, {@code run-batch})
+     * start their own JVM with the module, the OpenAI client commands ({@code chat}, {@code complete}) talk HTTP
+     * to another process, and the other self-describing commands never load the CPU kernels.
      */
     static boolean runsEngineInProcess(Command command) {
         switch (command.name()) {
@@ -205,7 +207,6 @@ public final class Launcher {
             case "version":
             case "help":
             case "cache-list":
-            case "collect-env":
                 return false;
             default:
                 return true;

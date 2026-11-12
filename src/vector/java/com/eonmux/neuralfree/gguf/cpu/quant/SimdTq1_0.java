@@ -80,7 +80,7 @@ public final class SimdTq1_0 implements CpuVecDot {
                     for (int l = 0; l < POW3.length; l++) {
                         final IntVector trit = v.mul(POW3[l]).and(0xFF).mul(3)
                                 .lanewise(VectorOperators.LSHR, 8);
-                        acc = acc.add(trit.mul(IntVector.fromArray(SimdI8.I8, yw, y + stride * l)));
+                        acc = trit.mul(IntVector.fromArray(SimdI8.I8, yw, y + stride * l)).add(acc);
                     }
                 }
             }
@@ -93,7 +93,8 @@ public final class SimdTq1_0 implements CpuVecDot {
                         + trit(v, 9) * yw[y0 + 2 * TQ1_0_QH_BYTES]
                         + trit(v, 27) * yw[y0 + 3 * TQ1_0_QH_BYTES];
             }
-            final int sum = SimdI8.sum(acc) + qhSum - blockSum(bsums, i);
+            final int sum = ((IntVector) acc.check(SimdI8.I8)).reduceLanes(VectorOperators.ADD) + qhSum
+                    - blockSum(bsums, i);
             sumf += (float) sum * (fp16At(b, off + TQ1_0_D) * yd[i]);
         }
         return sumf;

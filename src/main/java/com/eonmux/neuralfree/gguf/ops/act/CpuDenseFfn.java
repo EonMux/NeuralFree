@@ -173,6 +173,12 @@ public final class CpuDenseFfn implements CpuFfnBlock {
 
     // ------------------------------------------------------------------ step
 
+    /** The projections, the activation and the per-row norms act on each token row alone. */
+    @Override
+    public boolean rowLocal() {
+        return true;
+    }
+
     /**
      * Runs the FFN over {@code n} rows of {@code in} (the up projection's input width, from index 0) into {@code out}
      * (the down projection's output width, from index 0).
