@@ -67,3 +67,32 @@ task writeServerClasspath {
                     'TESTCP=' + sourceSets.test.compileClasspath.files*.absolutePath.join(':') + '\n'
     }
 }
+
+// Server hot-path microbenchmarks (JMH 1.37, server/src/jmh/java), in the server's packages so they reach its
+// package-private writers: `./gradlew serverJmh -Pjmh.args='<JMH options>'`. The task has its own name because
+// Gradle runs a task name in every project that has it, so a root `jmh` filter would also reach this JMH run, which
+// exits with an error when the filter matches none of its benchmarks. Neither the benchmarks nor JMH are packaged
+// into the runner.
+sourceSets {
+    jmh {
+        java.srcDirs = ['src/jmh/java']
+        resources.srcDirs = []
+    }
+}
+sourceSets.jmh.compileClasspath += sourceSets.main.output.classesDirs + configurations.compileClasspath
+sourceSets.jmh.runtimeClasspath += sourceSets.main.runtimeClasspath
+dependencies {
+    jmhImplementation 'org.openjdk.jmh:jmh-core:1.37'
+    jmhAnnotationProcessor 'org.openjdk.jmh:jmh-generator-annprocess:1.37'
+}
+tasks.register('serverJmh', JavaExec) {
+    group = 'verification'
+    description = 'Runs the JMH microbenchmarks of server/src/jmh/java; -Pjmh.args passes JMH options and filters.'
+    classpath = sourceSets.jmh.runtimeClasspath
+    mainClass = 'org.openjdk.jmh.Main'
+    jvmArgs '--add-modules=jdk.incubator.vector'
+    def jmhArgs = project.findProperty('jmh.args')
+    if (jmhArgs != null) {
+        args jmhArgs.toString().trim().split(/\s+/).findAll { !it.isEmpty() }
+    }
+}

@@ -405,9 +405,47 @@ public final class MemoryPlan {
     }
 
     /**
+     * Why the context cannot shift: recurrent state, sparse side caches (DSA indexer, MSA index keys, DSV4
+     * compressed rows), or layers that read a target model's cache; null when it can.
+     */
+    public String shiftBlocker() {
+        if (hasRecurrentState()) {
+            if (!hasOnlyPositionalState()) {
+                return "the model keeps recurrent state";
+            }
+            if (config == null || !config.contextShift()) {
+                return "the Step5 region state holds only the open region; plan the memory with "
+                        + MemoryConfig.PROP_CONTEXT_SHIFT + "=true so every kept position survives a shift";
+            }
+        }
+        for (LayerMemoryPlan lp : layers()) {
+            if (lp.indexer() != null || lp.msa() != null || !lp.compressed().isEmpty()) {
+                return "sparse-attention caches (DSA indexer, MSA index keys, DSV4 compressed rows) cannot be "
+                        + "re-positioned";
+            }
+            if (lp.sharedFrom() != null && lp.sharedFrom().target()) {
+                return "layer " + lp.layer() + " reads the KV cache of a target model";
+            }
+        }
+        return null;
+    }
+
+    /**
+     * True when a device memory of this plan reserves its {@code shift_delta} buffers at allocation: whenever any
+     * edit can install RoPE deltas, so none allocates beyond the plan mid-run. That is the context shift's
+     * setting, a paged memory (whose {@code seq_add}, {@code seq_div}, self-extend and KV chunk reuse install
+     * them), and a contiguous one whose context can shift ({@link #shiftBlocker()} null), as an {@code n_keep}/
+     * {@code n_discard} request shifts it.
+     */
+    public boolean shiftDeltasReserved() {
+        return kind != MemoryKind.NONE && !groups.isEmpty()
+                && (contextShiftReserved() || paged() || shiftBlocker() == null);
+    }
+
+    /**
      * Bytes of the device addressing buffers a memory allocates beside its caches ({@code DeviceStepInputs}): per
      * group a {@code cell_idx} of the ubatch, the step's query and RoPE positions, the state row, the identity row
-     * map and the tree mask; with {@link #contextShiftReserved()} a {@code shift_delta} per group of its rows; when
+     * map and the tree mask; with {@link #shiftDeltasReserved()} a {@code shift_delta} per group of its rows; when
      * {@link #paged()} per group a page table of {@code parallel x maxPages} entries and the per-sequence key
      * lengths, the per-sequence query positions and a segment's positions, and for every
      * {@link #sequenceAddressed} group a {@code kv_pos} copy per sequence slot. 0 for a memoryless plan, whose
@@ -420,7 +458,7 @@ public final class MemoryPlan {
         int n = groups.size();
         long ints = (long) n * ubatch + ubatch + (long) MropeTextPositions.SECTIONS * ubatch + 1 + identityLength();
         long bytes = ints * Integer.BYTES + (long) ubatch * Long.BYTES;
-        if (contextShiftReserved()) {
+        if (shiftDeltasReserved()) {
             bytes += positionBytes();
         }
         if (paged()) {

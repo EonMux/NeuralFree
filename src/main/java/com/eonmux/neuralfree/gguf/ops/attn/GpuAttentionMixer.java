@@ -7,6 +7,7 @@ import com.eonmux.neuralfree.gguf.arch.ActOp;
 import com.eonmux.neuralfree.gguf.arch.MixerKind;
 import com.eonmux.neuralfree.gguf.arch.NormKind;
 import com.eonmux.neuralfree.gguf.arch.SwaType;
+import com.eonmux.neuralfree.gguf.engine.BatchSegments;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuMixer;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuProjectionDeltas;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuForwardContext;
@@ -586,9 +587,14 @@ public final class GpuAttentionMixer implements GpuMixer {
             /* The dense dual-chunk step never enqueues the flash group a patcher would claim. */
             return List.of();
         }
-        return dualFlash == null
-                ? List.of(flash.prefillPatcher())
-                : List.of(flash.prefillPatcher(), dualFlash.prefillPatcher());
+        GpuStepPatcher main = flash.prefillPatcher();
+        GpuStepPatcher dual = dualFlash == null ? null : dualFlash.prefillPatcher();
+        if (main == null || dualFlash != null && dual == null) {
+            /* A plan without the prefill kernel (batch-invariant runs) attends a multi-row step one decode launch
+             * per row, values no step patcher derives: the step keeps the body replay. */
+            return List.of();
+        }
+        return dual == null ? List.of(main) : List.of(main, dual);
     }
 
     /** True when this mixer's one-row step runs the tensor-core prefill launch, the plan's fastest kernel. */
@@ -949,7 +955,10 @@ public final class GpuAttentionMixer implements GpuMixer {
             flash.bindStepQueries(q, qPos);
         }
         try {
-            if (dualChunk != null) {
+            BatchSegments runs = ctx.stepSegments().current();
+            if (runs != null) {
+                flash.prefillRuns(runs, ctx.stepSegments().queryPositions());
+            } else if (dualChunk != null) {
                 dualChunkAttention.runDense(0, n, Math.min(kvLayer.layout().rows(), pos0 + n));
             } else if (n == 1 && !routesDecodeThroughPrefill(pos0)) {
                 flash.decode(pos0, tree);
@@ -1137,19 +1146,7 @@ public final class GpuAttentionMixer implements GpuMixer {
 
     /** Why this layer's attention cannot run under the step's tree mask, or null when it can. */
     private String treeRefusal() {
-        if (dualChunk != null) {
-            return "layer " + layer.il() + " runs dual-chunk attention, which takes no tree mask";
-        }
-        if (dualFlash != null) {
-            return "layer " + layer.il() + " runs dual-attention layers, which take no tree mask";
-        }
-        AttentionSpec.BiasMode mode = spec.biasMode();
-        if (mode == AttentionSpec.BiasMode.T5_CAUSAL || mode == AttentionSpec.BiasMode.T5_BIDIR
-                || mode == AttentionSpec.BiasMode.INKLING) {
-            return "layer " + layer.il() + " runs " + mode + " position bias, which reads a relative table over the"
-                    + " position rules a tree mask replaces";
-        }
-        return null;
+        return TreeMaskRules.refusal(layer.il(), dualChunk != null, dualFlash != null, spec.biasMode());
     }
 
     static void addDeltas(GpuProjectionDeltas.Site site, int n, GpuBuffer x, int xOff, int xStride,

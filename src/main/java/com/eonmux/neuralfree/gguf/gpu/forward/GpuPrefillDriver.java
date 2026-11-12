@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf.gpu.forward;
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.GpuStepPatcher;
 import com.eonmux.neuralfree.gguf.BatchInvariance;
+import com.eonmux.neuralfree.gguf.engine.BatchSegments;
 import com.eonmux.neuralfree.gguf.engine.EmbeddingRowSupport;
 import com.eonmux.neuralfree.gguf.engine.ContextFullException;
 import com.eonmux.neuralfree.gguf.engine.DraftTree;
@@ -74,17 +75,19 @@ public final class GpuPrefillDriver {
         private final int topK;
         private final int[] topIds;
         private final float[] topLogits;
+        private final float[] topSumExp;
 
         Result(float[][] rows, int[] ids) {
-            this(rows, ids, 0, null, null);
+            this(rows, ids, 0, null, null, null);
         }
 
-        Result(float[][] rows, int[] ids, int topK, int[] topIds, float[] topLogits) {
+        Result(float[][] rows, int[] ids, int topK, int[] topIds, float[] topLogits, float[] topSumExp) {
             this.rows = rows;
             this.ids = ids;
             this.topK = topK;
             this.topIds = topIds;
             this.topLogits = topLogits;
+            this.topSumExp = topSumExp;
         }
 
         /**
@@ -113,6 +116,14 @@ public final class GpuPrefillDriver {
         /** Candidate logits in rank order, {@code rows * topK} ({@link Output#TOPK}); null otherwise. */
         public float[] topLogits() {
             return topLogits;
+        }
+
+        /**
+         * Each output row's softmax denominator {@code sum_j exp(l_j - max)} over its whole row, whose maximum is the
+         * row's first candidate, for a call that asked for it ({@link #runBatchTopKNormalized}); null otherwise.
+         */
+        public float[] topSumExp() {
+            return topSumExp;
         }
     }
 
@@ -585,15 +596,16 @@ public final class GpuPrefillDriver {
 
     /**
      * Evaluates a whole {@link ForwardBatch} as one memoryless step (a model planned without memory: an encoder or
-     * a decision graph that keeps no cache, so every row attends every row): per-row tokens and embedding rows at
-     * the batch's own positions, every requested output row read back in batch order. The batch must hold one
-     * sequence and at most one ubatch, and carry no adapter slots outside slot 0. M-RoPE sections are refused: the
+     * a decision graph that keeps no cache, so every row attends every row of its sequence): per-row tokens and
+     * embedding rows at the batch's own positions, every requested output row read back in batch order. The batch
+     * holds at most one ubatch, several sequences only as packed runs ({@link BatchSegments#packed}), and carries no
+     * adapter slots outside slot 0. M-RoPE sections are refused: the
      * memoryless graphs read normal rope (llama.cpp's cache-less decision models), so a batch without
      * {@code ropePositions} fills the rows' positions from the text pattern.
      *
      * @param output {@link Output#LOGITS} or {@link Output#HIDDEN}
-     * @throws IllegalArgumentException  when the batch holds several sequences, exceeds one ubatch, or the model
-     *                                   holds memory
+     * @throws IllegalArgumentException  when the batch's sequences break the packed-run rules, exceeds one ubatch,
+     *                                   or the model holds memory
      * @throws UnsupportedOperationException when logits are asked of a model without an LM head, a row runs in an
      *                                       adapter slot that holds no adapter, the batch carries M-RoPE sections,
      *                                       or embedding rows the model cannot take
@@ -615,13 +627,7 @@ public final class GpuPrefillDriver {
             throw new IllegalArgumentException("a memoryless batch of " + n + " rows exceeds one ubatch of "
                     + ubatch + "; raise neuralfree.ubatch");
         }
-        int[] seqIds = batch.seqIds();
-        for (int t = 0; t < seqIds.length; t++) {
-            if (seqIds[t] != 0) {
-                throw new UnsupportedOperationException("a memoryless batch holds one sequence, row " + t
-                        + " runs in sequence " + seqIds[t]);
-            }
-        }
+        BatchSegments runs = BatchSegments.packed(batch, ctx.spec());
         if (output != Output.HIDDEN && !head.hasLmHead()) {
             throw new UnsupportedOperationException(ctx.spec().arch().ggufName() + " has no LM head; only hidden"
                     + " rows can be read");
@@ -663,7 +669,7 @@ public final class GpuPrefillDriver {
             taps.batchRows(identity(n));
             decodeReplay.invalidate();
             invalidateStepReplay();
-            executor.run(0, n, GpuLayerExecutor.StepMode.PREFILL, taps);
+            runMemorylessLayers(n, runs, taps);
             ScratchSlot hidden = head.hidden(n, rows, rows.length);
             calls.read(output, hidden, rows.length, rows);
             finished = true;
@@ -682,6 +688,19 @@ public final class GpuPrefillDriver {
         } finally {
             calls.closeEvents();
             taps.closeEvents();
+        }
+    }
+
+    /** The layers of a memoryless step, each attention launching per sequence run when {@code runs} is set. */
+    private void runMemorylessLayers(int n, BatchSegments runs, GpuTapReads taps) {
+        GpuStepSegments segments = ctx.stepSegments();
+        if (runs != null) {
+            segments.begin(runs, ubatch, ctx.backend(), queue);
+        }
+        try {
+            executor.run(0, n, GpuLayerExecutor.StepMode.PREFILL, taps);
+        } finally {
+            segments.end();
         }
     }
 
@@ -740,15 +759,28 @@ public final class GpuPrefillDriver {
         if (topK < 1) {
             throw new IllegalArgumentException("top-k readback of " + topK + " candidates");
         }
-        return runBatch(batch, ropeSections, Output.TOPK, topK, tap, prefilter, fullRows);
+        return runBatch(batch, ropeSections, Output.TOPK, topK, tap, prefilter, fullRows, false);
+    }
+
+    /**
+     * {@link #runBatchTopK(ForwardBatch, int[][], int, HiddenTap)} that also reads each output row's softmax
+     * denominator ({@link Result#topSumExp()}), so the caller can normalize the candidates' logits over the row.
+     *
+     * @throws IllegalArgumentException when {@code topK} is below one
+     */
+    public Result runBatchTopKNormalized(ForwardBatch batch, int[][] ropeSections, int topK, HiddenTap tap) {
+        if (topK < 1) {
+            throw new IllegalArgumentException("top-k readback of " + topK + " candidates");
+        }
+        return runBatch(batch, ropeSections, Output.TOPK, topK, tap, null, null, true);
     }
 
     private Result runBatch(ForwardBatch batch, int[][] ropeSections, Output output, int topK, HiddenTap tap) {
-        return runBatch(batch, ropeSections, output, topK, tap, null, null);
+        return runBatch(batch, ropeSections, output, topK, tap, null, null, false);
     }
 
     private Result runBatch(ForwardBatch batch, int[][] ropeSections, Output output, int topK, HiddenTap tap,
-                            LogitPrefilter prefilter, boolean[] fullRows) {
+                            LogitPrefilter prefilter, boolean[] fullRows, boolean normalized) {
         Objects.requireNonNull(batch, "batch");
         Objects.requireNonNull(output, "output");
         Objects.requireNonNull(tap, "tap");
@@ -778,6 +810,9 @@ public final class GpuPrefillDriver {
             }
         }
         BatchSteps steps = new BatchSteps(batch, memory, ropeSections, output, topK, tap, prefilter, null, fullRows);
+        if (normalized) {
+            steps.calls.readSoftmaxDenominators();
+        }
         decodeReplay.invalidate();
         int chunk = Math.min(ubatch, memory.plan().ubatch());
         boolean slotUniform = batch.adapterSlots() != null
@@ -1045,6 +1080,8 @@ public final class GpuPrefillDriver {
             AdapterRows adapterRows = ctx.projectionDeltas().rows();
             int[] slots = AdapterRows.ofRows(batch.adapterSlots(), u.batchRows());
             adapterRows.set(slots);
+            // the read rows a pruned trunk leaves at the front of its output, or null for a whole output
+            int[] stackRead = null;
             try {
                 if (treeMask != null && recurrentRound != null) {
                     recurrentRound.stepTreeMask(treeMask);
@@ -1083,7 +1120,18 @@ public final class GpuPrefillDriver {
                         if (treeMask == null || pagedDecodeShape != null) {
                             invalidateStepReplay();
                         }
-                        stepReplay.trunk(capturable, () -> executor.run(u.layout(), taps));
+                        // a step of prompt chunks reads its completing chunks' last rows only: the last layer's
+                        // FFN runs over those (none for the chunks before a prompt's last); never captured, since
+                        // only a tree step or an all-single-row step is
+                        int[] read = readRows(u.layout().outputRows(), u.layout().outputRows().length);
+                        if (treeMask == null && accept == null
+                                && executor.prunesOutputRows(u.nTokens(), GpuLayerExecutor.StepMode.PREFILL, taps,
+                                read)) {
+                            stackRead = read;
+                            stepReplay.trunk(false, () -> executor.run(u.layout(), taps, read));
+                        } else {
+                            stepReplay.trunk(capturable, () -> executor.run(u.layout(), taps));
+                        }
                     }
                 }
                 for (int seg = 0; seg < step.nSeg(); seg++) {
@@ -1102,7 +1150,7 @@ public final class GpuPrefillDriver {
                 if (accept != null) {
                     stageAccept(accept, u, slots);
                 } else {
-                    readOutputs(u, calls, output, slots);
+                    readOutputs(u, calls, output, slots, stackRead);
                 }
                 if (observed) {
                     obs.onStepEnd(step.segPos0(0), step.nTokens());
@@ -1165,9 +1213,10 @@ public final class GpuPrefillDriver {
 
     /**
      * Enqueues the head reads of the ubatch's output rows, mapped to their batch-order result slots; the head's
-     * products run with the output rows' adapter slots ({@code slots} of the ubatch rows, null for slot 0).
+     * products run with the output rows' adapter slots ({@code slots} of the ubatch rows, null for slot 0). A trunk
+     * pruned to the ascending ubatch rows {@code stackRead} holds row {@code stackRead[j]} at row {@code j}.
      */
-    private void readOutputs(UBatch u, GpuCallReads calls, Output output, int[] slots) {
+    private void readOutputs(UBatch u, GpuCallReads calls, Output output, int[] slots, int[] stackRead) {
         int[] localRows = u.layout().outputRows();
         if (localRows.length == 0) {
             return;
@@ -1184,7 +1233,14 @@ public final class GpuPrefillDriver {
             k++;
         }
         ctx.projectionDeltas().rows().set(AdapterRows.ofRows(slots, local));
-        ScratchSlot hidden = head.hidden(u.nTokens(), local, localRows.length);
+        int stackRows = u.nTokens();
+        if (stackRead != null) {
+            for (int i = 0; i < k; i++) {
+                local[i] = Arrays.binarySearch(stackRead, local[i]);
+            }
+            stackRows = stackRead.length;
+        }
+        ScratchSlot hidden = head.hidden(stackRows, local, localRows.length);
         calls.read(output, hidden, localRows.length, targets);
     }
 

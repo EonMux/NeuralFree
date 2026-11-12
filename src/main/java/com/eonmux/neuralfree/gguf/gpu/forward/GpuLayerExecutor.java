@@ -130,10 +130,6 @@ public final class GpuLayerExecutor implements AutoCloseable {
     static final String TEMP_HRM_HIGH = "exec.hrm.z_h";
     /** HRM low-level stream {@code zL}. */
     static final String TEMP_HRM_LOW = "exec.hrm.z_l";
-    /** Repeat schedule: the stream entering the repeated block. */
-    static final String TEMP_REPEAT_INPUT = "exec.repeat.input";
-    /** Repeat schedule: the state carried between passes. */
-    static final String TEMP_REPEAT_STATE = "exec.repeat.state";
     /** SLERP residual: the normalized stream and branch rows. */
     static final String TEMP_SLERP_A = "exec.slerp.a";
     static final String TEMP_SLERP_B = "exec.slerp.b";
@@ -153,10 +149,8 @@ public final class GpuLayerExecutor implements AutoCloseable {
     private final ScratchSlot hrmLow;
     private final GpuWeight hrmLowInit;
     private final int hrmWidth;
-    private final ScratchSlot repeatInput;
-    private final ScratchSlot repeatState;
-    private final int repeatWidth;
-    private final boolean repeatCombine;
+    /** The JUSTNORM pass bookkeeping of a repeat schedule; null for every other stack. */
+    private final RepeatLoopStream repeat;
     private final ScratchSlot slerpA;
     private final ScratchSlot slerpB;
     private final int ubatch;
@@ -235,17 +229,7 @@ public final class GpuLayerExecutor implements AutoCloseable {
         if (hrm && hrmLow.offset() != 0) {
             throw new IllegalStateException(TEMP_HRM_LOW + " must start at element 0 for " + NormKernels.MUL_ROW_SCALE);
         }
-        this.repeatCombine = schedule != null && schedule.kind() == LayerSchedule.Kind.REPEAT
-                && schedule.loopCombine() == LayerSchedule.LoopCombine.JUSTNORM;
-        if (repeatCombine) {
-            this.repeatWidth = stack.get(0).residual().streamWidth();
-            this.repeatInput = scratch.temp(TEMP_REPEAT_INPUT, (long) ubatch * repeatWidth);
-            this.repeatState = scratch.temp(TEMP_REPEAT_STATE, (long) ubatch * repeatWidth);
-        } else {
-            this.repeatWidth = 0;
-            this.repeatInput = null;
-            this.repeatState = null;
-        }
+        this.repeat = RepeatLoopStream.of(ctx, schedule, x, stack.get(0).residual().streamWidth(), ubatch);
         boolean anySlerp = false;
         for (LayerSpec l : stack) {
             anySlerp |= l.residual().kind() == ResidualKind.SLERP;
@@ -277,7 +261,7 @@ public final class GpuLayerExecutor implements AutoCloseable {
      * same width carries it.
      */
     private void bindResidualNormFusion(boolean hrm) {
-        if (hrm || repeatCombine) {
+        if (hrm || repeat != null) {
             return;
         }
         for (int i = 0; i < layers.size() - 1; i++) {
@@ -547,7 +531,7 @@ public final class GpuLayerExecutor implements AutoCloseable {
      */
     public boolean prunesOutputRows(int nTokens, StepMode mode, TapSink taps, int[] rows) {
         ensureOpen();
-        return mode == StepMode.PREFILL && hrmHigh == null && !repeatCombine && !ctx.observer().enabled()
+        return mode == StepMode.PREFILL && hrmHigh == null && repeat == null && !ctx.observer().enabled()
                 && LastLayerRows.matmulTapsIdle() && (taps == null || !taps.wants(layers.size()))
                 && LastLayerRows.compactable(nTokens, rows) && (rows.length > 0 || ctx.hasMemory()) && LastLayerRows.layerPrunable(layers.get(layers.size() - 1));
     }
@@ -605,21 +589,27 @@ public final class GpuLayerExecutor implements AutoCloseable {
             if (hrm && schedule.passStart(i)) {
                 mix(MixMode.ADD, 1.0f, hrmHigh, hrmLow, nTokens * hrmWidth);
             }
-            repeatBeforeSlot(i, nTokens);
+            if (repeat != null) {
+                repeat.beforeSlot(i, nTokens);
+            }
             if (sink.wants(i) && pendingMix != null) {
                 flushPendingMix();
             }
             if (sink.wants(i)) {
                 sink.capture(i, x, nTokens, l.streamWidth);
             }
-            if (batched != null) {
+            if (batched != null && rows != null && i == layers.size() - 1) {
+                runLayerBatchedForRows(l, batched, rows);
+            } else if (batched != null) {
                 runLayerBatched(l, batched);
             } else if (rows != null && i == layers.size() - 1) {
                 runLayerForRows(l, pos0, nTokens, mode, rows);
             } else {
                 runLayer(l, pos0, nTokens, mode);
             }
-            repeatAfterSlot(i, nTokens);
+            if (repeat != null) {
+                repeat.afterSlot(i, nTokens);
+            }
             if (hrm && schedule.passEnd(i)) {
                 endHrmPass(i, l, nTokens);
             }
@@ -742,6 +732,49 @@ public final class GpuLayerExecutor implements AutoCloseable {
             return;
         }
         runStack(s.pos0(0), n, StepMode.PREFILL, taps, null, s);
+    }
+
+    /**
+     * {@link #run(StepLayout, TapSink)} for a batched step whose stack output is read at the ascending step-local
+     * {@code rows} only (each read sequence's sampled rows, none for the chunks that complete no prompt): the last
+     * layer's attention part runs over every row of every segment, since its K/V rows are stored, and its FFN part
+     * over the read rows alone, which {@code X} then holds at rows {@code 0 .. rows.length - 1}; with no row read the
+     * FFN part is skipped and {@code X} is left mid-layer. A mixed adapter table follows the read rows.
+     *
+     * @throws IllegalArgumentException as {@link #run(StepLayout, TapSink)}, or when {@link #prunesOutputRows} does
+     *                                  not hold for the step's rows
+     */
+    public void run(StepLayout s, TapSink taps, int[] rows) {
+        ensureOpen();
+        Objects.requireNonNull(s, "s");
+        int n = s.nTokens();
+        if (n < 1 || n > ubatch) {
+            throw new IllegalArgumentException("step of " + n + " tokens outside [1, " + ubatch + "]");
+        }
+        if (s.contiguousSingle()) {
+            run(s.pos0(0), n, StepMode.PREFILL, taps, rows);
+            return;
+        }
+        if (!prunesOutputRows(n, StepMode.PREFILL, taps, rows)) {
+            throw new IllegalArgumentException("the step of " + n + " rows cannot prune its output to "
+                    + Arrays.toString(rows));
+        }
+        runStack(s.pos0(0), n, StepMode.PREFILL, taps, rows, s);
+    }
+
+    /** The pruned last layer of a batched step ({@link #run(StepLayout, TapSink, int[])}). */
+    private void runLayerBatchedForRows(LayerBlocks l, StepLayout s, int[] rows) {
+        if (l.keepInput) {
+            ops.copy(x.buffer(), x.offset(), layerInput.buffer(), layerInput.offset(), s.nTokens() * l.streamWidth);
+        }
+        mixerBlockBatched(l, s);
+        if (rows.length == 0) {
+            return;
+        }
+        flushPendingMix();
+        LastLayerRows.compact(ops, x, l.streamWidth, rows);
+        LastLayerRows.selectAdapterRows(ctx.projectionDeltas().rows(), rows);
+        runLayerPost(l.spec.il(), s.pos0(0), rows.length, null);
     }
 
     /** One layer over a batched step: the extras' and mixers' batched hooks instead of the contiguous ones. */
@@ -1310,52 +1343,6 @@ public final class GpuLayerExecutor implements AutoCloseable {
             m.decode(pos0, in, out);
         } else {
             m.prefill(pos0, n, in, out);
-        }
-    }
-
-    // ================================================================== repeat schedules
-
-    /**
-     * {@link LayerSchedule.LoopCombine#JUSTNORM} before slot {@code i}: keep the stream entering the repeated block,
-     * start each pass from {@code justNorm(state + input)} (Dory's {@code combined = justnorm(state + input_h)}).
-     */
-    private void repeatBeforeSlot(int i, int n) {
-        if (!repeatCombine) {
-            return;
-        }
-        int len = n * repeatWidth;
-        if (i == 0 && schedule.nInputLayers() == 0) {
-            ops.copy(x.buffer(), x.offset(), repeatInput.buffer(), repeatInput.offset(), len);
-        }
-        if (i == schedule.recurrentStart()) {
-            ops.copy(repeatInput.buffer(), repeatInput.offset(), repeatState.buffer(), repeatState.offset(), len);
-        }
-        if (schedule.loopStart(i)) {
-            mix(MixMode.ADD, 1.0f, repeatState, repeatInput, len);
-            ops.norm(NormKind.L2_GDN, null, null, schedule.loopEps(), x.buffer(), x.offset(), x.buffer(), x.offset(),
-                    n, repeatWidth);
-        }
-    }
-
-    /**
-     * {@link LayerSchedule.LoopCombine#JUSTNORM} after slot {@code i}: a pass ends with {@code state = justNorm(x)};
-     * the input stream is captured after the last input layer, and the first output layer starts from the state.
-     */
-    private void repeatAfterSlot(int i, int n) {
-        if (!repeatCombine) {
-            return;
-        }
-        int len = n * repeatWidth;
-        if (schedule.loopEnd(i)) {
-            ops.norm(NormKind.L2_GDN, null, null, schedule.loopEps(), x.buffer(), x.offset(), x.buffer(), x.offset(),
-                    n, repeatWidth);
-            ops.copy(x.buffer(), x.offset(), repeatState.buffer(), repeatState.offset(), len);
-        }
-        if (i == schedule.nInputLayers() - 1) {
-            ops.copy(x.buffer(), x.offset(), repeatInput.buffer(), repeatInput.offset(), len);
-        }
-        if (i + 1 == schedule.recurrentEnd() && schedule.nOutputLayers() > 0) {
-            ops.copy(repeatState.buffer(), repeatState.offset(), x.buffer(), x.offset(), len);
         }
     }
 

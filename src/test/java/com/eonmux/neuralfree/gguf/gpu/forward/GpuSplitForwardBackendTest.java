@@ -74,7 +74,7 @@ public class GpuSplitForwardBackendTest {
         final int firstIl;
 
         Device(String name, FakeComputeBackend backend, ModelSpec spec, int firstIl, int endIl, boolean withMemory,
-                List<String> events, ExecutionObserver observer) {
+                List<String> events, ExecutionObserver observer, GpuBlockRegistry registry) {
             this.name = name;
             this.backend = backend;
             this.firstIl = firstIl;
@@ -99,7 +99,7 @@ public class GpuSplitForwardBackendTest {
                 this.memory = null;
             }
             this.context = b.build();
-            this.executor = GpuLayerExecutor.forStack(context, registry(), spec.layers().subList(firstIl, endIl));
+            this.executor = GpuLayerExecutor.forStack(context, registry, spec.layers().subList(firstIl, endIl));
             this.events = events;
         }
 
@@ -159,6 +159,14 @@ public class GpuSplitForwardBackendTest {
 
     /** Recording stand-ins for the mixers and FFNs: the per-family blocks have their own traces. */
     private static GpuBlockRegistry registry() {
+        return registry(null);
+    }
+
+    /**
+     * {@link #registry()} with row-local FFNs that append {@code "<il> <rows>"} to {@code ffnCalls} on every call
+     * when it is non-null; a null list keeps the FFNs whole-step.
+     */
+    private static GpuBlockRegistry registry(List<String> ffnCalls) {
         GpuMixerFactory mixer = new GpuMixerFactory() {
             @Override
             public MixerKind kind() {
@@ -178,7 +186,7 @@ public class GpuSplitForwardBackendTest {
 
             @Override
             public GpuFfnBlock create(LayerSpec layer) {
-                return new RecordingFfn();
+                return new RecordingFfn(ffnCalls);
             }
         };
         return new GpuBlockRegistry(Collections.singletonList(mixer), Collections.singletonList(ffn),
@@ -201,12 +209,28 @@ public class GpuSplitForwardBackendTest {
     }
 
     private static final class RecordingFfn implements GpuFfnBlock {
+        private final List<String> calls;
+        private int il;
+
+        RecordingFfn(List<String> calls) {
+            this.calls = calls;
+        }
+
         @Override
         public void bind(GpuForwardContext ctx, LayerSpec layer) {
+            this.il = layer.il();
         }
 
         @Override
         public void forward(int nTokens, ScratchSlot in, ScratchSlot out) {
+            if (calls != null) {
+                calls.add(il + " " + nTokens);
+            }
+        }
+
+        @Override
+        public boolean rowLocal() {
+            return calls != null;
         }
     }
 
@@ -241,11 +265,15 @@ public class GpuSplitForwardBackendTest {
 
     /** A two-device split of a four-layer trunk: device one holds layers 0-1 plus the model-level tensors. */
     private void openSplit(MemoryKind kind) {
+        openSplit(kind, registry());
+    }
+
+    private void openSplit(MemoryKind kind, GpuBlockRegistry registry) {
         spec = SplitSpecs.trunk(4, kind);
         main = new Device("one", FakeComputeBackend.builder().strictLlmArgs(true).build(), spec, 0, 2,
-                kind == MemoryKind.KV, mainEvents, mainObserver);
+                kind == MemoryKind.KV, mainEvents, mainObserver, registry);
         second = new Device("two", FakeComputeBackend.builder().strictLlmArgs(true).build(), spec, 2, 4,
-                kind == MemoryKind.KV, secondEvents, secondObserver);
+                kind == MemoryKind.KV, secondEvents, secondObserver, registry);
         devices.add(main);
         devices.add(second);
         // model-level tensors live on the main device
@@ -390,6 +418,48 @@ public class GpuSplitForwardBackendTest {
         assertEquals(6, main.memory.sequence().nPast());
         // two ubatch steps, so the stream crosses to device two and back twice
         assertEquals(2, countWriteTo(second.backend.ops(), second.xBuffer()));
+    }
+
+    /**
+     * The last shard's last layer runs its FFN over the read rows alone, and only those rows travel back to the
+     * head's device: a prompt's chunk before the last reads no row, so it runs the last layer's cache writes alone
+     * and sends nothing home; the last chunk sends its last row; a call reading two rows of three moves the second
+     * read row next to the first and sends both.
+     */
+    @Test
+    public void theLastShardPrunesItsLastLayerAndSendsOnlyTheReadRowsHome() {
+        List<String> ffnCalls = new ArrayList<>();
+        openSplit(MemoryKind.KV, registry(ffnCalls));
+        long rowBytes = (long) SplitSpecs.N_EMBD * Float.BYTES;
+
+        backend.prefill(new int[]{1, 2, 3, 4, 5, 6}, 0);
+
+        assertEquals(java.util.Arrays.asList("0 3", "1 3", "2 3", "0 3", "1 3", "2 3", "3 1"), ffnCalls);
+        assertEquals("one handoff home, for the last chunk only", java.util.Arrays.asList(rowBytes),
+                readBytesOf(second.backend.ops(), second.xBuffer()));
+        assertEquals(6, second.memory.sequence().nPast());
+
+        ffnCalls.clear();
+        second.backend.clearLog();
+        float[][] rows = backend.forwardRows(new int[]{7, 8, 9}, 6, new int[]{0, 2});
+
+        assertEquals(2, rows.length);
+        assertEquals(java.util.Arrays.asList("0 3", "1 3", "2 3", "3 2"), ffnCalls);
+        assertEquals(java.util.Arrays.asList(2 * rowBytes), readBytesOf(second.backend.ops(), second.xBuffer()));
+        List<FakeDispatch> moves = second.backend.dispatchesOf(GpuOps.COPY2D);
+        assertEquals("row 2 moves to row 1", 1, moves.size());
+        assertEquals(SplitSpecs.N_EMBD, moves.get(0).intArg(3) - moves.get(0).intArg(5));
+    }
+
+    /** The byte counts of the READ ops of the given source buffer, in order. */
+    private static List<Long> readBytesOf(List<FakeOp> ops, FakeGpuBuffer source) {
+        List<Long> out = new ArrayList<>();
+        for (FakeOp op : ops) {
+            if (op.kind() == FakeOpKind.READ && source.equals(op.buffer())) {
+                out.add(op.bytes());
+            }
+        }
+        return out;
     }
 
     @Test

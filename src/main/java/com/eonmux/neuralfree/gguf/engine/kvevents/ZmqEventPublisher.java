@@ -6,6 +6,11 @@ import org.zeromq.ZMQ;
 import org.zeromq.ZMQException;
 import org.zeromq.ZMsg;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
+import java.nio.channels.Pipe;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.Objects;
@@ -36,13 +41,15 @@ public final class ZmqEventPublisher implements KvEventPublisher {
 
     private static final Logger LOGGER = Logger.getLogger(ZmqEventPublisher.class.getName());
 
-    /** Milliseconds the publisher thread waits for a batch before it re-checks the replay socket. */
+    /** Milliseconds the publisher thread waits for a batch, or for a batch or a replay request, before it re-checks. */
     private static final int POLL_MILLIS = 100;
     /** Milliseconds {@link #close()} lets the publisher thread flush the queue, vLLM's {@code SHUTDOWN_TIMEOUT}. */
     private static final long SHUTDOWN_TIMEOUT_MILLIS = 1_000;
     /** The sequence of the replay's end marker, vLLM's {@code END_SEQ}. */
     private static final long END_SEQ = -1L;
     private static final byte[] EMPTY = new byte[0];
+    /** The one byte a wake-up signal writes. */
+    private static final byte[] WAKE_BYTE = {1};
     /** The queue entry {@link #close()} appends so the publisher thread stops once it has sent the rest. */
     private static final Object STOP = new Object();
 
@@ -55,6 +62,11 @@ public final class ZmqEventPublisher implements KvEventPublisher {
     private final ZContext context;
     private final ZMQ.Socket pub;
     private final ZMQ.Socket replay;
+    /**
+     * With a replay socket, the pipe a queued batch or the stop entry signals, so the publisher thread waits on the
+     * replay socket and the queue at once and answers either at once; null without one.
+     */
+    private final Pipe wake;
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final Thread thread;
     /** Set when the flush timed out: the publisher thread drops the queued batches and stops. */
@@ -106,12 +118,14 @@ public final class ZmqEventPublisher implements KvEventPublisher {
             if (replayAt == null) {
                 this.replay = null;
                 this.replayEndpoint = null;
+                this.wake = null;
             } else {
                 this.replay = context.createSocket(SocketType.ROUTER);
                 replay.setLinger(0);
                 // a full replay plus its end marker fits even when ZMQ sees half the HWM as unacknowledged
                 replay.setSndHWM(2 * (bufferSteps + 1));
                 this.replayEndpoint = bind(replay, "replay_endpoint", replayAt);
+                this.wake = openWake();
             }
         } catch (RuntimeException e) {
             context.close();
@@ -150,6 +164,7 @@ public final class ZmqEventPublisher implements KvEventPublisher {
         try {
             while (!closed.get()) {
                 if (queue.offer(stamped, POLL_MILLIS, TimeUnit.MILLISECONDS)) {
+                    signal();
                     return;
                 }
             }
@@ -170,6 +185,7 @@ public final class ZmqEventPublisher implements KvEventPublisher {
             return;
         }
         queue.offer(STOP);
+        signal();
         boolean interrupted = false;
         try {
             thread.join(SHUTDOWN_TIMEOUT_MILLIS);
@@ -259,23 +275,91 @@ public final class ZmqEventPublisher implements KvEventPublisher {
      * when a full queue left no room for it, the drained queue of a closed publisher).
      */
     private void run() {
+        ZMQ.Poller poller = null;
         try {
+            if (replay != null) {
+                poller = context.createPoller(2);
+                poller.register(replay, ZMQ.Poller.POLLIN);
+                poller.register(wake.source(), ZMQ.Poller.POLLIN);
+            }
             while (!abandon) {
                 if (replay != null) {
                     serviceReplaySafely();
                 }
-                Object item = queue.poll(POLL_MILLIS, TimeUnit.MILLISECONDS);
+                Object item = poller == null ? queue.poll(POLL_MILLIS, TimeUnit.MILLISECONDS) : queue.poll();
                 if (item == STOP || item == null && closed.get() && queue.isEmpty()) {
                     return;
                 }
                 if (item != null) {
                     publishOne((KvEventBatch) item);
+                } else if (poller != null) {
+                    awaitWork(poller);
                 }
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } finally {
+            if (poller != null) {
+                poller.close();
+            }
+            closeWake();
             context.close();
+        }
+    }
+
+    /** A non-blocking pipe for {@link #wake}. */
+    private static Pipe openWake() {
+        try {
+            Pipe pipe = Pipe.open();
+            pipe.source().configureBlocking(false);
+            pipe.sink().configureBlocking(false);
+            return pipe;
+        } catch (IOException e) {
+            throw new UncheckedIOException("the KV events publisher cannot open its wake-up pipe", e);
+        }
+    }
+
+    /** Wakes the publisher thread waiting in {@link #awaitWork}; a full pipe already holds a pending wake-up. */
+    private void signal() {
+        if (wake == null) {
+            return;
+        }
+        try {
+            wake.sink().write(ByteBuffer.wrap(WAKE_BYTE));
+        } catch (ClosedChannelException e) {
+            // the publisher thread has ended and closed the pipe: nothing waits for the signal
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "waking the KV events publisher failed; it re-checks within "
+                    + POLL_MILLIS + " ms", e);
+        }
+    }
+
+    /**
+     * Waits up to {@link #POLL_MILLIS} for a replay request or a queued batch, then empties the wake-up pipe, whose
+     * bytes only signal: the loop re-reads the queue and the replay socket itself.
+     */
+    private void awaitWork(ZMQ.Poller poller) {
+        poller.poll(POLL_MILLIS);
+        ByteBuffer drain = ByteBuffer.allocate(64);
+        try {
+            while (wake.source().read(drain) > 0) {
+                drain.clear();
+            }
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "reading the KV events publisher's wake-up pipe failed", e);
+            pause();
+        }
+    }
+
+    private void closeWake() {
+        if (wake == null) {
+            return;
+        }
+        try {
+            wake.sink().close();
+            wake.source().close();
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "closing the KV events publisher's wake-up pipe failed", e);
         }
     }
 

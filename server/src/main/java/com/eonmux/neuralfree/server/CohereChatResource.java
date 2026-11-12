@@ -223,7 +223,8 @@ public class CohereChatResource {
     /** Writes the answer's Cohere event stream; a failure becomes an {@code ERROR} message end. */
     private void stream(OutputStream out, GenerationBatch batch, ChatPlan plan, CohereChatRequest request, String id)
             throws IOException {
-        CohereChatStream stream = new CohereChatStream(out, id);
+        EventDrain.HeldFlushes held = new EventDrain.HeldFlushes(out);
+        CohereChatStream stream = new CohereChatStream(held, id);
         ChatChoice choice = plan.newChoice();
         try {
             while (true) {
@@ -231,8 +232,16 @@ public class CohereChatResource {
                 if (event == null) {
                     continue;
                 }
-                stream.start();
-                if (event instanceof GenerationBatch.Done) {
+                boolean ended = EventDrain.drain(batch, event, held, e -> {
+                    stream.start();
+                    if (e instanceof GenerationBatch.Done) {
+                        return true;
+                    }
+                    choice.accept(e);
+                    drain(stream, choice);
+                    return false;
+                });
+                if (ended) {
                     ToolParse parse = choice.finish();
                     drain(stream, choice);
                     String failure = batch.failure(0);
@@ -246,8 +255,6 @@ public class CohereChatResource {
                             batch.kvTransferParams(0));
                     return;
                 }
-                choice.accept(event);
-                drain(stream, choice);
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();

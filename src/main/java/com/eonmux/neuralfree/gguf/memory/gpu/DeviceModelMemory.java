@@ -174,7 +174,7 @@ public final class DeviceModelMemory implements GpuMemory {
             m.stepInputs = DeviceStepInputs.allocate(backend, queue, plan.groups(), plan.ubatch(),
                     plan.identityLength(), textPositions, m.sequence, m.paged);
             m.stepInputs.trackCompressorSteps(m.rollbacks);
-            if (plan.contextShiftReserved()) {
+            if (plan.shiftDeltasReserved()) {
                 m.stepInputs.reserveShiftDeltas();
             }
         } catch (RuntimeException e) {

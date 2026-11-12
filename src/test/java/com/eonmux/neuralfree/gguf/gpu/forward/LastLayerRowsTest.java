@@ -1,7 +1,9 @@
 package com.eonmux.neuralfree.gguf.gpu.forward;
 
+import com.eonmux.neuralfree.gguf.engine.lora.AdapterRows;
 import org.junit.Test;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
@@ -45,5 +47,21 @@ public class LastLayerRowsTest {
         assertFalse("a repeated row", LastLayerRows.compactable(8, new int[]{3, 3}));
         assertFalse("a negative row", LastLayerRows.compactable(8, new int[]{-1}));
         assertFalse("a row past the step", LastLayerRows.compactable(8, new int[]{8}));
+    }
+
+    @Test
+    public void aMixedAdapterTableFollowsTheCompactedRows() {
+        AdapterRows table = new AdapterRows();
+        table.set(new int[]{0, 0, 2, 2, 1, 1});
+        LastLayerRows.selectAdapterRows(table, new int[]{1, 3, 5});
+        assertEquals(3, table.rows());
+        assertEquals(0, table.slot(0));
+        assertEquals(2, table.slot(1));
+        assertEquals(1, table.slot(2));
+
+        AdapterRows uniform = new AdapterRows();
+        uniform.set(new int[]{3, 3, 3});
+        LastLayerRows.selectAdapterRows(uniform, new int[]{2});
+        assertEquals("a uniform table serves any rows", 3, uniform.uniform());
     }
 }

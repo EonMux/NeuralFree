@@ -79,19 +79,30 @@ final class BlockImage {
         byte[][] v = new byte[caches.size()][];
         byte[][][] kSides = new byte[caches.size()][][];
         byte[][][] vSides = new byte[caches.size()][][];
-        for (int c = 0; c < caches.size(); c++) {
-            StateTransfer.Cache cache = caches.get(c);
-            KvLayout l = cache.layout();
-            int row0 = block.pages[cache.group()] * layout.pageSize();
-            k[c] = new byte[Math.toIntExact(n * l.rowBytesK())];
-            cache.read(false, row0, n, k[c]);
-            kSides[c] = readSides(cache, false, row0, n);
-            if (!l.vAliasesK()) {
-                v[c] = new byte[Math.toIntExact(n * l.rowBytesV())];
-                cache.read(true, row0, n, v[c]);
-                vSides[c] = readSides(cache, true, row0, n);
+        // every layer's K and V rows start at once and share one wait; the side planes read at once
+        try {
+            for (int c = 0; c < caches.size(); c++) {
+                StateTransfer.Cache cache = caches.get(c);
+                KvLayout l = cache.layout();
+                int row0 = block.pages[cache.group()] * layout.pageSize();
+                k[c] = new byte[Math.toIntExact(n * l.rowBytesK())];
+                cache.readLater(false, row0, n, k[c]);
+                kSides[c] = readSides(cache, false, row0, n);
+                if (!l.vAliasesK()) {
+                    v[c] = new byte[Math.toIntExact(n * l.rowBytesV())];
+                    cache.readLater(true, row0, n, v[c]);
+                    vSides[c] = readSides(cache, true, row0, n);
+                }
             }
+        } catch (RuntimeException e) {
+            try {
+                layout.awaitReads();
+            } catch (RuntimeException suppressed) {
+                e.addSuppressed(suppressed);
+            }
+            throw e;
         }
+        layout.awaitReads();
         int[] positions = layout.paged().pagePositions(0, block.pages[0], n);
         return new BlockImage(tokens, positions, full, k, v, kSides, vSides);
     }

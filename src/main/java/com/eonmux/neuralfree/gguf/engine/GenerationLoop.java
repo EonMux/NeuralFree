@@ -90,7 +90,7 @@ public final class GenerationLoop {
     private static final Logger LOGGER = LogManager.getLogger(GenerationLoop.class);
     private static final ReasoningFilter.Sink DISCARD = (channel, tokenId, text) -> { };
 
-    /** Most candidates one device top-k readback carries ({@code LLM_Row_TopK} supports up to 64). */
+    /** Most candidates one device top-k readback carries ({@link RowTopK#MAX_DEVICE_CANDIDATES}). */
     private static final int MAX_DEVICE_TOPK = RowTopK.MAX_DEVICE_CANDIDATES;
     /** Whether a generation's per-step selection runs on the device ({@code neuralfree.sampling.device}). */
     public static final String PROP_SAMPLING_DEVICE = "neuralfree.sampling.device";

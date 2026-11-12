@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.engine.batch;
 
 import com.eonmux.neuralfree.gguf.GGUFModel;
+import com.eonmux.neuralfree.gguf.engine.DraftTree;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
 import com.eonmux.neuralfree.gguf.engine.EngineModel;
 import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
@@ -28,7 +29,9 @@ import static org.junit.Assert.assertTrue;
 /**
  * The batch draft model reads its rows' top candidates instead of whole rows when every draft of the step picks
  * greedily over an identity vocabulary on a backend that reads candidates back on the device: the proposals equal
- * the whole-row drafter's, no whole row is read, and a step with a sampled draft keeps the whole rows.
+ * the whole-row drafter's, no whole row is read, and a step with a sampled draft keeps the whole rows. A tree draft
+ * reads each root and tree row's top branches with the row's log-sum-exp, and proposes the whole-row drafter's trees
+ * with the same path scores.
  */
 public class BatchDrafterTopKTest {
 
@@ -55,6 +58,7 @@ public class BatchDrafterTopKTest {
                     calls.rows.incrementAndGet();
                     break;
                 case "forwardBatchTopK":
+                case "forwardBatchTopKNormalized":
                     calls.topK.incrementAndGet();
                     break;
                 default:
@@ -129,5 +133,53 @@ public class BatchDrafterTopKTest {
         drafts(model, draft, true, calls, 0.8f);
         assertEquals("a probabilistic draw needs the whole row", 0, calls.topK.get());
         assertTrue(calls.rows.get() > 0);
+    }
+
+    private static List<BatchDrafter.Request> treeRequests() {
+        List<BatchDrafter.Request> out = new ArrayList<>();
+        out.add(new BatchDrafter.Request(0, 10, 9, 0f, new SplittableRandom(3)));
+        out.add(new BatchDrafter.Request(1, 20, 6, 0.8f, new SplittableRandom(4)));
+        out.add(new BatchDrafter.Request(2, 33, 12, 0f, new SplittableRandom(5)));
+        return out;
+    }
+
+    private static List<TreeProposal> trees(Path model, Path draft, boolean deviceTopK, Calls calls)
+            throws IOException {
+        EngineConfig cfg = config().toBuilder().draftModelPath(draft.toString()).build();
+        try (GGUFModel target = new GGUFModel(model.toString(), cfg)) {
+            EngineModel draftModel = LLMModelFactory.openBatchDraftModel(target, cfg);
+            EngineModel used = deviceTopK ? deviceTopK(draftModel, calls) : draftModel;
+            try (BatchModelDrafter drafter = new BatchModelDrafter(used, target, 0f, false, false, 3)) {
+                List<TreeProposal> out = new ArrayList<>(List.of(drafter.draftTreeBatch(treeRequests())));
+                out.addAll(List.of(drafter.draftTreeBatch(treeRequests())));
+                return out;
+            }
+        }
+    }
+
+    @Test
+    public void treeDraftsReadTopBranchesAndProposeTheWholeRowsTrees() throws IOException {
+        Path model = SyntheticModels.llama().writeTempFile();
+        Path draft = SyntheticModels.llama(SyntheticModels.Config.llama().toBuilder().seed(7).build())
+                .writeTempFile();
+        List<TreeProposal> whole = trees(model, draft, false, null);
+        Calls calls = new Calls();
+        List<TreeProposal> top = trees(model, draft, true, calls);
+        assertEquals(whole.size(), top.size());
+        for (int i = 0; i < whole.size(); i++) {
+            List<DraftTree.Node> a = whole.get(i).tree().nodes();
+            List<DraftTree.Node> b = top.get(i).tree().nodes();
+            assertTrue("proposal " + i + " grew a tree", !a.isEmpty());
+            assertEquals("proposal " + i + " nodes", a.size(), b.size());
+            for (int n = 0; n < a.size(); n++) {
+                assertEquals("proposal " + i + " node " + n + " token", a.get(n).token(), b.get(n).token());
+                assertEquals("proposal " + i + " node " + n + " parent", a.get(n).parent(), b.get(n).parent());
+                assertEquals("proposal " + i + " node " + n + " depth", a.get(n).depth(), b.get(n).depth());
+            }
+            assertArrayEquals("proposal " + i + " path scores", whole.get(i).pathScores, top.get(i).pathScores,
+                    1e-9);
+        }
+        assertTrue("the trees read top candidates", calls.topK.get() > 0);
+        assertEquals("no whole row is read", 0, calls.rows.get());
     }
 }

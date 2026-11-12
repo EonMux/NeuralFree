@@ -167,7 +167,7 @@ import java.util.function.IntUnaryOperator;
 public final class SpeculativeDecoder {
 
     private static final Logger LOGGER = LogManager.getLogger(SpeculativeDecoder.class);
-    /** Most candidates one device top-k readback carries ({@code LLM_Row_TopK} supports up to 64). */
+    /** Most candidates one device top-k readback carries ({@link RowTopK#MAX_DEVICE_CANDIDATES}). */
     private static final int MAX_DEVICE_TOPK = RowTopK.MAX_DEVICE_CANDIDATES;
 
     private static final ReasoningFilter.Sink DISCARD = (channel, tokenId, text) -> { };
@@ -522,9 +522,7 @@ public final class SpeculativeDecoder {
         if (session.cancelled()) {
             reason = StopReason.CANCELLED;
         } else {
-            Sampler.Candidates cur = sampler.apply(logits);
-            token = cur.id(cur.selected());
-            scores.record(logits, cur, token);
+            token = scores.select(sampler, logits);
             sampler.accept(token);
             sampled++;
             reason = session.offer(token);
@@ -680,9 +678,7 @@ public final class SpeculativeDecoder {
         } else {
             float[] logits = backend.decode(token, pos);
             drafter.accept(0);
-            Sampler.Candidates cur = sampler.apply(logits);
-            next = cur.id(cur.selected());
-            scores.record(logits, cur, next);
+            next = scores.select(sampler, logits);
         }
         sampler.accept(next);
         return next;
@@ -763,7 +759,7 @@ public final class SpeculativeDecoder {
      * capture is routed to the sink as an empty content piece carrying it, so a stream carries one entry per
      * token. Inert when the request captures nothing.
      */
-    private static final class Scores {
+    static final class Scores {
         private final LogprobCapture capture;
         private final List<TokenScore[]> out;
         private final ReasoningFilter.Sink sink;
@@ -779,11 +775,20 @@ public final class SpeculativeDecoder {
             return capture.active();
         }
 
-        /** Records {@code token} sampled by the chain run over the raw row {@code raw} that left {@code cur}. */
-        void record(float[] raw, Sampler.Candidates cur, int token) {
-            if (capture.active()) {
-                emit(capture.capture(raw, cur, token), token);
+        /**
+         * The chain's token over the raw row {@code raw}, recorded when the request captures logprobs: a capture
+         * needs the chain's candidates over the whole row ({@link Sampler#apply}); otherwise the token comes
+         * sample-first ({@link Sampler#sample}, the plain loop's {@code SequenceRun.next}), which masks the whole row
+         * with a constraint head only when the head refuses the unmasked argmax. Both select the same token.
+         */
+        int select(Sampler sampler, float[] raw) {
+            if (!capture.active()) {
+                return sampler.sample(raw);
             }
+            Sampler.Candidates cur = sampler.apply(raw);
+            int token = cur.id(cur.selected());
+            emit(capture.capture(raw, cur, token), token);
+            return token;
         }
 
         /**
@@ -929,12 +934,7 @@ public final class SpeculativeDecoder {
         if (verifier != null) {
             return verifierVerify(verifier, roundsRng, sampler, session, draft, rows, scores);
         }
-        return matchVerify(sampler, session, draft, i -> {
-            Sampler.Candidates cur = sampler.apply(rows[i]);
-            int sampledId = cur.id(cur.selected());
-            scores.record(rows[i], cur, sampledId);
-            return sampledId;
-        });
+        return matchVerify(sampler, session, draft, i -> scores.select(sampler, rows[i]));
     }
 
     /**

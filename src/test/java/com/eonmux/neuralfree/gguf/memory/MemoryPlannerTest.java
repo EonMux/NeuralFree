@@ -559,7 +559,8 @@ public class MemoryPlannerTest {
             assertEquals(4096L * 512 + 4096L * 4, plan.cacheBytes());
             assertTotalsMatchLayers(plan);
         }
-        assertEquals(4096L * 512 + 4096L * 4 + contiguousAddressing(1, target.ubatch()),
+        // the NextN layer's KV rows, their positions and their shift deltas
+        assertEquals(4096L * 512 + 4096L * 4 + 4096L * 4 + contiguousAddressing(1, target.ubatch()),
                 MemoryPlanner.nextnBytes(spec, target));
         assertEquals(0L, MemoryPlanner.nextnBytes(gemma3(), MemoryPlanner.planForContext(gemma3(), f16(), 4096)));
         assertThrows(IllegalArgumentException.class, () -> MemoryPlanner.planNextn(spec, target, 1));
@@ -655,7 +656,7 @@ public class MemoryPlannerTest {
     }
 
     /**
-     * Device addressing bytes of a contiguous memory without a context shift ({@link MemoryPlan#addressingBytes()}):
+     * Device addressing bytes of a contiguous memory beside its shift deltas ({@link MemoryPlan#addressingBytes()}):
      * a {@code cell_idx} of the ubatch per group, the query positions, the four RoPE position sections, the state
      * row, the identity row map of the ubatch (ints) and the tree mask (longs).
      */

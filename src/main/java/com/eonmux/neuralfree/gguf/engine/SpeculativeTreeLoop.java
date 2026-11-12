@@ -192,8 +192,7 @@ final class SpeculativeTreeLoop {
         if (session.cancelled()) {
             reason = StopReason.CANCELLED;
         } else {
-            Sampler.Candidates cur = sampler.apply(logits);
-            token = cur.id(cur.selected());
+            token = sampler.sample(logits);
             sampler.accept(token);
             sampled++;
             reason = session.offer(token);
@@ -331,8 +330,7 @@ final class SpeculativeTreeLoop {
     private int decodeTree(int token, int pos, Sampler sampler) {
         ForwardBatch batch = ForwardBatch.builder(1).add(token, pos, 0, true).build();
         float[][] rows = decoder.backend.forwardBatch(batch);
-        Sampler.Candidates cur = sampler.apply(rows[0]);
-        int next = cur.id(cur.selected());
+        int next = sampler.sample(rows[0]);
         sampler.accept(next);
         return next;
     }
@@ -363,10 +361,8 @@ final class SpeculativeTreeLoop {
             b.add(batchTokens[i], pos + i, 0, true);
         }
         float[][] rows = decoder.backend.forwardBatch(b.build());
-        SpeculativeDecoder.Verified v = SpeculativeDecoder.matchVerify(sampler, session, draft, i -> {
-            Sampler.Candidates cur = sampler.apply(rows[i]);
-            return cur.id(cur.selected());
-        });
+        SpeculativeDecoder.Verified v = SpeculativeDecoder.matchVerify(sampler, session, draft,
+                i -> sampler.sample(rows[i]));
         int drop = k - v.accepted;
         if (drop > 0) {
             seqs.remove(0, pos + v.accepted + 1, -1);
@@ -428,8 +424,7 @@ final class SpeculativeTreeLoop {
             for (int index : candidates) {
                 lastDepth[nodes.get(index).branch()] = depth;
             }
-            Sampler.Candidates cur = sampler.apply(predecessor);
-            next = cur.id(cur.selected());
+            next = sampler.sample(predecessor);
             sampler.accept(next);
             emitted++;
             reason = session.offer(next);
@@ -456,8 +451,7 @@ final class SpeculativeTreeLoop {
             advanced = true;
         }
         if (reason == null && advanced) {
-            Sampler.Candidates cur = sampler.apply(predecessor);
-            next = cur.id(cur.selected());
+            next = sampler.sample(predecessor);
             sampler.accept(next);
             emitted++;
             reason = session.offer(next);

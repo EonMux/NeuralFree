@@ -17,6 +17,8 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 /**
  * A vLLM-style KV events subscriber for the tests of both modules: SUB and DEALER sockets speaking the frames of
@@ -27,6 +29,9 @@ public final class ZmqKvEventsTestSupport {
 
     /** Milliseconds a test waits for a frame before it fails. */
     public static final int TIMEOUT_MILLIS = 5_000;
+    /** Milliseconds one connection attempt waits for its ZMTP handshake before {@link #handshaken} retries. */
+    private static final int HANDSHAKE_ATTEMPT_MILLIS = 1_000;
+    private static final AtomicInteger MONITORS = new AtomicInteger();
 
     private ZmqKvEventsTestSupport() {
     }
@@ -63,21 +68,58 @@ public final class ZmqKvEventsTestSupport {
         return "tcp://127.0.0.1:" + endpoint.substring(endpoint.lastIndexOf(':') + 1);
     }
 
-    /** A SUB socket on {@code endpoint}, subscribed to {@code topicPrefix}, with the test's receive timeout. */
+    /**
+     * A SUB socket on a bound {@code endpoint}, subscribed to {@code topicPrefix}, with the test's receive timeout,
+     * returned once its ZMTP handshake completed ({@link #handshaken}).
+     */
     public static ZMQ.Socket subscriber(ZContext context, String endpoint, String topicPrefix) {
-        ZMQ.Socket sub = context.createSocket(SocketType.SUB);
-        sub.setReceiveTimeOut(200);
-        sub.subscribe(topicPrefix.getBytes(StandardCharsets.UTF_8));
-        sub.connect(endpoint);
-        return sub;
+        return handshaken(context, SocketType.SUB, endpoint, sub -> {
+            sub.setReceiveTimeOut(200);
+            sub.subscribe(topicPrefix.getBytes(StandardCharsets.UTF_8));
+        });
     }
 
-    /** A DEALER socket on a replay {@code endpoint}, as vLLM's replay clients connect. */
+    /**
+     * A DEALER socket on a replay {@code endpoint}, as vLLM's replay clients connect, returned once its ZMTP handshake
+     * completed ({@link #handshaken}).
+     */
     public static ZMQ.Socket replayClient(ZContext context, String endpoint) {
-        ZMQ.Socket dealer = context.createSocket(SocketType.DEALER);
-        dealer.setReceiveTimeOut(TIMEOUT_MILLIS);
-        dealer.connect(endpoint);
-        return dealer;
+        return handshaken(context, SocketType.DEALER, endpoint, dealer -> dealer.setReceiveTimeOut(TIMEOUT_MILLIS));
+    }
+
+    /**
+     * A {@code type} socket connected to a bound {@code endpoint} whose ZMTP handshake completed. A JeroMQ 0.6.0
+     * connecting socket now and then stalls after its TCP connect: the connection is established and the peer's
+     * greeting sits unread in the socket, but the connecting side never sends its own greeting, so the connection
+     * carries nothing, however long the test waits. Such a stalled socket is closed and a fresh one connects, until
+     * one completes its handshake within {@link #TIMEOUT_MILLIS}.
+     */
+    private static ZMQ.Socket handshaken(ZContext context, SocketType type, String endpoint,
+                                         Consumer<ZMQ.Socket> setup) {
+        long deadline = System.currentTimeMillis() + TIMEOUT_MILLIS;
+        while (true) {
+            ZMQ.Socket socket = context.createSocket(type);
+            setup.accept(socket);
+            String monitorAt = "inproc://kv-events-test-handshake-" + MONITORS.incrementAndGet();
+            check(socket.monitor(monitorAt, ZMQ.EVENT_HANDSHAKE_PROTOCOL), "the socket monitor starts");
+            ZMQ.Socket monitor = context.createSocket(SocketType.PAIR);
+            boolean done;
+            try {
+                monitor.setReceiveTimeOut(HANDSHAKE_ATTEMPT_MILLIS);
+                monitor.connect(monitorAt);
+                check(socket.connect(endpoint), "the socket connects to " + endpoint);
+                done = ZMQ.Event.recv(monitor) != null;
+            } finally {
+                socket.monitor(null, 0);
+                context.destroySocket(monitor);
+            }
+            if (done) {
+                return socket;
+            }
+            context.destroySocket(socket);
+            check(System.currentTimeMillis() < deadline, "no " + type + " socket completed its handshake with "
+                    + endpoint + " within " + TIMEOUT_MILLIS + " ms");
+        }
     }
 
     /** The next PUB message on {@code sub}, or null when none arrives within its receive timeout. */

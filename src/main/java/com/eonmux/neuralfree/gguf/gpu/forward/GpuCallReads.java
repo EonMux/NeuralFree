@@ -35,9 +35,11 @@ final class GpuCallReads {
     private final float[] topLogits;
     private final List<float[]> floatParts = new ArrayList<>();
     private final List<byte[]> idParts = new ArrayList<>();
+    /** Per top-k read part its rows' softmax denominators, when the call reads them; empty otherwise. */
+    private final List<float[]> sumParts = new ArrayList<>();
+    /** Whether a top-k call also reads each row's softmax denominator ({@link #readSoftmaxDenominators}). */
+    private boolean denominators;
     private final List<int[]> targets = new ArrayList<>();
-    /** Candidate slots per row of each read part: the bound readout's k, at least the requested one. */
-    private final List<Integer> candidateStrides = new ArrayList<>();
     private final List<GpuEvent> events = new ArrayList<>();
     /** The device slot the last greedy-id read came from, which a chained decode step reads its id from. */
     private ScratchSlot idSlot;
@@ -82,6 +84,19 @@ final class GpuCallReads {
     }
 
     /**
+     * Makes this top-k call read each row's softmax denominator beside its candidates
+     * ({@link GpuPrefillDriver.Result#topSumExp()}); call it before the first {@link #read}.
+     *
+     * @throws IllegalStateException when the call is not a top-k call or has read already
+     */
+    void readSoftmaxDenominators() {
+        if (output != GpuPrefillDriver.Output.TOPK || !targets.isEmpty()) {
+            throw new IllegalStateException("softmax denominators belong to a top-k call, asked before its reads");
+        }
+        denominators = true;
+    }
+
+    /**
      * Enqueues the read of {@code count} consecutive rows the head prepared for {@code out}, placing them at the
      * {@code target} positions of the result.
      */
@@ -108,16 +123,18 @@ final class GpuCallReads {
             }
         }
         if (out == GpuPrefillDriver.Output.TOPK) {
-            // the readout keeps its bound width, which may exceed the requested candidates: read whole rows
-            int stride = top.k();
-            float[] vals = new float[count * stride];
-            byte[] idx = new byte[count * stride * Integer.BYTES];
+            float[] vals = new float[count * topK];
+            byte[] idx = new byte[count * topK * Integer.BYTES];
             events.add(queue.enqueueReadBuffer(top.topVal(), 0, (long) vals.length * Float.BYTES, vals));
             events.add(queue.enqueueReadBuffer(top.topIdx(), 0, idx.length, idx));
             floatParts.add(vals);
             idParts.add(idx);
             targets.add(target);
-            candidateStrides.add(stride);
+            if (denominators) {
+                float[] sums = new float[count];
+                events.add(queue.enqueueReadBuffer(top.sumExp(), 0, (long) count * Float.BYTES, sums));
+                sumParts.add(sums);
+            }
             if (fullRows != null) {
                 readWhole(src, count, target);
             }
@@ -167,20 +184,23 @@ final class GpuCallReads {
     /** Assembles the rows of every read into the result, in request order. */
     GpuPrefillDriver.Result result() {
         if (output == GpuPrefillDriver.Output.TOPK) {
+            float[] sumExp = denominators ? new float[topIds.length / topK] : null;
             for (int part = 0; part < targets.size(); part++) {
                 int[] target = targets.get(part);
                 float[] vals = floatParts.get(part);
-                int stride = candidateStrides.get(part);
                 ByteBuffer bb = ByteBuffer.wrap(idParts.get(part)).order(ByteOrder.LITTLE_ENDIAN);
                 for (int j = 0; j < target.length; j++) {
                     int row = target[j];
-                    System.arraycopy(vals, j * stride, topLogits, row * topK, topK);
+                    System.arraycopy(vals, j * topK, topLogits, row * topK, topK);
                     for (int c = 0; c < topK; c++) {
-                        topIds[row * topK + c] = bb.getInt((j * stride + c) * Integer.BYTES);
+                        topIds[row * topK + c] = bb.getInt((j * topK + c) * Integer.BYTES);
+                    }
+                    if (sumExp != null) {
+                        sumExp[row] = sumParts.get(part)[j];
                     }
                 }
             }
-            return new GpuPrefillDriver.Result(rows, null, topK, topIds, topLogits);
+            return new GpuPrefillDriver.Result(rows, null, topK, topIds, topLogits, sumExp);
         }
         for (int part = 0; part < targets.size(); part++) {
             int[] target = targets.get(part);

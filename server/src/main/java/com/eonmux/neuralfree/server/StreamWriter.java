@@ -9,7 +9,6 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 
 /**
@@ -32,9 +31,9 @@ import java.util.function.BooleanSupplier;
 final class StreamWriter {
 
     /** The most queued events one drain writes before it flushes. */
-    static final int MAX_DRAIN_EVENTS = 64;
+    static final int MAX_DRAIN_EVENTS = EventDrain.MAX_EVENTS;
     /** The longest one drain writes before it flushes. */
-    static final long MAX_DRAIN_NANOS = TimeUnit.MILLISECONDS.toNanos(10);
+    static final long MAX_DRAIN_NANOS = EventDrain.MAX_NANOS;
 
     /** Handles one event, writing its chunks through the writer. */
     interface Handler {

@@ -22,10 +22,18 @@ final class BlockLayout {
 
     private final PagedSequences paged;
     private final List<StateTransfer.Cache> caches;
+    /** The transfer whose deferred reads {@link #awaitReads()} completes; null for caches that read at once. */
+    private final StateTransfer transfer;
 
+    /** A layout over {@code caches} that read at once (their {@link StateTransfer.Cache#readLater} is the default). */
     BlockLayout(PagedSequences paged, List<StateTransfer.Cache> caches) {
+        this(paged, caches, null);
+    }
+
+    private BlockLayout(PagedSequences paged, List<StateTransfer.Cache> caches, StateTransfer transfer) {
         this.paged = paged;
         this.caches = caches;
+        this.transfer = transfer;
     }
 
     /**
@@ -38,7 +46,8 @@ final class BlockLayout {
         if (why != null) {
             throw new UnsupportedOperationException(why);
         }
-        return new BlockLayout(memory.pagedSequences(), memory.stateTransfer().caches());
+        StateTransfer transfer = memory.stateTransfer();
+        return new BlockLayout(memory.pagedSequences(), transfer.caches(), transfer);
     }
 
     /** Why the cached blocks of {@code memory} cannot move to the host and back, or null when they can. */
@@ -81,6 +90,13 @@ final class BlockLayout {
     /** The owning cache layers, in the memory's transfer order. */
     List<StateTransfer.Cache> caches() {
         return caches;
+    }
+
+    /** Waits for the reads {@link StateTransfer.Cache#readLater} started on {@link #caches()}. */
+    void awaitReads() {
+        if (transfer != null) {
+            transfer.awaitReads();
+        }
     }
 
     /**

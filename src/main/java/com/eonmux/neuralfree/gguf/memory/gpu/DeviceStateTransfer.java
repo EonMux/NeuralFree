@@ -15,7 +15,8 @@ import java.util.Objects;
  * The host transfer of a {@link DeviceModelMemory} ({@link StateTransfer}): K/V rows and recurrent state tensors move
  * between the device buffers and host arrays through the memory's queue, in order with its forward pass. A read
  * waits for every command enqueued before it and for its own bytes, then drains the queue so the backend recycles its
- * staging; a write is staged at once, so the caller may reuse its array.
+ * staging; a deferred read ({@link Cache#readLater}) keeps its event until {@link #awaitReads()} waits for the batch
+ * and drains the queue once. A write is staged at once, so the caller may reuse its array.
  */
 final class DeviceStateTransfer implements StateTransfer {
 
@@ -23,6 +24,10 @@ final class DeviceStateTransfer implements StateTransfer {
     private final DeviceStepInputs stepInputs;
     private final List<Cache> caches;
     private final List<State> states;
+    /** The events of the reads started by {@link Cache#readLater} that {@link #awaitReads()} has not waited for. */
+    private final List<GpuEvent> pendingReads = new ArrayList<>();
+    /** Whether a deferred read started since the last {@link #awaitReads()} (a backend may return no event). */
+    private boolean readsStarted;
 
     DeviceStateTransfer(ComputeQueue queue, DeviceStepInputs stepInputs, List<DeviceKvLayer> kv,
                         List<DeviceRecurrentState> recurrent) {
@@ -60,8 +65,38 @@ final class DeviceStateTransfer implements StateTransfer {
         stepInputs.installPositions(group, Objects.requireNonNull(mirror, "mirror"));
     }
 
-    /** Waits for {@code read}'s bytes on the host, releases the event and drains the queue. */
-    private void complete(GpuEvent read) {
+    /**
+     * Waits for every deferred read in start order, releasing each event, then drains the queue once; a failed wait
+     * still releases the remaining events.
+     */
+    @Override
+    public void awaitReads() {
+        if (!readsStarted) {
+            return;
+        }
+        readsStarted = false;
+        List<GpuEvent> reads = new ArrayList<>(pendingReads);
+        pendingReads.clear();
+        RuntimeException failure = null;
+        for (GpuEvent read : reads) {
+            if (failure != null) {
+                read.close();
+                continue;
+            }
+            try {
+                await(read);
+            } catch (RuntimeException e) {
+                failure = e;
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
+        queue.finish();
+    }
+
+    /** Waits for {@code read}'s bytes on the host and releases the event. */
+    private static void await(GpuEvent read) {
         try {
             read.awaitCompletion();
         } catch (InterruptedException e) {
@@ -70,6 +105,11 @@ final class DeviceStateTransfer implements StateTransfer {
         } finally {
             read.close();
         }
+    }
+
+    /** Waits for {@code read}'s bytes on the host, releases the event and drains the queue. */
+    private void complete(GpuEvent read) {
+        await(read);
         queue.finish();
     }
 
@@ -107,6 +147,17 @@ final class DeviceStateTransfer implements StateTransfer {
         public void read(boolean v, int row0, int rows, byte[] dst) {
             long rowBytes = check(v, row0, rows, dst);
             complete(queue.enqueueReadBuffer(buffer(v), row0 * rowBytes, rows * rowBytes, dst));
+        }
+
+        /** Enqueues the read and keeps its event for {@link #awaitReads()}, whose drain also covers an eventless one. */
+        @Override
+        public void readLater(boolean v, int row0, int rows, byte[] dst) {
+            long rowBytes = check(v, row0, rows, dst);
+            GpuEvent read = queue.enqueueReadBuffer(buffer(v), row0 * rowBytes, rows * rowBytes, dst);
+            readsStarted = true;
+            if (read != null) {
+                pendingReads.add(read);
+            }
         }
 
         @Override

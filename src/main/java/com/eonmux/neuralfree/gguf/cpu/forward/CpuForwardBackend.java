@@ -8,6 +8,7 @@ import com.eonmux.neuralfree.gguf.cpu.head.CpuEmbeddingStage;
 import com.eonmux.neuralfree.gguf.cpu.head.CpuHeadPreprocessor;
 import com.eonmux.neuralfree.gguf.cpu.head.CpuLogitsHead;
 import com.eonmux.neuralfree.gguf.cpu.ops.CpuOps;
+import com.eonmux.neuralfree.gguf.engine.BatchSegments;
 import com.eonmux.neuralfree.gguf.engine.ContextFullException;
 import com.eonmux.neuralfree.gguf.engine.EmbeddingRowSupport;
 import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
@@ -382,8 +383,9 @@ public final class CpuForwardBackend implements ForwardBackend {
 
     /**
      * The whole {@code batch} as one memoryless step (a model planned without memory: an encoder or a decision
-     * graph that keeps no cache, so every row attends every row): per-row tokens and embedding rows at the batch's
-     * positions, one output row per requested row. The batch must hold one sequence and at most one ubatch.
+     * graph that keeps no cache, so every row attends every row of its sequence): per-row tokens and embedding rows
+     * at the batch's positions, one output row per requested row. The batch holds at most one ubatch, and several
+     * sequences only as packed runs ({@link BatchSegments#packed}).
      */
     private float[][] runMemorylessBatch(ForwardBatch batch, boolean logits) {
         Objects.requireNonNull(batch, "batch");
@@ -396,20 +398,19 @@ public final class CpuForwardBackend implements ForwardBackend {
             throw new IllegalArgumentException("the memoryless batch evaluates all " + n + " rows in one step,"
                     + " more than the ubatch " + scratch.ubatch() + "; raise neuralfree.ubatch");
         }
-        int[] seqIds = batch.seqIds();
-        for (int t = 0; t < seqIds.length; t++) {
-            if (seqIds[t] != 0) {
-                throw new UnsupportedOperationException("a memoryless batch holds one sequence, row " + t
-                        + " runs in sequence " + seqIds[t] + ": " + batchRefusal());
-            }
-        }
+        BatchSegments segments = BatchSegments.packed(batch, spec);
         float[][] embd = batch.embeddings();
         checkBatchRows(batch, embd);
         int[] outputs = batch.outputRows();
         CpuTapRows taps = CpuTapRows.open(tap, n, spec.nLayer());
         float[] x = scratch.slot(CpuScratch.X);
         embedding.embedBatched(batch.tokens(), batch.positions(), embd, x);
-        runSlots(0, 0, n, x, taps);
+        ctx.stepSegments(segments);
+        try {
+            runSlots(0, 0, n, x, taps);
+        } finally {
+            ctx.stepSegments(null);
+        }
         float[][] out = new float[outputs.length][];
         emitRows(outputs, 0, n, out, logits);
         deliver(taps);
@@ -1103,6 +1104,19 @@ public final class CpuForwardBackend implements ForwardBackend {
     public int maxSequences() {
         checkOpen();
         return memory != null && memory.pagedSequences() != null ? memory.pagedSequences().maxSequences() : 1;
+    }
+
+    /** {@link BatchSegments#MAX_PACKED} for a model without memory whose layers keep rows in their sequence. */
+    @Override
+    public int memorylessSequences() {
+        checkOpen();
+        return memory == null && BatchSegments.packingRefusal(spec) == null ? BatchSegments.MAX_PACKED : 1;
+    }
+
+    /** The scratch ubatch while {@link #memorylessSequences()} packs. */
+    @Override
+    public int memorylessBatchRows() {
+        return memorylessSequences() > 1 ? scratch.ubatch() : 0;
     }
 
     /** Installs the tap for every later call; the context is rebuilt with it ({@link CpuForwardContext#withHiddenTap}). */

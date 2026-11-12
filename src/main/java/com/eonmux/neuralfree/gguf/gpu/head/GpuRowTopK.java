@@ -16,9 +16,11 @@ import java.util.Objects;
  * denominator {@code sum_j exp(l_j - max)}, so a caller reads {@code k} values per row back instead
  * of the whole vocabulary. The logits rows sit at the buffer's element 0, {@code vocab} floats apart.
  *
- * <p>The dispatch is prepared at construction for up to {@code maxRows} rows; a step re-sets only the
- * row count and the grid. A backend without the kernel binds nothing ({@link #bind} returns null), and
- * its caller reads the rows back and selects on the host. Not thread-safe.</p>
+ * <p>The dispatch is prepared at construction for up to {@code maxRows} rows of up to {@code k} candidates; a
+ * step re-sets only the row count, the grid and the step's width, so a narrower readout ranks and packs only
+ * its own candidates ({@code rows * width}) and its cost follows the step's width rather than the widest one
+ * bound. A backend without the kernel binds nothing ({@link #bind} returns null), and its caller reads the rows
+ * back and selects on the host. Not thread-safe.</p>
  */
 public final class GpuRowTopK implements AutoCloseable {
 
@@ -31,6 +33,7 @@ public final class GpuRowTopK implements AutoCloseable {
     private final int k;
     private final int maxRows;
     private int lastRows = -1;
+    private int width;
 
     private GpuRowTopK(GpuOps ops, PreparedDispatch dispatch, GpuBuffer topVal, GpuBuffer topIdx,
                        GpuBuffer sumExp, int vocab, int k, int maxRows) {
@@ -42,6 +45,7 @@ public final class GpuRowTopK implements AutoCloseable {
         this.vocab = vocab;
         this.k = k;
         this.maxRows = maxRows;
+        this.width = k;
     }
 
     /**
@@ -94,30 +98,53 @@ public final class GpuRowTopK implements AutoCloseable {
         }
     }
 
-    /** Enqueues the readout of the first {@code rows} logits rows. */
+    /** Enqueues the readout of the first {@code rows} logits rows at the bound width {@link #k()}. */
     public void run(int rows) {
+        run(rows, k);
+    }
+
+    /**
+     * Enqueues the readout of the first {@code rows} logits rows, {@code candidates} each, packed
+     * {@code candidates} apart from element 0 of {@link #topVal()} and {@link #topIdx()}.
+     *
+     * @throws IllegalArgumentException when {@code rows} is outside {@code [1, maxRows]} or {@code candidates}
+     *                                  outside {@code [1, k()]}
+     */
+    public void run(int rows, int candidates) {
         if (rows < 1 || rows > maxRows) {
             throw new IllegalArgumentException("row top-k of " + rows + " rows outside [1, " + maxRows + "]");
+        }
+        if (candidates < 1 || candidates > k) {
+            throw new IllegalArgumentException("row top-k of " + candidates + " candidates outside [1, " + k + "]");
         }
         if (rows != lastRows) {
             dispatch.setInt(GemmKernels.ROWTOPK_ARG_N_ROWS, rows);
             dispatch.setGlobal((long) rows * dispatchLocal());
             lastRows = rows;
         }
+        if (candidates != width) {
+            dispatch.setInt(GemmKernels.ROWTOPK_ARG_K, candidates);
+            width = candidates;
+        }
         dispatch.dispatch();
     }
 
-    /** Candidates per row. */
+    /** Most candidates per row the readout holds (its bound width). */
     public int k() {
         return k;
     }
 
-    /** The F32 candidate values, {@code rows * k}. */
+    /** Candidates per row of the last enqueued readout, the packing stride of its rows. */
+    public int width() {
+        return width;
+    }
+
+    /** The F32 candidate values, {@code rows * width()}. */
     public GpuBuffer topVal() {
         return topVal;
     }
 
-    /** The int32 candidate indices, {@code rows * k}. */
+    /** The int32 candidate indices, {@code rows * width()}. */
     public GpuBuffer topIdx() {
         return topIdx;
     }

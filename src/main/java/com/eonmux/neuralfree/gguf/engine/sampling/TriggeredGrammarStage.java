@@ -37,10 +37,18 @@ import java.util.Objects;
  */
 public final class TriggeredGrammarStage extends SamplerStage implements TokenGate {
 
-    /** The trigger buffer, its backing array readable so a word search needs no copy. */
+    /**
+     * The trigger buffer, its backing array readable so a word search needs no copy. Bytes below a saved length are
+     * never rewritten: a fresh trigger phase or a restore to another state starts a new buffer, and only
+     * {@link #admits} cuts a buffer back, to the length it found.
+     */
     private static final class TriggerBuffer extends ByteArrayOutputStream {
         byte[] array() {
             return buf;
+        }
+
+        void truncate(int length) {
+            count = length;
         }
     }
 
@@ -57,19 +65,26 @@ public final class TriggeredGrammarStage extends SamplerStage implements TokenGa
         }
     }
 
-    /** A saved stage state ({@link #saveState}); spans are immutable and the lists are copies. */
+    /**
+     * A saved stage state ({@link #saveState}): the buffer and the span list it found with their lengths, whose
+     * prefixes stay as they were (see {@link TriggerBuffer}), so a save copies nothing.
+     */
     private static final class State {
         final GrammarStage active;
         final Object activeState;
-        final byte[] buffer;
+        final TriggerBuffer buffer;
+        final int length;
         final List<Span> spans;
+        final int spanCount;
         final boolean armed;
 
-        State(GrammarStage active, Object activeState, byte[] buffer, List<Span> spans, boolean armed) {
+        State(GrammarStage active, Object activeState, TriggerBuffer buffer, List<Span> spans, boolean armed) {
             this.active = active;
             this.activeState = activeState;
             this.buffer = buffer;
+            this.length = buffer.size();
             this.spans = spans;
+            this.spanCount = spans.size();
             this.armed = armed;
         }
     }
@@ -90,8 +105,8 @@ public final class TriggeredGrammarStage extends SamplerStage implements TokenGa
      */
     private final boolean wordsOnly;
 
-    private final TriggerBuffer buffer = new TriggerBuffer();
-    private final List<Span> spans = new ArrayList<>();
+    private TriggerBuffer buffer = new TriggerBuffer();
+    private List<Span> spans = new ArrayList<>();
     private GrammarStage active;
     /** The grammar the waiting-phase check replays a would-be trigger into, reset to {@link #probeStart} each time. */
     private GrammarStage probe;
@@ -211,7 +226,7 @@ public final class TriggeredGrammarStage extends SamplerStage implements TokenGa
             return true;
         }
         int byteStart = text.byteOffset(at);
-        List<Span> replay = new ArrayList<>(spans);
+        List<Span> replay = spans;
         start();
         for (Span s : replay) {
             if (s.end <= byteStart) {
@@ -272,11 +287,11 @@ public final class TriggeredGrammarStage extends SamplerStage implements TokenGa
         if (!armed) {
             return true;
         }
-        Object saved = saveState();
+        State saved = (State) saveState();
         try {
             return consume(token);
         } finally {
-            restoreState(saved);
+            rollBack(saved);
         }
     }
 
@@ -288,8 +303,7 @@ public final class TriggeredGrammarStage extends SamplerStage implements TokenGa
     /** The active grammar with its own state, the trigger buffer with its spans and the armed flag. */
     @Override
     public Object saveState() {
-        return new State(active, active == null ? null : active.saveState(), buffer.toByteArray(),
-                new ArrayList<>(spans), armed);
+        return new State(active, active == null ? null : active.saveState(), buffer, spans, armed);
     }
 
     @Override
@@ -302,10 +316,32 @@ public final class TriggeredGrammarStage extends SamplerStage implements TokenGa
         if (active != null) {
             active.restoreState(s.activeState);
         }
-        buffer.reset();
-        buffer.writeBytes(s.buffer);
-        spans.clear();
-        spans.addAll(s.spans);
+        if (s.buffer != buffer || s.length != buffer.size()) {
+            TriggerBuffer copy = new TriggerBuffer();
+            copy.write(s.buffer.array(), 0, s.length);
+            buffer = copy;
+        }
+        if (s.spans != spans || s.spanCount != spans.size()) {
+            spans = new ArrayList<>(s.spans.subList(0, s.spanCount));
+        }
+        armed = s.armed;
+    }
+
+    /**
+     * Returns to {@code s}, saved by {@link #admits} just before its trial {@link #consume}: no state was saved in
+     * between, so the buffer and span list it found are cut back to their lengths in place.
+     */
+    private void rollBack(State s) {
+        active = s.active;
+        if (active != null) {
+            active.restoreState(s.activeState);
+        }
+        buffer = s.buffer;
+        buffer.truncate(s.length);
+        spans = s.spans;
+        if (spans.size() > s.spanCount) {
+            spans.subList(s.spanCount, spans.size()).clear();
+        }
         armed = s.armed;
     }
 
@@ -318,16 +354,16 @@ public final class TriggeredGrammarStage extends SamplerStage implements TokenGa
     public void reset() {
         active = null;
         armed = false;
-        buffer.reset();
-        spans.clear();
+        buffer = new TriggerBuffer();
+        spans = new ArrayList<>();
     }
 
     /** Opens a fresh grammar for the trigger that just fired and clears the trigger buffer. */
     private void start() {
         active = new GrammarStage(grammar, vocab);
         active.arm();
-        buffer.reset();
-        spans.clear();
+        buffer = new TriggerBuffer();
+        spans = new ArrayList<>();
     }
 
     /** Masks what the waiting phase refuses: trigger-completing tokens with rejected text, and the exclusions. */

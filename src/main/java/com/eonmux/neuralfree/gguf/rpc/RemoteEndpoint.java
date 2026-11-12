@@ -36,7 +36,7 @@ final class RemoteEndpoint {
     private final boolean cacheEnabled;
     private final boolean pipeline;
     /** The bodies of the commands appended since the last flush, each starting with its opcode; guarded by this. */
-    private final List<byte[]> pending = new ArrayList<>();
+    private final List<RpcWire.Writer> pending = new ArrayList<>();
     private int pendingBytes;
     /** The sequence number the last appended command carries. */
     private long sequence;
@@ -108,10 +108,10 @@ final class RemoteEndpoint {
      */
     synchronized long submit(RpcWire.Writer member, boolean syncAfter) {
         Objects.requireNonNull(member, "member");
-        long seq = append(member.toBytes());
+        long seq = append(member);
         if (!pipeline) {
             if (syncAfter) {
-                append(new RpcWire.Writer(RpcWire.OP_FINISH).toBytes());
+                append(new RpcWire.Writer(RpcWire.OP_FINISH));
             }
             flush();
             if (syncAfter) {
@@ -135,7 +135,7 @@ final class RemoteEndpoint {
      * command of the endpoint up to now.
      */
     synchronized void finish() {
-        append(new RpcWire.Writer(RpcWire.OP_FINISH).toBytes());
+        append(new RpcWire.Writer(RpcWire.OP_FINISH));
         flush();
         finishedUpTo = flushedUpTo;
     }
@@ -184,7 +184,7 @@ final class RemoteEndpoint {
      * member count goes before the bodies, so the server can bound its member loop.
      */
     private List<Batch> takeBatches() {
-        List<byte[]> bodies = new ArrayList<>(pending);
+        List<RpcWire.Writer> bodies = new ArrayList<>(pending);
         pending.clear();
         pendingBytes = 0;
         List<Batch> batches = new ArrayList<>(1);
@@ -194,7 +194,7 @@ final class RemoteEndpoint {
             int count = 0;
             int size = BATCH_OVERHEAD;
             while (i < bodies.size()) {
-                int needed = 1 + bodies.get(i).length;
+                int needed = 1 + bodies.get(i).size();
                 if (count > 0 && size + needed > RpcWire.MAX_FRAME) {
                     break;
                 }
@@ -202,7 +202,7 @@ final class RemoteEndpoint {
                 size += needed;
                 i++;
             }
-            RpcWire.Writer w = new RpcWire.Writer(RpcWire.OP_BATCH).i32(count);
+            RpcWire.Writer w = new RpcWire.Writer(RpcWire.OP_BATCH, size).i32(count);
             for (int j = start; j < i; j++) {
                 w.body(bodies.get(j));
             }
@@ -354,9 +354,9 @@ final class RemoteEndpoint {
     }
 
     /** Appends one command body and returns its sequence; each member carries its opcode prefix and body. */
-    private long append(byte[] member) {
+    private long append(RpcWire.Writer member) {
         pending.add(member);
-        pendingBytes += member.length;
+        pendingBytes += member.size();
         sequence++;
         return sequence;
     }

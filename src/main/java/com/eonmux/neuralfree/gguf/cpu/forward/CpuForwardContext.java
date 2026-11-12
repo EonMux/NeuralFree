@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf.cpu.forward;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuProjectionDeltas;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
 import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
+import com.eonmux.neuralfree.gguf.engine.BatchSegments;
 import com.eonmux.neuralfree.gguf.engine.HiddenTap;
 import com.eonmux.neuralfree.gguf.memory.cpu.CpuMemory;
 import com.eonmux.neuralfree.gguf.ops.moe.MoeExpertHeat;
@@ -148,6 +149,19 @@ public final class CpuForwardContext {
     /** Sets the running step's KV store positions; the backend sets it around a contiguous tree step. */
     public void stepStorePositions(int[] positions) {
         stepState.storePositions(positions);
+    }
+
+    /**
+     * The running memoryless step's sequence runs, each attending only its own rows, or null when the step's rows
+     * form one sequence.
+     */
+    public BatchSegments stepSegments() {
+        return stepState.segments();
+    }
+
+    /** Sets the running memoryless step's sequence runs; the backend sets it around a packed step. */
+    public void stepSegments(BatchSegments segments) {
+        stepState.segments(segments);
     }
 
     /** The MoE expert-heat recorder the routed blocks note their selections into; null without a profile save. */

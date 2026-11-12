@@ -45,7 +45,8 @@ final class OutputRouter {
 
     /**
      * Routes one step's outputs in batch order: a piece with a {@code topRow} entry samples the token its chain
-     * selects over that row of {@code top}; every other decode piece samples its row or walks its verify round, a
+     * selects over that row of {@code top} (a verify round walks its rows from there on, one per round row); every
+     * other decode piece samples its row or walks its verify round, a
      * completing prompt chunk samples from its logits, a pooling piece's rows land in its submission's pooling run
      * (the completing one retires the request through its pooling completion), and the chunks without an output row
      * advance their cursors. A piece's whole rows sit at its {@code outIdx} in the step's outputs — one row, or all
@@ -53,8 +54,8 @@ final class OutputRouter {
      *
      * @param top         the device candidates of the shared batch's output rows, or null when every row was read
      *                    whole
-     * @param topRow      for each piece its row in {@code top}, or -1 when it routes over whole rows; null with
-     *                    {@code top}
+     * @param topRow      for each piece its (first) row in {@code top}, or -1 when it routes over whole rows; null
+     *                    without {@code top}
      * @param prefiltered whether the readout applied each candidate row's logit prefilter before its top-k, so the
      *                    chain runs over the candidates without repeating those edits
      */
@@ -64,7 +65,9 @@ final class OutputRouter {
             Piece p = pieces.get(i);
             try {
                 if (topRow != null && topRow[i] >= 0) {
-                    if (p.decode) {
+                    if (p.decode && p.rows > 1) {
+                        rounds.verify(p.slot, p.tokens, top, topRow[i], prefiltered);
+                    } else if (p.decode) {
                         sampleAndOfferTopK(p.slot, top, topRow[i], true, prefiltered);
                     } else {
                         p.slot.nextPromptPos = p.from + p.rows;

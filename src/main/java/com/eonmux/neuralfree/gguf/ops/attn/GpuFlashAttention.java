@@ -4,6 +4,7 @@ import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuStepPatcher;
 import com.eonmux.neuralfree.gguf.BatchInvariance;
+import com.eonmux.neuralfree.gguf.engine.BatchSegments;
 import com.eonmux.neuralfree.gguf.gpu.forward.PreparedDispatch;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuStepInputs;
 import com.eonmux.neuralfree.gguf.memory.paged.PagedStep;
@@ -52,6 +53,8 @@ final class GpuFlashAttention {
     /** The key and query buffers of this layer's decode kernel, the identity of its graph dispatches. */
     private final GpuBuffer k;
     private final GpuBuffer q;
+    /** The query positions the prepared prefill reads, restored after a packed step's run launches. */
+    private final GpuBuffer qPos;
     /** True when the plan's tensor-core prefill serves the one-row step faster than the decode kernel. */
     private final boolean routesDecodeThroughPrefill;
     /** True when the one-row route follows the step's live key count (an mma prefill and a dense fast-path plan). */
@@ -87,6 +90,7 @@ final class GpuFlashAttention {
         this.lse = lse;
         this.k = args.keys().k();
         this.q = args.q();
+        this.qPos = args.qPos();
         this.routesDecodeThroughPrefill = plan.routesDecodeThroughPrefill();
         this.routesDecodeByDepth = plan.routesDecodeByDepth();
     }
@@ -206,7 +210,7 @@ final class GpuFlashAttention {
      * the fresh slot its mask word names (bit 0) ahead of the ordinary rules.
      */
     void decode(int pos, GpuBuffer treeMask) {
-        decodeRow(pos, 0, cached ? cachedKeys(pos + 1) : 1, treeMask);
+        decodeRow(pos, 0, 0, cached ? cachedKeys(pos + 1) : 1, treeMask);
     }
 
     /**
@@ -339,7 +343,65 @@ final class GpuFlashAttention {
         for (int t = 0; t < n; t++) {
             int qPos = pos0 + t;
             int keys = cached && causal ? cachedKeys(qPos + 1) : nKeys;
-            decodeRow(qPos, t, keys, treeMask);
+            decodeRow(qPos, t, 0, keys, treeMask);
+        }
+    }
+
+    /**
+     * The attention of a packed memoryless step over the step's own K and V rows: one launch per sequence run of
+     * {@code runs}, its query rows against the run's key rows {@code [start, start + length)} alone, so no row sees
+     * another sequence (llama.cpp's per-sequence KQ mask). The prefill launches read {@code queryPositions}
+     * (positions {@code 0 ..}) as their launch-local query positions, which a run numbered from 0 shares with its
+     * keys' positions; the per-row decode fallback takes each row's run-local position as its scalar. The prepared
+     * query positions and offsets are restored before the call returns.
+     *
+     * @throws UnsupportedOperationException when the keys are a cache, or the layer merges a static sink partial or
+     *                                       writes a context-parallel log-sum-exp
+     */
+    void prefillRuns(BatchSegments runs, GpuBuffer queryPositions) {
+        if (cached || sinkPartial != null || lse != null) {
+            throw new UnsupportedOperationException("a packed memoryless step attends the step's own rows without"
+                    + " a cache, static sink tokens or a context-parallel merge");
+        }
+        if (prefill == null) {
+            for (int r = 0; r < runs.count(); r++) {
+                int start = runs.start(r);
+                int len = runs.length(r);
+                for (int t = 0; t < len; t++) {
+                    decodeRow(t, start + t, start, len, null);
+                }
+            }
+            return;
+        }
+        prefill.setBuffer(AttnKernels.ARG_FA_BUF_Q_POS, queryPositions);
+        try {
+            for (int r = 0; r < runs.count(); r++) {
+                prefillRun(runs.start(r), runs.length(r));
+            }
+        } finally {
+            prefill.setBuffer(AttnKernels.ARG_FA_BUF_Q_POS, qPos);
+            prefill.setInt(AttnKernels.ARG_FA_KV_START, 0);
+            prefill.setInt(AttnKernels.ARG_FA_Q_OFF, 0);
+            prefill.setInt(AttnKernels.ARG_FA_OUT_OFF, 0);
+        }
+    }
+
+    /** One run's prefill launch over rows and keys {@code [start, start + len)}, then its split merge. */
+    private void prefillRun(int start, int len) {
+        FlashAttnTiling.Split s = prefillPlan.prefillSplit(len, len, partialCapacity);
+        boolean direct = s.direct();
+        prefill.setInt(AttnKernels.ARG_FA_N_TOKENS, len);
+        prefill.setInt(AttnKernels.ARG_FA_N_SPLIT, s.count());
+        prefill.setInt(AttnKernels.ARG_FA_SPLIT_LEN, s.length());
+        prefill.setInt(AttnKernels.ARG_FA_KV_START, start);
+        prefill.setInt(AttnKernels.ARG_FA_KV_END, start + len);
+        prefill.setInt(AttnKernels.ARG_FA_FLAGS, stepFlags(flags, direct, false, len));
+        prefill.setInt(AttnKernels.ARG_FA_Q_OFF, start * qDim);
+        prefill.setInt(AttnKernels.ARG_FA_OUT_OFF, start * outDim);
+        prefill.setGlobal(prefillPlan.prefillGlobal(len, s.count()));
+        prefill.dispatch();
+        if (!direct) {
+            combine.run(len * nHead, s.count(), start * outDim);
         }
     }
 
@@ -393,13 +455,15 @@ final class GpuFlashAttention {
     }
 
     /**
-     * One query row of the decode kernel. Split count and length follow the live key count under the launch's plan
+     * One query row of the decode kernel over the {@code nKeys} keys from row {@code kvStart} (0 for a cache or a
+     * whole batch, a run's first row in a packed step). Split count and length follow the live key count under the
+     * launch's plan
      * ({@link FlashAttnTiling#decodeSplit}: the row kernel's own plan for a row without a tree mask), and the grid
      * follows the count. {@code treeMask} is the step's tree
      * mask (the row reads its word at {@code tree_mask[0]}, the step's one fresh row), or null. A row without a
      * tree mask on the plan's one-row kernel always writes its partial and merges it ({@link #mergesEveryRow}).
      */
-    private void decodeRow(int qPos, int row, int nKeys, GpuBuffer treeMask) {
+    private void decodeRow(int qPos, int row, int kvStart, int nKeys, GpuBuffer treeMask) {
         boolean tree = treeMask != null;
         FlashAttnTiling launchPlan = tree ? decodePlan : plainPlan();
         FlashAttnTiling.Split s = launchPlan.decodeSplit(nKeys);
@@ -412,7 +476,8 @@ final class GpuFlashAttention {
         }
         decode.setInt(AttnKernels.ARG_FD_N_SPLIT, layoutSplits);
         decode.setInt(AttnKernels.ARG_FD_SPLIT_LEN, s.length());
-        decode.setInt(AttnKernels.ARG_FD_KV_END, nKeys);
+        decode.setInt(AttnKernels.ARG_FD_KV_START, kvStart);
+        decode.setInt(AttnKernels.ARG_FD_KV_END, kvStart + nKeys);
         decode.setInt(AttnKernels.ARG_FD_Q_POS, qPos);
         decode.setInt(AttnKernels.ARG_FD_FLAGS, stepFlags(flags, direct, tree, 1));
         decode.setInt(AttnKernels.ARG_FD_Q_OFF, row * qDim);

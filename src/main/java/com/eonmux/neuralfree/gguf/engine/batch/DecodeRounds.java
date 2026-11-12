@@ -2,6 +2,7 @@ package com.eonmux.neuralfree.gguf.engine.batch;
 
 import com.eonmux.neuralfree.gguf.engine.DraftTree;
 import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
+import com.eonmux.neuralfree.gguf.engine.RowTopK;
 import com.eonmux.neuralfree.gguf.engine.SequenceRun;
 import com.eonmux.neuralfree.gguf.engine.StopReason;
 import com.eonmux.neuralfree.gguf.engine.VerifyRound;
@@ -9,6 +10,7 @@ import com.eonmux.neuralfree.gguf.engine.VerifyRound;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.function.IntUnaryOperator;
 
 /**
  * The decode rounds of a {@link BatchEngine} step: a running sequence's armed token, plus the drafter's proposal
@@ -22,7 +24,9 @@ import java.util.List;
  * sequence's rows, its own uniform stream and the drafter's proposal distributions ({@link BatchDrafter#draftProbs}).
  * A proposal is cut before its first token the sequence's grammar refuses
  * ({@code Sampler#admitted}, vLLM's {@code validate_tokens}), as {@code SpeculativeDecoder} cuts it, so a
- * constrained sequence verifies no row its grammar could never confirm.
+ * constrained sequence verifies no row its grammar could never confirm. A {@code MATCH} round whose chain keeps its
+ * candidates inside a device top-k cone walks its rows' device candidates rather than whole rows (the step reads
+ * them back as a single-row decode's, {@code StepExecutor}), drawing the same tokens.
  *
  * <p>In tree verify ({@code neuralfree.draft.tree}, the batch form of SpecPilot's ragged verify, arXiv 2611.02501)
  * the step's draft call asks {@link BatchDrafter#draftTreeBatch} for a draft tree per sequence, the verify budget
@@ -353,8 +357,37 @@ final class DecodeRounds {
             lifecycle.finish(slot, StopReason.CANCELLED);
             return;
         }
+        Verified v = slot.verifier == null
+                ? matchWalk(slot, round, i -> sample(slot, rows[base + i]))
+                : verifierRound(slot, round, rows, base);
+        settleRound(slot, round, v);
+    }
+
+    /**
+     * {@link #verify(Slot, int[], float[][], int)} by {@code MATCH} over the round's rows of a device top-k readback,
+     * rows {@code topBase .. topBase + round.length) of {@code top}: each row samples through the chain over its
+     * candidates, which is the token the chain samples over the whole row (llama.cpp backend sampling over the
+     * verified rows; the single-stream {@code SpeculativeDecoder}'s sampled verify).
+     *
+     * @param prefiltered whether the readout applied each row's logit prefilter before its top-k
+     * @throws IllegalStateException when the slot verifies through a verifier, which reads whole rows
+     */
+    void verify(Slot slot, int[] round, RowTopK top, int topBase, boolean prefiltered) {
+        if (slot.verifier != null) {
+            throw new IllegalStateException("a verify round under " + slot.verifier
+                    + " reads the processed distributions of whole rows, not device candidates");
+        }
+        if (state.cancelRequested(slot)) {
+            lifecycle.finish(slot, StopReason.CANCELLED);
+            return;
+        }
+        Verified v = matchWalk(slot, round, i -> sampleTopK(slot, top, topBase + i, prefiltered));
+        settleRound(slot, round, v);
+    }
+
+    /** A verified chain round's bookkeeping: counters, the tail removal, the drafter's outcome, the fed rows. */
+    private void settleRound(Slot slot, int[] round, Verified v) {
         int k = round.length - 1;
-        Verified v = slot.verifier == null ? matchWalk(slot, round, rows, base) : verifierRound(slot, round, rows, base);
         state.stats.specRounds++;
         state.stats.specDrafted += k;
         state.stats.specAccepted += v.accepted;
@@ -479,12 +512,24 @@ final class DecodeRounds {
         return token;
     }
 
+    /** One verify row's device candidates through the slot's chain, accepted as {@link #sample} accepts a row's. */
+    private int sampleTopK(Slot slot, RowTopK top, int row, boolean prefiltered) {
+        long t0 = System.nanoTime();
+        int token = slot.run.sampleTopK(top, row, prefiltered);
+        slot.run.accept(token);
+        state.stats.hostSampleNanos += System.nanoTime() - t0;
+        state.stats.deviceSampledRows++;
+        return token;
+    }
+
     /**
      * {@code MATCH}: the slot's verify rows sampled in order through its own chain — row {@code i} answers the
      * token after {@code [pendingToken, drafts 0..i-1]}, so the walk continues while the chain's sample equals
      * draft {@code i}, and the first mismatching sample, or the last row's, is the target's next token.
+     *
+     * @param rowToken the chain's sample of verify row {@code i}, accepted into the chain, asked in ascending order
      */
-    private Verified matchWalk(Slot slot, int[] round, float[][] rows, int base) {
+    private Verified matchWalk(Slot slot, int[] round, IntUnaryOperator rowToken) {
         int k = round.length - 1;
         int accepted = 0;
         int token = -1;
@@ -493,7 +538,7 @@ final class DecodeRounds {
             if (i > 0 && state.cancelRequested(slot)) {
                 return new Verified(accepted, -1, StopReason.CANCELLED);
             }
-            token = sample(slot, rows[base + i]);
+            token = rowToken.applyAsInt(i);
             state.stats.generatedTokens++;
             SequenceRun.Step step = slot.run.offer(token);
             if (step.stopped()) {

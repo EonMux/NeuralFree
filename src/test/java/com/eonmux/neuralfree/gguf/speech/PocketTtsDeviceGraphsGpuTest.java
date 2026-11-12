@@ -45,13 +45,21 @@ public class PocketTtsDeviceGraphsGpuTest {
         }
         EngineConfig gpu = EngineConfig.builder()
                 .backend(backends)
-                .addGpuDevice("0")
+                .addGpuDevice(selector(backends))
                 .memory(MemoryConfig.builder().nCtx(128).ubatch(128).typeK(KvDType.F32).typeV(KvDType.F32)
                         .build())
                 .build();
         model = new GGUFModelGPU(PocketTtsBackboneFixture.write().toString(), null, gpu);
         clip = PocketTtsClip.open(new PocketTtsFixtures(31L).write().toString());
         device = clip.bindDevice(model.forwardContext());
+    }
+
+    /**
+     * Device 0 of OpenCL and CUDA; on Vulkan the fastest device by name ({@link GpuTestUtil#getVulkanDeviceName}),
+     * since the Vulkan enumeration order puts an integrated GPU first on some machines.
+     */
+    private static String selector(EngineConfig.BackendMode backends) {
+        return backends == EngineConfig.BackendMode.VULKAN ? GpuTestUtil.getVulkanDeviceName() : "0";
     }
 
     @After

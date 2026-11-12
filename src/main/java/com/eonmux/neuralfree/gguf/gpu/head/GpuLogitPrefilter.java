@@ -75,6 +75,15 @@ public final class GpuLogitPrefilter implements AutoCloseable {
     private float[] lastCfg;
     private int[] lastBiasIds;
     private float[] lastBiasValues;
+    /** Grow-only host staging of the tables {@link #run} builds every call; the last uploads above are copies. */
+    private int[] metaHost = new int[0];
+    private float[] cfgHost = new float[0];
+    private int[] biasIdHost = new int[0];
+    private float[] biasValHost = new float[0];
+    private int[] tokenHost = new int[0];
+    private DryBreakers[] dryRowBreakers = new DryBreakers[0];
+    /** Grow-only little-endian staging of an int table's upload. */
+    private byte[] intBytes = new byte[0];
     private long breakerUploads;
     private long breakerUploadsSkipped;
     private long fixedUploads;
@@ -161,13 +170,16 @@ public final class GpuLogitPrefilter implements AutoCloseable {
         int[][] penaltyRowIds = new int[rows][];
         int[][] penaltyRowCounts = new int[rows][];
         int[][] dryRowTokens = new int[rows][];
-        DryBreakers[] dryRowBreakers = new DryBreakers[rows];
+        if (dryRowBreakers.length < rows) {
+            dryRowBreakers = new DryBreakers[maxRows];
+        }
         int totalBias = 0;
         int totalTokens = 0;
         int totalBreakers = 0;
         int totalTails = 0;
         for (int r = 0; r < rows; r++) {
             LogitPrefilter.Row row = prefilter.row(r);
+            dryRowBreakers[r] = null;
             biasRowIds[r] = row.biasIds();
             biasRowValues[r] = row.biasValues();
             checkIds(biasRowIds[r], biasRowValues[r].length, "bias");
@@ -198,12 +210,17 @@ public final class GpuLogitPrefilter implements AutoCloseable {
         }
         ensure(rows, totalBias, totalTokens, totalBreakers, totalTails);
 
-        int[] metaHost = new int[rows * META_STRIDE];
-        float[] cfgHost = new float[rows * FCFG_STRIDE];
-        int[] biasIdHost = new int[totalBias];
-        float[] biasValHost = new float[totalBias];
-        int[] tokenHost = new int[totalTokens];
-        boolean sameBreakers = Arrays.equals(dryRowBreakers, lastBreakers);
+        int metaCount = rows * META_STRIDE;
+        int cfgCount = rows * FCFG_STRIDE;
+        int[] metaHost = this.metaHost = grow(this.metaHost, metaCount);
+        Arrays.fill(metaHost, 0, metaCount, 0);
+        float[] cfgHost = this.cfgHost = grow(this.cfgHost, cfgCount);
+        Arrays.fill(cfgHost, 0, cfgCount, 0f);
+        int[] biasIdHost = this.biasIdHost = grow(this.biasIdHost, totalBias);
+        float[] biasValHost = this.biasValHost = grow(this.biasValHost, totalBias);
+        int[] tokenHost = this.tokenHost = grow(this.tokenHost, totalTokens);
+        boolean sameBreakers = lastBreakers != null
+                && Arrays.equals(dryRowBreakers, 0, rows, lastBreakers, 0, lastBreakers.length);
         int[] breakerHost = sameBreakers ? null : new int[totalBreakers * BREAKER_STRIDE];
         int[] tailHost = sameBreakers ? null : new int[totalTails];
         int biasAt = 0;
@@ -271,24 +288,25 @@ public final class GpuLogitPrefilter implements AutoCloseable {
             metaHost[m + 10] = brCount;
             metaHost[m + 11] = row.penaltiesFirst() ? 1 : 0;
         }
-        writeInts(meta, metaHost);
-        if (Arrays.equals(cfgHost, lastCfg) && Arrays.equals(biasIdHost, lastBiasIds)
-                && Arrays.equals(biasValHost, lastBiasValues)) {
+        writeInts(meta, metaHost, metaCount);
+        if (lastCfg != null && Arrays.equals(cfgHost, 0, cfgCount, lastCfg, 0, lastCfg.length)
+                && Arrays.equals(biasIdHost, 0, totalBias, lastBiasIds, 0, lastBiasIds.length)
+                && Arrays.equals(biasValHost, 0, totalBias, lastBiasValues, 0, lastBiasValues.length)) {
             fixedUploadsSkipped++;
         } else {
-            writeFloats(fcfg, cfgHost);
-            writeInts(biasIds, biasIdHost);
-            writeFloats(biasVals, biasValHost);
-            lastCfg = cfgHost;
-            lastBiasIds = biasIdHost;
-            lastBiasValues = biasValHost;
+            writeFloats(fcfg, cfgHost, cfgCount);
+            writeInts(biasIds, biasIdHost, totalBias);
+            writeFloats(biasVals, biasValHost, totalBias);
+            lastCfg = Arrays.copyOf(cfgHost, cfgCount);
+            lastBiasIds = Arrays.copyOf(biasIdHost, totalBias);
+            lastBiasValues = Arrays.copyOf(biasValHost, totalBias);
             fixedUploads++;
         }
-        writeInts(tokens, tokenHost);
+        writeInts(tokens, tokenHost, totalTokens);
         if (!sameBreakers) {
-            writeInts(breakerMeta, breakerHost);
-            writeInts(breakerTails, tailHost);
-            lastBreakers = dryRowBreakers;
+            writeInts(breakerMeta, breakerHost, breakerHost.length);
+            writeInts(breakerTails, tailHost, tailHost.length);
+            lastBreakers = Arrays.copyOf(dryRowBreakers, rows);
             breakerUploads++;
         } else {
             breakerUploadsSkipped++;
@@ -383,26 +401,36 @@ public final class GpuLogitPrefilter implements AutoCloseable {
         return backend.allocateBuffer(Math.max(bytes, Integer.BYTES));
     }
 
-    private void writeInts(GpuBuffer buffer, int[] values) {
-        if (values.length == 0) {
+    /** Uploads the first {@code count} values through the reused little-endian staging. */
+    private void writeInts(GpuBuffer buffer, int[] values, int count) {
+        if (count == 0) {
             return;
         }
-        byte[] bytes = new byte[values.length * Integer.BYTES];
-        ByteBuffer bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
-        for (int v : values) {
-            bb.putInt(v);
+        int byteCount = count * Integer.BYTES;
+        if (intBytes.length < byteCount) {
+            intBytes = new byte[byteCount];
         }
-        GpuEvent event = queue.enqueueWriteBuffer(buffer, 0, bytes.length, bytes);
+        ByteBuffer.wrap(intBytes, 0, byteCount).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer().put(values, 0, count);
+        GpuEvent event = queue.enqueueWriteBuffer(buffer, 0, byteCount, intBytes);
         if (event != null) {
             event.close();
         }
     }
 
-    private void writeFloats(GpuBuffer buffer, float[] values) {
-        if (values.length == 0) {
+    /** {@code values} itself when it holds {@code count} entries, else a larger array. */
+    private static int[] grow(int[] values, int count) {
+        return values.length >= count ? values : new int[Math.max(count, values.length + values.length / 2)];
+    }
+
+    private static float[] grow(float[] values, int count) {
+        return values.length >= count ? values : new float[Math.max(count, values.length + values.length / 2)];
+    }
+
+    private void writeFloats(GpuBuffer buffer, float[] values, int count) {
+        if (count == 0) {
             return;
         }
-        GpuEvent event = queue.enqueueWriteBuffer(buffer, 0, (long) values.length * Float.BYTES, values);
+        GpuEvent event = queue.enqueueWriteBuffer(buffer, 0, (long) count * Float.BYTES, values);
         if (event != null) {
             event.close();
         }

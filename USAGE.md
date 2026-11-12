@@ -739,8 +739,12 @@ part over those rows alone, as llama.cpp's `inp_out_ids` does. The last layer's 
 every row of the step, since its K/V rows and every query's keys are needed; the rows that are read then move to
 the front of the residual stream, and the FFN, the output norm and the head run over them. A prompt chunk whose
 output nothing reads (every chunk before the last, when a call reads only the prompt's last row) runs only the last
-layer's cache writes. This applies to the single-sequence prefill of the GPU engine on every GPU backend; the
-hybrid CPU+GPU split and multi-sequence batched steps run every row.
+layer's cache writes. This applies to the single-sequence prefill of the GPU engine on every GPU backend, to the
+last device of a layer split (`--split-mode layer`), which then moves only the read rows to the head's device, and to
+the batched steps of continuous batching: a step of prompt chunks runs the last layer's FFN over each completing
+chunk's sampled row (and over none for the chunks before a prompt's last, which skip it), with the step's attention
+over every row of every sequence and a mixed per-request adapter table following the read rows. The hybrid CPU+GPU
+split runs every row.
 
 The last layer keeps every row when:
 
@@ -2688,13 +2692,13 @@ keep it:
 llama.cpp; `--[no-]spec-draft-backend-sampling` sets the draft row alone. `neuralfree-server` takes the same
 switches.
 
-**On-device sampling.** With `neuralfree.sampling.device`, a GPU generation step whose sampler chain selects inside a top-k cone does not read the logits row back: the device computes the row's best candidates (`LLM_Row_TopK`, at most 64) and the host chain selects over them, which is exactly the token it selects over the whole row (llama.cpp's backend sampling). The single-sequence loop and the batch engine use the same cones; speculative verification keeps its own. A chain fits in three shapes:
+**On-device sampling.** With `neuralfree.sampling.device`, a GPU generation step whose sampler chain selects inside a top-k cone does not read the logits row back: the device computes the row's best candidates (`LLM_Row_TopK`, at most 1024, the width of its radix-select form; a step reads back only its own cone's candidates) and the host chain selects over them, which is exactly the token it selects over the whole row (llama.cpp's backend sampling). The single-sequence loop and the batch engine use the same cones; speculative verification keeps its own. A chain fits in three shapes:
 
 - a truncated chain whose top-k stage runs before every whole-row stage (top-p, min-p, typical, top-n-sigma, XTC); banned tokens and non-positive `logit_bias` entries widen the cone by one slot each;
 - a greedy chain (`top_k` 0, or a top-k of 1) whose only edits are bans (`tokenizer.ggml.suppress_tokens`, the end-of-generation tokens under ignore-eos, `-100` entries) and non-positive `logit_bias`: the winner lies among the largest *n + 1* raw logits for *n* edited tokens (Avalon's `greedy_argmax`), so banning the top token costs one extra candidate instead of a whole-row readback;
 - a truncated chain whose pre-top-k stages edit the row (repetition, presence and frequency penalties, DRY, banned tokens and any `logit_bias`, positive included): `LLM_LogitsPrefilter` (Vulkan `penalties.comp`) applies those edits to the whole row on the device in the chain's own order, with llama.cpp's semantics (`-inf` for a ban or a bias of `-100` and below, `l = (l <= 0 ? l * repeat : l / repeat) - (count * frequency + presence)` over each sequence's window, DRY's restart-sequence matching with `multiplier * base^(repeatLength - allowed)`), the readout returns `max(top_k, min_keep)` candidates, and the host chain skips the stages the device ran. Each sequence uploads its own window and counts per step, as llama.cpp's backend penalties sampler feeds its graph; the tables a request fixes (each row's penalty and DRY parameters, the `logit_bias` table and the DRY restart sequences) go to the device only when a step brings other ones than it holds. A penalty window over 16384 distinct tokens, a DRY window over 256 tokens, or a DRY breaker set over 8192 restart sequences or 16384 tail ids keeps the host path.
 
-The step reads whole rows back for a greedy chain with penalties, DRY or a positive bias, mirostat, adaptive-p, infill, a whole-row stage or a dynamic temperature range ahead of the chain's top-k, a grammar, `allowed_token_ids`, bad words, the min-tokens ban or a reasoning budget (llama.cpp disables backend sampling under a grammar or reasoning budget too), a logprobs request, and a cone wider than 64. Speculative verification reads its verified rows back when the chain carries penalties, DRY or a positive bias. In the batch engine such a row costs only its own sequence the readback: a step reads its other sequences' candidates and the whole rows of the sequences that need them (that list, a prompt-logprobs request, a multi-row speculative verification) from one forward (`ForwardBackend.forwardBatchSplit`), while pooling requests and media chunks run their own forwards beside it. `BatchStats.deviceSampledRows()` and the Prometheus counter `neuralfree_tokens_predicted_device_total` count the tokens selected over a device readback. The generated tokens are identical on either path, for the same seed.
+The step reads whole rows back for a greedy chain with penalties, DRY or a positive bias, mirostat, adaptive-p, infill, a whole-row stage or a dynamic temperature range ahead of the chain's top-k, a grammar, `allowed_token_ids`, bad words, the min-tokens ban or a reasoning budget (llama.cpp disables backend sampling under a grammar or reasoning budget too), a logprobs request, and a cone wider than 1024. Speculative verification reads its verified rows back when the chain carries penalties, DRY or a positive bias. In the batch engine such a row costs only its own sequence the readback: a step reads its other sequences' candidates and the whole rows of the sequences that need them (that list, a prompt-logprobs request, a tree verification, a verification under a verify mode other than `match`; a `match` verification of a chain draft reads each verified row's candidates, every row carrying its own prefilter over the history plus the drafts before it) from one forward (`ForwardBackend.forwardBatchSplit`), while pooling requests and media chunks run their own forwards beside it. `BatchStats.deviceSampledRows()` and the Prometheus counter `neuralfree_tokens_predicted_device_total` count the tokens selected over a device readback. The generated tokens are identical on either path, for the same seed.
 
 **vLLM speculative config.** `--speculative-config '<json>'` takes vLLM's `SpeculativeConfig` object on the CLI
 and on the server. Each key is applied as the flag below, so it sets the same properties with the same checks, and a
@@ -3006,7 +3010,10 @@ non-linear layer schedule. A separate draft model drafts its branching tree for 
 In the batch engine (the server's continuous batching, `-np` > 1) `neuralfree.draft.tree=true` drafts one tree per
 decoding request and verifies every request's tree in one masked forward of the step, prompt chunks of new requests
 included. The step's verify rows are shared out over the requests' trees, best path scores first, so cutting a tree
-only shortens its round and never changes a token.
+only shortens its round and never changes a token. A separate draft model grows each tree breadth first, one batched
+forward per depth; on a GPU over a shared vocabulary each forward reads back only its rows' best
+`neuralfree.draft.tree.branches` candidates (plus any draft ids past the target's vocabulary, at most 1024) with each
+row's log-sum-exp, which the readout's softmax denominator gives, instead of whole rows, and proposes the same trees.
 
 | Property | Default | Meaning |
 |---|---|---|
@@ -4302,7 +4309,9 @@ For a RANK model, a prompt holding the `--cls-separator` is scored as a query/do
 
 Results go to stdout; the run summary, the last-token-not-SEP/EOS warning and the verbose dump go to stderr. Prompts (or chunks) embed in llama.cpp's batches: a batch closes when the next prompt would pass `--batch-size`
 tokens or the memory's sequence count. Each batch runs as one multi-sequence forward over a paged memory, and the
-vectors match the one-prompt-per-forward run.
+vectors match the one-prompt-per-forward run. A memoryless encoder (the BERT family) packs up to 64 prompts that
+fit one `--ubatch-size` into each forward instead: the projections and FFNs run once over every packed row, and
+each prompt's attention reads only its own rows, as llama.cpp's per-sequence mask over a cache-less ubatch does.
 
 For example, eight sequences per batch on the GPU: `nftool embedding qwen3-0.6b.gguf --pooling last -np 8 -ngl all -p "first<#>second" --embd-separator "<#>"`
 
@@ -5535,8 +5544,11 @@ fit one `neuralfree.ubatch`. Such an engine runs no prefix cache, as vLLM runs n
 bidirectional pooling models.
 
 A model whose memory is not paged (the memoryless BERT and CLEF families, or `--parallel 1`) pools
-one input per forward on the engine's thread, once nothing else runs. `/generative_scoring` also
-keeps its one-shot forwards.
+one input per forward on the engine's thread, once nothing else runs. A memoryless encoder whose
+layers are plain attention with row-wise FFNs (the BERT family) packs a call's pooled embeddings
+instead: up to 64 inputs that fit one `neuralfree.ubatch` run as one forward, each input attending
+only its own rows, and its vectors match the one-input forwards. `/generative_scoring` also keeps
+its one-shot forwards.
 
 ### CLIP image and text embeddings
 
@@ -5983,6 +5995,12 @@ The model is the first unnamed argument (as `vllm serve <model>` takes it) or `-
 | `-h`, `--help` | — | The flag text |
 
 With TLS the server serves HTTPS on `--port` and plain HTTP is off, as llama-server does. Engine settings beyond these flags travel through their `neuralfree.*` properties, as in any launch. An unknown flag, a missing value and a value that cannot work are refused by name before the server starts; `--lora-modules` is refused because adapters are fixed at launch. The template override replaces the model's `tokenizer.chat_template` everywhere a tokenizer is built: prompts, tool routing and `/props`. The data-parallel flags are resolved together, as vLLM resolves them, and contradicting combinations are refused by name. For example, a rank at or past the size, `--data-parallel-external-lb` without a rank, a rank together with `--data-parallel-start-rank` or a local size other than 1, `--data-parallel-hybrid-lb` without a local size, or a device list whose length differs from the replicas placed here. vLLM's cross-process coordination flags (`--data-parallel-address`, `--data-parallel-rpc-port`, `--data-parallel-backend`, `--data-parallel-multi-port-external-lb`) are refused, because the replicas decode independently and need no coordination.
+
+Quarkus settings that have no flag take their `quarkus.*` property as a `-D` launch option:
+
+| Property | Meaning | Default |
+|---|---|---|
+| `quarkus.thread-pool.max-threads` | Worker threads of the HTTP server. A streamed response (SSE or chunked) holds one worker from its request to its last event, so this bounds the concurrent streams; raise it for more than about 200 simultaneous streams (each idle worker costs a thread stack, about 1 MiB of reserved memory). Requests past the bound wait in the worker queue rather than fail | max(200, 8 x CPU cores) |
 
 ### Image and audio input (`--mmproj`)
 
@@ -7621,7 +7639,9 @@ speculative verifiers and the `beam` parser's derived tag.
 A greedy chain picks the same token without masking the whole row. It takes the argmax of the unmasked row and asks
 each mask whether it keeps that token, and masks the row only when one refuses it. This works when the configured
 stages are per-token edits: penalties, DRY, bias, and the truncations greedy decoding skips. On a confident model
-the grammar then costs about one token check per step. A sampled chain keeps the whole-row mask, because its
+the grammar then costs about one token check per step. The single-sequence loop, the speculative verifiers (each
+verified row, the bonus row and the draftless decode, chain and tree) and the batch engine select this way unless
+the request captures logprobs, whose capture reads the masked row. A sampled chain keeps the whole-row mask, because its
 truncation and draw read the admitted set. So does a chain with an active typical-p (below 1), top-n-sigma, XTC
 (probability above 0), infill, mirostat, adaptive-p, a logits processor or a reasoning budget. The grammar remembers the masks of recent parse states, so
 a state the output returns to (the next key of a JSON object, the next array item) is not walked again. Those masks
@@ -8093,7 +8113,7 @@ Notes:
 
 Recurrent and hybrid models batch too. Every CPU token mixer has a multi-sequence step: softmax attention, MLA (latent and decompressed caches), Mamba-1/2 and PLaMo-2 selective scans, the Qwen3-Next and Qwen3.5 gated delta nets, KDA, lightning attention, the RWKV-6/7 time mixes and the LFM2 short convolutions. The paged memory keeps one recurrent-state row per sequence, and a slot whose sequence is evicted or preempted starts its next generation from a fresh state. Over such a memory a batch splits as llama.cpp splits it: each ubatch takes as many tokens of every sequence as fit (`split_equal`), or one sequence per ubatch when every row is an output (`split_seq`). The layer extras that transform whole rows (hyper-connections, attention-residual stacks, Gemma 3n AltUp and Laurel, per-layer embeddings including the n-gram variant, control vectors, embedding skip, alpha/beta residuals, loop norms, and limite's MUDD dense connections and learned residual scales) run on every layout. On the GPU, the Gemma 3n AltUp, Laurel and per-layer-embedding extras run batched steps as well, so Gemma 3n serves over the paged memory on both backends. A whole-memory snapshot is refused on a paged memory, because restoring it would rewind every sequence at once. The sparse mixers (DSA, MSA, QSA) batch with every sequence selecting among its own cached rows, DeepSeek-V4 batches causal steps over per-sequence compressed caches and compressor states (a sequence drops its tail only within the compressor's rollback snapshots, and copies take whole sequences), and T5 encoder-decoder models batch with one encoding per sequence, the batch engine encoding each request's prompt as it admits it; only switched-LoRA routing (its router is position-addressed) still refuses a batched step by name. On the GPU, DSA sparse attention, DeepSeek-V4 compressed attention (every sequence with its own compressed streams) and T5 encoder-decoders batch over the paged memory as well, so the batch engine serves GPU encoder-decoders; the GPU MSA and QSA mixers still run one sequence and refuse a batched step by name.
 
-**On the GPU.** The paged memory and the batch engine run on the GPU backends too. With `neuralfree.parallel` above 1 (or `neuralfree.kv.paged=true`) on a GPU backend, the device memory holds per-group page tables. The memory plan charges these addressing buffers with the caches (`MemoryPlan.addressingBytes()`: the page tables, per-sequence key counts and query positions, the per-step position buffers, a `kv_pos` copy per sequence slot for the groups the DSA, DeepSeek-V4 and Step5 mixers read per sequence, and with `neuralfree.context.shift=true` the shift deltas, reserved at allocation), so the context fit and the device placement budget, a CPU+GPU layer split's included, count every byte the memory allocates. `BatchEngine` then decodes all running sequences in one GPU step, and attention dispatches the paged flash kernels: one launch per decode batch and one per multi-token prompt segment. The paged kernels run on OpenCL, CUDA and Vulkan; their arguments fit Vulkan's 128-byte push-constant block. Prefix reuse, copy-on-write pages (the copy runs on the device) and preemption work as on the CPU. The server opens its model through the same factory as the CLI, so `neuralfree.backend` (default `auto`) decides where the HTTP API runs.
+**On the GPU.** The paged memory and the batch engine run on the GPU backends too. With `neuralfree.parallel` above 1 (or `neuralfree.kv.paged=true`) on a GPU backend, the device memory holds per-group page tables. The memory plan charges these addressing buffers with the caches (`MemoryPlan.addressingBytes()`: the page tables, per-sequence key counts and query positions, the per-step position buffers, a `kv_pos` copy per sequence slot for the groups the DSA, DeepSeek-V4 and Step5 mixers read per sequence, and the per-row RoPE shift deltas, reserved at allocation whenever an edit can move rows: with `neuralfree.context.shift=true`, on every paged memory (`seq_add`, `seq_div`, self-extend and KV chunk reuse install them) and on a contiguous one whose context can shift (an `n_keep`/`n_discard` request), so the context fit and the device placement budget, a CPU+GPU layer split's included, count every byte the memory allocates. `BatchEngine` then decodes all running sequences in one GPU step, and attention dispatches the paged flash kernels: one launch per decode batch and one per multi-token prompt segment. The paged kernels run on OpenCL, CUDA and Vulkan; their arguments fit Vulkan's 128-byte push-constant block. Prefix reuse, copy-on-write pages (the copy runs on the device) and preemption work as on the CPU. The server opens its model through the same factory as the CLI, so `neuralfree.backend` (default `auto`) decides where the HTTP API runs.
 
 A batched GPU step covers softmax attention, cross-attention, MLA, DSA and DeepSeek-V4 layers and the recurrent mixers (Mamba-1/2 selective scans, the gated delta nets, KDA, lightning attention, the RWKV-6/7 time mixes and the LFM2 short convolutions, each sequence keeping its state row in its paged slot), and serves the same requests as the CPU one:
 

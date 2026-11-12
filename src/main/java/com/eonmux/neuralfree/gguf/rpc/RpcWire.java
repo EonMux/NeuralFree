@@ -163,6 +163,27 @@ final class RpcWire {
         writeFrame(payload, true);
     }
 
+    /** Writes the payload {@code w} built as one frame, straight from its buffer, and flushes it to the peer. */
+    void writeFrame(Writer w) throws IOException {
+        writeFrame(w, true);
+    }
+
+    /**
+     * Writes the payload {@code w} built as one frame, straight from its buffer, flushing it to the peer when
+     * {@code flush} is set; otherwise it stays buffered.
+     */
+    void writeFrame(Writer w, boolean flush) throws IOException {
+        int length = w.size();
+        if (length > MAX_FRAME) {
+            throw new IOException("frame of " + length + " bytes exceeds the " + MAX_FRAME + "-byte limit");
+        }
+        out.writeInt(length);
+        out.write(w.array(), 0, length);
+        if (flush) {
+            out.flush();
+        }
+    }
+
     /** Writes one frame, flushing it to the peer when {@code flush} is set; otherwise it stays buffered. */
     void writeFrame(byte[] payload, boolean flush) throws IOException {
         if (payload.length > MAX_FRAME) {
@@ -266,13 +287,38 @@ final class RpcWire {
         return out;
     }
 
-    /** An append-only payload being built. */
+    /**
+     * An append-only payload being built. A frame goes to the wire straight from its buffer
+     * ({@link #writeFrame(Writer, boolean)}), and a batch frame copies its members' buffers in once
+     * ({@link #body(Writer)}); a payload a caller keeps as an array is {@link #toBytes()}'s copy.
+     */
     static final class Writer {
-        private final ByteArrayOutputStream bytes = new ByteArrayOutputStream(64);
-        private final DataOutputStream out = new DataOutputStream(bytes);
+        /** The payload buffer, readable in place. */
+        private static final class Buffer extends ByteArrayOutputStream {
+            Buffer(int capacity) {
+                super(capacity);
+            }
+
+            byte[] array() {
+                return buf;
+            }
+        }
+
+        private final Buffer bytes;
+        private final DataOutputStream out;
         private final byte opcode;
 
         Writer(byte opcode) {
+            this(opcode, 64);
+        }
+
+        /** A payload whose buffer starts with room for {@code capacity} bytes (a batch frame knows its size). */
+        Writer(byte opcode, int capacity) {
+            if (capacity < 1) {
+                throw new IllegalArgumentException("capacity " + capacity + " must be positive");
+            }
+            this.bytes = new Buffer(capacity);
+            this.out = new DataOutputStream(bytes);
             this.opcode = opcode;
             u8(opcode);
         }
@@ -345,10 +391,10 @@ final class RpcWire {
             return this;
         }
 
-        /** Appends {@code v} verbatim, without a length prefix; a batch frame's member bodies use it. */
-        Writer body(byte[] v) {
+        /** Appends the payload {@code member} built verbatim, without a length prefix: a batch frame's member. */
+        Writer body(Writer member) {
             try {
-                out.write(v);
+                out.write(member.array(), 0, member.size());
             } catch (IOException e) {
                 throw new IllegalStateException("in-memory write failed", e);
             }
@@ -381,13 +427,19 @@ final class RpcWire {
             return this;
         }
 
+        /** A copy of the payload. */
         byte[] toBytes() {
-            try {
-                out.flush();
-            } catch (IOException e) {
-                throw new IllegalStateException("in-memory flush failed", e);
-            }
             return bytes.toByteArray();
+        }
+
+        /** Bytes of the payload. */
+        int size() {
+            return bytes.size();
+        }
+
+        /** The buffer whose first {@link #size()} bytes are the payload, read in place. */
+        private byte[] array() {
+            return bytes.array();
         }
 
         @Override
@@ -398,10 +450,27 @@ final class RpcWire {
 
     /** A payload being consumed. */
     static final class Reader {
+        /** The payload stream with its read position readable, so array reads can view the payload in place. */
+        private static final class Payload extends ByteArrayInputStream {
+            Payload(byte[] payload) {
+                super(payload);
+            }
+
+            byte[] array() {
+                return buf;
+            }
+
+            int position() {
+                return pos;
+            }
+        }
+
+        private final Payload payload;
         private final DataInputStream in;
 
         Reader(byte[] payload) {
-            this.in = new DataInputStream(new ByteArrayInputStream(payload));
+            this.payload = new Payload(payload);
+            this.in = new DataInputStream(this.payload);
         }
 
         byte opcode() {
@@ -483,6 +552,29 @@ final class RpcWire {
                         + " carries " + n);
             }
             readFully(dst, offset, n);
+        }
+
+        /**
+         * Reads a length-prefixed byte array of exactly {@code count} little-endian floats straight into {@code dst}
+         * at {@code offset}, decoding them from the payload in place.
+         *
+         * @throws IllegalArgumentException when the payload carries another length or ends early
+         */
+        void rawFloatsInto(float[] dst, int offset, int count) {
+            int n = i32();
+            if (n != count * Float.BYTES) {
+                throw new IllegalArgumentException("expected a byte array of " + count * Float.BYTES + " bytes,"
+                        + " the payload carries " + n);
+            }
+            int at = payload.position();
+            if (payload.available() < n) {
+                throw new IllegalArgumentException("truncated RPC payload");
+            }
+            java.nio.ByteBuffer.wrap(payload.array(), at, n).order(java.nio.ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
+                    .get(dst, offset, count);
+            if (payload.skip(n) != n) {
+                throw new IllegalArgumentException("truncated RPC payload");
+            }
         }
 
         private void readFully(byte[] dst, int offset, int n) {
@@ -915,18 +1007,6 @@ final class RpcWire {
                 .order(java.nio.ByteOrder.LITTLE_ENDIAN);
         b.asFloatBuffer().put(values, 0, count);
         return b.array();
-    }
-
-    /**
-     * Decodes the little-endian floats of {@code bytes} into the start of {@code dst}; the length of {@code bytes}
-     * must be a multiple of four.
-     */
-    static void bytesToFloats(byte[] bytes, float[] dst) {
-        if ((bytes.length & 3) != 0) {
-            throw new IllegalArgumentException("read of " + bytes.length + " bytes is not a whole number of floats");
-        }
-        java.nio.ByteBuffer b = java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN);
-        b.asFloatBuffer().get(dst, 0, bytes.length / Float.BYTES);
     }
 
     private RpcWire() {

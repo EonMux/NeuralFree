@@ -239,7 +239,7 @@ public final class RpcComputeServer implements AutoCloseable {
             if (!RpcWire.sameMac(expected, got)) {
                 RpcWire.Writer error = new RpcWire.Writer(RpcWire.STATUS_ERROR);
                 error.u8(RpcWire.ERR_ILLEGAL_STATE).utf("authentication failed");
-                wire.writeFrame(error.toBytes());
+                wire.writeFrame(error);
                 return false;
             }
             return true;
@@ -254,7 +254,7 @@ public final class RpcComputeServer implements AutoCloseable {
                         backend.supportsHostMappedBuffers(), bindHost + ":" + port));
             }
             RpcWire.writeHandshake(info, infos, cache != null);
-            wire.writeFrame(info.toBytes());
+            wire.writeFrame(info);
         }
 
         private void serve(RpcWire wire) throws IOException {
@@ -272,7 +272,7 @@ public final class RpcComputeServer implements AutoCloseable {
                 } catch (RuntimeException e) {
                     response = error(e);
                 }
-                wire.writeFrame(response.toBytes());
+                wire.writeFrame(response);
             }
         }
 

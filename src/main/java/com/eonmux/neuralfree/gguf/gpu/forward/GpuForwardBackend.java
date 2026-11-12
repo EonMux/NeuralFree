@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.gpu.forward;
 
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
+import com.eonmux.neuralfree.gguf.engine.BatchSegments;
 import com.eonmux.neuralfree.gguf.engine.ContextFullException;
 import com.eonmux.neuralfree.gguf.engine.DraftTree;
 import com.eonmux.neuralfree.gguf.engine.EmbeddingRowSupport;
@@ -495,6 +496,19 @@ public final class GpuForwardBackend implements ForwardBackend {
                 ? ((DeviceModelMemory) ctx.memory()).pagedSequences().maxSequences() : 1;
     }
 
+    /** {@link BatchSegments#MAX_PACKED} for a model without memory whose layers keep rows in their sequence. */
+    @Override
+    public int memorylessSequences() {
+        ensureOpen();
+        return !ctx.hasMemory() && BatchSegments.packingRefusal(ctx.spec()) == null ? BatchSegments.MAX_PACKED : 1;
+    }
+
+    /** The scratch ubatch while {@link #memorylessSequences()} packs. */
+    @Override
+    public int memorylessBatchRows() {
+        return memorylessSequences() > 1 ? ctx.scratch().ubatch() : 0;
+    }
+
     /**
      * Null when this backend can run {@link #forwardBatch}: a memory with paged sequences whose attention mixers
      * run the paged kernels. Otherwise the reason by name; mixers without a batched step refuse at the call too.
@@ -664,12 +678,33 @@ public final class GpuForwardBackend implements ForwardBackend {
         return new SplitReadout(RowTopK.packed(width, fullRows.length, r.topIds(), r.topLogits()), r.rows());
     }
 
+    /**
+     * Top candidates of every output row on the device with each row's log-sum-exp from the readout's softmax
+     * denominator; only the candidates and one value per row are read back.
+     */
+    @Override
+    public RowTopK forwardBatchTopKNormalized(ForwardBatch batch, int k) {
+        Objects.requireNonNull(batch, "batch");
+        if (k < 1) {
+            throw new IllegalArgumentException("top-k readback of " + k + " candidates");
+        }
+        ensureOpen();
+        int width = Math.min(k, head.vocab());
+        GpuPrefillDriver.Result r = batched(batch, GpuPrefillDriver.Output.TOPK, width, null, null, true);
+        return RowTopK.packed(width, batch.outputRows().length, r.topIds(), r.topLogits(), r.topSumExp());
+    }
+
     private GpuPrefillDriver.Result batched(ForwardBatch batch, GpuPrefillDriver.Output output) {
         return batched(batch, output, 0, null, null);
     }
 
     private GpuPrefillDriver.Result batched(ForwardBatch batch, GpuPrefillDriver.Output output, int topK,
                                             LogitPrefilter prefilter, boolean[] fullRows) {
+        return batched(batch, output, topK, prefilter, fullRows, false);
+    }
+
+    private GpuPrefillDriver.Result batched(ForwardBatch batch, GpuPrefillDriver.Output output, int topK,
+                                            LogitPrefilter prefilter, boolean[] fullRows, boolean normalized) {
         Objects.requireNonNull(batch, "batch");
         ensureOpen();
         String refusal = batchRefusal();
@@ -700,6 +735,9 @@ public final class GpuForwardBackend implements ForwardBackend {
                         + "; the batched GPU path reads logits (forwardBatch), hidden rows (hiddenBatch) or top"
                         + " candidates (forwardBatchTopK)");
             }
+        }
+        if (normalized) {
+            return driver.runBatchTopKNormalized(batch, ropeSections, topK, tap);
         }
         return output == GpuPrefillDriver.Output.TOPK
                 ? driver.runBatchTopK(batch, ropeSections, topK, tap, prefilter, fullRows)
@@ -757,8 +795,9 @@ public final class GpuForwardBackend implements ForwardBackend {
             throw new IllegalArgumentException("top-k readback of " + k + " candidates");
         }
         int[] rows = outputRows != null ? outputRows : identity(tokens.length);
-        GpuPrefillDriver.Result r = causalTopK(tokens, pos0, rows, k, prefilter);
-        return RowTopK.packed(k, rows.length, r.topIds(), r.topLogits());
+        int width = Math.min(k, head.vocab());
+        GpuPrefillDriver.Result r = causalTopK(tokens, pos0, rows, width, prefilter);
+        return RowTopK.packed(width, rows.length, r.topIds(), r.topLogits());
     }
 
     /** Top candidates of the decoded row on the device; only the candidates are read back. */
@@ -773,8 +812,9 @@ public final class GpuForwardBackend implements ForwardBackend {
         if (k < 1) {
             throw new IllegalArgumentException("top-k readback of " + k + " candidates");
         }
-        GpuPrefillDriver.Result r = causalTopK(new int[]{token}, pos, new int[]{0}, k, prefilter);
-        return RowTopK.packed(k, 1, r.topIds(), r.topLogits());
+        int width = Math.min(k, head.vocab());
+        GpuPrefillDriver.Result r = causalTopK(new int[]{token}, pos, new int[]{0}, width, prefilter);
+        return RowTopK.packed(width, 1, r.topIds(), r.topLogits());
     }
 
     private static int[] identity(int n) {
@@ -1241,6 +1281,7 @@ public final class GpuForwardBackend implements ForwardBackend {
         }
         first = Closeables.close(executor, first);
         first = Closeables.close(head, first);
+        first = Closeables.close(ctx.stepSegments(), first);
         if (first != null) {
             throw first;
         }

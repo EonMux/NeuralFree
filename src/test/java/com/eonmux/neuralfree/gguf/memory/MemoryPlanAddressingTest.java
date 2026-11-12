@@ -20,9 +20,9 @@ import static org.junit.Assert.assertTrue;
 /**
  * The plan charges every byte the device memory allocates ({@link MemoryPlan#totalBytes()}): the caches plus the
  * addressing buffers of the step inputs (page tables, per-sequence key lengths and query positions, the per-step
- * position and index buffers, the shift deltas a context shift reserves at allocation, and the per-sequence
- * {@code kv_pos} copies of the groups a sparse mixer reads per sequence). A fit that budgets the plan's total can
- * therefore never be overrun by the memory it planned.
+ * position and index buffers, the shift deltas of a memory whose rows can move, reserved at allocation, and the
+ * per-sequence {@code kv_pos} copies of the groups a sparse mixer reads per sequence). A fit that budgets the plan's
+ * total can therefore never be overrun by the memory it planned.
  */
 public class MemoryPlanAddressingTest {
 
@@ -127,11 +127,39 @@ public class MemoryPlanAddressingTest {
                 four.addressingBytes() - split.addressingBytes());
     }
 
+    /**
+     * A contiguous memory whose context cannot shift (the DSA indexer's keys cannot be re-positioned) reserves
+     * the deltas only for the context shift's setting, one per row.
+     */
     @Test
     public void theContextShiftReservesOneDeltaPerRow() {
-        MemoryPlan plain = MemoryPlanner.planForContext(gemma3(), config(16, 2, false, true), 256);
-        MemoryPlan shifted = MemoryPlanner.planForContext(gemma3(), config(16, 2, true, true), 256);
+        MemoryPlan plain = MemoryPlanner.planForContext(deepseek32(), config(0, 1, false, true), 128);
+        MemoryPlan shifted = MemoryPlanner.planForContext(deepseek32(), config(0, 1, true, true), 128);
+        assertFalse(plain.shiftDeltasReserved());
+        assertTrue(shifted.shiftDeltasReserved());
         assertEquals(plain.positionBytes(), shifted.addressingBytes() - plain.addressingBytes());
+    }
+
+    /**
+     * A memory whose rows can move without the context shift's setting (a contiguous one by {@code n_keep}/
+     * {@code n_discard}, a paged one by {@code seq_add}, {@code seq_div}, self-extend and chunk reuse) charges
+     * the deltas too, and a paged edit then allocates nothing beyond the plan.
+     */
+    @Test
+    public void aMemoryWhoseRowsCanMoveChargesTheDeltasItsEditsInstall() {
+        assertTrue(MemoryPlanner.planForContext(gemma3(), config(0, 1, false, true), 256).shiftDeltasReserved());
+        for (ModelSpec spec : new ModelSpec[] {gemma3(), deepseek32()}) {
+            MemoryPlan plan = MemoryPlanner.planForContext(spec, config(16, 2, false, true), 128);
+            assertTrue(plan.shiftDeltasReserved());
+            long before = liveBytes();
+            try (DeviceModelMemory mem = DeviceModelMemory.allocate(backend, backend.computeQueue(), plan,
+                    MropeTextPositions.PPP0, null)) {
+                long allocated = liveBytes() - before;
+                mem.addSequence(0, 0, 64, 8);
+                mem.divSequence(1, 0, 64, 2);
+                assertEquals(plan.toString(), allocated, liveBytes() - before);
+            }
+        }
     }
 
     /**

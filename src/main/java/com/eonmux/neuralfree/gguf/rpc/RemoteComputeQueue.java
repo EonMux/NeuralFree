@@ -113,9 +113,19 @@ final class RemoteComputeQueue implements ComputeQueue {
         if (dstData == null || floats > dstData.length) {
             throw new IllegalArgumentException("read of " + floats + " floats exceeds the destination array");
         }
-        byte[] bytes = new byte[(int) sizeInBytes];
-        enqueueReadBuffer(srcBuffer, srcOffset, sizeInBytes, bytes, waitOnEvents);
-        RpcWire.bytesToFloats(bytes, dstData);
+        await(waitOnEvents);
+        RemoteBuffer src = buffer(srcBuffer, "read source");
+        checkRange(src, srcOffset, sizeInBytes, (long) dstData.length * Float.BYTES, "read");
+        long done = 0;
+        while (done < sizeInBytes) {
+            // whole floats per chunk, decoded from each answer's payload in place
+            int n = (int) Math.min(RpcWire.CHUNK & ~3, sizeInBytes - done);
+            final long offset = srcOffset + done;
+            backend.batch()
+                    .request(new RpcWire.Writer(RpcWire.OP_READ).i64(src.id()).i64(offset).i32(n), true)
+                    .rawFloatsInto(dstData, (int) (done / Float.BYTES), n / Float.BYTES);
+            done += n;
+        }
         return RemoteGpuEvent.COMPLETE;
     }
 

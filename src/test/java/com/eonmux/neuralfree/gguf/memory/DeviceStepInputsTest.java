@@ -23,6 +23,7 @@ import java.util.List;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
@@ -517,7 +518,7 @@ public class DeviceStepInputsTest {
     /**
      * Ring of 16 rows holding positions 4..19 (16..19 in rows 0..3). Shift keep 2 / discard 5: positions 7..15 move
      * down from rows 7..15 to 2..10 and 16..19 move up from rows 0..3 to 11..14, so the rows go through a staging
-     * buffer that is released afterwards.
+     * buffer that is released afterwards; the deltas land in the buffer reserved at allocation.
      */
     @Test
     public void contextShiftOnARingRotatesThroughStaging() {
@@ -530,7 +531,7 @@ public class DeviceStepInputsTest {
 
             List<GpuBuffer> deltas = mem.shiftPositions(2, 5);
 
-            assertEquals(live + 1, backend.liveBuffers().size());
+            assertEquals(live, backend.liveBuffers().size());
             DeviceStepInputs in = mem.stepInputs();
             FakeGpuBuffer k = fake(mem.kv(0).k());
             int[] delta = ints(deltas.get(0), 16);
@@ -580,12 +581,15 @@ public class DeviceStepInputsTest {
         try (DeviceModelMemory mem = allocate(hybridPlan(32))) {
             step(mem, 0, 8);
             assertThrows(UnsupportedOperationException.class, () -> mem.shiftPositions(2, 2));
+            // nothing moves the rows of a contiguous recurrent memory, so it reserves no deltas
+            assertThrows(IllegalStateException.class, () -> mem.shiftDelta(0));
         }
         try (DeviceModelMemory mem = allocate(fullPlan(32))) {
             step(mem, 0, 8);
             assertThrows(IllegalArgumentException.class, () -> mem.shiftPositions(4, 5));
             assertThrows(IllegalArgumentException.class, () -> mem.shiftPositions(4, 0));
-            assertThrows(IllegalStateException.class, () -> mem.shiftDelta(0));
+            // a memory whose context can shift holds its deltas from allocation on
+            assertNotNull(mem.shiftDelta(0));
         }
     }
 

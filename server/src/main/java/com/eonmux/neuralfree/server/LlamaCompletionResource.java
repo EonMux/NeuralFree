@@ -227,17 +227,24 @@ public class LlamaCompletionResource {
     private void stream(OutputStream out, GenerationBatch batch, LlamaCompletionBodies bodies,
                         List<LlamaPrompts.Prompt> prompts, GenerationRequest request) throws IOException {
         LlamaStreamChunks chunks = new LlamaStreamChunks(batch.size());
+        EventDrain.HeldFlushes held = new EventDrain.HeldFlushes(out);
         try {
-            int done = 0;
-            while (done < batch.size()) {
-                GenerationBatch.Event event = batch.next(50);
-                if (event instanceof GenerationBatch.Text t) {
-                    chunk(out, batch, bodies, prompts, chunks.offer(t));
-                } else if (event instanceof GenerationBatch.Done d) {
-                    done++;
-                    chunk(out, batch, bodies, prompts, chunks.flush(d.choice()));
-                    finish(out, batch, bodies, prompts, request, d.choice());
+            int[] done = {0};
+            while (done[0] < batch.size()) {
+                GenerationBatch.Event first = batch.next(50);
+                if (first == null) {
+                    continue;
                 }
+                EventDrain.drain(batch, first, held, event -> {
+                    if (event instanceof GenerationBatch.Text t) {
+                        chunk(held, batch, bodies, prompts, chunks.offer(t));
+                    } else if (event instanceof GenerationBatch.Done d) {
+                        done[0]++;
+                        chunk(held, batch, bodies, prompts, chunks.flush(d.choice()));
+                        finish(held, batch, bodies, prompts, request, d.choice());
+                    }
+                    return done[0] == batch.size();
+                });
             }
         } catch (IOException e) {
             batch.cancel();

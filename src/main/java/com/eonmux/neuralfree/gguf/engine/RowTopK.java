@@ -14,17 +14,24 @@ import java.util.Objects;
  */
 public final class RowTopK {
 
-    /** Most candidates one device readback of a sampled row carries. */
-    public static final int MAX_DEVICE_CANDIDATES = 64;
+    /**
+     * Most candidates one device readback of a sampled row carries: the widest readout {@code LLM_Row_TopK} serves
+     * in its radix-select form ({@code NF_ROW_TOPK_MAX_K}, {@code kernels/llm/sampling_topk.cl} and {@code
+     * shaders/llm/row_topk.comp}); a wider one would run one work-group argmax round per candidate.
+     */
+    public static final int MAX_DEVICE_CANDIDATES = 1024;
 
     private final int k;
     private final int[] ids;
     private final float[] logits;
+    /** Each row's log-sum-exp over its whole (prefiltered) row, or null when the readout carries none. */
+    private final double[] logSumExp;
 
-    private RowTopK(int k, int[] ids, float[] logits) {
+    private RowTopK(int k, int[] ids, float[] logits, double[] logSumExp) {
         this.k = k;
         this.ids = ids;
         this.logits = logits;
+        this.logSumExp = logSumExp;
     }
 
     /**
@@ -59,7 +66,46 @@ public final class RowTopK {
                 vals[r * width + j] = rows[r][top[j]];
             }
         }
-        return new RowTopK(width, ids, vals);
+        return new RowTopK(width, ids, vals, null);
+    }
+
+    /**
+     * {@link #of} that also keeps each row's log-sum-exp over its finite logits (NaN and {@code -inf} excluded), the
+     * normalizer a candidate's log-softmax {@code logit - logSumExp} needs.
+     *
+     * @throws IllegalArgumentException as {@link #of}, or when a row holds no finite logit
+     */
+    public static RowTopK ofNormalized(float[][] rows, int k) {
+        RowTopK top = of(rows, k);
+        double[] lse = new double[rows.length];
+        for (int r = 0; r < rows.length; r++) {
+            lse[r] = logSumExp(rows[r]);
+        }
+        return new RowTopK(top.k, top.ids, top.logits, lse);
+    }
+
+    /**
+     * The log-sum-exp of {@code row}'s finite logits, NaN and {@code -inf} excluded.
+     *
+     * @throws IllegalArgumentException when the row holds no finite logit
+     */
+    public static double logSumExp(float[] row) {
+        double max = Double.NEGATIVE_INFINITY;
+        for (float v : row) {
+            if (!Float.isNaN(v) && v != Float.NEGATIVE_INFINITY) {
+                max = Math.max(max, v);
+            }
+        }
+        if (max == Double.NEGATIVE_INFINITY) {
+            throw new IllegalArgumentException("the logits row holds no finite value");
+        }
+        double sum = 0.0;
+        for (float v : row) {
+            if (!Float.isNaN(v) && v != Float.NEGATIVE_INFINITY) {
+                sum += Math.exp(v - max);
+            }
+        }
+        return max + Math.log(sum);
     }
 
     /** The candidates of a device readback: {@code rows} rows of {@code k} packed ids and logits, in rank order. */
@@ -71,7 +117,47 @@ public final class RowTopK {
             throw new IllegalArgumentException("top-k readback of " + rows + " rows of " + k + " candidates needs "
                     + (rows * k) + " entries, got " + ids.length + "/" + logits.length);
         }
-        return new RowTopK(k, ids.clone(), logits.clone());
+        return new RowTopK(k, ids.clone(), logits.clone(), null);
+    }
+
+    /**
+     * {@link #packed(int, int, int[], float[])} with each row's softmax denominator over its whole row as the device
+     * computed it ({@code sum_j exp(l_j - max)}, {@code LLM_Row_TopK}'s {@code sum_exp}), whose row maximum is the
+     * row's first candidate: the rows then carry their log-sum-exp {@code max + log(sumExp)}.
+     *
+     * @throws IllegalArgumentException as {@link #packed(int, int, int[], float[])}, or when {@code sumExp} holds
+     *                                  fewer than {@code rows} values
+     */
+    public static RowTopK packed(int k, int rows, int[] ids, float[] logits, float[] sumExp) {
+        RowTopK top = packed(k, rows, ids, logits);
+        Objects.requireNonNull(sumExp, "sumExp");
+        if (sumExp.length < rows) {
+            throw new IllegalArgumentException("softmax denominators of " + sumExp.length + " values for " + rows
+                    + " rows");
+        }
+        double[] lse = new double[rows];
+        for (int r = 0; r < rows; r++) {
+            lse[r] = top.logits[r * k] + Math.log(sumExp[r]);
+        }
+        return new RowTopK(k, top.ids, top.logits, lse);
+    }
+
+    /** Whether the rows carry their log-sum-exp ({@link #logSumExp(int)}). */
+    public boolean normalized() {
+        return logSumExp != null;
+    }
+
+    /**
+     * The log-sum-exp of row {@code row} over its whole row, so candidate {@code j}'s log-softmax is
+     * {@code logit(row, j) - logSumExp(row)}.
+     *
+     * @throws IllegalStateException when the readout carries no normalizers ({@link #normalized()} false)
+     */
+    public double logSumExp(int row) {
+        if (logSumExp == null) {
+            throw new IllegalStateException("this top-k readout carries no log-sum-exp per row");
+        }
+        return logSumExp[row];
     }
 
     /** Candidates per row. */

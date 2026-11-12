@@ -22,6 +22,7 @@ import java.nio.file.Path;
 import java.util.List;
 
 import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -89,6 +90,25 @@ public class RemoteComputeBackendTest {
         assertEquals(served.getIdentity(), seen.getIdentity());
         assertFalse(remote.supportsHostMappedBuffers());
         assertTrue(server.port() > 0);
+    }
+
+    /** A float read decodes the answer's payload into the destination's first floats, from any source offset. */
+    @Test
+    public void aFloatReadDecodesItsRangeFromTheAnswer() {
+        GpuBuffer buffer = remote.allocateBuffer(4L * Float.BYTES);
+        try {
+            ComputeQueue queue = remote.computeQueue();
+            queue.enqueueWriteBuffer(buffer, 0, 4L * Float.BYTES, new float[]{1f, -2.5f, 3f, Float.MIN_VALUE});
+            float[] out = {9f, 9f, 9f};
+            queue.enqueueReadBuffer(buffer, 2L * Float.BYTES, 2L * Float.BYTES, out);
+            assertArrayEquals(new float[]{3f, Float.MIN_VALUE, 9f}, out, 0f);
+            assertThrows(IllegalArgumentException.class,
+                    () -> queue.enqueueReadBuffer(buffer, 0, 6, new float[2]));
+            assertThrows(IllegalArgumentException.class,
+                    () -> queue.enqueueReadBuffer(buffer, 0, 4L * Float.BYTES, new float[3]));
+        } finally {
+            buffer.close();
+        }
     }
 
     @Test

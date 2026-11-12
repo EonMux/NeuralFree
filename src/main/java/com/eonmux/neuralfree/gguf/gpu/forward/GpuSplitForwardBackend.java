@@ -245,9 +245,10 @@ public final class GpuSplitForwardBackend implements ForwardBackend {
             throw new IllegalArgumentException("top-k readback of " + k + " candidates");
         }
         int[] rows = outputRows != null ? outputRows : identity(tokens.length);
-        GpuPrefillDriver.Result r = run(tokens, null, pos0, outputRows, GpuPrefillDriver.Output.TOPK, k, true,
+        int width = Math.min(k, head.vocab());
+        GpuPrefillDriver.Result r = run(tokens, null, pos0, outputRows, GpuPrefillDriver.Output.TOPK, width, true,
                 prefilter);
-        return RowTopK.packed(k, rows.length, r.topIds(), r.topLogits());
+        return RowTopK.packed(width, rows.length, r.topIds(), r.topLogits());
     }
 
     /** Top candidates of the decoded row on the head's device; only the candidates are read back. */
@@ -262,9 +263,10 @@ public final class GpuSplitForwardBackend implements ForwardBackend {
         if (k < 1) {
             throw new IllegalArgumentException("top-k readback of " + k + " candidates");
         }
-        GpuPrefillDriver.Result r = run(new int[]{token}, null, pos, new int[]{0}, GpuPrefillDriver.Output.TOPK, k,
-                true, prefilter);
-        return RowTopK.packed(k, 1, r.topIds(), r.topLogits());
+        int width = Math.min(k, head.vocab());
+        GpuPrefillDriver.Result r = run(new int[]{token}, null, pos, new int[]{0}, GpuPrefillDriver.Output.TOPK,
+                width, true, prefilter);
+        return RowTopK.packed(width, 1, r.topIds(), r.topLogits());
     }
 
     /**
@@ -483,17 +485,6 @@ public final class GpuSplitForwardBackend implements ForwardBackend {
             embedding.embed(tokens, c0, n, types, p);
             current = main;
         }
-        for (int s = 0; s < shards.size(); s++) {
-            Shard shard = shards.get(s);
-            if (s != current) {
-                transferStream(shards.get(current), shard, n);
-                current = s;
-            }
-            shard.executor().run(p, n, mode, shardSink(taps[s], s));
-        }
-        if (current != main) {
-            transferStream(shards.get(current), shards.get(main), n);
-        }
         int k = 0;
         int[] local = new int[rows.length];
         int[] targets = new int[rows.length];
@@ -505,9 +496,35 @@ public final class GpuSplitForwardBackend implements ForwardBackend {
                 k++;
             }
         }
+        // the last shard's last layer runs its FFN over the read rows alone (none for a chunk before the prompt's
+        // last), which its stream then holds at the front: only those rows move to the head's device
+        int last = shards.size() - 1;
+        int[] read = Arrays.stream(local, 0, k).distinct().sorted().toArray();
+        boolean pruned = shards.get(last).executor().prunesOutputRows(n, mode, shardSink(taps[last], last), read);
+        for (int s = 0; s < shards.size(); s++) {
+            Shard shard = shards.get(s);
+            if (s != current) {
+                transferStream(shards.get(current), shard, n);
+                current = s;
+            }
+            if (s == last && pruned) {
+                shard.executor().run(p, n, mode, shardSink(taps[s], s), read);
+            } else {
+                shard.executor().run(p, n, mode, shardSink(taps[s], s));
+            }
+        }
+        int stackRows = pruned ? read.length : n;
+        if (current != main && stackRows > 0) {
+            transferStream(shards.get(current), shards.get(main), stackRows);
+        }
+        if (pruned) {
+            for (int i = 0; i < k; i++) {
+                local[i] = Arrays.binarySearch(read, local[i]);
+            }
+        }
         for (int done = 0; done < k; ) {
             int count = Math.min(n, k - done);
-            ScratchSlot hidden = head.hidden(n, Arrays.copyOfRange(local, done, done + count), count);
+            ScratchSlot hidden = head.hidden(stackRows, Arrays.copyOfRange(local, done, done + count), count);
             calls.read(output, hidden, count, Arrays.copyOfRange(targets, done, done + count));
             done += count;
         }

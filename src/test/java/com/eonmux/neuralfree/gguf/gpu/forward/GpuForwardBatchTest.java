@@ -290,6 +290,33 @@ public class GpuForwardBatchTest {
         }
     }
 
+    /**
+     * The normalized readout ({@code forwardBatchTopKNormalized}) reads the same candidates and each row's
+     * log-sum-exp from the readout's softmax denominator, equal to the host's over the whole row.
+     */
+    @Test
+    public void normalizedBatchTopKCarriesEachRowsLogSumExp() throws IOException {
+        Path model = SyntheticModels.llama().writeTempFile();
+        int[] a = tokens(5, N_TOKENS);
+        int[] b = tokens(6, N_TOKENS);
+        try (GGUFModelGPU two = new GGUFModelGPU(model.toString(), backend, config(2).build())) {
+            ForwardBackend f = two.forwardBackend();
+            float[][] rows = f.forwardBatch(interleave(a, b));
+            for (int k : new int[]{3, 40}) {
+                RowTopK host = RowTopK.ofNormalized(rows, k);
+                f.reset();
+                RowTopK device = f.forwardBatchTopKNormalized(interleave(a, b), k);
+                assertTrue(device.normalized());
+                for (int r = 0; r < host.rows(); r++) {
+                    assertArrayEquals("k " + k + " row " + r + " ids", host.ids(r), device.ids(r));
+                    assertEquals("k " + k + " row " + r + " log-sum-exp", host.logSumExp(r), device.logSumExp(r),
+                            1e-3);
+                }
+            }
+            f.reset();
+        }
+    }
+
     /** Resets the backend, reads {@code k} candidates of the two-sequence batch back and compares them. */
     private static void assertTopKMatches(RowTopK host, ForwardBackend f, int[] a, int[] b, int k) {
         f.reset();

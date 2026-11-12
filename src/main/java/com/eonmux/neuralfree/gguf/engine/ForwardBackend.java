@@ -30,6 +30,24 @@ public interface ForwardBackend extends AutoCloseable {
     }
 
     /**
+     * Sequences one memoryless batch packs ({@link #hiddenBatch} or {@link #forwardBatch} on a backend planned
+     * without memory): each a contiguous run of rows from position 0 that attends only its own rows
+     * ({@link BatchSegments}), within {@link #memorylessBatchRows()} rows. Default 1: a memoryless batch holds one
+     * sequence.
+     */
+    default int memorylessSequences() {
+        return 1;
+    }
+
+    /**
+     * Rows one packed memoryless batch holds (the ubatch a cache-less step runs at once) while
+     * {@link #memorylessSequences()} is above 1; 0 (the default) when the backend packs no sequences.
+     */
+    default int memorylessBatchRows() {
+        return 0;
+    }
+
+    /**
      * Why this backend refuses {@link #forwardBatch}, or null when it can run batches. The device backends keep the
      * default: their batches run over paged memory ({@code neuralfree.parallel > 1}), on {@code neuralfree.parallel
      * = 1} their memory holds one sequence. The heap backend runs a single-sequence batch over the plain contiguous
@@ -177,6 +195,23 @@ public interface ForwardBackend extends AutoCloseable {
             throw new IllegalArgumentException("top-k readback of " + k + " candidates");
         }
         return RowTopK.of(forwardBatch(batch), k);
+    }
+
+    /**
+     * {@link #forwardBatchTopK(ForwardBatch, int)} whose rows also carry their log-sum-exp over the whole row
+     * ({@link RowTopK#logSumExp}), the normalizer of a candidate's log-softmax: a caller that scores candidates by
+     * their probability under the row (a tree drafter's path scores) reads {@code k} values and one normalizer per
+     * row instead of the vocabulary. GPU backends take the denominator their readout computes; the default reads
+     * the full rows and computes both on the host.
+     *
+     * @throws IllegalArgumentException when {@code k} is below one, or a row holds no finite logit
+     */
+    default RowTopK forwardBatchTopKNormalized(ForwardBatch batch, int k) {
+        Objects.requireNonNull(batch, "batch");
+        if (k < 1) {
+            throw new IllegalArgumentException("top-k readback of " + k + " candidates");
+        }
+        return RowTopK.ofNormalized(forwardBatch(batch), k);
     }
 
     /**

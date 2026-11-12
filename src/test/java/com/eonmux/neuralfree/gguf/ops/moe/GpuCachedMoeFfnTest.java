@@ -394,14 +394,47 @@ public class GpuCachedMoeFfnTest {
         expected.addAll(shexp("Float_MatVec"));
         expected.add(WSUM);
         assertEquals(expected, names(ds));
-        assertEquals(2, rowWrites());
+        assertEquals(0, rowWrites());
+        List<FakeOp> writes = rowWriteOps(FakeOpKind.WRITE);
+        assertEquals("the two consecutive miss rows go up in one write", 1, writes.size());
+        assertEquals(2L * N_EMBD * Float.BYTES, writes.get(0).bytes());
     }
 
-    /** The expert-output row writes of the last forward, one per host row or dropped row. */
-    private List<FakeOp> rowWriteOps() {
+    /** Miss pairs 1, 2, 3 and 5 of four tokens go up in two writes, each run's rows landing at its pairs. */
+    @Test
+    public void missRowsGoUpInOneWritePerRunOfConsecutivePairs() {
+        forward(1, new int[]{3, 5});
+        // pairs: 0 -> 3 (hit), 1 -> 1, 2 -> 2, 3 -> 4 (misses), 4 -> 5 (hit), 5 -> 6 (miss), 6 -> 3, 7 -> 5 (hits)
+        forwardOnes(4, new int[]{3, 1, 2, 4, 5, 6, 3, 5});
+
+        List<FakeOp> writes = new ArrayList<>(rowWriteOps(FakeOpKind.WRITE));
+        writes.sort((a, b) -> Long.compare(a.offset(), b.offset()));
+        assertEquals(2, writes.size());
+        assertEquals(3L * N_EMBD * Float.BYTES, writes.get(0).bytes());
+        assertEquals(1L * N_EMBD * Float.BYTES, writes.get(1).bytes());
+        assertEquals("the second run starts 4 rows after the first", 4L * N_EMBD * Float.BYTES,
+                writes.get(1).offset() - writes.get(0).offset());
+        assertFalse("the host rows are computed", allZero(writes.get(0)));
+        assertFalse("the run past the first row reads its own rows", allZero(writes.get(1)));
+    }
+
+    @Test
+    public void runEndStopsAtTheFirstGapOrTheCount() {
+        int[] pairs = {1, 2, 3, 5, 6, 9};
+        assertEquals(3, GpuCachedMoePass.runEnd(pairs, 0, pairs.length));
+        assertEquals(5, GpuCachedMoePass.runEnd(pairs, 3, pairs.length));
+        assertEquals(6, GpuCachedMoePass.runEnd(pairs, 5, pairs.length));
+        assertEquals("the count bounds the run", 2, GpuCachedMoePass.runEnd(pairs, 0, 2));
+    }
+
+    /** The expert-output row writes (or fills) of the last forward, one per run of host rows or dropped rows. */
+    private List<FakeOp> rowWriteOps(FakeOpKind kind) {
+        ScratchSlot rows = scratch.temp(GpuCachedMoePass.T_EXPERT_OUT_IND, 1);
+        long start = 4L * rows.offset();
         List<FakeOp> out = new ArrayList<>();
         for (FakeOp op : backend.ops()) {
-            if (op.kind() == FakeOpKind.WRITE && op.bytes() == (long) N_EMBD * Float.BYTES) {
+            if (op.kind() == kind && op.buffer() == rows.buffer() && op.offset() >= start
+                    && op.offset() + op.bytes() <= start + 4L * UBATCH * K * N_EMBD) {
                 out.add(op);
             }
         }
@@ -425,9 +458,11 @@ public class GpuCachedMoeFfnTest {
         bindBlock(1);
         forward(1, new int[]{3, 6}); // 3 is a preloaded hit, 6 is a miss at rank 1
 
-        List<FakeOp> writes = rowWriteOps();
-        assertEquals("one row write for the dropped miss", 1, writes.size());
-        assertTrue("the dropped expert's row stays zero", allZero(writes.get(0)));
+        assertEquals("the dropped miss computes no host row", 0, rowWriteOps(FakeOpKind.WRITE).size());
+        List<FakeOp> fills = rowWriteOps(FakeOpKind.FILL);
+        assertEquals("one device fill zeroes the dropped row", 1, fills.size());
+        assertEquals((long) N_EMBD * Float.BYTES, fills.get(0).bytes());
+        assertTrue("the dropped expert's row stays zero", allZero(fills.get(0)));
     }
 
     /** The rule keeps a miss some token routes at a better rank and drops the experts that are pure tail picks. */
@@ -438,12 +473,15 @@ public class GpuCachedMoeFfnTest {
         // pairs: 0 -> expert 3 (hit), 1 -> 6 (rank 1), 2 -> 6 (rank 0), 3 -> 4 (rank 1)
         forwardOnes(2, new int[]{3, 6, 6, 4});
 
-        List<FakeOp> writes = new ArrayList<>(rowWriteOps());
-        writes.sort((a, b) -> Long.compare(a.offset(), b.offset()));
-        assertEquals("two computed rows and one zeroed row", 3, writes.size());
+        List<FakeOp> writes = rowWriteOps(FakeOpKind.WRITE);
+        assertEquals("the two consecutive 6 rows go up in one write", 1, writes.size());
+        assertEquals(2L * N_EMBD * Float.BYTES, writes.get(0).bytes());
         assertFalse("the 6 rows are token 1's first pick and computed", allZero(writes.get(0)));
-        assertFalse("the 6 rows are token 1's first pick and computed", allZero(writes.get(1)));
-        assertTrue("expert 4 is only ever the second pick, its row stays zero", allZero(writes.get(2)));
+        List<FakeOp> fills = rowWriteOps(FakeOpKind.FILL);
+        assertEquals("one zeroed row", 1, fills.size());
+        assertEquals("pair 3 follows the 6 rows", writes.get(0).offset() + writes.get(0).bytes(),
+                fills.get(0).offset());
+        assertTrue("expert 4 is only ever the second pick, its row stays zero", allZero(fills.get(0)));
     }
 
     @Test

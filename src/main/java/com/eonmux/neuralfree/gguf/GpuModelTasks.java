@@ -87,15 +87,17 @@ final class GpuModelTasks implements AutoCloseable {
 
     /**
      * The pooled output row of every token sequence of one batch (MEAN / CLS / LAST pooling, the RANK scores): a
-     * paged memory runs the sequences as multi-sequence forwards from position 0; any other form embeds them one
-     * after another.
+     * paged memory runs the sequences as multi-sequence forwards from position 0, an encoder planned without memory
+     * packs them into memoryless batches ({@link PagedEvaluations#memorylessSequences}); any other form embeds them
+     * one after another.
      */
     float[][] encodeBatch(int[][] sequences) throws IOException {
         model.ensureOpen();
         PagedEvaluations.checkSequences(sequences);
         EncodeGate.checkEncodeBatch(model.spec());
         ForwardBackend f = model.forwardBackend();
-        if (!PagedEvaluations.paged(f)) {
+        boolean packs = PagedEvaluations.packsMemoryless(f);
+        if (!PagedEvaluations.paged(f) && !packs) {
             float[][] out = new float[sequences.length][];
             for (int i = 0; i < sequences.length; i++) {
                 out[i] = encode(sequences[i], null);
@@ -103,8 +105,13 @@ final class GpuModelTasks implements AutoCloseable {
             return out;
         }
         PoolingHead head = poolingHead();
-        f.reset();
-        float[][][] hidden = PagedEvaluations.hiddenSequences(f, sequences);
+        float[][][] hidden;
+        if (packs) {
+            hidden = PagedEvaluations.memorylessSequences(f, sequences);
+        } else {
+            f.reset();
+            hidden = PagedEvaluations.hiddenSequences(f, sequences);
+        }
         float[][] out = new float[sequences.length][];
         for (int s = 0; s < sequences.length; s++) {
             out[s] = head.pool(hidden[s]);

@@ -44,10 +44,14 @@ final class ResponsesRun {
         this.asked = Collections.unmodifiableList(new ArrayList<>(asked));
     }
 
-    /** Streams the response to {@code sink}; a broken client stream cancels the generation. */
-    Map<String, Object> stream(GenerationBatch batch, ResponsesEvents.Sink sink) throws IOException {
+    /**
+     * Streams the response to {@code sink}, which writes to {@code held}: the events queued behind each awaited one
+     * leave in one flush ({@link EventDrain}). A broken client stream cancels the generation.
+     */
+    Map<String, Object> stream(GenerationBatch batch, ResponsesEvents.Sink sink, EventDrain.HeldFlushes held)
+            throws IOException {
         try {
-            return drive(batch, sink, false, false);
+            return drive(batch, sink, held, false, false);
         } catch (IOException e) {
             batch.cancel();
             throw e;
@@ -60,7 +64,7 @@ final class ResponsesRun {
     /** The final response of a finished batch, its events dropped. */
     Map<String, Object> collect(GenerationBatch batch) {
         try {
-            return drive(batch, (type, data) -> { }, false, true);
+            return drive(batch, (type, data) -> { }, null, false, true);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         } catch (InterruptedException e) {
@@ -72,7 +76,7 @@ final class ResponsesRun {
     /** Runs a background response into {@code sink}, which does not fail; any error ends it {@code failed}. */
     Map<String, Object> detached(GenerationBatch batch, ResponsesEvents.Sink sink) {
         try {
-            return drive(batch, sink, true, false);
+            return drive(batch, sink, null, true, false);
         } catch (IOException | InterruptedException e) {
             // the store's sink neither fails nor waits, and drive answers an interruption itself when detached
             throw new IllegalStateException("background response " + head.get("id") + " ended abnormally", e);
@@ -95,23 +99,27 @@ final class ResponsesRun {
      * (non-streamed) response whose reasoning came again as its content (a content fallback) keeps it as the
      * message only, without the reasoning item, as vLLM's non-streamed swap does.
      */
-    private Map<String, Object> drive(GenerationBatch batch, ResponsesEvents.Sink sink, boolean detached,
-                                      boolean assembled)
+    private Map<String, Object> drive(GenerationBatch batch, ResponsesEvents.Sink sink,
+                                      EventDrain.HeldFlushes held, boolean detached, boolean assembled)
             throws IOException, InterruptedException {
         ChatChoice choice = plan.newChoice();
         ResponsesEvents events = new ResponsesEvents(head, sink, bodies, logprobs);
         events.start();
         try {
-            while (true) {
+            boolean ended = false;
+            while (!ended) {
                 GenerationBatch.Event event = batch.next(50);
                 if (event == null) {
                     continue;
                 }
-                if (event instanceof GenerationBatch.Done) {
-                    break;
-                }
-                choice.accept(event);
-                events.accept(choice.drain());
+                ended = EventDrain.drain(batch, event, held, e -> {
+                    if (e instanceof GenerationBatch.Done) {
+                        return true;
+                    }
+                    choice.accept(e);
+                    events.accept(choice.drain());
+                    return false;
+                });
             }
             ToolParse parse = choice.finish();
             events.accept(choice.drain());

@@ -428,29 +428,33 @@ final class ScaleOutGenerate {
         for (int i = 0; i < n; i++) {
             sent[i] = new StringBuilder();
         }
+        EventDrain.HeldFlushes held = new EventDrain.HeldFlushes(out);
         try {
-            int done = 0;
-            while (done < n) {
-                GenerationBatch.Event event = batch.next(50);
-                if (event == null) {
+            int[] done = {0};
+            while (done[0] < n) {
+                GenerationBatch.Event first = batch.next(50);
+                if (first == null) {
                     continue;
                 }
-                int choice = event.choice();
-                if (event instanceof GenerationBatch.Text text) {
-                    generated[choice] = Math.max(generated[choice], text.predicted());
-                    int index = text.predicted() - 1;
-                    if (parsed.text()) {
-                        writeText(out, parsed, service, choice, index, text, emitted, sent, lastLogprob, generated,
-                                promptIdsSent);
-                    } else {
-                        writeTokens(out, parsed, service, choice, index, text, emitted, buffering, generated,
+                EventDrain.drain(batch, first, held, event -> {
+                    int choice = event.choice();
+                    if (event instanceof GenerationBatch.Text text) {
+                        generated[choice] = Math.max(generated[choice], text.predicted());
+                        int index = text.predicted() - 1;
+                        if (parsed.text()) {
+                            writeText(held, parsed, service, choice, index, text, emitted, sent, lastLogprob,
+                                    generated, promptIdsSent);
+                        } else {
+                            writeTokens(held, parsed, service, choice, index, text, emitted, buffering, generated,
+                                    promptIdsSent);
+                        }
+                    } else if (event instanceof GenerationBatch.Done) {
+                        done[0]++;
+                        finish(held, batch, parsed, service, choice, emitted, sent, generated, lastLogprob,
                                 promptIdsSent);
                     }
-                } else if (event instanceof GenerationBatch.Done) {
-                    done++;
-                    finish(out, batch, parsed, service, choice, emitted, sent, generated, lastLogprob,
-                            promptIdsSent);
-                }
+                    return done[0] == n;
+                });
             }
             if (parsed.includeUsage()) {
                 Map<String, Object> chunk = new LinkedHashMap<>();

@@ -47,12 +47,20 @@ public class Qwen3TtsDeviceGraphsGpuTest {
                 .build();
         EngineConfig gpu = EngineConfig.builder()
                 .backend(backends)
-                .addGpuDevice("0")
+                .addGpuDevice(selector(backends))
                 .memory(memory)
                 .build();
         model = new GGUFModelGPU(Qwen3TtsBackboneFixture.write().toString(), null, gpu);
         clip = Qwen3TtsClip.open(new Qwen3TtsClipFixture(71L, Qwen3TtsBackboneFixture.EMB).write().toString());
         device = clip.bindDevice(model.forwardContext());
+    }
+
+    /**
+     * Device 0 of OpenCL and CUDA; on Vulkan the fastest device by name ({@link GpuTestUtil#getVulkanDeviceName}),
+     * since the Vulkan enumeration order puts an integrated GPU first on some machines.
+     */
+    private static String selector(EngineConfig.BackendMode backends) {
+        return backends == EngineConfig.BackendMode.VULKAN ? GpuTestUtil.getVulkanDeviceName() : "0";
     }
 
     @After

@@ -196,6 +196,26 @@ public class ZmqEventPublisherTest {
         }
     }
 
+    /**
+     * An idle publisher answers a replay request at once instead of after its queue wait: ten replays one after
+     * another take a fraction of the ten 100 ms waits a queue-bound thread would add, one per request.
+     */
+    @Test
+    public void anIdlePublisherAnswersReplaysWithoutWaitingOutItsQueuePoll() {
+        try (ZContext context = new ZContext();
+             ZmqEventPublisher publisher = new ZmqEventPublisher(config("tcp://*:0", 3, "kv", 3))) {
+            publisher.publish(removal(10, null));
+            ZMQ.Socket dealer = replayClient(context, loopback(publisher.replayEndpoint()));
+            replayThrough(dealer, 0, 0);
+            long started = System.nanoTime();
+            for (int i = 0; i < 10; i++) {
+                assertEquals(1, replay(dealer, 0).size());
+            }
+            long millis = (System.nanoTime() - started) / 1_000_000;
+            assertTrue("ten replays took " + millis + " ms", millis < 700);
+        }
+    }
+
     @Test
     public void noBufferStepsReplaysNothing() {
         try (ZContext context = new ZContext();

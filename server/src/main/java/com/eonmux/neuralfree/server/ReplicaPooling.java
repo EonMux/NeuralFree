@@ -1,6 +1,9 @@
 package com.eonmux.neuralfree.server;
 
+import com.eonmux.neuralfree.gguf.LLMModel;
 import com.eonmux.neuralfree.gguf.engine.EngineModel;
+import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
+import com.eonmux.neuralfree.gguf.engine.PagedEvaluations;
 import com.eonmux.neuralfree.gguf.engine.PoolingOutput;
 import com.eonmux.neuralfree.gguf.engine.batch.BatchEngine;
 import com.eonmux.neuralfree.gguf.engine.batch.PoolingSequence;
@@ -13,6 +16,7 @@ import com.eonmux.neuralfree.gguf.engine.lora.LoraSession;
 import java.io.IOException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Deque;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -213,19 +217,43 @@ final class ReplicaPooling {
 
     /**
      * One handoff of {@link #oneShots}: the requests from {@code finished} on, into {@code out}, until every request
-     * ran, other work waits for the pump, or the caller {@code abandoned} the call. Returns how many have finished.
+     * ran, other work waits for the pump, or the caller {@code abandoned} the call; an encoder's pooled rows run a
+     * packed memoryless batch per step ({@link #packedPooling}). Returns how many have finished.
      */
     private Integer oneShotsFrom(PoolingOutput output, int[][] requests, boolean activation, Object[] out,
                                  AtomicInteger finished, AtomicBoolean abandoned) throws IOException {
         int next = finished.get();
+        int pack = packedPooling(output);
         while (next < requests.length && !abandoned.get()) {
-            out[next] = oneShot(output, requests[next], activation);
-            finished.set(++next);
+            if (pack > 1) {
+                int end = Math.min(requests.length, next + pack);
+                float[][] rows = owner.model().encodeBatch(Arrays.copyOfRange(requests, next, end));
+                System.arraycopy(rows, 0, out, next, rows.length);
+                next = end;
+            } else {
+                out[next] = oneShot(output, requests[next], activation);
+                next++;
+            }
+            finished.set(next);
             if (!owner.work().isEmpty()) {
                 break;
             }
         }
         return next;
+    }
+
+    /**
+     * Requests one pump step pools together: the sequences one memoryless batch packs when the model is an encoder
+     * planned without memory and {@code output} is its pooled row ({@code EngineModel.encodeBatch} packs them, each
+     * sequence attending only itself), else 1.
+     */
+    private int packedPooling(PoolingOutput output) {
+        EngineModel open = owner.model();
+        if (output != PoolingOutput.POOLED || open.poolingType() == LLMModel.PoolingType.NONE) {
+            return 1;
+        }
+        ForwardBackend backend = open.forwardBackend();
+        return PagedEvaluations.packsMemoryless(backend) ? backend.memorylessSequences() : 1;
     }
 
     /**

@@ -132,15 +132,39 @@ public class DeviceSamplingSparseTest {
         }
     }
 
-    /** A sparse chain wider than the device readback keeps the whole-row path and the same tokens. */
+    /**
+     * A greedy chain banning a hundred tokens selects among the largest 101 raw logits: wider than a few dozen
+     * candidates, inside the device readout's radix-select width, so it reads those candidates back, not the row.
+     */
     @Test
-    public void aSparseChainWiderThanTheReadbackReadsTheRow() throws IOException {
+    public void aBanChainOfAHundredTokensReadsItsCandidatesBack() throws IOException {
         openModel();
         Map<Integer, Float> bias = new LinkedHashMap<>();
-        for (int id = 1; id <= RowTopK.MAX_DEVICE_CANDIDATES; id++) {
+        for (int id = 1; id <= 100; id++) {
             bias.put(id, -100f);
         }
         GenerationRequest req = request(1, bias);
+        try (GGUFModel one = new GGUFModel(model.toString(), config())) {
+            int[] host = generate(one, wrap(one.forwardBackend()), req, false);
+            TopKBackend device = wrap(one.forwardBackend());
+            int[] tokens = generate(one, device, req, true);
+            assertArrayEquals(host, tokens);
+            assertTrue("a 101-candidate cone reads the candidates back: " + device.decodeTopKCalls,
+                    device.decodeTopKCalls > 0);
+            assertEquals("every candidate readback is the cone's width", 101, device.widestK);
+        }
+    }
+
+    /** A chain wider than the device readback keeps the whole-row path and the same tokens. */
+    @Test
+    public void aChainWiderThanTheReadbackReadsTheRow() throws IOException {
+        openModel();
+        GenerationRequest req = GenerationRequest.builder()
+                .maxNewTokens(TOKENS)
+                .sampler(SamplerConfig.builder().topK(RowTopK.MAX_DEVICE_CANDIDATES).temperature(0.8f).seed(7L)
+                        .penaltyLastN(0).build())
+                .logitBias(9, -3f)
+                .build();
         try (GGUFModel one = new GGUFModel(model.toString(), config())) {
             int[] host = generate(one, wrap(one.forwardBackend()), req, false);
             TopKBackend device = wrap(one.forwardBackend());
@@ -160,6 +184,7 @@ public class DeviceSamplingSparseTest {
 
         private final ForwardBackend delegate;
         int decodeTopKCalls;
+        int widestK;
         int greedyCalls;
 
         TopKBackend(ForwardBackend delegate) {
@@ -174,6 +199,7 @@ public class DeviceSamplingSparseTest {
         @Override
         public RowTopK decodeTopKOnDevice(int token, int pos, int k) {
             decodeTopKCalls++;
+            widestK = Math.max(widestK, k);
             return RowTopK.of(new float[][]{delegate.decode(token, pos)}, k);
         }
 

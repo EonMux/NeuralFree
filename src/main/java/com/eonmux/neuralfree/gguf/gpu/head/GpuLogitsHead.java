@@ -811,7 +811,8 @@ public final class GpuLogitsHead implements AutoCloseable {
      * candidates in rank order (larger logit first, the lower id on ties) and the row's softmax denominator, so a
      * truncated sampler chain samples from a few read-back values per row (llama.cpp backend sampling {@code -bs}).
      * The readout binds at its first {@code k} and rebinds for a later, larger {@code k}, so a caller may widen the
-     * cone between steps; a narrower {@code k} reuses the bound readout and reads its first candidates.
+     * cone between steps; a narrower {@code k} reuses the bound buffers and ranks and packs only its own {@code k}
+     * candidates per row ({@link GpuRowTopK#width()}).
      *
      * @throws UnsupportedOperationException when the backend provides no row top-k kernel
      * @throws IllegalArgumentException      when {@code nRows} is outside {@code [1, ubatch]} or {@code k} is
@@ -838,7 +839,7 @@ public final class GpuLogitsHead implements AutoCloseable {
             }
             topKReadout = bound;
         }
-        topKReadout.run(nRows);
+        topKReadout.run(nRows, k);
         return topKReadout;
     }
 

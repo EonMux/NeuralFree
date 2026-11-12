@@ -128,7 +128,7 @@ final class GpuCachedMoePass implements AutoCloseable {
     private final HostedMoeExperts hosted;
     private final byte[] idBytes;
     private final float[] xsHost;
-    private final float[] rowHost;
+    private float[] rowHost;
     private final int idLocal;
     /**
      * The hosted tail-skip rank of this layer ({@link MoeTailSkip}); {@link MoeTailSkip#OFF} on an MTP layer, which
@@ -455,8 +455,12 @@ final class GpuCachedMoePass implements AutoCloseable {
     /** The cached experts on the GPU over the cache's map, the misses on the host; every pair when {@code allHost}. */
     private void runHosted(int n, Path p, GpuBuffer xs, int xsOff, boolean allHost) {
         int pairs = n * k;
-        float[] xsValues = readRows(xs, xsOff, (long) (weightBefore ? pairs : n) * inDim);
+        int xsCount = Math.toIntExact((long) (weightBefore ? pairs : n) * inDim);
+        // both reads behind one synchronization: the input rows queue ahead of the ids and land first
+        GpuEvent xsRead = ctx.queue().enqueueReadBuffer(xs, 4L * xsOff, 4L * xsCount, xsHost);
         int[] ids = readIds(pairs);
+        await(xsRead);
+        float[] xsValues = xsCount == xsHost.length ? xsHost : Arrays.copyOf(xsHost, xsCount);
         MoeExpertCache.Step step = served && !allHost
                 ? cache.beginStep(weightLayer, ids, pairs, n, true, tailSkipRank)
                 : MoeExpertCache.Step.allMiss(pairs);
@@ -507,12 +511,6 @@ final class GpuCachedMoePass implements AutoCloseable {
         return ids;
     }
 
-    private float[] readRows(GpuBuffer buf, int off, long count) {
-        GpuEvent evt = ctx.queue().enqueueReadBuffer(buf, 4L * off, 4L * count, xsHost);
-        await(evt);
-        return count == xsHost.length ? xsHost : Arrays.copyOf(xsHost, Math.toIntExact(count));
-    }
-
     private void await(GpuEvent evt) {
         if (evt == null) {
             ctx.queue().finish();
@@ -522,46 +520,69 @@ final class GpuCachedMoePass implements AutoCloseable {
             evt.awaitCompletion();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new IllegalStateException("interrupted while waiting for the routed ids of layer "
+            throw new IllegalStateException("interrupted while waiting for the routed reads of layer "
                     + layer.il(), e);
         } finally {
             evt.close();
         }
     }
 
-    /** Uploads each miss row into the expert output, then runs the post-scale and the weighted sum. */
+    /**
+     * Uploads the miss rows into the expert output, one write per run of consecutive pairs (a prefill whose experts
+     * miss for consecutive slots writes them together).
+     */
     private void uploadMissRows(MoeExpertCache.Step step, float[] rows) {
-        for (int q = 0; q < step.missCount(); q++) {
-            int p = step.missPairs()[q];
-            System.arraycopy(rows, q * outDim, rowHost, 0, outDim);
+        int[] pairs = step.missPairs();
+        int count = step.missCount();
+        for (int q = 0; q < count; ) {
+            int end = runEnd(pairs, q, count);
+            int len = (end - q) * outDim;
+            float[] src = rows;
+            if (q > 0) {
+                src = runStaging(len);
+                System.arraycopy(rows, q * outDim, src, 0, len);
+            }
             GpuEvent evt = ctx.queue().enqueueWriteBuffer(expertOut.buffer(),
-                    4L * (expertOut.offset() + (long) p * outDim), 4L * outDim, rowHost);
+                    4L * (expertOut.offset() + (long) pairs[q] * outDim), 4L * len, src);
             if (evt != null) {
                 evt.close();
             }
+            q = end;
         }
     }
 
     /**
-     * Writes zeros over the expert output rows of the pairs the tail-skip rule drops ({@link MoeTailSkip}): the
-     * weighted sum then adds nothing for them while the other experts keep their router weights (no
-     * renormalisation). The rows are misses, so no product wrote them this step; the write clears whatever an
-     * earlier step left in the scratch.
+     * Zeros the expert output rows of the pairs the tail-skip rule drops ({@link MoeTailSkip}) on the device, one
+     * fill per run of consecutive pairs: the weighted sum then adds nothing for them while the other experts keep
+     * their router weights (no renormalisation). The rows are misses, so no product wrote them this step; the fill
+     * clears whatever an earlier step left in the scratch.
      */
     private void zeroSkippedRows(MoeExpertCache.Step step) {
-        if (step.skippedCount() == 0) {
-            return;
-        }
-        Arrays.fill(rowHost, 0.0f);
         int[] skipped = step.skippedPairs();
-        for (int q = 0; q < step.skippedCount(); q++) {
-            int p = skipped[q];
-            GpuEvent evt = ctx.queue().enqueueWriteBuffer(expertOut.buffer(),
-                    4L * (expertOut.offset() + (long) p * outDim), 4L * outDim, rowHost);
-            if (evt != null) {
-                evt.close();
-            }
+        int count = step.skippedCount();
+        for (int q = 0; q < count; ) {
+            int end = runEnd(skipped, q, count);
+            ops.fill(expertOut.buffer(), 4L * (expertOut.offset() + (long) skipped[q] * outDim),
+                    4L * (end - q) * outDim, 0);
+            q = end;
         }
+    }
+
+    /** End of the run of consecutive pair indices starting at {@code pairs[from]}, exclusive, within {@code count}. */
+    static int runEnd(int[] pairs, int from, int count) {
+        int end = from + 1;
+        while (end < count && pairs[end] == pairs[end - 1] + 1) {
+            end++;
+        }
+        return end;
+    }
+
+    /** A host array of at least {@code len} floats for a run of miss rows past the first, grown on demand. */
+    private float[] runStaging(int len) {
+        if (rowHost.length < len) {
+            rowHost = new float[len];
+        }
+        return rowHost;
     }
 
     /** Post-expert scale and norm over all pair rows, then the weighted sum into {@code dst}. */

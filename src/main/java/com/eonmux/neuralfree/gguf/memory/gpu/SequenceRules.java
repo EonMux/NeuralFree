@@ -92,30 +92,9 @@ public final class SequenceRules {
         return null;
     }
 
-    /**
-     * Why the context cannot shift: recurrent state, sparse side caches (DSA indexer, MSA index keys, DSV4
-     * compressed rows), or layers that read a target model's cache.
-     */
+    /** Why the context cannot shift ({@link MemoryPlan#shiftBlocker()}); null when it can. */
     public static String shiftBlocker(MemoryPlan plan) {
-        if (plan.hasRecurrentState()) {
-            if (!plan.hasOnlyPositionalState()) {
-                return "the model keeps recurrent state";
-            }
-            if (plan.config() == null || !plan.config().contextShift()) {
-                return "the Step5 region state holds only the open region; plan the memory with "
-                        + MemoryConfig.PROP_CONTEXT_SHIFT + "=true so every kept position survives a shift";
-            }
-        }
-        for (LayerMemoryPlan lp : plan.layers()) {
-            if (lp.indexer() != null || lp.msa() != null || !lp.compressed().isEmpty()) {
-                return "sparse-attention caches (DSA indexer, MSA index keys, DSV4 compressed rows) cannot be "
-                        + "re-positioned";
-            }
-            if (lp.sharedFrom() != null && lp.sharedFrom().target()) {
-                return "layer " + lp.layer() + " reads the KV cache of a target model";
-            }
-        }
-        return null;
+        return plan.shiftBlocker();
     }
 
     /**

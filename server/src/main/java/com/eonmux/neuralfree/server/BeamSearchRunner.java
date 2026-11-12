@@ -49,13 +49,20 @@ final class BeamSearchRunner {
     private final QueueAdmission admission = new QueueAdmission();
     /** The submissions of the most recent step, the trace's engine handles. */
     private volatile List<EngineService.Submission> lastStep = List.of();
+    /**
+     * The search's request latencies, as one choice: a step's beam tokens are its token, so the time to the first
+     * token is the first step's, the inter-token latency a step's, and the queue time the first submission's.
+     */
+    private final RequestLatencies.Choice latency;
 
     private BeamSearchRunner(EngineService service, RequestTracing.Trace trace, GenerationRequest step) {
+        long arrival = System.nanoTime();
         this.service = service;
         this.options = service.options();
-        this.deadline = System.nanoTime() + options.requestTimeout().toNanos();
+        this.deadline = arrival + options.requestTimeout().toNanos();
         this.trace = trace;
         this.step = step;
+        this.latency = service.latencies().choice(arrival);
     }
 
     /**
@@ -118,11 +125,15 @@ final class BeamSearchRunner {
         } catch (EngineUnavailableException | EngineSaturatedException e) {
             throw unavailable(e);
         }
+        if (lastStep.isEmpty() && !submissions.isEmpty()) {
+            latency.submitted(submissions.get(0)::sequence);
+        }
         lastStep = submissions;
         List<TokenScore[]> rows = new ArrayList<>(submissions.size());
         for (EngineService.Submission submission : submissions) {
             rows.add(rowOf(submission));
         }
+        latency.token(System.nanoTime());
         RequestTracing.Trace t = trace;
         if (t != null) {
             for (int i = 0; i < submissions.size(); i++) {
@@ -185,8 +196,12 @@ final class BeamSearchRunner {
                 "unavailable_error");
     }
 
-    /** Ends the request's trace with {@code forced}, or normally over the last step's submissions. */
+    /**
+     * Ends the search's latencies, and the request's trace with {@code forced} or normally over the last step's
+     * submissions.
+     */
     private void finish(Throwable forced) {
+        latency.done(System.nanoTime());
         RequestTracing.Trace t = trace;
         if (t == null) {
             return;

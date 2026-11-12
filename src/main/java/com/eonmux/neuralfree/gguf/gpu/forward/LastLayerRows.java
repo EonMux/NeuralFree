@@ -2,6 +2,7 @@ package com.eonmux.neuralfree.gguf.gpu.forward;
 
 import com.eonmux.neuralfree.gguf.arch.ResidualKind;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
+import com.eonmux.neuralfree.gguf.engine.lora.AdapterRows;
 
 /**
  * Output-row pruning of a stack's last layer (llama.cpp {@code inp_out_ids}): when a step's stack output is read at
@@ -85,6 +86,21 @@ final class LastLayerRows {
             }
             i += len;
         }
+    }
+
+    /**
+     * Narrows a mixed adapter table to the compacted rows: row {@code i} of the following products is step row
+     * {@code rows[i]}, so it takes that row's slot. A uniform table already serves any rows.
+     */
+    static void selectAdapterRows(AdapterRows table, int[] rows) {
+        if (table.uniform() >= 0) {
+            return;
+        }
+        int[] slots = new int[rows.length];
+        for (int i = 0; i < rows.length; i++) {
+            slots[i] = table.slot(rows[i]);
+        }
+        table.set(slots);
     }
 
     /** The length of the run of consecutive rows starting at index {@code i}. */

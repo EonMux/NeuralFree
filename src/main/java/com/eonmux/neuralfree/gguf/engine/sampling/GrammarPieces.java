@@ -1,6 +1,5 @@
 package com.eonmux.neuralfree.gguf.engine.sampling;
 
-import java.util.Collections;
 import java.util.Map;
 import java.util.WeakHashMap;
 
@@ -23,7 +22,7 @@ final class GrammarPieces {
     /** The UTF-8 sequence length minus one by lead-byte high nibble; -1 marks a continuation byte. */
     private static final int[] LOOKUP = {1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 3, 4};
 
-    private static final Map<SamplerVocab, GrammarPieces> CACHE = Collections.synchronizedMap(new WeakHashMap<>());
+    private static final Map<SamplerVocab, Slot> CACHE = new WeakHashMap<>();
 
     private final int size;
     private final byte[] flags;
@@ -59,13 +58,25 @@ final class GrammarPieces {
         this.cps = out.trimmed();
     }
 
-    /** The table of {@code vocab}, built on first use and kept while the vocabulary object is reachable. */
+    /**
+     * The table of {@code vocab}, built on first use and kept while the vocabulary object is reachable. The build runs
+     * under its vocabulary's own slot, so a first constrained request on one model does not wait for another's.
+     */
     static GrammarPieces of(SamplerVocab vocab) {
+        Slot slot;
         synchronized (CACHE) {
-            GrammarPieces pieces = CACHE.get(vocab);
+            slot = CACHE.computeIfAbsent(vocab, v -> new Slot());
+        }
+        return slot.get(vocab);
+    }
+
+    /** One vocabulary's table, built once by the first caller while later callers of the vocabulary wait. */
+    private static final class Slot {
+        private GrammarPieces pieces;
+
+        synchronized GrammarPieces get(SamplerVocab vocab) {
             if (pieces == null) {
                 pieces = new GrammarPieces(vocab);
-                CACHE.put(vocab, pieces);
             }
             return pieces;
         }

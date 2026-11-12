@@ -15,6 +15,7 @@ import com.eonmux.neuralfree.gguf.cpu.quant.CpuInt8Fusion;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
 import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
+import com.eonmux.neuralfree.gguf.engine.BatchSegments;
 import com.eonmux.neuralfree.gguf.hparams.ModelHparams;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.memory.KvLayout;
@@ -841,20 +842,9 @@ public final class CpuAttentionMixer implements CpuMixer {
         // their ancestors within the fresh rows
         final CpuAttentionCore.TreeMask tree = treeMask(n);
         if (tree != null) {
-            if (dualChunk != null) {
-                throw new UnsupportedOperationException("layer " + layer.il() + " runs dual-chunk attention, which"
-                        + " takes no tree mask");
-            }
-            if (spec.dual()) {
-                throw new UnsupportedOperationException("layer " + layer.il() + " runs dual-attention layers, which"
-                        + " take no tree mask");
-            }
-            com.eonmux.neuralfree.gguf.spec.AttentionSpec.BiasMode mode = spec.biasMode();
-            if (mode == com.eonmux.neuralfree.gguf.spec.AttentionSpec.BiasMode.T5_CAUSAL
-                    || mode == com.eonmux.neuralfree.gguf.spec.AttentionSpec.BiasMode.T5_BIDIR
-                    || mode == com.eonmux.neuralfree.gguf.spec.AttentionSpec.BiasMode.INKLING) {
-                throw new UnsupportedOperationException("layer " + layer.il() + " runs " + mode + " position bias,"
-                        + " which reads a relative table over the position rules a tree mask replaces");
+            String refusal = TreeMaskRules.refusal(layer.il(), dualChunk != null, spec.dual(), spec.biasMode());
+            if (refusal != null) {
+                throw new UnsupportedOperationException(refusal);
             }
         }
         int[] stepStore = ctx.stepStorePositions();
@@ -960,7 +950,19 @@ public final class CpuAttentionMixer implements CpuMixer {
             }
             CpuAttentionCore.DenseKv batch = CpuAttentionCore.DenseKv.of(k, 0, spec.kDim(), spec.headDimK(), v, 0,
                     spec.vDim(), spec.headDimV(), spec.nHeadKv(), spec.headDimK(), spec.headDimV(), pos, 0);
-            CpuAttentionCore.attendRows(stepParams, n, q, 0, spec.qDim(), pos, 0, batch, 0, n, attn, 0, spec.outDim());
+            BatchSegments runs = ctx.stepSegments();
+            if (runs == null) {
+                CpuAttentionCore.attendRows(stepParams, n, q, 0, spec.qDim(), pos, 0, batch, 0, n, attn, 0,
+                        spec.outDim());
+            } else {
+                // a packed memoryless step: each sequence's rows attend their own run's keys
+                for (int r = 0; r < runs.count(); r++) {
+                    int s0 = runs.start(r);
+                    int len = runs.length(r);
+                    CpuAttentionCore.attendRows(stepParams, len, q, s0 * spec.qDim(), spec.qDim(), pos, s0, batch,
+                            s0, s0 + len, attn, s0 * spec.outDim(), spec.outDim());
+                }
+            }
         }
         if (rotation != null) {
             rotation.afterAttention(n, attn);

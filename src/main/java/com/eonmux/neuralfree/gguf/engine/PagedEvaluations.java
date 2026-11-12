@@ -154,6 +154,78 @@ public final class PagedEvaluations {
     }
 
     /**
+     * True when {@code backend} is planned without memory and packs several sequences into one memoryless batch
+     * ({@link ForwardBackend#memorylessSequences()} above 1), the case {@link #memorylessSequences} serves.
+     */
+    public static boolean packsMemoryless(ForwardBackend backend) {
+        return backend.memory() == null && backend.memorylessSequences() > 1 && backend.memorylessBatchRows() > 0;
+    }
+
+    /**
+     * The final hidden rows (after the output norm) of every token of every sequence on a backend that packs
+     * memoryless batches ({@link #packsMemoryless}): consecutive sequences pack into batches of at most
+     * {@link ForwardBackend#memorylessSequences()} sequences and {@link ForwardBackend#memorylessBatchRows()} rows,
+     * each sequence a run of rows from position 0 that attends only itself, so every sequence's rows equal its own
+     * single-sequence evaluation while the weights are read once per batch.
+     *
+     * @return per sequence, its hidden rows in token order
+     * @throws IllegalStateException    when the backend does not pack memoryless batches
+     * @throws IllegalArgumentException when a sequence is empty or longer than one batch's rows
+     */
+    public static float[][][] memorylessSequences(ForwardBackend backend, int[][] sequences) {
+        if (!packsMemoryless(Objects.requireNonNull(backend, "backend"))) {
+            throw new IllegalStateException(backend + " packs no memoryless sequences");
+        }
+        checkSequences(sequences);
+        int maxRows = backend.memorylessBatchRows();
+        for (int s = 0; s < sequences.length; s++) {
+            if (sequences[s].length > maxRows) {
+                throw new IllegalArgumentException("sequence " + s + " holds " + sequences[s].length + " tokens; one"
+                        + " memoryless batch holds " + maxRows + " (neuralfree.ubatch)");
+            }
+        }
+        int maxSequences = backend.memorylessSequences();
+        float[][][] out = new float[sequences.length][][];
+        int first = 0;
+        while (first < sequences.length) {
+            int end = first;
+            int rows = 0;
+            while (end < sequences.length && end - first < maxSequences && rows + sequences[end].length <= maxRows) {
+                rows += sequences[end].length;
+                end++;
+            }
+            float[][] hidden = backend.hiddenBatch(sequenceBatch(sequences, first, end, rows));
+            splitRows(hidden, sequences, first, end, out);
+            first = end;
+        }
+        return out;
+    }
+
+    /**
+     * Sequences {@code first .. end - 1} ({@code total} rows) as one batch: sequence {@code s - first} from position
+     * 0, every row a hidden output row.
+     */
+    private static ForwardBatch sequenceBatch(int[][] sequences, int first, int end, int total) {
+        ForwardBatch.Builder batch = ForwardBatch.builder(total);
+        for (int s = first; s < end; s++) {
+            for (int i = 0; i < sequences[s].length; i++) {
+                batch.add(sequences[s][i], i, s - first, true);
+            }
+        }
+        batch.outputKinds(EnumSet.of(OutputKind.HIDDEN));
+        return batch.build();
+    }
+
+    /** Hands each of sequences {@code first .. end - 1} its own rows of the batch's {@code hidden} rows. */
+    private static void splitRows(float[][] hidden, int[][] sequences, int first, int end, float[][][] out) {
+        int off = 0;
+        for (int s = first; s < end; s++) {
+            out[s] = Arrays.copyOfRange(hidden, off, off + sequences[s].length);
+            off += sequences[s].length;
+        }
+    }
+
+    /**
      * The whole media {@code prompt} as one single-sequence non-causal batch: the chunks' rows keep their absolute
      * positions (a text chunk's tokens at consecutive positions, a media chunk's embedding rows at the chunk's
      * positions), every row an output row, or only {@code logitsRow} producing logits when it is not negative. Rows
@@ -446,28 +518,18 @@ public final class PagedEvaluations {
         for (int s = first; s < end; s++) {
             total = Math.addExact(total, sequences[s].length);
         }
-        ForwardBatch.Builder batch = ForwardBatch.builder(total);
-        for (int s = first; s < end; s++) {
-            for (int i = 0; i < sequences[s].length; i++) {
-                batch.add(sequences[s][i], i, s - first, true);
-            }
-        }
-        batch.outputKinds(EnumSet.of(OutputKind.HIDDEN));
+        ForwardBatch batch = sequenceBatch(sequences, first, end, total);
         int n = end - first;
         SequenceMemory memory = backend.memory().sequences();
         float[][] hidden;
         try {
-            hidden = backend.hiddenBatch(batch.build());
+            hidden = backend.hiddenBatch(batch);
         } catch (RuntimeException e) {
             removeSequences(memory, n, e);
             throw e;
         }
         removeSequences(memory, n, null);
-        int off = 0;
-        for (int s = first; s < end; s++) {
-            out[s] = Arrays.copyOfRange(hidden, off, off + sequences[s].length);
-            off += sequences[s].length;
-        }
+        splitRows(hidden, sequences, first, end, out);
     }
 
     private static long roundUp(int rows, int pageSize) {

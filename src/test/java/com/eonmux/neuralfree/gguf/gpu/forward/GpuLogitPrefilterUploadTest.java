@@ -69,6 +69,36 @@ public class GpuLogitPrefilterUploadTest {
         assertEquals(3, head.prefilterFixedUploads()[1]);
     }
 
+    /**
+     * The reused staging uploads exactly a step's tables: after a step with a two-entry bias table, a step whose bias
+     * table is that table's first entry alone is another table (one 4-byte id and one 4-byte value go up), and a
+     * step repeating it keeps it.
+     */
+    @Test
+    public void aShorterTableAfterALongerOneIsAnotherTable() {
+        GpuForwardBackend fb = rig.open(true);
+        GpuLogitsHead head = fb.logitsHead();
+        Sampler both = sampler(1.3f, Map.of(3, 4.0f, 5, 1.0f));
+        both.accept(5);
+        fb.decodeTopKOnDevice(5, 0, K, LogitPrefilter.of(List.of(both.prefilterRow())));
+        Sampler first = sampler(1.3f, Map.of(3, 4.0f));
+        first.accept(5);
+        long changed = fourByteWrites(() -> fb.decodeTopKOnDevice(5, 1, K,
+                LogitPrefilter.of(List.of(first.prefilterRow()))));
+        assertEquals(2, head.prefilterFixedUploads()[0]);
+        long kept = fourByteWrites(() -> fb.decodeTopKOnDevice(5, 2, K,
+                LogitPrefilter.of(List.of(first.prefilterRow()))));
+        assertEquals("one 4-byte bias id and one 4-byte bias value more than a kept table", 2, changed - kept);
+        assertEquals("the same one-entry table stays", 2, head.prefilterFixedUploads()[0]);
+    }
+
+    private long fourByteWrites(Runnable step) {
+        int from = rig.backend.ops().size();
+        step.run();
+        return rig.backend.ops().subList(from, rig.backend.ops().size()).stream()
+                .filter(op -> op.kind() == FakeOpKind.WRITE && op.bytes() == 4).count();
+    }
+
     private long writes() {
         return rig.backend.ops().stream().filter(op -> op.kind() == FakeOpKind.WRITE).count();
     }

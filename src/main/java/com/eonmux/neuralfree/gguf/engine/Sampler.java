@@ -11,12 +11,14 @@ import com.eonmux.neuralfree.gguf.engine.watermark.WatermarkConfig;
 import com.eonmux.neuralfree.gguf.engine.watermark.WatermarkState;
 import com.eonmux.neuralfree.gguf.engine.watermark.Watermarker;
 
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.WeakHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
@@ -68,6 +70,9 @@ import java.util.concurrent.ThreadLocalRandom;
 public final class Sampler {
 
     private static final int[] NO_TOKENS = new int[0];
+
+    /** The {@link #vocab} handle of each tokenizer while an engine holds it; the values do not keep their keys. */
+    private static final Map<GGUFTokenizer, WeakReference<SamplerVocab>> VOCABS = new WeakHashMap<>();
 
     /** Most distinct penalized tokens one device prefilter row carries; a wider window keeps the host path. */
     public static final int MAX_PREFILTER_PENALTY_TOKENS = 16384;
@@ -485,11 +490,21 @@ public final class Sampler {
 
     /**
      * The vocabulary handle built on a GGUF model's tokenizer: the model handle the DRY and infill stages read through
-     * (llama.cpp's llama_vocab of the chain construction).
+     * (llama.cpp's llama_vocab of the chain construction). Every engine of one tokenizer shares one handle, so its
+     * piece caches and its grammar piece table ({@code GrammarPieces}) are built once per model; the handle lives as
+     * long as an engine holds it.
      */
     public static SamplerVocab vocab(GGUFTokenizer tokenizer) {
         Objects.requireNonNull(tokenizer, "tokenizer");
-        return new GgufVocab(tokenizer);
+        synchronized (VOCABS) {
+            WeakReference<SamplerVocab> ref = VOCABS.get(tokenizer);
+            SamplerVocab vocab = ref != null ? ref.get() : null;
+            if (vocab == null) {
+                vocab = new GgufVocab(tokenizer);
+                VOCABS.put(tokenizer, new WeakReference<>(vocab));
+            }
+            return vocab;
+        }
     }
 
     /** A fresh non-negative seed for {@link SamplerConfig#RANDOM_SEED}. */

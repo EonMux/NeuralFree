@@ -2,6 +2,7 @@ package com.eonmux.neuralfree.gguf.engine;
 
 import com.eonmux.neuralfree.gguf.GGUFTokenizer;
 import com.eonmux.neuralfree.gguf.engine.sampling.GrammarStage;
+import com.eonmux.neuralfree.gguf.engine.sampling.SamplerVocab;
 import com.eonmux.neuralfree.gguf.grammar.GbnfParser;
 import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
 import com.eonmux.neuralfree.gguf.tokenizer.TokenizerVocab;
@@ -16,6 +17,8 @@ import java.util.Map;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotSame;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -39,6 +42,10 @@ public class GgufVocabTest {
 
     /** A GPT-2 byte-level vocabulary: E5 is {@code å}, 8F {@code ı}, AB {@code «}, a space {@code Ġ}. */
     private static GgufVocab vocab(boolean cleanUp) {
+        return new GgufVocab(tokenizer(cleanUp));
+    }
+
+    private static GGUFTokenizer tokenizer(boolean cleanUp) {
         Map<String, Object> md = new HashMap<>();
         md.put("tokenizer.ggml.model", "gpt2");
         md.put("tokenizer.ggml.pre", "gpt-2");
@@ -50,7 +57,7 @@ public class GgufVocabTest {
         if (cleanUp) {
             md.put(GgufKeys.NF_TOKENIZER_CLEAN_SPACES, true);
         }
-        return new GgufVocab(new GGUFTokenizer(TokenizerVocab.fromMetadata(md)));
+        return new GGUFTokenizer(TokenizerVocab.fromMetadata(md));
     }
 
     private static byte[] bytes(int... v) {
@@ -111,5 +118,14 @@ public class GgufVocabTest {
         GgufVocab v = vocab(false);
         assertArrayEquals(new byte[0], v.piece(END));
         assertArrayEquals("<|endoftext|>".getBytes(java.nio.charset.StandardCharsets.UTF_8), v.grammarPiece(END));
+    }
+
+    /** Every engine of one tokenizer reads one sampler vocabulary, so the piece caches and grammar table build once. */
+    @Test
+    public void engineVocabulariesOfOneTokenizerAreOneHandle() {
+        GGUFTokenizer one = tokenizer(false);
+        SamplerVocab first = Sampler.vocab(one);
+        assertSame(first, Sampler.vocab(one));
+        assertNotSame("another tokenizer has its own handle", first, Sampler.vocab(tokenizer(false)));
     }
 }

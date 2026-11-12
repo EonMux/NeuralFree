@@ -53,13 +53,21 @@ public class Lfm3aDeviceGraphsGpuTest {
         }
         EngineConfig gpu = EngineConfig.builder()
                 .backend(backends)
-                .addGpuDevice("0")
+                .addGpuDevice(selector(backends))
                 .memory(MemoryConfig.builder().nCtx(256).ubatch(256).typeK(KvDType.F32).typeV(KvDType.F32)
                         .build())
                 .build();
         model = new GGUFModelGPU(Lfm3aBackboneFixture.ttsBackbone().toString(), null, gpu);
         clip = Lfm3aGenClip.open(Lfm3aClipFixture.randomWeights(41L).writeTempFile().toString());
         device = clip.bindDevice(model.forwardContext());
+    }
+
+    /**
+     * Device 0 of OpenCL and CUDA; on Vulkan the fastest device by name ({@link GpuTestUtil#getVulkanDeviceName}),
+     * since the Vulkan enumeration order puts an integrated GPU first on some machines.
+     */
+    private static String selector(EngineConfig.BackendMode backends) {
+        return backends == EngineConfig.BackendMode.VULKAN ? GpuTestUtil.getVulkanDeviceName() : "0";
     }
 
     @After

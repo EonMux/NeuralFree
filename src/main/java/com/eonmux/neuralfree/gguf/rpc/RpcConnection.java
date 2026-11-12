@@ -139,7 +139,7 @@ final class RpcConnection implements AutoCloseable {
         synchronized (ioLock) {
             ensureOpen();
             try {
-                wire.writeFrame(request.toBytes());
+                wire.writeFrame(request);
                 response = wire.readFrame();
             } catch (IOException e) {
                 throw failed(e);
@@ -166,8 +166,8 @@ final class RpcConnection implements AutoCloseable {
         synchronized (ioLock) {
             ensureOpen();
             try {
-                wire.writeFrame(first.toBytes(), false);
-                wire.writeFrame(second.toBytes());
+                wire.writeFrame(first, false);
+                wire.writeFrame(second);
                 firstResponse = wire.readFrame();
                 secondResponse = wire.readFrame();
             } catch (IOException e) {

@@ -21,10 +21,8 @@ import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
-import java.util.Set;
 import java.util.SplittableRandom;
 import java.util.logging.Logger;
 
@@ -308,8 +306,8 @@ public final class BatchModelDrafter implements BatchDrafter {
         final List<Integer> depths = new ArrayList<>();
         /** Cumulative path log-probabilities, node 0's first. */
         final List<Double> scores = new ArrayList<>();
-        /** The logits rows of the current depth's nodes, parallel to {@code [frontierFrom, tokens.size())}. */
-        float[][] frontier;
+        /** The children rows of the current depth's nodes, parallel to {@code [frontierFrom, tokens.size())}. */
+        TreeCandidates[] frontier;
         /** The index of the current depth's first node. */
         int frontierFrom;
         /** The node depth the current frontier sits at. */
@@ -401,15 +399,10 @@ public final class BatchModelDrafter implements BatchDrafter {
             }
             roots.add(vocab.toDraft(t.request.lastToken()), t.base, t.request.seq(), true);
         }
-        float[][] rootLogits;
         try {
-            rootLogits = backend.forwardBatch(roots.build());
-            if (rootLogits.length != chunk.size()) {
-                throw new IllegalStateException("the draft model returned " + rootLogits.length + " rows for a"
-                        + " batch of " + chunk.size());
-            }
+            TreeCandidates[] rootRows = treeRows(roots.build(), chunk.size());
             for (int i = 0; i < chunk.size(); i++) {
-                expand(chunk.get(i), new float[][] {rootLogits[i]}, -1);
+                expand(chunk.get(i), new TreeCandidates[] {rootRows[i]}, -1);
             }
             while (chunk.stream().anyMatch(t -> t.frontier != null && t.frontier.length > 0)) {
                 forwardTreeRows(chunk);
@@ -472,15 +465,11 @@ public final class BatchModelDrafter implements BatchDrafter {
                 mask[row++] = bits;
             }
         }
-        float[][] out = backend.forwardBatch(batch.treeMask(mask).build());
-        if (out.length != rows) {
-            throw new IllegalStateException("the draft model returned " + out.length + " rows for a batch of "
-                    + rows);
-        }
+        TreeCandidates[] out = treeRows(batch.treeMask(mask).build(), rows);
         int at = 0;
         for (TreeSeq t : active) {
             int n = t.tokens.size();
-            t.frontier = new float[n - t.frontierFrom][];
+            t.frontier = new TreeCandidates[n - t.frontierFrom];
             for (int i = t.frontierFrom; i < n; i++) {
                 t.frontier[i - t.frontierFrom] = out[at + i];
             }
@@ -489,12 +478,43 @@ public final class BatchModelDrafter implements BatchDrafter {
     }
 
     /**
-     * Extends {@code t} with the children of {@code rows}' logits rows: per row, the top {@code treeBranches}
-     * candidates (distinct target ids, best first) score the parent's path plus their log-softmax. {@code
-     * parentFrom} names the node index of the first row's parent, or -1 for the root row (its children sit at
-     * depth 1, parents -1). False when the frontier is empty or the tree is spent.
+     * Forwards one tree draft batch and returns the children rows of its {@code rows} output rows: over an identity
+     * vocabulary on a backend that reads candidates back on the device, each row's top {@link
+     * TreeCandidates#deviceWidth} candidates and its log-sum-exp ({@link ForwardBackend#forwardBatchTopKNormalized});
+     * otherwise the whole rows, selected on the host. Both give the same children.
      */
-    private boolean expand(TreeSeq t, float[][] rows, int parentFrom) {
+    private TreeCandidates[] treeRows(ForwardBatch batch, int rows) {
+        int width = backend.batchTopKOnDevice() ? TreeCandidates.deviceWidth(treeBranches, vocab) : -1;
+        TreeCandidates[] out = new TreeCandidates[rows];
+        if (width > 0) {
+            RowTopK top = backend.forwardBatchTopKNormalized(batch, width);
+            checkRows(top.rows(), rows);
+            for (int r = 0; r < rows; r++) {
+                out[r] = TreeCandidates.ofTopK(top, r, treeBranches, vocab);
+            }
+            return out;
+        }
+        float[][] logits = backend.forwardBatch(batch);
+        checkRows(logits.length, rows);
+        for (int r = 0; r < rows; r++) {
+            out[r] = TreeCandidates.ofRow(logits[r], treeBranches, vocab);
+        }
+        return out;
+    }
+
+    private static void checkRows(int got, int rows) {
+        if (got != rows) {
+            throw new IllegalStateException("the draft model returned " + got + " rows for a batch of " + rows);
+        }
+    }
+
+    /**
+     * Extends {@code t} with the children of {@code rows}: per row, its best candidates (distinct target ids, best
+     * first, at most {@code treeBranches} and the tree's remaining budget) score the parent's path plus their
+     * log-softmax. {@code parentFrom} names the node index of the first row's parent, or -1 for the root row (its
+     * children sit at depth 1, parents -1). False when the frontier is empty or the tree is spent.
+     */
+    private boolean expand(TreeSeq t, TreeCandidates[] rows, int parentFrom) {
         if (rows == null || rows.length == 0 || t.tokens.size() >= t.budget) {
             t.frontier = null;
             return false;
@@ -502,12 +522,13 @@ public final class BatchModelDrafter implements BatchDrafter {
         int grew = 0;
         for (int f = 0; f < rows.length && t.tokens.size() < t.budget; f++) {
             int parent = parentFrom < 0 ? -1 : parentFrom + f;
-            int[] ids = treeCandidates(rows[f], Math.min(treeBranches, t.budget - t.tokens.size()));
-            for (int id : ids) {
-                t.tokens.add(vocab.toTarget(id));
+            TreeCandidates row = rows[f];
+            int children = Math.min(row.size(), t.budget - t.tokens.size());
+            for (int c = 0; c < children; c++) {
+                t.tokens.add(vocab.toTarget(row.id(c)));
                 t.parents.add(parent);
                 t.depths.add(parent < 0 ? 1 : t.depths.get(parent) + 1);
-                t.scores.add(parent < 0 ? 0.0 : t.scores.get(parent) + logSoftmaxAt(rows[f], id));
+                t.scores.add(parent < 0 ? 0.0 : t.scores.get(parent) + row.logProb(c));
                 grew++;
             }
         }
@@ -518,54 +539,6 @@ public final class BatchModelDrafter implements BatchDrafter {
         t.frontierFrom = t.tokens.size() - grew;
         t.depth = t.depths.get(t.frontierFrom);
         return true;
-    }
-
-    /**
-     * The top {@code k} draft ids of a logits row after the draft vocabulary's mask, best first, target-id
-     * duplicates keeping their highest-ranked occurrence.
-     */
-    private int[] treeCandidates(float[] logits, int k) {
-        vocab.constrain(logits);
-        Integer[] order = new Integer[logits.length];
-        int n = 0;
-        for (int i = 0; i < logits.length; i++) {
-            float v = logits[i];
-            if (!Float.isNaN(v) && v != Float.NEGATIVE_INFINITY) {
-                order[n++] = i;
-            }
-        }
-        java.util.Arrays.sort(order, 0, n, (a, b) -> Float.compare(logits[b], logits[a]));
-        Set<Integer> seen = new HashSet<>();
-        int[] ids = new int[Math.min(k, n)];
-        int kept = 0;
-        for (int i = 0; i < n && kept < ids.length; i++) {
-            int targetToken = vocab.toTarget(order[i]);
-            if (targetToken < 0 || !seen.add(targetToken)) {
-                continue;
-            }
-            ids[kept++] = order[i];
-        }
-        return kept == ids.length ? ids : Arrays.copyOf(ids, kept);
-    }
-
-    /** The log-softmax of draft id {@code id} over a row's finite logits. */
-    private static double logSoftmaxAt(float[] logits, int id) {
-        double max = Double.NEGATIVE_INFINITY;
-        for (float v : logits) {
-            if (!Float.isNaN(v) && v != Float.NEGATIVE_INFINITY) {
-                max = Math.max(max, v);
-            }
-        }
-        if (max == Double.NEGATIVE_INFINITY) {
-            throw new IllegalStateException("the draft logits hold no finite value");
-        }
-        double sum = 0.0;
-        for (float v : logits) {
-            if (!Float.isNaN(v) && v != Float.NEGATIVE_INFINITY) {
-                sum += Math.exp(v - max);
-            }
-        }
-        return (logits[id] - max) - Math.log(sum);
     }
 
     /**

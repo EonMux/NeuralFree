@@ -278,4 +278,39 @@ public class TriggeredGrammarStageTest {
         drive(sampler, raw, 'x');
         assertTrue(stage.admits(0));
     }
+
+    /**
+     * Saved states keep their trigger text across restores to one another and across trial admits: a state saved
+     * one byte into a trigger word still fires the trigger after a restore to an earlier state took other text.
+     */
+    @Test
+    public void savedStatesKeepTheirTriggerTextAcrossRestoresAndTrials() {
+        TriggeredGrammarStage stage = new TriggeredGrammarStage(grammar("root ::= \"<t>x\""),
+                GrammarTriggers.lazyWords(List.of("<t>")), VOCAB);
+        stage.keeps('a');
+        stage.accept('a');
+        stage.accept('<');
+        Object early = stage.saveState();
+        stage.accept('t');
+        Object inWord = stage.saveState();
+        assertTrue("a trial of the closing byte fires and is rolled back", stage.admits('>'));
+        assertTrue(stage.awaitingTrigger());
+
+        stage.restoreState(early);
+        stage.accept('q');
+        stage.accept('>');
+        assertTrue("\"a<q>\" holds no trigger", stage.awaitingTrigger());
+
+        stage.restoreState(inWord);
+        stage.accept('>');
+        assertFalse("the restored \"a<t\" completes the word", stage.awaitingTrigger());
+        assertTrue(stage.admits('x'));
+        assertFalse(stage.admits('y'));
+
+        stage.restoreState(early);
+        assertTrue(stage.awaitingTrigger());
+        stage.accept('t');
+        stage.accept('>');
+        assertFalse("the early state still reads \"a<\"", stage.awaitingTrigger());
+    }
 }

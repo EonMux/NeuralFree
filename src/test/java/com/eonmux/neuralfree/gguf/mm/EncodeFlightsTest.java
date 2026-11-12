@@ -11,6 +11,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -92,6 +93,56 @@ public class EncodeFlightsTest {
         } finally {
             pool.shutdownNow();
         }
+    }
+
+    /**
+     * A leader whose decode is interrupted fails alone: the waiter on its flight encodes the item itself instead of
+     * taking the leader's interruption.
+     */
+    @Test
+    public void aWaiterEncodesAgainWhenTheLeaderIsInterrupted() throws Exception {
+        EncodeFlights<String, String> flights = new EncodeFlights<>();
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicInteger waiterEncodes = new AtomicInteger();
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<String> leader = pool.submit(() -> flights.run("video", () -> {
+                started.countDown();
+                awaitQuietly(release);
+                Thread.currentThread().interrupt();
+                throw new MediaInputException("video: the ffmpeg decode was interrupted",
+                        new InterruptedException());
+            }));
+            assertTrue(started.await(WAIT_SECONDS, TimeUnit.SECONDS));
+            Future<String> waiter = pool.submit(() -> flights.run("video", () -> {
+                waiterEncodes.incrementAndGet();
+                return "frames";
+            }));
+            Thread.sleep(50);
+            release.countDown();
+            try {
+                leader.get(WAIT_SECONDS, TimeUnit.SECONDS);
+                fail("the interrupted encode answered");
+            } catch (java.util.concurrent.ExecutionException e) {
+                assertTrue(e.getCause() instanceof MediaInputException);
+            }
+            assertEquals("frames", waiter.get(WAIT_SECONDS, TimeUnit.SECONDS));
+            assertEquals("the waiter encoded once itself", 1, waiterEncodes.get());
+            assertEquals(0, flights.inFlight());
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    public void interruptionsAndCancellationsAreTheCallersOwnFailures() {
+        assertTrue(EncodeFlights.callersOwn(new MediaInputException("x: the ffprobe run was interrupted",
+                new InterruptedException())));
+        assertTrue(EncodeFlights.callersOwn(new IllegalStateException(new java.io.InterruptedIOException())));
+        assertTrue(EncodeFlights.callersOwn(new java.util.concurrent.CancellationException("request cancelled")));
+        assertFalse("a broken item fails every caller",
+                EncodeFlights.callersOwn(new MediaInputException("the image cannot be decoded")));
     }
 
     @Test

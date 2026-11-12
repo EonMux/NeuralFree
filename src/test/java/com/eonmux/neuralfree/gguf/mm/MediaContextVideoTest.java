@@ -192,7 +192,7 @@ public class MediaContextVideoTest {
                             .filter(s -> s.startsWith("[")).collect(java.util.stream.Collectors.toList()));
             assertEquals("<|vision_start|>", text.seen.get(text.seen.indexOf("[0m1.50s]") + 1));
 
-            // the first pair's rows equal a direct encode of frames 0 and 1 through the temporal kernels
+            // every pair's rows equal a direct encode of its two frames through the temporal kernels
             VideoDecoder decoder = new VideoDecoder();
             VideoMeta meta = decoder.probe(video, "video_url.url");
             VideoSamplePlan plan = ctx.videoConfig().plan(meta, null, null, 0, "video_url.url");
@@ -201,16 +201,22 @@ public class MediaContextVideoTest {
                  CpuVisionEncoder enc = mm.openCpuVisionEncoder()) {
                 ImageProcessorParams params = ImageProcessorParams.fromGguf(mm.metadata(),
                         ImageTokenBudget.none());
-                ImageTile a = ImagePreprocessors.forParams(params).prepare(frames.get(0)).encodedTiles().get(0);
-                ImageTile b = ImagePreprocessors.forParams(params).prepare(frames.get(1)).encodedTiles().get(0);
-                float[][] expected = enc.encode(ClipImage.of(a.width(), a.height(),
-                        a.normalized(params.mean(), params.std()))
-                        .withSecondFrame(ClipImage.of(b.width(), b.height(),
-                                b.normalized(params.mean(), params.std())).pixels()));
-                assertEquals(9, expected.length);
-                assertEquals(expected.length, pairs.get(0).nTokens());
-                for (int r = 0; r < expected.length; r++) {
-                    assertArrayEquals(expected[r], pairs.get(0).embeddings()[r], 0f);
+                // the pairs encode as one batch: each one's rows land on its own chunk, in frame order
+                for (int p = 0; p < pairs.size(); p++) {
+                    ImageTile a = ImagePreprocessors.forParams(params).prepare(frames.get(2 * p)).encodedTiles()
+                            .get(0);
+                    ImageTile b = ImagePreprocessors.forParams(params).prepare(frames.get(2 * p + 1))
+                            .encodedTiles().get(0);
+                    float[][] expected = enc.encode(ClipImage.of(a.width(), a.height(),
+                            a.normalized(params.mean(), params.std()))
+                            .withSecondFrame(ClipImage.of(b.width(), b.height(),
+                                    b.normalized(params.mean(), params.std())).pixels()));
+                    assertEquals(9, expected.length);
+                    assertEquals(expected.length, pairs.get(p).nTokens());
+                    for (int r = 0; r < expected.length; r++) {
+                        assertArrayEquals("pair " + p + " row " + r, expected[r], pairs.get(p).embeddings()[r],
+                                0f);
+                    }
                 }
             }
         }

@@ -283,7 +283,8 @@ public class ResponsesResource {
         }
         if (body.optBool("stream", false)) {
             StreamingOutput out = o -> {
-                Map<String, Object> done = run.stream(batch, (type, data) -> ServerJson.event(o, type, data));
+                EventDrain.HeldFlushes held = new EventDrain.HeldFlushes(o);
+                Map<String, Object> done = run.stream(batch, (type, data) -> ServerJson.event(held, type, data), held);
                 keep(stored, id, inputItems, done, run, service);
             };
             return Response.ok(out).type("text/event-stream").build();

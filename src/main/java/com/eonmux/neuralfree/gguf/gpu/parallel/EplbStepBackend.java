@@ -128,6 +128,13 @@ public final class EplbStepBackend implements ForwardBackend {
     }
 
     @Override
+    public RowTopK forwardBatchTopKNormalized(ForwardBatch batch, int k) {
+        RowTopK out = delegate.forwardBatchTopKNormalized(batch, k);
+        rebalancer.afterStep();
+        return out;
+    }
+
+    @Override
     public SplitReadout forwardBatchSplit(ForwardBatch batch, boolean[] fullRows, int k, LogitPrefilter prefilter) {
         SplitReadout out = delegate.forwardBatchSplit(batch, fullRows, k, prefilter);
         rebalancer.afterStep();

@@ -121,6 +121,34 @@ public class GpuDeviceVerifyTest {
     }
 
     /**
+     * Readouts of changing widths over one bound readout, wider than 64 candidates: a narrower width after
+     * a wider one packs its own candidates per row (the readback strides by the requested width, not the bound one),
+     * and a wider one rebinds; each equals the host selection over the read-back rows.
+     */
+    @Test
+    public void deviceTopKReadoutsOfChangingWidthsEqualTheHostSelection() throws IOException {
+        try (GGUFModelGPU m = new GGUFModelGPU(model.toString(), null, oneDevice().build())) {
+            ForwardBackend f = m.forwardBackend();
+            f.prefill(PROMPT, 0);
+            int[] batch = {7, 19, 3, 64};
+            int pos = PROMPT.length;
+            float[][] rows = f.forwardRows(batch, pos, null);
+            f.rollback(batch.length);
+            for (int k : new int[]{200, 40, 8, 300, RowTopK.MAX_DEVICE_CANDIDATES}) {
+                RowTopK host = RowTopK.of(rows, k);
+                RowTopK device = f.forwardRowsTopK(batch, pos, k, null);
+                f.rollback(batch.length);
+                assertEquals("k " + k, host.k(), device.k());
+                for (int r = 0; r < host.rows(); r++) {
+                    assertArrayEquals("k " + k + " row " + r + " ids", host.ids(r), device.ids(r));
+                    assertArrayEquals("k " + k + " row " + r + " logits", host.logits(r), device.logits(r), 1e-4f);
+                }
+            }
+            f.reset();
+        }
+    }
+
+    /**
      * A seeded temperature chain generates the same tokens with the per-step device sampling on and off: the draw
      * over the device's top candidates is the draw the host chain makes over the whole row.
      */

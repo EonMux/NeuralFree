@@ -4,6 +4,8 @@ import com.eonmux.neuralfree.demo.EngineLoadFlags;
 import com.eonmux.neuralfree.gguf.arch.PoolingKind;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
 import com.eonmux.neuralfree.gguf.engine.EngineModel;
+import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
+import com.eonmux.neuralfree.gguf.engine.PagedEvaluations;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
 
@@ -23,7 +25,8 @@ import java.util.Locale;
  *
  * <p>The run embeds its prompts in llama.cpp's batches ({@link #windows}): a batch closes when the next prompt
  * would push it past the batch size or past the memory's sequence count, and every batch runs through
- * {@link EngineModel#encodeBatch}, one multi-sequence forward over a paged memory.</p>
+ * {@link EngineModel#encodeBatch}, one multi-sequence forward over a paged memory or packed memoryless forwards of
+ * an encoder.</p>
  *
  * <p>One instance parses one command line; it is not thread-safe.</p>
  */
@@ -234,12 +237,15 @@ final class EmbeddingBatchFlags {
 
     /**
      * The pooled output row of every input in order (the RANK scores for a ranking model), embedded in llama.cpp's
-     * batches ({@link #windows}) through {@link EngineModel#encodeBatch}.
+     * batches ({@link #windows}) through {@link EngineModel#encodeBatch}: a batch holds up to the paged memory's
+     * sequences, or the sequences one memoryless batch packs for an encoder planned without memory.
      *
      * @throws IOException when the model fails to encode
      */
     static List<float[]> encode(EngineModel model, List<int[]> inputs, int batchSize) throws IOException {
-        int maxSequences = model.forwardBackend().maxSequences();
+        ForwardBackend backend = model.forwardBackend();
+        int maxSequences = PagedEvaluations.packsMemoryless(backend) ? backend.memorylessSequences()
+                : backend.maxSequences();
         List<float[]> rows = new ArrayList<>(inputs.size());
         for (int[] w : windows(inputs, batchSize, maxSequences)) {
             Collections.addAll(rows, model.encodeBatch(inputs.subList(w[0], w[1]).toArray(new int[0][])));

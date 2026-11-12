@@ -1,6 +1,11 @@
 package com.eonmux.neuralfree.gguf;
 
+import com.eonmux.neuralfree.gguf.engine.BatchSegments;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
+import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
+import com.eonmux.neuralfree.gguf.engine.ForwardBatch;
+import com.eonmux.neuralfree.gguf.engine.OutputKind;
+import com.eonmux.neuralfree.gguf.engine.PagedEvaluations;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
 import com.eonmux.neuralfree.gguf.testutil.SyntheticModels;
@@ -8,9 +13,11 @@ import org.junit.Test;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.EnumSet;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
@@ -18,7 +25,8 @@ import static org.junit.Assert.assertTrue;
  * {@link GGUFModel#encodeBatch(int[][])}: a paged memory ({@code neuralfree.parallel} slots) runs the sequences of
  * one batch as one multi-sequence forward and answers the pooled rows the sequential {@code encode} loop answers,
  * one output row per sequence, the RANK classifier scores included. A memoryless encoder (the BERT family plans no
- * memory) embeds its sequences one prefill at a time through the same entry point, with the same rows.
+ * memory) packs its sequences into memoryless batches of one ubatch, each sequence attending only its own rows
+ * ({@link PagedEvaluations#memorylessSequences}), with the rows its single-sequence steps produce.
  */
 public class GGUFModelBatchedEncodeTest {
 
@@ -53,6 +61,66 @@ public class GGUFModelBatchedEncodeTest {
             }
             float[][] single = batched.encodeBatch(new int[][]{prompts[1]});
             assertArrayEquals(expected[1], single[0], 1e-6f);
+        }
+    }
+
+    private static EngineConfig memoryless(int ubatch) {
+        return EngineConfig.builder().backend(EngineConfig.BackendMode.CPU)
+                .memory(MemoryConfig.builder().nCtx(ubatch).ubatch(ubatch).build()).build();
+    }
+
+    /**
+     * Five sequences over a 32-row ubatch pack as {9, 1}, {23, 4} and {20}: each packed batch answers every
+     * sequence's own hidden rows and pooled row, a one-row sequence and runs longer than the first included; a
+     * sequence longer than the ubatch refuses by name.
+     */
+    @Test
+    public void aMemorylessEncoderPacksItsSequencesPerUbatch() throws IOException {
+        Path model = SyntheticModels.bert().writeTempFile();
+        int[][] prompts = {tokens(1, 9), tokens(2, 1), tokens(3, 23), tokens(4, 4), tokens(5, 20)};
+        try (GGUFModel m = new GGUFModel(model.toString(), memoryless(32))) {
+            ForwardBackend b = m.forwardBackend();
+            assertNull(b.memory());
+            assertEquals(BatchSegments.MAX_PACKED, b.memorylessSequences());
+            assertEquals(32, b.memorylessBatchRows());
+            float[][][] packed = PagedEvaluations.memorylessSequences(b, prompts);
+            float[][] pooled = m.encodeBatch(prompts);
+            for (int s = 0; s < prompts.length; s++) {
+                float[][] own = b.hiddenRows(prompts[s], null);
+                assertEquals(own.length, packed[s].length);
+                for (int t = 0; t < own.length; t++) {
+                    assertArrayEquals("sequence " + s + " row " + t, own[t], packed[s][t], 1e-5f);
+                }
+                assertArrayEquals("pooled sequence " + s, m.encode(prompts[s]), pooled[s], 1e-5f);
+            }
+            IllegalArgumentException tooLong = assertThrows(IllegalArgumentException.class,
+                    () -> m.encodeBatch(new int[][]{tokens(1, 4), tokens(2, 40)}));
+            assertTrue(tooLong.getMessage(), tooLong.getMessage().startsWith("sequence 1 holds 40 tokens"));
+        }
+    }
+
+    /** One packed batch of three sequences equals each sequence's own memoryless step. */
+    @Test
+    public void aPackedMemorylessBatchKeepsEachSequenceToItsOwnRows() throws IOException {
+        Path model = SyntheticModels.bert().writeTempFile();
+        int[][] prompts = {tokens(7, 5), tokens(8, 11), tokens(9, 3)};
+        try (GGUFModel m = new GGUFModel(model.toString(), memoryless(32))) {
+            ForwardBackend b = m.forwardBackend();
+            ForwardBatch.Builder batch = ForwardBatch.builder(19);
+            for (int s = 0; s < prompts.length; s++) {
+                for (int t = 0; t < prompts[s].length; t++) {
+                    batch.add(prompts[s][t], t, s, true);
+                }
+            }
+            batch.outputKinds(EnumSet.of(OutputKind.HIDDEN));
+            float[][] rows = b.hiddenBatch(batch.build());
+            int row = 0;
+            for (int s = 0; s < prompts.length; s++) {
+                float[][] own = b.hiddenRows(prompts[s], null);
+                for (int t = 0; t < own.length; t++) {
+                    assertArrayEquals("sequence " + s + " row " + t, own[t], rows[row++], 1e-5f);
+                }
+            }
         }
     }
 

@@ -1,5 +1,7 @@
 package com.eonmux.neuralfree.gguf.cpu.forward;
 
+import com.eonmux.neuralfree.gguf.engine.BatchSegments;
+
 /**
  * Per-step flags the forward backend sets before it runs the slots and clears after, read by the mixers of the
  * step (the paged step they read off the memory is the sibling mechanism). Created with the context and shared by
@@ -12,6 +14,7 @@ final class CpuForwardStepState {
     private int treeFresh = -1;     // the mask's fresh rows (the tree rows of the step); -1 = none
     private int[] storePositions;   // per-ubatch-row KV store positions; null = the POS slot stores too
     private CpuRecurrentTreeRound treeRound; // the tree step's recurrent round; null = no recurrent tree step
+    private BatchSegments segments; // the sequence runs of a packed memoryless step; null = one sequence
 
     /** True when the running step attends without the causal mask ({@code llama_set_causal_attn(false)}). */
     boolean nonCausal() {
@@ -57,5 +60,15 @@ final class CpuForwardStepState {
     /** Sets the running step's KV store positions (a contiguous tree verify's row slots). */
     void storePositions(int[] positions) {
         this.storePositions = positions;
+    }
+
+    /** The running memoryless step's sequence runs, or null when its rows form one sequence. */
+    BatchSegments segments() {
+        return segments;
+    }
+
+    /** Sets the running memoryless step's sequence runs (a packed encoder batch). */
+    void segments(BatchSegments v) {
+        this.segments = v;
     }
 }

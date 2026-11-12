@@ -33,11 +33,12 @@ import java.util.concurrent.TimeUnit;
  * kept. On a constant-rate stream that starts with its container ffmpeg's {@code select} filter picks the plan's
  * frames, so only they are converted, scaled and piped; another stream (a variable rate, or a video that starts
  * after its soundtrack, whose first frame the reference's decode repeats over the lead) pipes every frame up to
- * the plan's last and the reader keeps the plan's. When the vision preprocessor recommends a frame size, the decode scales the frames to it with the
- * reference's bicubic RGB filter ({@code mtmd_helper_video::start_ffmpeg}), so the kept frames never hold the
- * source's full resolution. The soundtrack of an LFM3-Omni video decodes to mono float32 at the audio tower's rate
- * and splits into the temporal groups' spans. The binaries are taken from the configured directory (llama.cpp's
- * {@code --video-ffmpeg-dir}) or the PATH, and are refused by name when missing. Immutable and stateless.
+ * the plan's last and the reader keeps the plan's. When the vision preprocessor recommends a frame size, the decode
+ * scales the frames to it with the reference's bicubic RGB filter ({@code mtmd_helper_video::start_ffmpeg}), so the
+ * kept frames never hold the source's full resolution. The soundtrack of an LFM3-Omni video decodes to mono float32
+ * at the audio tower's rate and splits into the temporal groups' spans. The binaries are taken from the configured
+ * directory (llama.cpp's {@code --video-ffmpeg-dir}) or the PATH, and are refused by name when missing. Immutable and
+ * stateless.
  */
 public final class VideoDecoder {
 

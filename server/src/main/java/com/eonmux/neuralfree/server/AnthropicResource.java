@@ -236,10 +236,12 @@ public class AnthropicResource {
      */
     private void stream(OutputStream out, GenerationBatch batch, ToolOutput tools, String id, String model,
                         int promptTokens) throws IOException {
+        EventDrain.HeldFlushes held = new EventDrain.HeldFlushes(out);
         try {
-            AnthropicStream blocks = new AnthropicStream(out);
+            AnthropicStream blocks = new AnthropicStream(held);
             boolean started = false;
-            while (true) {
+            boolean ended = false;
+            while (!ended) {
                 GenerationBatch.Event event = batch.next(50);
                 if (event == null) {
                     continue;
@@ -249,10 +251,13 @@ public class AnthropicResource {
                             startMessage(id, model, usage(promptTokens, batch.cachedTokens(0), 0))));
                     started = true;
                 }
-                if (event instanceof GenerationBatch.Done) {
-                    break;
-                }
-                route(event, tools, blocks);
+                ended = EventDrain.drain(batch, event, held, e -> {
+                    if (e instanceof GenerationBatch.Done) {
+                        return true;
+                    }
+                    route(e, tools, blocks);
+                    return false;
+                });
             }
             tools.finish(blocks);
             blocks.end();

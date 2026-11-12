@@ -23,10 +23,10 @@ import java.util.List;
  * {@code hiddenBatch} (the pooling heads' input), a media chunk piece runs its own batch, and every output row lands
  * at its piece's place in the step's output order. A sampling piece whose chain keeps its candidates inside a top-k
  * cone reads only those candidates back on the device ({@code ForwardBackend.forwardBatchTopK}, llama.cpp backend
- * sampling {@code -bs}); the pieces that need whole rows beside it (a grammar, a logprobs capture, a verify round)
- * read theirs from the same forward ({@code ForwardBackend.forwardBatchSplit}). Counts the step, reads
- * prompt-logprobs rows back, then hands the outputs to the {@link OutputRouter}; a forward that throws rolls the step
- * back through the {@link SlotLifecycle}.
+ * sampling {@code -bs}); the pieces that need whole rows beside it (a grammar, a logprobs capture, a tree round or
+ * a verify round under a verifier) read theirs from the same forward ({@code ForwardBackend.forwardBatchSplit}).
+ * Counts the step, reads prompt-logprobs rows back, then hands the outputs to the {@link OutputRouter}; a forward
+ * that throws rolls the step back through the {@link SlotLifecycle}.
  */
 final class StepExecutor {
 
@@ -405,18 +405,18 @@ final class StepExecutor {
     /**
      * The shared token batch's device cone: the pieces that sample from it, its width and the prefilter it applies
      * first; {@link StepCone#NONE} when no piece does (device sampling is off, the backend has no batched row top-k,
-     * or no chain fits). A piece samples from the cone when it samples one output row (a single-row decode or a
-     * completing text chunk without a prompt-logprobs read) and its chain keeps its candidates inside its top-k
+     * or no chain fits). A piece samples from the cone when it samples its output rows through its chain alone
+     * ({@link #samplesFromCone}: a single-row decode, a {@code MATCH} verify round of a chain draft, or a completing
+     * text chunk without a prompt-logprobs read) and its chain keeps its candidates inside its top-k
      * ({@link Sampler#coneWidth}). Every other piece reads its rows whole from the same forward: a grammar or a
-     * logprobs capture ({@code wantsHostSampling}), a chain that needs the whole row, a verify round, a
-     * prompt-logprobs piece; a pooling piece and a media chunk run their own batches.
-     *
-     * <p>A chain whose cone needs the pre-top-k logit edits (penalties, DRY, a positive bias) uses
-     * {@link Sampler#deviceConeWidth()} and carries its {@link Sampler#prefilterRow()} to the readout when the backend
-     * applies the prefilter on the device. The width is the widest piece cone: a chain over a wider cone selects
-     * exactly what it selects over its own. When the step prefilters, every cone piece's row rides the readout (a
-     * plain chain with its own, possibly empty, row) and every whole-read output row carries an empty row, which
-     * leaves it as the forward computed it.</p>
+     * logprobs capture, a tree round, a verify round under another verify mode (its verifier reads the processed
+     * distributions), or a chain wider than the readout. A chain whose cone needs its penalties, DRY or bias applied
+     * first ({@link Sampler#deviceConeWidth()}) takes the cone only over a backend that applies a per-row prefilter
+     * on the device: the step then runs every row's prefilter and reads every cone at the widest such chain's
+     * {@link Sampler#deviceConeWidth()}; each piece's row carries its {@link Sampler#prefilterRow()} — a verify
+     * round's row {@code i} over the chain's history plus the round's drafts before it, the history the walk holds
+     * when it samples that row (the single-stream {@code SpeculativeDecoder}'s prefiltered verify) — and the rows
+     * outside the cone an unedited one.
      */
     private StepCone logitsCone(List<Piece> pieces) {
         if (!deviceSampling || !backend.batchTopKOnDevice()) {
@@ -427,7 +427,7 @@ final class StepExecutor {
         boolean needsPrefilter = false;
         for (int i = 0; i < pieces.size(); i++) {
             Piece p = pieces.get(i);
-            if (!samplesConeRow(p)) {
+            if (!samplesFromCone(p)) {
                 continue;
             }
             Sampler sampler = p.slot.run.sampler();
@@ -462,9 +462,14 @@ final class StepExecutor {
         List<LogitPrefilter.Row> rows = new ArrayList<>();
         for (int i = 0; i < pieces.size(); i++) {
             Piece p = pieces.get(i);
-            if (coned[i]) {
-                int[] pending = !p.decode ? p.slot.submission.prompt.samplerTokens() : null;
-                rows.add(p.slot.run.sampler().prefilterRow(pending));
+            if (coned[i] && p.decode) {
+                // row r answers the token after the round's pending token and drafts 0..r-1, which the walk has
+                // accepted into the chain by the time it samples the row
+                for (int r = 0; r < p.rows; r++) {
+                    rows.add(p.slot.run.sampler().prefilterRow(Arrays.copyOfRange(p.tokens, 1, 1 + r)));
+                }
+            } else if (coned[i]) {
+                rows.add(p.slot.run.sampler().prefilterRow(p.slot.submission.prompt.samplerTokens()));
             } else {
                 for (int r = sharedOutputRows(p); r > 0; r--) {
                     rows.add(unedited);
@@ -480,16 +485,19 @@ final class StepExecutor {
     }
 
     /**
-     * Whether a piece samples exactly one output row of the shared batch through its chain alone: a single-row
-     * decode or a completing text chunk that reads no prompt logprobs, whose run captures no logprobs and runs no
-     * host-only stage ({@code wantsHostSampling}).
+     * Whether a piece samples its output rows of the shared batch through its chain alone: a single-row decode, a
+     * chain draft's verify round walked by {@code MATCH} (row by row through the chain, {@link DecodeRounds#verify}),
+     * or a completing text chunk that reads no prompt logprobs, whose run captures no logprobs
+     * ({@code wantsHostSampling}). A tree round's walk and another verify mode's verifier read whole rows.
      */
-    private static boolean samplesConeRow(Piece p) {
-        if (p.isMediaChunk() || p.wantsHidden || p.readRows) {
+    private static boolean samplesFromCone(Piece p) {
+        if (p.isMediaChunk() || p.wantsHidden || p.readRows || p.slot.run.wantsHostSampling()) {
             return false;
         }
-        boolean one = p.decode ? p.rows == 1 : p.output;
-        return one && !p.slot.run.wantsHostSampling();
+        if (!p.decode) {
+            return p.output;
+        }
+        return p.rows == 1 || p.tree == null && p.slot.verifier == null;
     }
 
     /**

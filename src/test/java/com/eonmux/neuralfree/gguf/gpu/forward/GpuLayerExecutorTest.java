@@ -25,6 +25,7 @@ import com.eonmux.neuralfree.gguf.hparams.ModelHparamsBuilder;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
+import com.eonmux.neuralfree.gguf.memory.StepLayout;
 import com.eonmux.neuralfree.gguf.memory.MemoryPlan;
 import com.eonmux.neuralfree.gguf.memory.MemoryPlanner;
 import com.eonmux.neuralfree.gguf.memory.gpu.DeviceModelMemory;
@@ -162,6 +163,20 @@ public class GpuLayerExecutorTest {
         @Override
         public String kvRefusal() {
             return null;
+        }
+
+        @Override
+        public String batchRefusal() {
+            return null;
+        }
+
+        @Override
+        public void batch(StepLayout s, ScratchSlot in, ScratchSlot out) {
+            if (s.contiguousSingle()) {
+                GpuMixer.super.batch(s, in, out);
+                return;
+            }
+            record("mixer " + name + " batch " + s.nTokens() + " " + in.name() + "->" + out.name());
         }
     }
 
@@ -817,6 +832,96 @@ public class GpuLayerExecutorTest {
         assertEquals(N_EMBD, move.intArg(1));
         assertEquals("the last row moves to row 0", 2 * N_EMBD, move.intArg(3) - move.intArg(5));
         assertEquals(6, memory.sequence().nPast());
+    }
+
+    /**
+     * A batched step of two sequences read at each one's last row runs the last layer's attention over all four rows
+     * and its FFN over the two read rows, moved to the front; a step that reads no row skips the last FFN, and the
+     * unpruned step runs it over every row.
+     */
+    @Test
+    public void aBatchedStepRunsTheLastLayerFfnOverItsReadRowsOnly() {
+        GpuForwardContext ctx = open(llama(2, null, null, null), true);
+        GpuLayerExecutor exec = GpuLayerExecutor.forTrunk(ctx, registry(true));
+        closeables.add(exec);
+        StepLayout two = StepLayout.of(4, new int[]{0, 1}, new int[]{0, 2}, new int[]{2, 2}, new int[]{0, 0},
+                new int[]{1, 3}, true);
+        GpuLayerExecutor.TapSink none = GpuLayerExecutor.TapSink.NONE;
+        startTrace();
+        exec.run(two, none, new int[]{1, 3});
+        List<String> t = trace();
+        assertEquals(1, Collections.frequency(t, "mixer ATTENTION 1 batch 4 NORMED->BRANCH"));
+        assertEquals(1, Collections.frequency(t, "ffn 0 4 NORMED->BRANCH"));
+        assertEquals(1, Collections.frequency(t, "ffn 1 2 NORMED->BRANCH"));
+        assertFalse(t.contains("ffn 1 4 NORMED->BRANCH"));
+        List<FakeDispatch> moves = dispatchesOf(GpuOps.COPY2D);
+        assertEquals("rows 1 and 3 move to rows 0 and 1, one copy each", 2, moves.size());
+        for (FakeDispatch move : moves) {
+            assertEquals(1, move.intArg(0));
+            assertEquals(N_EMBD, move.intArg(1));
+        }
+
+        startTrace();
+        exec.run(two, none, new int[0]);
+        t = trace();
+        assertEquals(1, Collections.frequency(t, "mixer ATTENTION 1 batch 4 NORMED->BRANCH"));
+        assertTrue("no row is read: the last FFN is skipped", t.stream().noneMatch(e -> e.startsWith("ffn 1")));
+
+        startTrace();
+        exec.run(two, none);
+        assertEquals(1, Collections.frequency(trace(), "ffn 1 4 NORMED->BRANCH"));
+        assertThrows(IllegalArgumentException.class, () -> exec.run(two, none, new int[]{0, 1, 2, 3}));
+    }
+
+    /**
+     * A pruned last layer that re-adds its input after the mixer (jina-bert-v2's {@code attn_norm_2}) first saves
+     * that input, as the unpruned layer does: on the batched and the contiguous step, each layer copies the stream
+     * into the layer-input slot before its mixer, so the re-add reads this layer's input and not an earlier one's.
+     */
+    @Test
+    public void aPrunedLastLayerSavesTheInputItReaddsAfterTheMixer() {
+        int nLayer = 2;
+        List<GGUFTensorInfo> t = tensors(nLayer, TensorNames.ATTN_OUT_NORM, TensorNames.ATTN_NORM_2,
+                TensorNames.LAYER_OUT_NORM);
+        ModelSpec spec = model(hparams(Arch.JINA_BERT_V2, nLayer).build(), t, nLayer,
+                (il, resolved) -> LayerSpec.builder(il, MixerKind.ATTENTION, FfnKind.DENSE)
+                        .norm(resolved).residual(standardResidual()).attention(attention(il)).ffn(denseFfn())
+                        .build(),
+                1.0f, 0f, MemoryKind.KV);
+        GpuForwardContext ctx = open(spec, true);
+        GpuLayerExecutor exec = GpuLayerExecutor.forTrunk(ctx, registry(true));
+        closeables.add(exec);
+        GpuLayerExecutor.TapSink none = GpuLayerExecutor.TapSink.NONE;
+        StepLayout two = StepLayout.of(4, new int[]{0, 1}, new int[]{0, 2}, new int[]{2, 2}, new int[]{0, 0},
+                new int[]{1, 3}, true);
+        assertTrue(exec.prunesOutputRows(4, GpuLayerExecutor.StepMode.PREFILL, none, new int[]{1, 3}));
+
+        startTrace();
+        exec.run(two, none, new int[]{1, 3});
+        assertEquals(1, Collections.frequency(trace(), "ffn 1 2 X->BRANCH"));
+        assertLayerInputSavedBeforeEachMixer(ctx, "batch 4", nLayer);
+
+        startTrace();
+        exec.run(0, 3, GpuLayerExecutor.StepMode.PREFILL, none, new int[]{2});
+        assertEquals(1, Collections.frequency(trace(), "ffn 1 1 X->BRANCH"));
+        assertLayerInputSavedBeforeEachMixer(ctx, "prefill 3", nLayer);
+    }
+
+    /** Exactly one stream copy into the layer-input slot runs between consecutive layers' mixer calls. */
+    private void assertLayerInputSavedBeforeEachMixer(GpuForwardContext ctx, String mixerCall, int nLayer) {
+        Object layerInput = ctx.scratch().temp(GpuLayerExecutor.TEMP_LAYER_INPUT, (long) UBATCH * N_EMBD).buffer();
+        List<FakeDispatch> ds = backend.dispatches();
+        int from = 0;
+        for (int il = 0; il < nLayer; il++) {
+            String label = "mixer ATTENTION " + il + " " + mixerCall + " X->BRANCH";
+            int to = events.stream().filter(e -> e.label.equals(label)).mapToInt(e -> e.at).findFirst()
+                    .orElseThrow(() -> new AssertionError("no call " + label));
+            long saves = ds.subList(from, to).stream()
+                    .filter(d -> d.kernelName().equals(GpuOps.COPY2D) && d.bufferArgs().contains(layerInput))
+                    .count();
+            assertEquals("layer " + il + " saves its input before its mixer", 1, saves);
+            from = to;
+        }
     }
 
     @Test

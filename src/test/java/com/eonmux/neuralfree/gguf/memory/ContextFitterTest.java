@@ -10,23 +10,28 @@ import static org.junit.Assert.assertTrue;
 
 /**
  * Context selection of {@link ContextFitter} on the gemma3 fixture of {@link MemoryPlannerTest} (n_ctx_train 8192).
- * For {@code n >= 1024} its plan takes {@code 5 * 1024 * 1024} ring bytes, {@code 1024 * 4} ring positions and
- * {@code n * (1024 + 4)} bytes of full-attention KV and positions: {@code 5_246_976 + 1028 * n}. Also covers the
+ * For {@code n >= 1024} its plan takes {@code 5 * 1024 * 1024} ring bytes, {@code 1024 * (4 + 4)} ring positions and
+ * shift deltas, and {@code n * (1024 + 4 + 4)} bytes of full-attention KV, positions and shift deltas:
+ * {@code 5_251_072 + 1032 * n}. Also covers the
  * recurrent-state snapshot shadows, the NextN draft memory and the companion (drafter) memory that the fit reserves.
  */
 public class ContextFitterTest {
 
     /** Device addressing of the gemma3 fixture's two groups at the default ubatch. */
     private static final long GEMMA3_ADDRESSING = contiguousAddressing(2, MemoryConfig.DEFAULT_UBATCH);
-    private static final long FULL_TRAIN_BYTES = 13_668_352L + GEMMA3_ADDRESSING;
+    private static final long FULL_TRAIN_BYTES = 13_705_216L + GEMMA3_ADDRESSING;
     /** Device addressing of one group at the default ubatch: the NextN fixture's main and draft memories. */
     private static final long ONE_GROUP_ADDRESSING = contiguousAddressing(1, MemoryConfig.DEFAULT_UBATCH);
     /** Device addressing of the mamba2 fixture, which keeps no KV group. */
     private static final long MAMBA2_ADDRESSING = contiguousAddressing(0, MemoryConfig.DEFAULT_UBATCH);
 
-    /** The gemma3 fixture's caches at {@code nCtx} plus its addressing, at a ubatch capped by the context. */
+    /**
+     * The gemma3 fixture's caches at {@code nCtx} (at least the 1024-row window) plus its addressing, at a ubatch
+     * capped by the context: per row 1024 KV bytes, a position and a shift delta (4 each) in the global group,
+     * and the window group's 1024 rows of the same.
+     */
     private static long gemma3Bytes(int nCtx) {
-        return 5_246_976L + 1028L * nCtx + contiguousAddressing(2, Math.min(nCtx, MemoryConfig.DEFAULT_UBATCH));
+        return 5_251_072L + 1032L * nCtx + contiguousAddressing(2, Math.min(nCtx, MemoryConfig.DEFAULT_UBATCH));
     }
 
     private static MemoryConfig auto() {
@@ -74,7 +79,8 @@ public class ContextFitterTest {
     public void autoThrowsWhenNotEvenTheSmallestContextFits() {
         ModelSpec spec = MemoryPlannerTest.gemma3();
         long smallest = ContextFitter.requiredBytes(spec, auto(), ContextFitter.CONTEXT_STEP);
-        assertEquals(6L * 256 * 1024 + 2L * 256 * 4 + contiguousAddressing(2, 256), smallest);
+        // six KV layers of 256 rows, and a position and a shift delta per row of both groups
+        assertEquals(6L * 256 * 1024 + 2L * 256 * 4 + 2L * 256 * 4 + contiguousAddressing(2, 256), smallest);
         ContextFitter.ContextBudgetException e = assertThrows(ContextFitter.ContextBudgetException.class,
                 () -> ContextFitter.fit(spec, auto(), smallest - 1));
         assertEquals(ContextFitter.CONTEXT_STEP, e.nCtx());
@@ -112,16 +118,16 @@ public class ContextFitterTest {
     }
 
     /**
-     * NextN fixture of {@link MemoryPlannerTest#withNextn()}: the main context takes {@code 1028 * n} bytes (two KV
-     * layers of 512 bytes per row plus positions), the NextN draft memory {@code 516 * n}, each memory with the
-     * addressing of its one group.
+     * NextN fixture of {@link MemoryPlannerTest#withNextn()}: the main context takes {@code 1032 * n} bytes (two KV
+     * layers of 512 bytes per row plus a position and a shift delta), the NextN draft memory {@code 520 * n}, each
+     * memory with the addressing of its one group.
      */
     @Test
     public void nextnDraftMemoryIsReservedBesideThePlan() {
         ModelSpec spec = MemoryPlannerTest.withNextn();
         MemoryConfig mtp = MemoryConfig.builder().nextnMemory(true).build();
-        assertEquals(1028L * 4096 + ONE_GROUP_ADDRESSING, ContextFitter.requiredBytes(spec, auto(), 4096));
-        long budget = 1544L * 4096 + 2 * ONE_GROUP_ADDRESSING;
+        assertEquals(1032L * 4096 + ONE_GROUP_ADDRESSING, ContextFitter.requiredBytes(spec, auto(), 4096));
+        long budget = 1552L * 4096 + 2 * ONE_GROUP_ADDRESSING;
         assertEquals(budget, ContextFitter.requiredBytes(spec, mtp, 4096));
         assertEquals(4096, ContextFitter.fit(spec, mtp, budget));
         assertEquals(6144, ContextFitter.fit(spec, auto(), budget));
@@ -201,9 +207,9 @@ public class ContextFitterTest {
         MemoryConfig mtp = MemoryConfig.builder().nextnMemory(true).build();
         ContextFitter.Companion weights = ContextFitter.Companion.of("draft model weights", 1000L, 0L);
         MemoryPlan withNextn = MemoryPlanner.planForContext(spec, mtp, 4096);
-        assertEquals(516L * 4096 + ONE_GROUP_ADDRESSING,
+        assertEquals(520L * 4096 + ONE_GROUP_ADDRESSING,
                 ContextFitter.reservedBytes(spec, mtp, withNextn, ContextFitter.Companion.NONE));
-        assertEquals(516L * 4096 + ONE_GROUP_ADDRESSING + 1000L,
+        assertEquals(520L * 4096 + ONE_GROUP_ADDRESSING + 1000L,
                 ContextFitter.reservedBytes(spec, mtp, withNextn, weights));
         MemoryPlan plain = MemoryPlanner.planForContext(spec, auto(), 4096);
         assertEquals(1000L, ContextFitter.reservedBytes(spec, auto(), plain, weights));

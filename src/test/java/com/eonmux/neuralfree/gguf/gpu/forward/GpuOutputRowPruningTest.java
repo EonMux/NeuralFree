@@ -4,6 +4,7 @@ import com.eonmux.neuralfree.acceleration.GpuTestUtil;
 import com.eonmux.neuralfree.gguf.GGUFModelGPU;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
 import com.eonmux.neuralfree.gguf.engine.EngineModel;
+import com.eonmux.neuralfree.gguf.engine.ForwardBatch;
 import com.eonmux.neuralfree.gguf.engine.LLMModelFactory;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
@@ -27,7 +28,9 @@ import static org.junit.Assert.assertTrue;
  * every layer's caches the pruned chunks wrote, matches the CPU engine's. The Mixture-of-Experts cases prune a
  * qwen3moe last layer whose experts sit on the device, and in RAM behind the device expert cache
  * ({@code moeCacheMb}), so the routing and the cached expert pass, with its host-computed misses, run at the pruned
- * row counts.
+ * row counts. Over a paged memory the batched steps of continuous batching prune the same way: two prompts
+ * interleaved across ubatches read only their last rows, a ubatch reading none skips the last FFN, and the
+ * sampled rows and a decode step of both sequences after them match the CPU engine's.
  */
 public class GpuOutputRowPruningTest {
 
@@ -74,6 +77,66 @@ public class GpuOutputRowPruningTest {
     public void openclPrunedMoeRowsMatchTheCpuEngine() throws IOException {
         Assume.assumeTrue("OpenCL not available", GpuTestUtil.isOpenCLAvailable());
         assertPrunedMoeRowsMatch(EngineConfig.BackendMode.OPENCL);
+    }
+
+    @Test
+    public void cudaBatchedPrunedRowsMatchTheCpuEngine() throws IOException {
+        Assume.assumeTrue("CUDA not available", GpuTestUtil.isCudaAvailable());
+        assertBatchedPrunedRowsMatch(EngineConfig.BackendMode.CUDA);
+    }
+
+    @Test
+    public void openclBatchedPrunedRowsMatchTheCpuEngine() throws IOException {
+        Assume.assumeTrue("OpenCL not available", GpuTestUtil.isOpenCLAvailable());
+        assertBatchedPrunedRowsMatch(EngineConfig.BackendMode.OPENCL);
+    }
+
+    @Test
+    public void vulkanBatchedPrunedRowsMatchTheCpuEngine() throws IOException {
+        Assume.assumeTrue("Vulkan not available", GpuTestUtil.isVulkanAvailable());
+        assertBatchedPrunedRowsMatch(EngineConfig.BackendMode.VULKAN);
+    }
+
+    /**
+     * Two prompts in one paged batch, sequence 0's 29 rows before sequence 1's 11 (ubatches of 16: the first reads
+     * no row, the second sequence 0's last, the third sequence 1's last), then one decode row each.
+     */
+    private static void assertBatchedPrunedRowsMatch(EngineConfig.BackendMode mode) throws IOException {
+        Path model = SyntheticModels.llama().writeTempFile();
+        int[] tokens = tokens();
+        int split = 29;
+        ForwardBatch.Builder prompts = ForwardBatch.builder(N_TOKENS);
+        for (int i = 0; i < split; i++) {
+            prompts.add(tokens[i], i, 0, i == split - 1);
+        }
+        for (int i = split; i < N_TOKENS; i++) {
+            prompts.add(tokens[i], i - split, 1, i == N_TOKENS - 1);
+        }
+        ForwardBatch batch = prompts.build();
+        ForwardBatch decode = ForwardBatch.builder(2).add(NEXT, split, 0, true)
+                .add(NEXT + 1, N_TOKENS - split, 1, true).build();
+        MemoryConfig memory = MemoryConfig.builder().nCtx(4 * N_TOKENS).ubatch(UBATCH).parallel(2)
+                .typeK(KvDType.F32).typeV(KvDType.F32).build();
+        float[][] ref;
+        float[][] refNext;
+        try (EngineModel cpu = LLMModelFactory.open(model.toString(), EngineConfig.builder()
+                .backend(EngineConfig.BackendMode.CPU).memory(memory).build())) {
+            ref = cpu.forwardBackend().forwardBatch(batch);
+            refNext = cpu.forwardBackend().forwardBatch(decode);
+        }
+        try (EngineModel gpu = LLMModelFactory.open(model.toString(), EngineConfig.builder().backend(mode)
+                .gpuLayers(EngineConfig.GPU_LAYERS_ALL).memory(memory).build())) {
+            Assume.assumeTrue(mode + " did not open the GPU engine", gpu instanceof GGUFModelGPU);
+            float[][] rows = gpu.forwardBackend().forwardBatch(batch);
+            assertEquals(2, rows.length);
+            for (int i = 0; i < rows.length; i++) {
+                assertArrayEquals(mode + " batched prompt row " + i, ref[i], rows[i], TOL);
+            }
+            float[][] next = gpu.forwardBackend().forwardBatch(decode);
+            for (int i = 0; i < next.length; i++) {
+                assertArrayEquals(mode + " decode after the pruned batch, sequence " + i, refNext[i], next[i], TOL);
+            }
+        }
     }
 
     private static void assertPrunedRowsMatch(EngineConfig.BackendMode mode) throws IOException {

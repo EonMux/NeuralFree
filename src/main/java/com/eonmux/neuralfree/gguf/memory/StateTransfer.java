@@ -38,6 +38,18 @@ public interface StateTransfer {
         void read(boolean v, int row0, int rows, byte[] dst);
 
         /**
+         * {@link #read} without waiting for the bytes: {@code dst} holds the rows once the transfer's
+         * {@link StateTransfer#awaitReads()} returned, and the caller leaves it untouched until then, so the reads
+         * of a batch (every cache layer of a block) share one wait. The default reads at once.
+         *
+         * @throws IllegalArgumentException  for V of a layout whose V aliases K, or a destination too small
+         * @throws IndexOutOfBoundsException for rows outside the cache
+         */
+        default void readLater(boolean v, int row0, int rows, byte[] dst) {
+            read(v, row0, rows, dst);
+        }
+
+        /**
          * Stores {@code src[0, rows * rowBytes)} as rows {@code [row0, row0 + rows)} of K or V.
          *
          * @throws IllegalArgumentException  for V of a layout whose V aliases K, or a source too small
@@ -104,6 +116,13 @@ public interface StateTransfer {
 
     /** The recurrent-state layers, in allocation order. */
     List<State> states();
+
+    /**
+     * Waits for every {@link Cache#readLater} of this transfer's caches started since the last call; their
+     * destinations hold the rows once it returns. The default has nothing to wait for: its reads complete at once.
+     */
+    default void awaitReads() {
+    }
 
     /**
      * A copy of the contiguous form's position mirror of KV group {@code group}: the position each row stores,

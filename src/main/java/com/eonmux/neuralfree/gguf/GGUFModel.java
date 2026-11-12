@@ -730,8 +730,9 @@ public final class GGUFModel implements EngineModel {
     /**
      * The pooled output row of every token sequence of one batch (MEAN / CLS / LAST pooling, the RANK classifier
      * scores): a paged memory runs the sequences as multi-sequence forwards from position 0, packed to its
-     * {@code neuralfree.parallel} sequences and its context ({@link PagedEvaluations#hiddenSequences}); any other
-     * form embeds them one after another.
+     * {@code neuralfree.parallel} sequences and its context ({@link PagedEvaluations#hiddenSequences}); an encoder
+     * planned without memory packs them into memoryless batches of one ubatch, each sequence attending only itself
+     * ({@link PagedEvaluations#memorylessSequences}); any other form embeds them one after another.
      *
      * @throws UnsupportedOperationException for a decision model, and for NONE pooling
      * @throws IllegalArgumentException      when the batch or one of its sequences is empty, or a sequence is longer
@@ -743,7 +744,8 @@ public final class GGUFModel implements EngineModel {
         PagedEvaluations.checkSequences(sequences);
         EncodeGate.checkEncodeBatch(spec);
         ForwardBackend b = forwardBackend();
-        if (!PagedEvaluations.paged(b)) {
+        boolean packs = PagedEvaluations.packsMemoryless(b);
+        if (!PagedEvaluations.paged(b) && !packs) {
             float[][] out = new float[sequences.length][];
             for (int i = 0; i < sequences.length; i++) {
                 out[i] = encode(sequences[i]);
@@ -751,8 +753,13 @@ public final class GGUFModel implements EngineModel {
             return out;
         }
         PoolingHead head = poolingHead();
-        b.reset();
-        float[][][] hidden = PagedEvaluations.hiddenSequences(b, sequences);
+        float[][][] hidden;
+        if (packs) {
+            hidden = PagedEvaluations.memorylessSequences(b, sequences);
+        } else {
+            b.reset();
+            hidden = PagedEvaluations.hiddenSequences(b, sequences);
+        }
         float[][] out = new float[sequences.length][];
         for (int s = 0; s < sequences.length; s++) {
             out[s] = head.pool(hidden[s]);

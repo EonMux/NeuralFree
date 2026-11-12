@@ -82,6 +82,33 @@ public class BeamSearchResourceTest {
                 "the beam steps reused prompt rows");
     }
 
+    /**
+     * A beam search reports to the request latencies as one request: its first step is the time to the first token,
+     * each later step an inter-token gap, then its end-to-end latency and its queue time, once each.
+     */
+    @Test
+    void aBeamSearchReportsItsLatenciesAsOneRequest() {
+        Map<String, List<Long>> seen = new java.util.concurrent.ConcurrentHashMap<>();
+        RequestLatencies.Listener recorder = new RequestLatencies.Listener() {
+            private void note(String kind, long nanos) {
+                seen.computeIfAbsent(kind, k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(nanos);
+            }
+
+            @Override public void firstToken(long nanos) { note("first", nanos); }
+            @Override public void interToken(long nanos) { note("itl", nanos); }
+            @Override public void finished(long nanos) { note("e2e", nanos); }
+            @Override public void queued(long nanos) { note("queue", nanos); }
+        };
+        service.latencies().add(recorder);
+        JsonView body = view(resource.completions(completion("\"n\": 2, \"ignore_eos\": true")).getEntity());
+        assertEquals(2, size(body, "choices"));
+        assertEquals(1, seen.get("first").size(), "one time to first token: " + seen);
+        assertEquals(3, seen.get("itl").size(), "four steps of max_tokens 4 make three gaps: " + seen);
+        assertEquals(1, seen.get("e2e").size());
+        assertEquals(1, seen.get("queue").size());
+        assertTrue(seen.get("e2e").get(0) >= seen.get("first").get(0));
+    }
+
     @Test
     void aBeamChatIsDeterministicAndRanksTheSameBeamsOnEveryRun() {
         JsonView first = view(resource.chatCompletions(chat("\"n\": 3")).getEntity());

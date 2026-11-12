@@ -572,8 +572,10 @@ public final class PagedSequences implements SequenceMemory {
         dropRowMoves(seq); // the removal frees the rows the queued moves would read
         hi = Math.min(hi, max + 1);
         boolean tail = hi == max + 1;
+        // the kept rows' position range, gathered by the removal's own walk over every page
+        int[] kept = {-1, -1};
         for (int g = 0; g < groupsCount(); g++) {
-            removeGroup(g, seq, lo, hi);
+            removeGroup(g, seq, lo, hi, kept);
             if (tail) {
                 // the cursor follows the live rows: a row move (a verify commit's compaction) unmaps its source
                 // before the removal runs, so the range can hold no live row at all and the dead slots it leaves
@@ -590,7 +592,8 @@ public final class PagedSequences implements SequenceMemory {
             }
         }
         states[seq].removePositions(lo, hi);
-        recomputePos(seq);
+        posMinArr[seq] = kept[0];
+        posMaxArr[seq] = kept[1];
     }
 
     /**
@@ -632,9 +635,11 @@ public final class PagedSequences implements SequenceMemory {
      * leaves through {@code removeBack}: a page that is wholly in the range always sits above the pages still to
      * visit, so it is the last entry when the walk reaches it and no interior tombstone can ever stay behind in
      * the list. A shared page counts only the rows of the removing sequence's own slots: rows above its cursor
-     * belong to the holder it shares the page with and stay untouched.
+     * belong to the holder it shares the page with and stay untouched. The positions of the live own rows the
+     * removal keeps widen {@code kept} ({@code {min, max}}, -1 while empty): they are the sequence's stored range
+     * afterwards, since a page that leaves keeps none and the cursor moves only over dead rows.
      */
-    private void removeGroup(int g, int seq, int lo, int hi) {
+    private void removeGroup(int g, int seq, int lo, int hi, int[] kept) {
         PageList list = lists[seq][g];
         int ownSlots = Math.min(slots[g][seq], list.size() * pageSize);
         for (int k = list.size() - 1; k >= 0; k--) {
@@ -651,6 +656,9 @@ public final class PagedSequences implements SequenceMemory {
                 live++;
                 if (pos >= lo && pos < hi) {
                     liveIn++;
+                } else {
+                    kept[0] = kept[0] < 0 ? pos : Math.min(kept[0], pos);
+                    kept[1] = Math.max(kept[1], pos);
                 }
             }
             if (live == 0 || liveIn == live) {
@@ -1266,6 +1274,16 @@ public final class PagedSequences implements SequenceMemory {
 
     /** The stored range of {@code seq} from its own rows (a shared page's rows above its cursor are another's). */
     private void recomputePos(int seq) {
+        int[] range = scannedRange(seq);
+        posMinArr[seq] = range[0];
+        posMaxArr[seq] = range[1];
+    }
+
+    /**
+     * {@code {min, max}} of the positions {@code seq}'s own live rows hold over every group, by a walk over all of
+     * its pages ({@code {-1, -1}} when it holds none).
+     */
+    int[] scannedRange(int seq) {
         int min = -1;
         int max = -1;
         for (int g = 0; g < groupsCount(); g++) {
@@ -1283,10 +1301,8 @@ public final class PagedSequences implements SequenceMemory {
                 }
             }
         }
-        posMinArr[seq] = min;
-        posMaxArr[seq] = max;
+        return new int[] {min, max};
     }
-
 
     // ------------------------------------------------------------------ SequenceMemory
 

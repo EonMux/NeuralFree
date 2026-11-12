@@ -22,10 +22,11 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * A multi-input pooling call over a memoryless encoder runs its one-shot forwards in as few pump handoffs as the pump
- * allows, and keeps the per-request contract of one handoff per input: another caller's request waiting for the pump
- * runs between the batch's inputs, the request budget bounds each input's wait rather than the whole batch, and a
- * batch whose caller gave up stops before its next input, so the pump is free again within about one input.
+ * A multi-input pooling call over a memoryless encoder runs its forwards in as few pump handoffs as the pump allows,
+ * and keeps the per-request contract of one handoff per forward (one packed batch of inputs on an encoder that packs
+ * them, one input otherwise): another caller's request waiting for the pump runs between the batch's forwards, the
+ * request budget bounds each forward's wait rather than the whole batch, and a batch whose caller gave up stops
+ * before its next forward, so the pump is free again within about one forward.
  */
 class PoolingOneShotHandoffTest {
 

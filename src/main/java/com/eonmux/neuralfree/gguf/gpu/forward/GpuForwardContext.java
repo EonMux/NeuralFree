@@ -56,6 +56,7 @@ public final class GpuForwardContext {
     private final EplbLoadWindow moeLoadWindow;
     private final MoeExpertRemap moeExpertRemap;
     private final IntPredicate hostKv;
+    private final GpuStepSegments stepSegments;
 
     private GpuForwardContext(Builder b) {
         this.backend = b.kernels.backend();
@@ -79,6 +80,7 @@ public final class GpuForwardContext {
         this.moeLoadWindow = b.moeLoadWindow;
         this.moeExpertRemap = b.moeExpertRemap;
         this.hostKv = b.hostKv;
+        this.stepSegments = b.stepSegments != null ? b.stepSegments : new GpuStepSegments();
     }
 
     /**
@@ -161,6 +163,12 @@ public final class GpuForwardContext {
         return memory;
     }
 
+    /**
+     * The sequence runs of the running packed memoryless step ({@link GpuStepSegments}), shared by every context
+     * derived from this one; the forward driver closes it.
+     */
+    public GpuStepSegments stepSegments() { return stepSegments; }
+
     /** This context with another hidden-state tap ({@link HiddenTap#NONE} to stop tapping). */
     public GpuForwardContext withHiddenTap(HiddenTap tap) {
         Builder b = toBuilder();
@@ -183,6 +191,7 @@ public final class GpuForwardContext {
         b.moeLoadWindow = moeLoadWindow;
         b.moeExpertRemap = moeExpertRemap;
         b.hostKv = hostKv;
+        b.stepSegments = stepSegments;
         return b;
     }
 
@@ -211,6 +220,7 @@ public final class GpuForwardContext {
         private EplbLoadWindow moeLoadWindow;
         private MoeExpertRemap moeExpertRemap;
         private IntPredicate hostKv = il -> false;
+        private GpuStepSegments stepSegments;
 
         private Builder(LlmKernels kernels, GpuOps ops, GpuWeights weights, ModelSpec spec) {
             this.kernels = Objects.requireNonNull(kernels, "kernels");
