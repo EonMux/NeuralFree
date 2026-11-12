@@ -832,6 +832,8 @@ LLM_AddPosEmbed	eltwise.cl	2	2	i,i	iiBB
 LLM_AltUp_Correct	gemma3n.cl	4	9	i,i,i,i,i,i,i,i,i	iiiiiiiiiBBBB
 LLM_AltUp_Predict	gemma3n.cl	3	7	i,i,i,i,i,i,i	iiiiiiiBBB
 LLM_Argmax	sampling.cl	2	2	i,i	iBBi
+LLM_ArgmaxCombine	sampling.cl	2	2	i,i	iBBi
+LLM_ArgmaxSplit	sampling.cl	2	3	i,i,i	iiBBi
 LLM_AttnCpMerge	cp_merge.cl	3	3	i,i,i	iiiBBB
 LLM_AttnOutGate	attn_ext.cl	3	9	i,i,i,i,i,i,i,i,i	iiiiiiiiiBBB
 LLM_AttnSsmaxScale	attn_ext.cl	4	6	i,i,i,i,i,i	iiiiiiBBBB
@@ -1782,6 +1784,8 @@ Q4_K_MatVecN7_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q4_K_MatVecN8_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q4_K_MatVecN9_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q4_K_MatVecN_Q8	matvec_kquant.cl	3	3	i,i,i	iiiBBB
+Q4_K_MatVecQKVRowVQ6_K_Q8	matvec_row.cl	7	4	i,i,i,i	iiiiBBBBBBB
+Q4_K_MatVecQKVRow_Q8	matvec_row.cl	7	4	i,i,i,i	iiiiBBBBBBB
 Q4_K_MatVecRow_Q8	matvec_row.cl	3	2	i,i	iiBBB
 Q4_K_MatVec_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q5_0_BatchEmbeddingLookup	matvec_legacy.cl	3	2	i,i	iiBBB
@@ -1959,6 +1963,8 @@ Q5_K_MatVecN7_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q5_K_MatVecN8_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q5_K_MatVecN9_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q5_K_MatVecN_Q8	matvec_kquant.cl	3	3	i,i,i	iiiBBB
+Q5_K_MatVecQKVRowVQ6_K_Q8	matvec_row.cl	7	4	i,i,i,i	iiiiBBBBBBB
+Q5_K_MatVecQKVRow_Q8	matvec_row.cl	7	4	i,i,i,i	iiiiBBBBBBB
 Q5_K_MatVecRow_Q8	matvec_row.cl	3	2	i,i	iiBBB
 Q5_K_MatVec_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q6_K_BatchEmbeddingLookup	matvec_kquant.cl	3	2	i,i	iiBBB
@@ -2032,6 +2038,7 @@ Q6_K_MatVecN7_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q6_K_MatVecN8_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q6_K_MatVecN9_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q6_K_MatVecN_Q8	matvec_kquant.cl	3	3	i,i,i	iiiBBB
+Q6_K_MatVecQKVRow_Q8	matvec_row.cl	7	4	i,i,i,i	iiiiBBBBBBB
 Q6_K_MatVecRow_Q8	matvec_row.cl	3	2	i,i	iiBBB
 Q6_K_MatVec_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q8_0_BatchMatMulId	moe_matvec.cl	6	8	i,i,i,i,i,i,i,i	iiiiiiiiBBBBBB
@@ -2101,6 +2108,7 @@ Q8_0_MatVecN7_Q8	matvec_q8_0.cl	3	2	i,i	iiBBB
 Q8_0_MatVecN8_Q8	matvec_q8_0.cl	3	2	i,i	iiBBB
 Q8_0_MatVecN9_Q8	matvec_q8_0.cl	3	2	i,i	iiBBB
 Q8_0_MatVecN_Q8	matvec_q8_0.cl	3	3	i,i,i	iiiBBB
+Q8_0_MatVecQKVRow_Q8	matvec_row.cl	7	4	i,i,i,i	iiiiBBBBBBB
 Q8_0_MatVecRow_Q8	matvec_row.cl	3	2	i,i	iiBBB
 Q8_0_MatVec_Q8	matvec_q8_0.cl	3	2	i,i	iiBBB
 Q8_K_BatchEmbeddingLookup	matvec_kquant.cl	3	2	i,i	iiBBB

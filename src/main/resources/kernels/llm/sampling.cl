@@ -55,28 +55,104 @@ NF_KERNEL void LLM_Softmax(
 
 /* Index sentinel of an argmax candidate that holds no element. */
 #define NF_ARGMAX_NONE 0x7fffffff
+/* Elements each work-item of an LLM_ArgmaxSplit group loads, all issued before the first compare
+ * (Java: GpuArgmax.UNROLL). */
+#define NF_ARGMAX_UNROLL 8
 
 /*
  * Total order of argmax candidates (v, i): a non-NaN value beats NaN; among non-NaN values the
- * larger wins; equal values (and two NaNs) go to the lower index. Returns 1 when (v, i) beats
- * (bv, bi). This makes the result the first maximum, as std::max_element and the llama.cpp greedy
- * sampler (llama-sampler.cpp llama_sampler_greedy_apply, strict '>' scan), and never selects NaN
- * unless the row holds nothing else.
+ * larger wins; equal values (-0 and +0 among them, and two NaNs) go to the lower index. This makes
+ * the result the first maximum, as std::max_element and the llama.cpp greedy sampler
+ * (llama-sampler.cpp llama_sampler_greedy_apply, strict '>' scan), and never selects NaN unless
+ * the row holds nothing else.
+ *
+ * nf_argmax_key maps a value to an unsigned rank with that order on values: NaN ranks 0, below
+ * every other value (-INF ranks 0x007fffff); -0 ranks as +0; otherwise the sign-magnitude bits
+ * become two's-order bits. It reads the bits only, so no float compare and no fast-math NaN rule
+ * enters the order. Candidate (k, i) beats (bk, bi) when k > bk || (k == bk && i < bi); the order is
+ * total, so every reduction tree and every split of the row gives the same winner.
  */
-NF_INLINE int nf_argmax_better(float v, int i, float bv, int bi) {
-    if (isnan(v)) {
-        return isnan(bv) && i < bi;
+NF_INLINE uint nf_argmax_key(float v) {
+    const uint u = as_uint(v);
+    const uint a = u & 0x7fffffffu;
+    if (a > 0x7f800000u) {
+        return 0u;
     }
-    if (isnan(bv)) {
-        return 1;
+    if (a == 0u) {
+        return 0x80000000u;
     }
-    return v > bv || (v == bv && i < bi);
+    return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u);
+}
+
+/* 1 when candidate (k, i) beats (bk, bi). */
+NF_INLINE int nf_argmax_before(uint k, int i, uint bk, int bi) {
+    return k > bk || (k == bk && i < bi);
+}
+
+/*
+ * Work-group reduction of every work-item's candidate (k, i) into (*wk, *wi), valid in work-item 0.
+ * Every work-item calls it in uniform control flow; sk / si are NF_LOCAL arrays of at least L
+ * entries. CUDA and HIP fold each warp by shuffles; OpenCL with subgroups folds each subgroup by
+ * sub_group_reduce_max of the keys and sub_group_reduce_min of the indices holding the maximum key;
+ * work-item 0 then folds the subgroup winners. Without subgroups a local-memory tree.
+ */
+NF_INLINE void nf_wg_argmax(uint k, int i, NF_LOCAL_PTR uint* sk, NF_LOCAL_PTR int* si, uint* wk, int* wi) {
+    const int lid = get_local_id(0);
+#if defined(NF_HAS_SG_SHUFFLE) || defined(USE_SUBGROUPS)
+#ifdef NF_HAS_SG_SHUFFLE
+    for (int o = 16; o > 0; o >>= 1) {
+        const uint ok = (uint)nf_sg_shuffle_xor_i((int)k, o);
+        const int oi = nf_sg_shuffle_xor_i(i, o);
+        if (nf_argmax_before(ok, oi, k, i)) {
+            k = ok;
+            i = oi;
+        }
+    }
+#else
+    const uint mk = sub_group_reduce_max(k);
+    i = sub_group_reduce_min(k == mk ? i : NF_ARGMAX_NONE);
+    k = mk;
+#endif
+    if (get_sub_group_local_id() == 0) {
+        sk[get_sub_group_id()] = k;
+        si[get_sub_group_id()] = i;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lid == 0) {
+        k = sk[0];
+        i = si[0];
+        const int n_sg = (int)get_num_sub_groups();
+        for (int w = 1; w < n_sg; w++) {
+            if (nf_argmax_before(sk[w], si[w], k, i)) {
+                k = sk[w];
+                i = si[w];
+            }
+        }
+    }
+#else
+    sk[lid] = k;
+    si[lid] = i;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int stride = get_local_size(0) >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride && nf_argmax_before(sk[lid + stride], si[lid + stride], sk[lid], si[lid])) {
+            sk[lid] = sk[lid + stride];
+            si[lid] = si[lid + stride];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    k = sk[0];
+    i = si[0];
+#endif
+    *wk = k;
+    *wi = i;
 }
 
 /*
  * Row-wise argmax over n_rows rows of `size` floats (row stride = size): max_idx[row] is the index
  * of the first maximum of row `row`. NaN is never selected; a row of only NaN yields 0, and so does
- * size == 0. Dispatch: global = {n_rows * L}, local = {L} (CUDA and HIP: a multiple of 32); one workgroup per
+ * size == 0. One workgroup scans a whole row, the form for rows of at most NF_ARGMAX_UNROLL * L
+ * elements; longer rows take LLM_ArgmaxSplit and LLM_ArgmaxCombine, which give the same ids.
+ * Dispatch: global = {n_rows * L}, local = {L} (CUDA and HIP: a multiple of 32); one workgroup per
  * row.
  */
 NF_KERNEL void LLM_Argmax(
@@ -89,67 +165,116 @@ NF_KERNEL void LLM_Argmax(
     if (row >= n_rows) return;
     const int lid = get_local_id(0);
     const int lsize = get_local_size(0);
-    NF_LOCAL float best_v[LLM_DIMX];
+    NF_LOCAL uint best_k[LLM_DIMX];
     NF_LOCAL int best_i[LLM_DIMX];
 
-    const nf_i64 base = (nf_i64)row * size;
-    float bv = NF_NAN;
+    NF_GLOBAL const float* x = input + (nf_i64)row * size;
+    uint bk = 0u;
     int bi = NF_ARGMAX_NONE;
     for (int i = lid; i < size; i += lsize) {
-        const float v = input[base + i];
-        if (nf_argmax_better(v, i, bv, bi)) {
-            bv = v;
+        const uint k = nf_argmax_key(x[i]);
+        if (nf_argmax_before(k, i, bk, bi)) {
+            bk = k;
             bi = i;
         }
     }
-#ifdef NF_HAS_SG_SHUFFLE
-    /* the order is total, so any reduction tree gives the same winner: within each warp by shuffles, then the
-     * warps' winners through local memory */
-    for (int o = 16; o > 0; o >>= 1) {
-        const float ov = nf_sg_shuffle_xor(bv, o);
-        const int oi = nf_sg_shuffle_xor_i(bi, o);
-        if (nf_argmax_better(ov, oi, bv, bi)) {
-            bv = ov;
-            bi = oi;
-        }
-    }
-    if (get_sub_group_local_id() == 0) {
-        best_v[get_sub_group_id()] = bv;
-        best_i[get_sub_group_id()] = bi;
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
+    uint wk;
+    int wi;
+    nf_wg_argmax(bk, bi, best_k, best_i, &wk, &wi);
     if (lid == 0) {
-        const int n_sg = (int)get_num_sub_groups();
-        for (int w = 1; w < n_sg; w++) {
-            if (nf_argmax_better(best_v[w], best_i[w], bv, bi)) {
-                bv = best_v[w];
-                bi = best_i[w];
-            }
-        }
-        max_idx[row] = (bi == NF_ARGMAX_NONE) ? 0 : bi;
+        max_idx[row] = (wi == NF_ARGMAX_NONE) ? 0 : wi;
     }
-#else
-    best_v[lid] = bv;
-    best_i[lid] = bi;
-    barrier(CLK_LOCAL_MEM_FENCE);
+}
 
-    for (int stride = lsize >> 1; stride > 0; stride >>= 1) {
-        if (lid < stride) {
-            const float ov = best_v[lid + stride];
-            const int oi = best_i[lid + stride];
-            if (nf_argmax_better(ov, oi, best_v[lid], best_i[lid])) {
-                best_v[lid] = ov;
-                best_i[lid] = oi;
-            }
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
+/*
+ * First pass of the split row argmax: the vocabulary-wide row of a decode step is too long for one
+ * workgroup to stream at full bandwidth, so each row is cut into n_chunks chunks of
+ * NF_ARGMAX_UNROLL * L elements, one workgroup each. Workgroup g = row * n_chunks + c writes the
+ * winner of chunk c of row `row` (in the order above) to part[2 g] (its rank key, as int bits) and
+ * part[2 g + 1] (its index, NF_ARGMAX_NONE for a chunk past the row's end). Each work-item issues
+ * its NF_ARGMAX_UNROLL coalesced loads before the first compare.
+ * Dispatch: global = {n_rows * n_chunks * L}, local = {L} (CUDA and HIP: a multiple of 32);
+ * n_chunks = ceil(size / (NF_ARGMAX_UNROLL * L)) >= 1, 1 <= size <= 2^30.
+ */
+NF_KERNEL void LLM_ArgmaxSplit(
+    const int size,
+    const int n_chunks,
+    NF_GLOBAL const float* input,
+    NF_GLOBAL int* part,
+    const int n_rows)
+{
+    const int g = get_group_id(0);
+    if (g >= n_rows * n_chunks) return;
+    const int row = g / n_chunks;
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+    NF_LOCAL uint best_k[LLM_DIMX];
+    NF_LOCAL int best_i[LLM_DIMX];
+
+    NF_GLOBAL const float* x = input + (nf_i64)row * size;
+    const int i0 = (g - row * n_chunks) * (NF_ARGMAX_UNROLL * lsize) + lid;
+    float v[NF_ARGMAX_UNROLL];
+#pragma unroll
+    for (int u = 0; u < NF_ARGMAX_UNROLL; u++) {
+        const int i = i0 + u * lsize;
+        v[u] = i < size ? x[i] : NF_NAN;
     }
-
+    uint bk = 0u;
+    int bi = NF_ARGMAX_NONE;
+#pragma unroll
+    for (int u = 0; u < NF_ARGMAX_UNROLL; u++) {
+        const int i = i0 + u * lsize;
+        const uint k = nf_argmax_key(v[u]);
+        if (i < size && nf_argmax_before(k, i, bk, bi)) {
+            bk = k;
+            bi = i;
+        }
+    }
+    uint wk;
+    int wi;
+    nf_wg_argmax(bk, bi, best_k, best_i, &wk, &wi);
     if (lid == 0) {
-        const int r = best_i[0];
-        max_idx[row] = (r == NF_ARGMAX_NONE) ? 0 : r;
+        part[2 * g] = (int)wk;
+        part[2 * g + 1] = wi;
     }
-#endif
+}
+
+/*
+ * Second pass of the split row argmax: max_idx[row] = the index of the winner among the n_chunks
+ * chunk winners of row `row` in part (LLM_ArgmaxSplit), 0 when the row holds only NaN.
+ * Dispatch: global = {n_rows * L}, local = {L} (CUDA and HIP: a multiple of 32); one workgroup per
+ * row.
+ */
+NF_KERNEL void LLM_ArgmaxCombine(
+    const int n_chunks,
+    NF_GLOBAL const int* part,
+    NF_GLOBAL int* max_idx,
+    const int n_rows)
+{
+    const int row = get_group_id(0);
+    if (row >= n_rows) return;
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+    NF_LOCAL uint best_k[LLM_DIMX];
+    NF_LOCAL int best_i[LLM_DIMX];
+
+    NF_GLOBAL const int* p = part + 2 * (nf_i64)row * n_chunks;
+    uint bk = 0u;
+    int bi = NF_ARGMAX_NONE;
+    for (int c = lid; c < n_chunks; c += lsize) {
+        const uint k = (uint)p[2 * c];
+        const int i = p[2 * c + 1];
+        if (nf_argmax_before(k, i, bk, bi)) {
+            bk = k;
+            bi = i;
+        }
+    }
+    uint wk;
+    int wi;
+    nf_wg_argmax(bk, bi, best_k, best_i, &wk, &wi);
+    if (lid == 0) {
+        max_idx[row] = (wi == NF_ARGMAX_NONE) ? 0 : wi;
+    }
 }
 
 /*

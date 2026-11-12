@@ -40,7 +40,7 @@
  *   1. q of the g_tile heads is staged in q_s; ALiBi slopes per head in stats.
  *   2. Pass 1: work-item j scores keys j, j + 128, ... of the split; one K row read feeds the g_tile
  *      dot products; masked keys score -INF without touching K.
- *      NF_HAS_SG_SHUFFLE fast path (plain F32/F16/BF16 caches, no row-relative bias table, split_len
+ *      NF_HAS_SG_SHUFFLE fast path (F32/F16/BF16/Q8_0 caches, no row-relative bias table, split_len
  *      <= NF_FA_WG, g_tile <= 4): the workgroup first stages the split's rows cooperatively — the
  *      page id -> physical row -> kv_pos chain resolved for every key in parallel instead of once per
  *      serial scan step — then warp w scans the 32 keys [w * 32, +32) of the split, each lane
@@ -85,15 +85,17 @@ NF_INLINE int nf_fd_plan_ok(int n_head, int n_head_kv, int d_k, int d_v, int g_t
  * The warp fast path's gate (NF_HAS_SG_SHUFFLE backends only; elsewhere the scalar body runs and the
  * plan below always generates its shape): one query head's K row is read as one coalesced float4 per
  * lane (the row spans exactly one warp instruction) and its dot is reduced with the subgroup butterfly,
- * so pass 1 needs no local-memory tree per key; pass 2 accumulates V the same coalesced way. Plain
- * cache element types only (F32/F16/BF16: the loaders are direct vector loads, no side planes or
- * centroids), no row-relative bias table, head dims of at most NF_FA_FAST_DIM (32 lanes cover exactly
- * 32 * 4 dims; a wider row would need the lanes to loop and only the scalar body is measured there),
- * and the split no longer than the workgroup (each warp scans 32 keys of it). d_k and d_v are
- * multiples of 4 by the plan; lanes past d_k/4 or d_v/4 contribute zeros.
+ * so pass 1 needs no local-memory tree per key; pass 2 accumulates V the same coalesced way. F32,
+ * F16, BF16 and Q8_0 caches only (nf_fd_fast_load4: direct vector loads, a Q8_0 lane's 4 codes as two
+ * 2-byte words and its block's scale; no side planes, centroids or per-row scales), no row-relative
+ * bias table, head dims of at most NF_FA_FAST_DIM (32 lanes cover exactly 32 * 4 dims; a wider row
+ * would need the lanes to loop and only the scalar body is measured there), and the split no longer
+ * than the workgroup (each warp scans 32 keys of it). d_k and d_v are multiples of 4 by the plan;
+ * lanes past d_k/4 or d_v/4 contribute zeros.
  *
  * A step over at most one workgroup of keys reaches the fast path only through the plan's route: the
- * mixer routes those steps to the tensor-core prefill when the plan has one (paired CUDA benches over
+ * mixer routes those steps (and every one-row step over a Q8_0 cache) to the tensor-core prefill when
+ * the plan has one (paired CUDA benches over
  * 128-token runs put the prefill route 3-7% ahead of the decode route on every model tried), so the
  * scalar body below serves short steps only where no prefill kernel exists or the caches refuse the
  * fast path. The fast body measured faster than the scalar body at every depth on the decode route
@@ -103,8 +105,25 @@ NF_INLINE int nf_fd_fast_ok(int k_type, int v_type, int d_k, int d_v, int split_
                             int n_buckets, int g_tile) {
     return d_k <= NF_FA_FAST_DIM && d_v <= NF_FA_FAST_DIM
         && split_len <= NF_FA_WG && n_buckets == 0 && g_tile <= NF_FA_LG
-        && (k_type == NF_KV_F32 || k_type == NF_KV_F16 || k_type == NF_KV_BF16)
-        && (v_type == NF_KV_F32 || v_type == NF_KV_F16 || v_type == NF_KV_BF16);
+        && (k_type == NF_KV_F32 || k_type == NF_KV_F16 || k_type == NF_KV_BF16 || k_type == NF_KV_Q8_0)
+        && (v_type == NF_KV_F32 || v_type == NF_KV_F16 || v_type == NF_KV_BF16 || v_type == NF_KV_Q8_0);
+}
+
+/*
+ * Values e .. e + 3 (e % 4 == 0) of a fast-path cache (nf_fd_fast_ok's types), as nf_kv_load4 decodes them: a Q8_0
+ * row's 4 codes are two 2-byte words of the 34-byte block (2-byte aligned, as every block), times the block's scale.
+ */
+NF_INLINE float4 nf_fd_fast_load4(NF_GLOBAL const uchar* p, nf_i64 e, int kv_type) {
+    if (kv_type == NF_KV_Q8_0) {
+        NF_GLOBAL const uchar* bp = p + (e >> 5) * Q8_0_BLOCK_BYTES;
+        NF_GLOBAL const ushort* c = (NF_GLOBAL const ushort*)(bp + 2 + (int)(e & 31));
+        const ushort lo = c[0];
+        const ushort hi = c[1];
+        const float d = vload_half(0, (NF_GLOBAL const NF_HALF*)bp);
+        return NF_F4(d * (float)(nf_i8)(lo & 0xFF), d * (float)(nf_i8)(lo >> 8),
+                     d * (float)(nf_i8)(hi & 0xFF), d * (float)(nf_i8)(hi >> 8));
+    }
+    return nf_kv_load4(p, e, kv_type);
 }
 #endif /* NF_HAS_SG_SHUFFLE */
 
@@ -251,6 +270,8 @@ NF_INLINE void nf_fd_run(
     const nf_i64 k_head = (nf_i64)kvh * k_head_stride;
 #ifdef NF_HAS_SG_SHUFFLE
     if (fd_fast) {
+        /* the fast path's cache types hold one K scale per KV head (nf_fd_fast_ok), loaded once */
+        const float k_scale = nf_kv_head_scale(k_type, kv_scales, 0, kvh, n_head_kv, 0);
         const int slane = lid & 31;
         const int w = lid >> 5;
         const int j0 = w * 32;
@@ -264,7 +285,6 @@ NF_INLINE void nf_fd_run(
             int vis = 0;
             int row = 0;
             nf_i64 e0 = 0;
-            float ks = 1.0f;
             if (j < n_keys && fd_rows[j] >= 0) {
                 /* the staged row and position: the page id -> row -> kv_pos chain ran in step 1b */
                 row = fd_rows[j];
@@ -273,7 +293,6 @@ NF_INLINE void nf_fd_run(
                                            q_pos, causal, swa_type, n_swa);
                 if (vis) {
                     e0 = (nf_i64)row * k_row_stride + k_head;
-                    ks = nf_kv_head_scale(k_type, kv_scales, row, kvh, n_head_kv, 0);
                 }
             }
             float part[4];
@@ -282,8 +301,7 @@ NF_INLINE void nf_fd_run(
                 part[g] = 0.0f;
             }
             if (vis && slane < dk4) {
-                const float4 k4 = nf_kv_attn_load4(k, e0 + slane * 4, row, k_type, k_planes, plane_stride,
-                                                   k_row_stride, d_k, centroids) * ks;
+                const float4 k4 = nf_fd_fast_load4(k, e0 + slane * 4, k_type) * k_scale;
 #pragma unroll
                 for (int g = 0; g < 4; g++) {
                     if (g < g_tile) {
@@ -417,6 +435,7 @@ NF_INLINE void nf_fd_run(
          * below reads. */
         const int dv4 = d_v >> 2;
         const nf_i64 v_head = (nf_i64)kvh * v_head_stride;
+        const float v_scale = nf_kv_head_scale(v_type, kv_scales, 0, kvh, n_head_kv, 1);
         float4 acc[4];
 #pragma unroll
         for (int g = 0; g < 4; g++) {
@@ -435,11 +454,9 @@ NF_INLINE void nf_fd_run(
             }
             const int vrow = fd_rows[j];   /* staged with the scores' rows: live implies an on-page row */
             const nf_i64 e0 = (nf_i64)vrow * v_row_stride + v_head;
-            const float v_scale = nf_kv_head_scale(v_type, kv_scales, vrow, kvh, n_head_kv, 1);
             float4 v4 = NF_F4S(0.0f);
             if (lane < dv4) {
-                v4 = nf_kv_attn_load4(v, e0 + lane * 4, vrow, v_type, v_planes, plane_stride,
-                                      v_row_stride, d_v, centroids) * v_scale;
+                v4 = nf_fd_fast_load4(v, e0 + lane * 4, v_type) * v_scale;
             }
 #pragma unroll
             for (int g = 0; g < 4; g++) {

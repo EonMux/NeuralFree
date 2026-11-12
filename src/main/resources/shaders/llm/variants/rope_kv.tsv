@@ -1,5 +1,6 @@
 # kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
-# RoPE (kernels/llm/rope.cl) and KV cache store / context-shift kernels (kernels/llm/kv_cache.cl).
+# RoPE (kernels/llm/rope.cl), KV cache store / context-shift kernels (kernels/llm/kv_cache.cl) and the decode step
+# inputs (kernels/llm/step_inputs.cl).
 # rope.cl
 LLM_RoPE_Ext	rope.comp
 LLM_RoPE_FoPE	fope_rope.comp
@@ -42,3 +43,5 @@ LLM_KV_RopeShift_FP8_E5M2	kv_shift.comp	KV=NF_KV_FP8_E5M2
 LLM_KV_RopeShift_FP8_PER_TOKEN_HEAD	kv_shift.comp	KV=NF_KV_FP8_PER_TOKEN_HEAD
 LLM_KV_RopeShift_INT8_PER_TOKEN_HEAD	kv_shift.comp	KV=NF_KV_INT8_PER_TOKEN_HEAD
 LLM_KV_RopeShift_INT4_PER_TOKEN_HEAD	kv_shift.comp	KV=NF_KV_INT4_PER_TOKEN_HEAD
+# step_inputs.cl
+LLM_DecodeStepInputs	step_inputs.comp

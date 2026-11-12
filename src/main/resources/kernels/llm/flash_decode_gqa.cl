@@ -3,7 +3,7 @@
  * decode attention with every query head of a KV group in one work-group. Requires: common/dialect.h,
  * common/config.h, common/math.h, common/kv_types.h, common/attn_common.h */
 /*
- * CUDA twins (a [cuda] manifest entry; shaders/llm/flash_decode_gqa.comp ports the dense entries to Vulkan) of
+ * CUDA twins (a [cuda] manifest entry; shaders/llm/flash_decode_gqa.comp ports every entry to Vulkan) of
  * LLM_FlashDecode_<KV> and LLM_FlashDecodePaged_<KV> (flash_decode.cl) for plain F16, BF16 and Q8_0
  * caches with head dims of 64 or 128 and at most NF_FDG_MAX_G query heads per KV head: the same arguments, the same
  * addressing (the dense key range [kv_start, kv_end) with the q_pos scalar, or the paged per-sequence page tables,
@@ -13,19 +13,19 @@
  * and V row is read once for the G heads instead of once per head, and the keys stream through independent key groups
  * of L = D / 8 lanes (16 groups for D = 64, 8 for D = 128), each with its own online softmax:
  *
- *   - Staging: the work-group resolves the page id -> physical row -> kv_pos chain of NF_FDG_STAGE keys of the
- *     split at a time in parallel into shared memory (row -1 for a masked, unmapped or invisible slot); a split
- *     longer than one stage runs its stages in order, so the split length is not bounded by the staging.
- *   - Key loop: key group c (lanes c * L .. c * L + L - 1) takes keys c, c + 128 / L, ... of each stage,
- *     NF_FDG_KB of them per iteration with every load issued before the first use; lane i of the group holds
+ *   - Key loop: key group c (lanes c * L .. c * L + L - 1) takes keys c, c + 128 / L, ... of the split,
+ *     NF_FDG_KB of them per iteration with every load issued before the first use. Each lane resolves the page id
+ *     -> physical row -> kv_pos chain of its group's keys itself, one iteration ahead (the next iteration's chain
+ *     loads are in flight while the current keys compute), so no shared staging pass or barrier sits between the
+ *     address chain and the K / V loads; a masked, unmapped or invisible slot loads nothing. Lane i of the group holds
  *     dims [8 i, 8 i + 8) of the G query rows in registers and loads its slice of the K row and of the V row as
  *     one 16-byte vector each (one coalesced 2 * D-byte row per group per key; a Q8_0 row: the slice's 8 codes and
  *     its block's scale); the G dots reduce over the group's L lanes with butterfly shuffles; each group keeps its
  *     own running max, sum and output slice.
  *   - Merge: the groups of a warp merge by shuffles, the four warps through shared memory.
  *
- * Each key group visits its keys in ascending order whatever NF_FDG_KB and the stage length (a stage is a whole
- * number of key-group strides), so the result does not depend on how a split is staged.
+ * Each key group visits its keys in ascending order whatever NF_FDG_KB, so the result does not depend on how many
+ * keys are in flight.
  *
  * Arguments: the dense entry takes those of LLM_FlashDecode_<KV>; the paged entry those of
  * LLM_FlashDecodePaged_<KV> (NF_FLASH_DECODE_PAGED_RUN_ARGS_PAGED). g_tile is ignored (the work-group always
@@ -46,30 +46,38 @@
 #define NF_FDG_DS        8     /* dims per lane: one 16-byte vector of a K or V row */
 #define NF_FDG_MAX_G     4     /* query heads per KV head the registers hold */
 #define NF_FDG_MAX_D     128   /* largest head dim */
-#define NF_FDG_STAGE     512   /* keys staged at once (a whole number of key-group strides) */
 #define NF_FDG_KB        2     /* keys per key group in flight */
 
 /*
- * The lane's NF_FDG_DS consecutive values of a cache at element offset e (a multiple of 8), as floats: one 16-byte
- * load of an F16 / BF16 row, or the 8 codes of a Q8_0 block (e % 32 picks them; four 2-byte loads, the block being
- * 2-byte aligned) times the block's scale, as nf_kv_load does.
+ * The raw words of a lane's NF_FDG_DS consecutive values of a cache at element offset e (a multiple of 8): one
+ * 16-byte load of an F16 / BF16 row; or the 8 codes of a Q8_0 block (e % 32 picks them; four 2-byte loads, the
+ * block being 2-byte aligned) in x and y, code i in bits 8 (i % 4) of word i / 4, and the block's half scale
+ * bits in z. The words stay packed until nf_fdg_values converts them.
  */
 template <int KVT>
-NF_INLINE void nf_fdg_slice(NF_GLOBAL const uchar* base, const nf_i64 e, float v[NF_FDG_DS]) {
+NF_INLINE uint4 nf_fdg_raw(NF_GLOBAL const uchar* base, const nf_i64 e) {
     if (KVT == NF_KV_Q8_0) {
         NF_GLOBAL const uchar* bp = base + (e >> 5) * Q8_0_BLOCK_BYTES;
         NF_GLOBAL const ushort* qs = (NF_GLOBAL const ushort*)(bp + 2 + (int)(e & 31));
-        const float d = __half2float(*reinterpret_cast<const __half*>(bp));
+        return make_uint4((uint)qs[0] | ((uint)qs[1] << 16), (uint)qs[2] | ((uint)qs[3] << 16),
+                          (uint)*(NF_GLOBAL const ushort*)bp, 0u);
+    }
+    return *(NF_GLOBAL const uint4*)((NF_GLOBAL const ushort*)base + e);
+}
+
+/* The NF_FDG_DS floats of a slice from its raw words (nf_fdg_raw), as nf_kv_load decodes them. */
+template <int KVT>
+NF_INLINE void nf_fdg_values(const uint4 r, float v[NF_FDG_DS]) {
+    if (KVT == NF_KV_Q8_0) {
+        const float d = __half2float(__ushort_as_half((ushort)r.z));
 #pragma unroll
-        for (int k = 0; k < 4; k++) {
-            const ushort w = qs[k];
-            v[2 * k] = d * (float)(signed char)(w & 0xFF);
-            v[2 * k + 1] = d * (float)(signed char)(w >> 8);
+        for (int i = 0; i < 4; i++) {
+            v[i] = d * (float)((int)(r.x << (24 - 8 * i)) >> 24);
+            v[4 + i] = d * (float)((int)(r.y << (24 - 8 * i)) >> 24);
         }
         return;
     }
-    const uint4 u = *(NF_GLOBAL const uint4*)((NF_GLOBAL const ushort*)base + e);
-    const uint w[4] = {u.x, u.y, u.z, u.w};
+    const uint w[4] = {r.x, r.y, r.z, r.w};
 #pragma unroll
     for (int k = 0; k < 4; k++) {
         if (KVT == NF_KV_F16) {
@@ -118,12 +126,31 @@ NF_INLINE void nf_fdg_poison(int n_seq, int n_head, int d_v, int n_split, int di
 }
 
 /*
+ * The physical row and kv_pos of key j of a split starting at slot k_begin: *row = -1 (and *pos = -1) for a key
+ * past the split's n_keys or on an unmapped page.
+ */
+NF_INLINE void nf_fdg_locate(const int j, const int n_keys, const int k_begin, const int page_shift,
+                             NF_GLOBAL const int* page_table, const int pt_off, NF_GLOBAL const int* kv_pos,
+                             int* row, int* pos) {
+    *row = -1;
+    *pos = -1;
+    const int t = k_begin + j;
+    if (j < n_keys && nf_kv_page_ok(t, page_shift, page_table, pt_off)) {
+        const int r = nf_kv_row(t, page_shift, page_table, pt_off);
+        *row = r;
+        *pos = kv_pos[r];
+    }
+}
+
+/*
  * One (sequence s, KV head kvh, split) work-group over the key slots [kv_lo + split * split_len, + split_len)
  * clamped to kv_hi: slot t reads physical row nf_kv_row(t, page_shift, page_table, pt_off) (page_shift = -1: the
  * dense identity map). q_pos is the query's position, tree_bits its ancestor bitmask; the query rows, outputs and
- * partials are those of sequence s (q_seq_stride, out_seq_stride, partial rows s * n_head + h).
+ * partials are those of sequence s (q_seq_stride, out_seq_stride, partial rows s * n_head + h). GP is the register
+ * width of the group's heads: G = n_head / n_head_kv rounded up to a power of two (heads g >= G of a GP = 4
+ * instance hold zeros and are skipped).
  */
-template <int D, int KVT>
+template <int D, int KVT, int GP>
 NF_INLINE void nf_fdg_run(
     const int n_head, const int n_head_kv, const int n_split, const int split_len,
     const int k_row_stride, const int k_head_stride, const int v_row_stride, const int v_head_stride,
@@ -135,12 +162,12 @@ NF_INLINE void nf_fdg_run(
     NF_GLOBAL const float* q, NF_GLOBAL const uchar* k, NF_GLOBAL const uchar* v,
     NF_GLOBAL const int* kv_pos, NF_GLOBAL const float* sinks, NF_GLOBAL const float* rel_bias,
     NF_GLOBAL float* out, NF_GLOBAL float* partial, NF_GLOBAL const int* page_table,
-    NF_GLOBAL const float* kv_scales,
-    NF_LOCAL_PTR int* rows_s, NF_LOCAL_PTR int* pos_s, NF_LOCAL_PTR float* mrg)
+    NF_GLOBAL const float* kv_scales, NF_LOCAL_PTR float* mrg)
 {
     const int DS = NF_FDG_DS;
     const int L = D / DS;                             /* lanes of a key group: 8 or 16 */
     const int GROUPS = NF_FDG_WG / L;
+    const int P = NF_FDG_KB * GP;                     /* partial dots per lane and iteration */
     const int G = n_head / n_head_kv;
     const int lid = (int)get_local_id(0);
     const int warp = lid >> 5;
@@ -156,11 +183,11 @@ NF_INLINE void nf_fdg_run(
     const int n_keys = max(0, k_stop - k_begin);
 
     /* the lane's query slices and the heads' ALiBi slopes */
-    float qr[NF_FDG_MAX_G][DS];
-    float slope[NF_FDG_MAX_G];
+    float qr[GP][DS];
+    float slope[GP];
     NF_GLOBAL const float* qs = q + (nf_i64)q_off + (nf_i64)s * q_seq_stride + (nf_i64)h0 * D + d0;
 #pragma unroll
-    for (int g = 0; g < NF_FDG_MAX_G; g++) {
+    for (int g = 0; g < GP; g++) {
 #pragma unroll
         for (int i = 0; i < DS; i++) {
             qr[g][i] = g < G ? qs[g * D + i] : 0.0f;
@@ -169,9 +196,9 @@ NF_INLINE void nf_fdg_run(
                    ? nf_alibi_slope(h0 + g, n_head, max_bias) : 1.0f;
     }
 
-    float m[NF_FDG_MAX_G], l[NF_FDG_MAX_G], o[NF_FDG_MAX_G][DS];
+    float m[GP], l[GP], o[GP][DS];
 #pragma unroll
-    for (int g = 0; g < NF_FDG_MAX_G; g++) {
+    for (int g = 0; g < GP; g++) {
         m[g] = -NF_INF;
         l[g] = 0.0f;
 #pragma unroll
@@ -186,100 +213,101 @@ NF_INLINE void nf_fdg_run(
     const nf_i64 k_head = (nf_i64)kvh * k_head_stride + d0;
     const nf_i64 v_head = (nf_i64)kvh * v_head_stride + d0;
 
-    for (int c0 = 0; c0 < n_keys; c0 += NF_FDG_STAGE) {
-        const int c_keys = min(NF_FDG_STAGE, n_keys - c0);
-        if (c0 > 0) {
-            barrier(CLK_LOCAL_MEM_FENCE);   /* the previous stage's rows are consumed */
-        }
-        /* 1. the stage's rows: page id -> physical row -> kv_pos for every key at once; -1 marks a key no
-         * head sees (unmapped page, empty cell, masked position) */
-        for (int j = lid; j < c_keys; j += NF_FDG_WG) {
-            const int t = k_begin + c0 + j;
-            int row = -1;
-            int p_k = -1;
-            if (nf_kv_page_ok(t, page_shift, page_table, pt_off)) {
-                const int r = nf_kv_row(t, page_shift, page_table, pt_off);
-                p_k = kv_pos[r];
-                if (nf_attn_tree_visible(p_k, tree_bits, kv_hi, n_fresh, q_pos, causal, swa_type, n_swa)) {
-                    row = r;
-                }
-            }
-            rows_s[j] = row;
-            pos_s[j] = p_k;
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-
-        /* 2. the key loop: group grp takes keys grp, grp + GROUPS, ... of the stage, NF_FDG_KB at a time;
-         * every lane of a warp runs every iteration (the butterflies take the whole warp): a key past the
-         * stage or invisible loads nothing and leaves the group's state unchanged */
-        for (int base = 0; base < c_keys; base += GROUPS * NF_FDG_KB) {
-            int rowb[NF_FDG_KB];
-            int posb[NF_FDG_KB];
-            float kv[NF_FDG_KB][DS];
-            float vv[NF_FDG_KB][DS];
+    /* the key loop: group grp takes keys grp, grp + GROUPS, ... of the split, NF_FDG_KB at a time; every lane of
+     * a warp runs every iteration (the group sums take the whole warp). Each iteration issues the K and V loads of
+     * its visible keys before the first use and the row and kv_pos loads of the next iteration's keys, so the
+     * visibility test never waits on a load: a key past the split, on an unmapped page or invisible loads
+     * nothing and leaves the group's state unchanged */
+    const int step = GROUPS * NF_FDG_KB;
+    int rown[NF_FDG_KB];
+    int posn[NF_FDG_KB];
 #pragma unroll
-            for (int b = 0; b < NF_FDG_KB; b++) {
-                const int j = base + b * GROUPS + grp;
-                rowb[b] = j < c_keys ? rows_s[j] : -1;
-                posb[b] = rowb[b] >= 0 ? pos_s[j] : 0;
-                if (rowb[b] >= 0) {
-                    nf_fdg_slice<KVT>(k, (nf_i64)rowb[b] * k_row_stride + k_head, kv[b]);
-                    nf_fdg_slice<KVT>(v, (nf_i64)rowb[b] * v_row_stride + v_head, vv[b]);
-                } else {
+    for (int b = 0; b < NF_FDG_KB; b++) {
+        nf_fdg_locate(b * GROUPS + grp, n_keys, k_begin, page_shift, page_table, pt_off, kv_pos, &rown[b],
+                      &posn[b]);
+    }
+    for (int j0 = 0; j0 < n_keys; j0 += step) {
+        int rowb[NF_FDG_KB];
+        int posb[NF_FDG_KB];
+        uint4 kr[NF_FDG_KB];
+        uint4 vr[NF_FDG_KB];
+#pragma unroll
+        for (int b = 0; b < NF_FDG_KB; b++) {
+            posb[b] = posn[b];
+            rowb[b] = rown[b] >= 0 && nf_attn_tree_visible(posb[b], tree_bits, kv_hi, n_fresh, q_pos, causal,
+                                                           swa_type, n_swa) ? rown[b] : -1;
+            kr[b] = make_uint4(0u, 0u, 0u, 0u);
+            vr[b] = make_uint4(0u, 0u, 0u, 0u);
+            if (rowb[b] >= 0) {
+                kr[b] = nf_fdg_raw<KVT>(k, (nf_i64)rowb[b] * k_row_stride + k_head);
+                vr[b] = nf_fdg_raw<KVT>(v, (nf_i64)rowb[b] * v_row_stride + v_head);
+            }
+        }
+#pragma unroll
+        for (int b = 0; b < NF_FDG_KB; b++) {
+            nf_fdg_locate(j0 + step + b * GROUPS + grp, n_keys, k_begin, page_shift, page_table, pt_off, kv_pos,
+                          &rown[b], &posn[b]);
+        }
+        float sc[P];
+#pragma unroll
+        for (int b = 0; b < NF_FDG_KB; b++) {
+            float kv[DS];
+            nf_fdg_values<KVT>(kr[b], kv);
+#pragma unroll
+            for (int g = 0; g < GP; g++) {
+                float part = 0.0f;
+#pragma unroll
+                for (int i = 0; i < DS; i++) {
+                    part = fmaf(qr[g][i], kv[i], part);
+                }
+                sc[b * GP + g] = part;
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < P; i++) {
+#pragma unroll
+            for (int off = 1; off < L; off <<= 1) {
+                sc[i] += __shfl_xor_sync(0xffffffffu, sc[i], off);
+            }
+        }
+#pragma unroll
+        for (int b = 0; b < NF_FDG_KB; b++) {
+            if (rowb[b] < 0) {
+                continue;
+            }
+            float vv[DS];
+            nf_fdg_values<KVT>(vr[b], vv);
+#pragma unroll
+            for (int g = 0; g < GP; g++) {
+                if (g < G) {
+                    const float part = sc[b * GP + g];
+                    const float sv = nf_attn_score(KVT == NF_KV_Q8_0 ? part * k_scale : part, scale, softcap)
+                                   + nf_attn_bias(bias_mode, h0 + g, n_head, q_pos, posb[b], slope[g], rel_bias,
+                                                  n_buckets, max_distance, s);
+                    /* one exp per key: the larger of the old maximum and the score rescales by e^0 = 1 exactly */
+                    float a = 1.0f;
+                    float p;
+                    if (sv > m[g]) {
+                        a = nf_attn_rescale(m[g], sv);
+                        p = 1.0f;
+                        m[g] = sv;
+                    } else {
+                        p = nf_attn_rescale(sv, m[g]);
+                    }
+                    l[g] = l[g] * a + p;
 #pragma unroll
                     for (int i = 0; i < DS; i++) {
-                        kv[b][i] = 0.0f;
-                        vv[b][i] = 0.0f;
-                    }
-                }
-            }
-#pragma unroll
-            for (int b = 0; b < NF_FDG_KB; b++) {
-                const int live = rowb[b] >= 0;
-#pragma unroll
-                for (int g = 0; g < NF_FDG_MAX_G; g++) {
-                    if (g < G) {
-                        float part = 0.0f;
-#pragma unroll
-                        for (int i = 0; i < DS; i++) {
-                            part = fmaf(qr[g][i], kv[b][i], part);
-                        }
-#pragma unroll
-                        for (int off = 1; off < L; off <<= 1) {
-                            part += __shfl_xor_sync(0xffffffffu, part, off);
-                        }
-                        if (live) {
-                            const float sc = nf_attn_score(KVT == NF_KV_Q8_0 ? part * k_scale : part, scale,
-                                                           softcap)
-                                           + nf_attn_bias(bias_mode, h0 + g, n_head, q_pos, posb[b], slope[g],
-                                                          rel_bias, n_buckets, max_distance, s);
-                            /* one exp per key: the larger of the old maximum and the score rescales by
-                             * e^0 = 1 exactly */
-                            float a = 1.0f;
-                            float p;
-                            if (sc > m[g]) {
-                                a = nf_attn_rescale(m[g], sc);
-                                p = 1.0f;
-                                m[g] = sc;
-                            } else {
-                                p = nf_attn_rescale(sc, m[g]);
-                            }
-                            l[g] = l[g] * a + p;
-#pragma unroll
-                            for (int i = 0; i < DS; i++) {
-                                o[g][i] = fmaf(p, vv[b][i], o[g][i] * a);
-                            }
-                        }
+                        o[g][i] = fmaf(p, vv[i], o[g][i] * a);
                     }
                 }
             }
         }
     }
 
-    /* 3. merge the key groups of each warp (lanes xor L .. xor 16), then the four warps through shared memory:
-     * mrg holds per warp G maxima, G sums and the G x D output rows */
+    /* merge the key groups of each warp (lanes xor L .. xor 16), then the four warps through shared memory:
+     * mrg holds per warp NF_FDG_MAX_G maxima, NF_FDG_MAX_G sums and the G x D output rows */
 #pragma unroll
-    for (int g = 0; g < NF_FDG_MAX_G; g++) {
+    for (int g = 0; g < GP; g++) {
         if (g < G) {
             float mm = m[g];
 #pragma unroll
@@ -309,7 +337,7 @@ NF_INLINE void nf_fdg_run(
     NF_LOCAL_PTR float* mw = mrg + warp * wstride;
     if (lane < L) {
 #pragma unroll
-        for (int g = 0; g < NF_FDG_MAX_G; g++) {
+        for (int g = 0; g < GP; g++) {
             if (g < G) {
                 if (lane == 0) {
                     mw[g] = m[g];
@@ -324,7 +352,7 @@ NF_INLINE void nf_fdg_run(
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    /* 4. the work-group's rows: normalized (direct, sinks merged) or the split's (o, m, l) partial */
+    /* the work-group's rows: normalized (direct, sinks merged) or the split's (o, m, l) partial */
     const int direct = flags & NF_ATTN_FLAG_DIRECT;
     const int has_sinks = flags & NF_ATTN_FLAG_SINKS;
     const int nw = NF_FDG_WG / 32;
@@ -361,27 +389,48 @@ NF_INLINE void nf_fdg_run(
     }
 }
 
-/* The work-group's shared arrays: the staged rows and positions, the warps' merge rows. */
+
+/* The work-group's shared array: the warps' merge rows. */
 #define NF_FDG_LOCALS                                                                               \
-    NF_LOCAL int rows_s[NF_FDG_STAGE];                                                              \
-    NF_LOCAL int pos_s[NF_FDG_STAGE];                                                               \
     NF_LOCAL float mrg[(NF_FDG_WG / 32) * (2 * NF_FDG_MAX_G + NF_FDG_MAX_G * NF_FDG_MAX_D)]
 
-/* nf_fdg_run at the launch's head dim (64 or 128, checked by nf_fdg_shape_ok). */
+/* nf_fdg_run at the launch's head dim D (64 or 128) and head width GP (checked by nf_fdg_shape_ok). */
+#define NF_FDG_RUN(D, GP, KV_CODE, PAGE_SHIFT, PT_OFF, Q_SEQ_STRIDE, OUT_SEQ_STRIDE, SEQ, KVH, KV_LO, KV_HI,     \
+                   Q_POS, TREE_BITS, PAGE_TABLE)                                                             \
+    nf_fdg_run<D, KV_CODE, GP>(n_head, n_head_kv, n_split, split_len, k_row_stride, k_head_stride,               \
+        v_row_stride, v_head_stride, scale, softcap, max_bias, flags, swa_type, n_swa, bias_mode,                \
+        n_buckets, max_distance, q_off, out_off, PAGE_SHIFT, PT_OFF, Q_SEQ_STRIDE, OUT_SEQ_STRIDE, SEQ,          \
+        KVH, KV_LO, KV_HI, Q_POS, TREE_BITS, q, (NF_GLOBAL const uchar*)k, (NF_GLOBAL const uchar*)v,            \
+        kv_pos, sinks, rel_bias, out, partial, PAGE_TABLE, kv_scales, mrg)
+
+/* nf_fdg_run at the launch's head dim and the group's head count G = n_head / n_head_kv (1 to 4: GP 1, 2, 4). */
 #define NF_FDG_DISPATCH(KV_CODE, PAGE_SHIFT, PT_OFF, Q_SEQ_STRIDE, OUT_SEQ_STRIDE, SEQ, KVH, KV_LO, KV_HI,     \
                         Q_POS, TREE_BITS, PAGE_TABLE)                                                        \
-    if (d_k == 128) {                                                                                        \
-        nf_fdg_run<128, KV_CODE>(n_head, n_head_kv, n_split, split_len, k_row_stride, k_head_stride,          \
-            v_row_stride, v_head_stride, scale, softcap, max_bias, flags, swa_type, n_swa, bias_mode,          \
-            n_buckets, max_distance, q_off, out_off, PAGE_SHIFT, PT_OFF, Q_SEQ_STRIDE, OUT_SEQ_STRIDE, SEQ,    \
-            KVH, KV_LO, KV_HI, Q_POS, TREE_BITS, q, (NF_GLOBAL const uchar*)k, (NF_GLOBAL const uchar*)v,      \
-            kv_pos, sinks, rel_bias, out, partial, PAGE_TABLE, kv_scales, rows_s, pos_s, mrg);                \
-    } else {                                                                                                 \
-        nf_fdg_run<64, KV_CODE>(n_head, n_head_kv, n_split, split_len, k_row_stride, k_head_stride,           \
-            v_row_stride, v_head_stride, scale, softcap, max_bias, flags, swa_type, n_swa, bias_mode,          \
-            n_buckets, max_distance, q_off, out_off, PAGE_SHIFT, PT_OFF, Q_SEQ_STRIDE, OUT_SEQ_STRIDE, SEQ,    \
-            KVH, KV_LO, KV_HI, Q_POS, TREE_BITS, q, (NF_GLOBAL const uchar*)k, (NF_GLOBAL const uchar*)v,      \
-            kv_pos, sinks, rel_bias, out, partial, PAGE_TABLE, kv_scales, rows_s, pos_s, mrg);                \
+    {                                                                                                        \
+        const int n_g = n_head / n_head_kv;                                                                  \
+        if (d_k == 128) {                                                                                    \
+            if (n_g == 1) {                                                                                  \
+                NF_FDG_RUN(128, 1, KV_CODE, PAGE_SHIFT, PT_OFF, Q_SEQ_STRIDE, OUT_SEQ_STRIDE, SEQ, KVH, KV_LO, \
+                           KV_HI, Q_POS, TREE_BITS, PAGE_TABLE);                                             \
+            } else if (n_g == 2) {                                                                           \
+                NF_FDG_RUN(128, 2, KV_CODE, PAGE_SHIFT, PT_OFF, Q_SEQ_STRIDE, OUT_SEQ_STRIDE, SEQ, KVH, KV_LO, \
+                           KV_HI, Q_POS, TREE_BITS, PAGE_TABLE);                                             \
+            } else {                                                                                         \
+                NF_FDG_RUN(128, 4, KV_CODE, PAGE_SHIFT, PT_OFF, Q_SEQ_STRIDE, OUT_SEQ_STRIDE, SEQ, KVH, KV_LO, \
+                           KV_HI, Q_POS, TREE_BITS, PAGE_TABLE);                                             \
+            }                                                                                                \
+        } else {                                                                                             \
+            if (n_g == 1) {                                                                                  \
+                NF_FDG_RUN(64, 1, KV_CODE, PAGE_SHIFT, PT_OFF, Q_SEQ_STRIDE, OUT_SEQ_STRIDE, SEQ, KVH, KV_LO,  \
+                           KV_HI, Q_POS, TREE_BITS, PAGE_TABLE);                                             \
+            } else if (n_g == 2) {                                                                           \
+                NF_FDG_RUN(64, 2, KV_CODE, PAGE_SHIFT, PT_OFF, Q_SEQ_STRIDE, OUT_SEQ_STRIDE, SEQ, KVH, KV_LO,  \
+                           KV_HI, Q_POS, TREE_BITS, PAGE_TABLE);                                             \
+            } else {                                                                                         \
+                NF_FDG_RUN(64, 4, KV_CODE, PAGE_SHIFT, PT_OFF, Q_SEQ_STRIDE, OUT_SEQ_STRIDE, SEQ, KVH, KV_LO,  \
+                           KV_HI, Q_POS, TREE_BITS, PAGE_TABLE);                                             \
+            }                                                                                                \
+        }                                                                                                    \
     }
 
 /*

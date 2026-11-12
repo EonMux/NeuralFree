@@ -38,7 +38,8 @@ import static org.junit.Assert.assertTrue;
 
 /**
  * The persistent multi-task kernel {@code LLM_MultiTask} on every GPU backend: the row-norm and norm+rotation
- * bodies against the individual kernels they replace. The tolerance covers only the float summation order of the
+ * bodies against the individual kernels they replace, at a step shorter than the micro-batch the launch was built
+ * for (the launch then shrinks to the step's rows). The tolerance covers only the float summation order of the
  * reductions. A backend is skipped when its GPU or its kernel library is unavailable.
  */
 @RunWith(Parameterized.class)
@@ -202,7 +203,7 @@ public class MultiTaskBackendsTest {
                 FusedKernels.rmsNormRopeArgs(rope, nTokens, nHeads, headDim, rowStride, headDim, 0, nTokens, 0, 0,
                         NormKernels.FLAG_HAS_W, nHeads, EPS, false, pos, none, wb, none, xb, refRope));
 
-        GpuMultiTask batch = new GpuMultiTask(ops, nTokens, "backend.test");
+        GpuMultiTask batch = new GpuMultiTask(ops, nTokens + 3, "backend.test");
         try {
             batch.rowNorm(nHeads, headDim, headDim, NormKind.RMS, NormKernels.FLAG_HAS_W, nHeads, 0, 0, EPS, xb, wb,
                     none, norm);
@@ -245,7 +246,7 @@ public class MultiTaskBackendsTest {
         run(DeltaNetKernels.GDN_GATE_PREP, DeltaNetKernels.gatePrepGlobal(nTokens, nV, -1, headDim, local),
                 new Object[]{nTokens, nV, nK, 0, -1, headDim, 0f, nV, 0, nV, 0, 1.0f, ab, bb, dtb, a, refG,
                         refBeta});
-        GpuMultiTask batch = new GpuMultiTask(ops, nTokens, "backend.gate");
+        GpuMultiTask batch = new GpuMultiTask(ops, nTokens + 3, "backend.gate");
         try {
             batch.gatePrep(nV, nK, 0, -1, headDim, nV, 0, nV, 0, 0f, 1.0f, ab, bb, dtb, a, g, b);
             batch.build();

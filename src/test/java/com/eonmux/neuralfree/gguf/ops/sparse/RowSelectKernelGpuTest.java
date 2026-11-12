@@ -7,6 +7,7 @@ import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
 import com.eonmux.neuralfree.acceleration.kernels.Availability;
+import com.eonmux.neuralfree.gguf.gpu.head.GpuArgmax;
 import com.eonmux.neuralfree.gguf.gpu.head.GpuLogitsHead;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.ops.gemm.GemmKernels;
@@ -33,7 +34,9 @@ import static org.junit.Assert.assertTrue;
 /**
  * The row selection kernels of sampling and sparse attention: {@code LLM_Argmax} (kernels/llm/sampling.cl, twin
  * shaders/llm/argmax.comp) picks the first maximum of each row and never NaN unless the row holds nothing else (an
- * all-NaN row yields 0), whichever reduction tree the backend runs; and the two work-group top-k kernels over the
+ * all-NaN row yields 0), whichever reduction tree the backend runs, and the split pair {@code LLM_ArgmaxSplit} /
+ * {@code LLM_ArgmaxCombine} ({@link GpuArgmax}) picks the same index at every chunk count, ties and NaN straddling
+ * chunk edges included; and the two work-group top-k kernels over the
  * shared radix select ({@code kernels/llm/common/topk_select.h}, GLSL
  * twin {@code shaders/llm/common/topk_select.glsl}) against host references, on CUDA, and on OpenCL and Vulkan on
  * each device (the Intel iGPU and the NVIDIA GPU), skipping what the machine lacks:
@@ -155,6 +158,33 @@ public class RowSelectKernelGpuTest {
                     }
                     assertEquals(where("Argmax", size, 1, local) + " row " + r, want, got[r]);
                 }
+            }
+        }
+    }
+
+    @Test
+    public void splitArgmaxPicksTheFirstMaximumAtEveryChunkCount() {
+        Random rnd = new Random(14);
+        for (int local : LOCALS) {
+            int chunk = GpuArgmax.UNROLL * local;
+            for (int size : new int[]{1, 5, chunk - 1, chunk, chunk + 1, 3 * chunk + 7, 151936}) {
+                float[] x = rows(rnd, size);
+                if (size > chunk) {
+                    // row 0: -0 ahead of +0 across a chunk edge (they tie, so the lower index wins); row 1: the
+                    // maximum alone in the last element of the tail chunk
+                    for (int i = 0; i < size; i++) {
+                        x[i] = -1f - (i % 7);
+                        x[size + i] = -2f;
+                    }
+                    x[chunk - 1] = -0f;
+                    x[chunk + 1] = 0f;
+                    x[size - 1] = 0f;
+                    x[2 * size - 1] = 1f;
+                }
+                int[] want = hostArgmax(x, size);
+                int[] got = runArgmaxSplit(x, size, local);
+                assertArrayEquals(where("ArgmaxSplit", size, GpuArgmax.chunks(size, local), local), want, got);
+                assertArrayEquals(where("Argmax", size, 1, local), want, runArgmax(x, size, local));
             }
         }
     }
@@ -304,6 +334,45 @@ public class RowSelectKernelGpuTest {
         GpuBuffer out = upload(poison);
         close(backend.computeQueue().enqueueKernel(kernels.get(GpuLogitsHead.ARGMAX),
                 new long[]{(long) ROWS * local}, new long[]{local}, new Object[]{size, in, out, ROWS}));
+        int[] got = new int[ROWS];
+        byte[] raw = new byte[got.length * 4];
+        close(backend.computeQueue().enqueueReadBuffer(out, 0, raw.length, raw));
+        backend.computeQueue().finish();
+        ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer().get(got);
+        releaseAll();
+        return got;
+    }
+
+    /** The first maximum of each row under the kernels' order (NaN never, -0 ties +0), 0 for an all-NaN row. */
+    private static int[] hostArgmax(float[] x, int size) {
+        int[] want = new int[ROWS];
+        for (int r = 0; r < ROWS; r++) {
+            boolean found = false;
+            for (int i = 0; i < size; i++) {
+                float v = x[r * size + i];
+                if (!Float.isNaN(v) && (!found || v > x[r * size + want[r]])) {
+                    want[r] = i;
+                    found = true;
+                }
+            }
+        }
+        return want;
+    }
+
+    private int[] runArgmaxSplit(float[] x, int size, int local) {
+        int chunks = GpuArgmax.chunks(size, local);
+        GpuBuffer in = upload(x);
+        int[] poison = new int[ROWS];
+        Arrays.fill(poison, -7);
+        GpuBuffer out = upload(poison);
+        int[] partPoison = new int[ROWS * chunks * 2];
+        Arrays.fill(partPoison, -5);
+        GpuBuffer part = upload(partPoison);
+        close(backend.computeQueue().enqueueKernel(kernels.get(GpuArgmax.SPLIT),
+                new long[]{(long) ROWS * chunks * local}, new long[]{local},
+                new Object[]{size, chunks, in, part, ROWS}));
+        close(backend.computeQueue().enqueueKernel(kernels.get(GpuArgmax.COMBINE),
+                new long[]{(long) ROWS * local}, new long[]{local}, new Object[]{chunks, part, out, ROWS}));
         int[] got = new int[ROWS];
         byte[] raw = new byte[got.length * 4];
         close(backend.computeQueue().enqueueReadBuffer(out, 0, raw.length, raw));

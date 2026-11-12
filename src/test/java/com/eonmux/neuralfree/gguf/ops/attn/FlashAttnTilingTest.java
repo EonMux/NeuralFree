@@ -4,6 +4,15 @@ import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import org.junit.Test;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -111,18 +120,69 @@ public class FlashAttnTilingTest {
     }
 
     @Test
-    public void decodeFastPathServesOnlyPlainCachesWithinTheDimLimit() {
-        // The mirror of nf_fd_fast_ok's plan-level conditions: shuffle backends, F32/F16/BF16 caches,
+    public void decodeFastPathServesOnlyPlainAndQ8CachesWithinTheDimLimit() {
+        // The mirror of nf_fd_fast_ok's plan-level conditions: shuffle backends, F32/F16/BF16/Q8_0 caches,
         // head dims of at most one coalesced row float4 per lane (32 * 4).
         assertTrue(FlashAttnTiling.decodeFastPath(true, KvDType.F16, KvDType.F16, 128, 128));
         assertTrue(FlashAttnTiling.decodeFastPath(true, KvDType.F32, KvDType.F32, 80, 96));
         assertTrue(FlashAttnTiling.decodeFastPath(true, KvDType.BF16, KvDType.F16, 128, 128));
+        assertTrue(FlashAttnTiling.decodeFastPath(true, KvDType.Q8_0, KvDType.Q8_0, 128, 128));
+        assertTrue(FlashAttnTiling.decodeFastPath(true, KvDType.Q8_0, KvDType.F16, 64, 128));
         assertFalse(FlashAttnTiling.decodeFastPath(false, KvDType.F16, KvDType.F16, 128, 128));
-        assertFalse(FlashAttnTiling.decodeFastPath(true, KvDType.Q8_0, KvDType.F16, 128, 128));
+        assertFalse(FlashAttnTiling.decodeFastPath(false, KvDType.Q8_0, KvDType.Q8_0, 128, 128));
+        assertFalse(FlashAttnTiling.decodeFastPath(true, KvDType.Q4_0, KvDType.Q4_0, 128, 128));
+        assertFalse(FlashAttnTiling.decodeFastPath(true, KvDType.Q8_0, KvDType.Q8_0, 256, 256));
         assertFalse(FlashAttnTiling.decodeFastPath(true, KvDType.F16, KvDType.FP8_E4M3, 128, 128));
         assertFalse(FlashAttnTiling.decodeFastPath(true, KvDType.F16, KvDType.F16, 256, 128));
         assertFalse(FlashAttnTiling.decodeFastPath(true, KvDType.F16, KvDType.F16, 128, 256));
         assertFalse(FlashAttnTiling.decodeFastPath(true, KvDType.FP8_DS_MLA, KvDType.FP8_DS_MLA, 576, 512));
+    }
+
+    /**
+     * The cache types of the kernels' own fast-path gates (flash_decode.cl {@code nf_fd_fast_ok} for K and V, and
+     * flash_decode.comp {@code nf_fd_fast_type}) are those {@link FlashAttnTiling#decodeFastPath} plans for, Q8_0
+     * among them: a kernel gate that lost a type would run the scalar body under a fast-path plan.
+     */
+    @Test
+    public void theKernelGatesServeTheCacheTypesTheFastPathPlansFor() throws IOException {
+        Set<String> planned = new TreeSet<>();
+        for (KvDType t : KvDType.values()) {
+            if (FlashAttnTiling.decodeFastPath(true, t, t, 64, 64)) {
+                planned.add(t.name());
+            }
+        }
+        assertTrue(planned.contains(KvDType.Q8_0.name()));
+        String cl = gateBody(resource("kernels/llm/flash_decode.cl"), "NF_INLINE int nf_fd_fast_ok(");
+        assertEquals("nf_fd_fast_ok K types", planned, kvTypes(cl, "k_type"));
+        assertEquals("nf_fd_fast_ok V types", planned, kvTypes(cl, "v_type"));
+        String glsl = gateBody(resource("shaders/llm/flash_decode.comp"), "bool nf_fd_fast_type(int t)");
+        assertEquals("nf_fd_fast_type types", planned, kvTypes(glsl, "t"));
+    }
+
+    /** A kernel or shader source under {@code src/main/resources} (the tests run from the project root). */
+    private static String resource(String relative) throws IOException {
+        Path path = Path.of("src", "main", "resources").resolve(relative);
+        assertTrue("missing source file " + path.toAbsolutePath(), Files.exists(path));
+        return Files.readString(path, StandardCharsets.UTF_8);
+    }
+
+    /** The body of the function whose signature starts with {@code head}: up to its first closing brace. */
+    private static String gateBody(String source, String head) {
+        int at = source.indexOf(head);
+        assertTrue(head, at >= 0);
+        int end = source.indexOf('}', at);
+        assertTrue(head + " has no body", end > at);
+        return source.substring(at, end);
+    }
+
+    /** The KvDType names a gate compares {@code var} with ({@code var == NF_KV_<NAME>}). */
+    private static Set<String> kvTypes(String body, String var) {
+        Matcher m = Pattern.compile("\\b" + Pattern.quote(var) + "\\s*==\\s*NF_KV_(\\w+)").matcher(body);
+        Set<String> out = new TreeSet<>();
+        while (m.find()) {
+            out.add(m.group(1));
+        }
+        return out;
     }
 
     @Test

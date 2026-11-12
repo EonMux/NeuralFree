@@ -86,6 +86,22 @@ final class WarpRowMatvec {
     }
 
     /**
+     * The stacked single-token Q/K/V form ({@code {T}_MatVecQKVRow_Q8} over three weights of {@code qk}, or
+     * {@code {T}_MatVecQKVRowVQ6_K_Q8} for a Q6_K V weight beside Q4_K or Q5_K Q and K weights, as Q4_K_M and Q5_K_M
+     * models mix them), or null for any other pair.
+     */
+    static String qkvTwinName(GGMLType qk, GGMLType v) {
+        if (!TYPES.contains(qk) || v == null) {
+            return null;
+        }
+        if (v == qk) {
+            return qk.name() + "_MatVecQKVRow" + Q8_SUFFIX;
+        }
+        return v == GGMLType.Q6_K && (qk == GGMLType.Q4_K || qk == GGMLType.Q5_K)
+                ? qk.name() + "_MatVecQKVRowV" + v.name() + Q8_SUFFIX : null;
+    }
+
+    /**
      * The warps per work-group of a launch over {@code rows} rows of {@code cols} elements of {@code type}, or 0
      * when the family's forms serve the shape better (or the type has no forms, or the rows are not whole blocks).
      */

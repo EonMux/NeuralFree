@@ -57,10 +57,10 @@ import java.util.Objects;
  *       ({@value #BIAS_ADD}), the logit scale ({@code / s} or {@code * s} per
  *       {@link HeadSpec#logitScaleDivides()}), then the final softcap {@code cap * tanh(x / cap)}, then
  *       {@code -FLT_MAX} over the masked logit range of every row (models/chameleon.cpp:186-198).</li>
- *   <li>{@link #argmax}: {@value #ARGMAX} per row on the device, so greedy decoding reads back one id. A head that
- *       certifies argmax ({@link #certifiesArgmax}) serves the greedy readout instead through
- *       {@link #argmaxCertified}, which decides the ids on the device from the head's INT8 screen under its error
- *       bounds ({@link GpuCertArgmax}) without materializing the logits rows.</li>
+ *   <li>{@link #argmax}: the row argmax on the device ({@link GpuArgmax}, split over the vocabulary row), so greedy
+ *       decoding reads back one id. A head that certifies argmax ({@link #certifiesArgmax}) serves the greedy readout
+ *       instead through {@link #argmaxCertified}, which decides the ids on the device from the head's INT8 screen
+ *       under its error bounds ({@link GpuCertArgmax}) without materializing the logits rows.</li>
  * </ol>
  * Graphs whose block norms carry no weight and that have no {@code output_norm} tensor end with a weightless output
  * norm of the block kind (models/olmo.cpp:128-130, models/talkie.cpp:137); the HRM schedule already ends every pass
@@ -103,19 +103,21 @@ public final class GpuLogitsHead implements AutoCloseable {
 
     /** {@code data[s*dim + d] += bias[d]} ({@code kernels/llm/eltwise.cl}). */
     public static final String BIAS_ADD = GpuOps.BATCH_BIAS_ADD;
-    /** Row-wise first maximum ({@code kernels/llm/sampling.cl}). */
-    public static final String ARGMAX = "LLM_Argmax";
+    /** Row-wise first maximum, one work-group per row ({@link GpuArgmax#ROW}). */
+    public static final String ARGMAX = GpuArgmax.ROW;
     /** The tree verify's device accept walk over one masked batch's greedy ids ({@code kernels/llm/sampling.cl}). */
     public static final String TREE_ACCEPT = "LLM_TreeAccept";
     /** Kernels this stage launches besides the {@link GpuOps} families, for prewarming. */
     public static final List<String> KERNELS = Collections.unmodifiableList(Arrays.asList(
-            BIAS_ADD, ARGMAX, TREE_ACCEPT, FlowKernels.GATHER_ROWS, NormKernels.ROW_NORM,
-            NormKernels.MUL_ROW_SCALE));
+            BIAS_ADD, ARGMAX, GpuArgmax.SPLIT, GpuArgmax.COMBINE, TREE_ACCEPT, FlowKernels.GATHER_ROWS,
+            NormKernels.ROW_NORM, NormKernels.MUL_ROW_SCALE));
 
     /** Temporary holding the gathered row indices. */
     static final String TEMP_ROWS = "head.rows";
     /** Temporary holding the argmax ids. */
     static final String TEMP_ARGMAX = "head.argmax";
+    /** Temporary holding the split argmax's chunk winners. */
+    static final String TEMP_ARGMAX_PARTS = "head.argmaxParts";
     /** Temporary holding the projected embedding rows. */
     static final String TEMP_EMBD = "head.embd";
     /** Temporary holding the rows produced by {@code project_out} before the LM head. */
@@ -171,6 +173,10 @@ public final class GpuLogitsHead implements AutoCloseable {
     private final ScratchSlot logitsSlot;
     private final ScratchSlot rowsSlot;
     private final ScratchSlot argmaxSlot;
+    /** The greedy readout's launch plan over vocabulary rows; null without an LM head. */
+    private final GpuArgmax argmaxPlan;
+    /** The split argmax's chunk winners for {@code ubatch} rows; null unless {@link #argmaxPlan} splits. */
+    private final ScratchSlot argmaxParts;
     private final ScratchSlot embdSlot;
     private final ScratchSlot projSlot;
     private final ByteBuffer rowBytes;
@@ -336,6 +342,9 @@ public final class GpuLogitsHead implements AutoCloseable {
         }
         this.rowsSlot = ctx.scratch().temp(TEMP_ROWS, ubatch);
         this.argmaxSlot = ctx.scratch().temp(TEMP_ARGMAX, ubatch);
+        this.argmaxPlan = logitsSlot != null ? GpuArgmax.plan(ops, vocab, reduceLocal) : null;
+        this.argmaxParts = argmaxPlan != null && argmaxPlan.split()
+                ? ctx.scratch().temp(TEMP_ARGMAX_PARTS, argmaxPlan.partialInts(ubatch)) : null;
         this.shardSlot = vocabSplit != null ? vocabSplit.shardLogits() : logitsSlot;
         if (vocabSplit != null && (shardSlot == null || shardSlot.offset() != 0
                 || shardSlot.floats() < (long) ubatch * shardVocab)) {
@@ -347,7 +356,8 @@ public final class GpuLogitsHead implements AutoCloseable {
         this.embdSlot = projection != null ? ctx.scratch().temp(TEMP_EMBD, (long) ubatch * hiddenWidth) : null;
         this.projSlot = outputProjection != null
                 ? ctx.scratch().temp(TEMP_PROJECTED, (long) ubatch * lmWidth) : null;
-        if (rowsSlot.offset() != 0 || argmaxSlot.offset() != 0) {
+        if (rowsSlot.offset() != 0 || argmaxSlot.offset() != 0
+                || (argmaxParts != null && argmaxParts.offset() != 0)) {
             throw new IllegalStateException("head temporaries must start at element 0");
         }
         this.rowBytes = ByteBuffer.allocate(ubatch * Integer.BYTES).order(ByteOrder.LITTLE_ENDIAN);
@@ -366,15 +376,13 @@ public final class GpuLogitsHead implements AutoCloseable {
 
     /**
      * Prepares the kernels this head launches at the work-group sizes it launches them with
-     * ({@link GpuOps#prewarm}): the row gather, and with an LM head the output bias add and the argmax.
+     * ({@link GpuOps#prewarm}): the row gather, and with an LM head the output bias add (the argmax plan prepares
+     * its own kernels).
      */
     private void prewarmKernels() {
         ops.prewarm(FlowKernels.GATHER_ROWS, new long[]{FlowKernels.GATHER_LOCAL});
         if (outputBias != null) {
             ops.prewarm(BIAS_ADD, new long[]{ops.local()});
-        }
-        if (logitsSlot != null) {
-            ops.prewarm(ARGMAX, new long[]{reduceLocal});
         }
     }
 
@@ -631,8 +639,8 @@ public final class GpuLogitsHead implements AutoCloseable {
         if (nRows < 1 || nRows > ubatch) {
             throw new IllegalArgumentException("argmax of " + nRows + " rows outside [1, " + ubatch + "]");
         }
-        ops.enqueue(ARGMAX, new long[]{(long) nRows * reduceLocal}, new long[]{reduceLocal}, vocab,
-                logitsSlot.buffer(), argmaxSlot.buffer(), nRows);
+        argmaxPlan.enqueue(ops, logitsSlot.buffer(), argmaxSlot.buffer(), nRows,
+                argmaxParts != null ? argmaxParts.buffer() : null);
         return argmaxSlot.slice(0, nRows);
     }
 

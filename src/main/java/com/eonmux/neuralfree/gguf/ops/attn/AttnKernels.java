@@ -583,7 +583,7 @@ public final class AttnKernels {
     }
 
     /**
-     * Grouped-query paged decode kernel ({@code LLM_FlashDecodePagedGqa_<KV>}, CUDA only) over a K cache of type
+     * Grouped-query paged decode kernel ({@code LLM_FlashDecodePagedGqa_<KV>}, CUDA and Vulkan) over a K cache of type
      * {@code k} and a V cache of type {@code v}: the F16, BF16 and Q8_0 caches with both caches of one type; null
      * for every other pair, so only a caller that has checked {@link FlashAttnTiling#gqaDecodeServes} reaches it.
      */
@@ -642,8 +642,8 @@ public final class AttnKernels {
      * Every kernel of this family that each backend provides, for {@code LlmKernels.prewarm}. The kernels only some
      * backends build are absent: hosts look the tensor-core mma kernels (CUDA compute capability 8.0+, Vulkan with
      * {@code VK_NV_cooperative_matrix2}) up through {@link #flashAttnMma(KvDType)} and
-     * {@link #flashAttnMmaPaged(KvDType)}, and the grouped-query decodes (the dense one CUDA and Vulkan, the paged
-     * one CUDA) through {@link #flashDecodeGqa(KvDType, KvDType)} and {@link #flashDecodePagedGqa(KvDType, KvDType)}.
+     * {@link #flashAttnMmaPaged(KvDType)}, and the grouped-query decodes (CUDA and Vulkan) through
+     * {@link #flashDecodeGqa(KvDType, KvDType)} and {@link #flashDecodePagedGqa(KvDType, KvDType)}.
      */
     public static List<String> all() {
         return ALL;

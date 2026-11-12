@@ -3,9 +3,9 @@
  * Requires: common/nf_common.glsl, common/act.glsl, common/kv_types.glsl, common/attn_common.glsl,
  * common/flash_sg.glsl.
  *
- * The decode attention of LLM_FlashDecode_<KV> / LLM_FlashDecodePaged_<KV> (flash_decode.comp) for plain F32, F16
- * and BF16 caches, with their argument lists, layouts, masking, biases, sinks and partial outputs. Variants rows
- * select KV=NF_KV_F32, NF_KV_F16 or NF_KV_BF16, PAGED=1 for the paged entry point; flag sg16 (the pipeline pins
+ * The decode attention of LLM_FlashDecode_<KV> / LLM_FlashDecodePaged_<KV> (flash_decode.comp) for plain F32, F16,
+ * BF16 and Q8_0 caches, with their argument lists, layouts, masking, biases, sinks and partial outputs. Variants rows
+ * select KV=NF_KV_F32, NF_KV_F16, NF_KV_BF16 or NF_KV_Q8_0, PAGED=1 for the paged entry point; flag sg16 (the pipeline pins
  * 16-lane full subgroups).
  *
  * - A workgroup is NF_FDS_SUBGROUPS subgroups and serves one query head over one key split; lane l holds the head
@@ -18,7 +18,7 @@
  *
  * Dispatch: global {n_split * 64, [n_seq *] n_head}, local {64, 1, 1}. Plan constraints (violations write NaN
  * outputs): g_tile == 1, d_k == d_v a positive multiple of 8 of at most 128, K and V row and head strides multiples
- * of 8, n_split >= 1, split_len > 0, direct_out only with n_split == 1, local size 64 with 16-lane subgroups. Results
+ * of 8 (of 32 for Q8_0), n_split >= 1, split_len > 0, direct_out only with n_split == 1, local size 64 with 16-lane subgroups. Results
  * are deterministic (fixed key interleave and merge order). Shared memory: 4 * 130 floats.
  */
 #version 450

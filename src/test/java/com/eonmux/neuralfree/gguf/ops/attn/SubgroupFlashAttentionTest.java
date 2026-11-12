@@ -29,7 +29,22 @@ public class SubgroupFlashAttentionTest {
         assertFalse("not a multiple of the dims per lane", SubgroupFlashAttention.shapeServes(KvDType.F16, KvDType.F16, 68, 68));
         assertFalse("unequal head dims", SubgroupFlashAttention.shapeServes(KvDType.F16, KvDType.F16, 128, 64));
         assertFalse("mixed cache types", SubgroupFlashAttention.shapeServes(KvDType.F32, KvDType.F16, 128, 128));
-        assertFalse("quantized cache", SubgroupFlashAttention.shapeServes(KvDType.Q8_0, KvDType.Q8_0, 128, 128));
+        assertTrue("Q8_0 d=128", SubgroupFlashAttention.shapeServes(KvDType.Q8_0, KvDType.Q8_0, 128, 128));
+        assertTrue("Q8_0 d=64", SubgroupFlashAttention.shapeServes(KvDType.Q8_0, KvDType.Q8_0, 64, 64));
+        assertFalse("Q8_0 rows of part blocks", SubgroupFlashAttention.shapeServes(KvDType.Q8_0, KvDType.Q8_0, 80, 80));
+        assertFalse("mixed Q8_0 and F16", SubgroupFlashAttention.shapeServes(KvDType.Q8_0, KvDType.F16, 128, 128));
+        assertFalse("other quantized cache", SubgroupFlashAttention.shapeServes(KvDType.Q4_0, KvDType.Q4_0, 128, 128));
+    }
+
+    /** Row strides must keep every load on the kernels' alignment: whole 8-value groups, whole Q8_0 blocks. */
+    @Test
+    public void strideGateMirrorsTheKernelPlanCheck() {
+        assertTrue(SubgroupFlashAttention.stridesServe(KvDType.F16, 1024, 1024));
+        assertTrue(SubgroupFlashAttention.stridesServe(KvDType.F16, 1032, 1032));
+        assertFalse(SubgroupFlashAttention.stridesServe(KvDType.F16, 1028, 1024));
+        assertTrue(SubgroupFlashAttention.stridesServe(KvDType.Q8_0, 1024, 1024));
+        assertFalse("K rows of part blocks", SubgroupFlashAttention.stridesServe(KvDType.Q8_0, 1032, 1024));
+        assertFalse("V rows of part blocks", SubgroupFlashAttention.stridesServe(KvDType.Q8_0, 1024, 1040));
     }
 
     @Test

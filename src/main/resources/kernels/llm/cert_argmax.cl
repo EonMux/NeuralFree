@@ -13,8 +13,9 @@
  * The row dot helpers and the candidate order are exact-copy reasoning only; the certification itself
  * (|exact - screen| <= hidden_norm * bound) holds for every accumulation order of both sides, since
  * the bound is a Cauchy-Schwarz norm product. Ties resolve to the lower token id through the same
- * total order the LLM_Argmax reduction uses (nf_cert_better repeats nf_argmax_better), and the
- * compaction order of the atomic gather therefore cannot change the result.
+ * total order the LLM_Argmax reduction uses (nf_cert_better orders as nf_argmax_key and
+ * nf_argmax_before in sampling.cl), and the compaction order of the atomic gather therefore cannot
+ * change the result.
  *
  * Launch contract: local size L a power of two <= LLM_DIMX and a multiple of Q8_0_THREADS_PER_BLOCK
  * (the host launches both kernels at the matvec work-group size); CUDA: a multiple of 32. The early
@@ -29,7 +30,7 @@
 /* Relative tie slack: one ulp of the f32 logit format (CertifiedArgmaxScreen.TIE_RELATIVE_ULP). */
 #define NF_CERT_TIE_REL 0x1p-23f
 
-/* Index sentinel of an argmax candidate that holds no element (nf_argmax_better's order). */
+/* Index sentinel of an argmax candidate that holds no element (the LLM_Argmax order). */
 #define NF_CERT_NONE 0x7fffffff
 
 /*

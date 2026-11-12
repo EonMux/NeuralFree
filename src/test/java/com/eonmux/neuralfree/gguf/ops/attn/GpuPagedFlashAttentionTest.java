@@ -180,8 +180,13 @@ public class GpuPagedFlashAttentionTest {
         String[] missing = gqa ? new String[]{AttnKernels.flashAttnMmaPaged(KvDType.F16)}
                 : new String[]{AttnKernels.flashAttnMmaPaged(KvDType.F16),
                         AttnKernels.flashDecodePagedGqa(KvDType.F16, KvDType.F16)};
-        backend = FakeComputeBackend.builder().strictLlmArgs(true).backendType(ComputeBackend.BackendType.CUDA)
-                .capabilities(tensorCoreCaps()).unavailableKernels(missing)
+        bindPaged(ComputeBackend.BackendType.CUDA, tensorCoreCaps(), missing);
+    }
+
+    /** Binds the llama mixer over a paged F16 cache of {@link #PARALLEL} sequences on a fake {@code type} device. */
+    private void bindPaged(ComputeBackend.BackendType type, DeviceCapabilities caps, String... missing) {
+        backend = FakeComputeBackend.builder().strictLlmArgs(true).backendType(type)
+                .capabilities(caps).unavailableKernels(missing)
                 .build();
         ModelSpec spec = llama();
         LayerSpec l = spec.layers().get(0);
@@ -331,6 +336,53 @@ public class GpuPagedFlashAttentionTest {
         assertEquals(2L * N_HEAD_KV, d.global()[1]);
         assertTrue("every split holds keys", (long) splits * d.intArg(AttnKernels.ARG_FD_SPLIT_LEN) >= 6);
         assertTrue((d.intArg(AttnKernels.ARG_FD_FLAGS) & AttnKernels.FLAG_CAUSAL) != 0);
+    }
+
+    /**
+     * On Vulkan the grouped-query paged decode serves where the one-row decodes do
+     * ({@code LlmKernels.flashDecodeRowPath}): an NVIDIA device's decode step launches it, an Intel device's keeps the
+     * paged decode.
+     */
+    @Test
+    public void aVulkanDecodeStepTakesTheGroupedKernelOnNvidiaOnly() {
+        String gqa = AttnKernels.flashDecodePagedGqa(KvDType.F16, KvDType.F16);
+        for (int vendor : new int[]{FakeComputeBackend.NVIDIA_VENDOR_ID, FakeComputeBackend.INTEL_VENDOR_ID}) {
+            bindPaged(ComputeBackend.BackendType.VULKAN, vulkanCaps(vendor));
+            runStep(new int[]{3, 2}, new int[]{0, 0});
+            List<FakeDispatch> grouped = runStep(new int[]{1, 1}, new int[]{3, 2}, gqa);
+            List<FakeDispatch> plain = runStep(new int[]{1, 1}, new int[]{4, 3});
+            boolean nvidia = vendor == FakeComputeBackend.NVIDIA_VENDOR_ID;
+            assertEquals("vendor " + vendor + " grouped launches", nvidia ? 1 : 0, grouped.size());
+            assertEquals("vendor " + vendor + " paged decode launches", nvidia ? 0 : 1, plain.size());
+            tearDown();
+            mixer = null;
+            ops = null;
+            placeholders = null;
+            scratch = null;
+            memory = null;
+            backend = null;
+        }
+    }
+
+    /** A Vulkan device of {@code vendorId} with what the LLM kernel set needs there. */
+    private static DeviceCapabilities vulkanCaps(int vendorId) {
+        return new DeviceCapabilities.Builder()
+                .deviceName("FakeVulkan")
+                .totalVramBytes(8L << 30)
+                .maxAllocSizeBytes(2L << 30)
+                .computeUnits(32)
+                .maxClockFrequencyMhz(1500)
+                .maxWorkGroupSize(1024)
+                .driverVersion("fake-1.0")
+                .supportsFloat16(true)
+                .maxLocalMemoryBytes(48L * 1024)
+                .maxWorkGroupCount(new long[]{65535, 65535, 65535})
+                .feature(DeviceFeature.STORAGE_8BIT)
+                .feature(DeviceFeature.STORAGE_16BIT)
+                .feature(DeviceFeature.TIMELINE_SEMAPHORE)
+                .deviceClass(DeviceClass.DISCRETE)
+                .identity(new DeviceIdentity("FakeVulkan", vendorId, null, null))
+                .build();
     }
 
     /** A one-split launch writes directly unless it merges its one split, carries a sink partial or captures lse. */

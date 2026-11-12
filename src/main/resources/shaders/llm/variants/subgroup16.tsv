@@ -26,12 +26,16 @@ Q6_K_MatVecFusedGateUpSg_Q8	matvec_sg.comp	NF_SGR_Q6_K OP=OP_GATEUP_SILU	sg16
 LLM_FlashDecodeSg_F32	flash_decode_sg.comp	KV=NF_KV_F32	sg16
 LLM_FlashDecodeSg_F16	flash_decode_sg.comp	KV=NF_KV_F16	sg16
 LLM_FlashDecodeSg_BF16	flash_decode_sg.comp	KV=NF_KV_BF16	sg16
+LLM_FlashDecodeSg_Q8_0	flash_decode_sg.comp	KV=NF_KV_Q8_0	sg16
 LLM_FlashDecodePagedSg_F32	flash_decode_sg.comp	KV=NF_KV_F32 PAGED=1	sg16
 LLM_FlashDecodePagedSg_F16	flash_decode_sg.comp	KV=NF_KV_F16 PAGED=1	sg16
 LLM_FlashDecodePagedSg_BF16	flash_decode_sg.comp	KV=NF_KV_BF16 PAGED=1	sg16
+LLM_FlashDecodePagedSg_Q8_0	flash_decode_sg.comp	KV=NF_KV_Q8_0 PAGED=1	sg16
 LLM_FlashAttnSg_F32	flash_prefill_sg.comp	KV=NF_KV_F32	sg16
 LLM_FlashAttnSg_F16	flash_prefill_sg.comp	KV=NF_KV_F16	sg16
 LLM_FlashAttnSg_BF16	flash_prefill_sg.comp	KV=NF_KV_BF16	sg16
+LLM_FlashAttnSg_Q8_0	flash_prefill_sg.comp	KV=NF_KV_Q8_0	sg16
 LLM_FlashAttnPagedSg_F32	flash_prefill_sg.comp	KV=NF_KV_F32 PAGED=1	sg16
 LLM_FlashAttnPagedSg_F16	flash_prefill_sg.comp	KV=NF_KV_F16 PAGED=1	sg16
 LLM_FlashAttnPagedSg_BF16	flash_prefill_sg.comp	KV=NF_KV_BF16 PAGED=1	sg16
+LLM_FlashAttnPagedSg_Q8_0	flash_prefill_sg.comp	KV=NF_KV_Q8_0 PAGED=1	sg16

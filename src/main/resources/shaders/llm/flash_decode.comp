@@ -196,7 +196,7 @@ shared float nf_fd_stats[3 * NF_FD_MAX_G];   /* m[16] | l[16] | ALiBi slope[16] 
  * The warp fast path's gate (flash_decode.cl nf_fd_fast_ok), in the __sg module on 32-wide subgroups only, where a
  * subgroup is the .cl warp: one query head's K row is read as one coalesced vec4 per lane (the row spans exactly
  * one subgroup instruction) and its dot is reduced over the subgroup, so pass 1 needs no shared-memory tree per key;
- * pass 2 accumulates V the same coalesced way. Plain cache element types only (F32/F16/BF16), no row-relative bias
+ * pass 2 accumulates V the same coalesced way. F32, F16, BF16 and Q8_0 caches only, no row-relative bias
  * table, head dims of at most NF_FA_FAST_DIM, the split no longer than the workgroup and at most NF_FA_LG heads per
  * workgroup. Every other shape, and the plain module, runs the portable scalar body.
  */
@@ -204,8 +204,8 @@ shared float nf_fd_stats[3 * NF_FD_MAX_G];   /* m[16] | l[16] | ALiBi slope[16] 
  * so NF_FD_KEYS row reads are in flight per subgroup instead of one dependent read per key. */
 #define NF_FD_KEYS 4
 
-bool nf_fd_plain_type(int t) {
-    return t == NF_KV_F32 || t == NF_KV_F16 || t == NF_KV_BF16;
+bool nf_fd_fast_type(int t) {
+    return t == NF_KV_F32 || t == NF_KV_F16 || t == NF_KV_BF16 || t == NF_KV_Q8_0;
 }
 
 bool nf_fd_fast_ok() {
@@ -213,7 +213,7 @@ bool nf_fd_fast_ok() {
     return gl_SubgroupSize == 32u && gl_NumSubgroups == uint(NF_FA_LG)
         && pc.d_k <= NF_FA_FAST_DIM && pc.d_v <= NF_FA_FAST_DIM
         && pc.split_len <= NF_FA_WG && pc.n_buckets == 0 && pc.g_tile <= NF_FA_LG
-        && nf_fd_plain_type(NF_FD_K_TYPE) && nf_fd_plain_type(NF_FD_V_TYPE);
+        && nf_fd_fast_type(NF_FD_K_TYPE) && nf_fd_fast_type(NF_FD_V_TYPE);
 #else
     return false;
 #endif
@@ -446,6 +446,8 @@ void main() {
     const uint k_head = uint(kvh * pc.k_head_stride);
 #ifdef USE_SUBGROUPS
     if (fast) {
+        /* the fast path's cache types hold one K scale per KV head (nf_fd_fast_ok), loaded once */
+        const float k_scale = kv_scales[kvh];
         const int slane = int(gl_SubgroupInvocationID);
         const int dk4 = d_k >> 2;
         for (int jb = int(gl_SubgroupID); jb < split_len; jb += NF_FD_KEYS * NF_FA_LG) {
@@ -465,7 +467,7 @@ void main() {
                                                   (pc.flags & NF_ATTN_FLAG_CAUSAL), pc.swa_type, pc.n_swa) != 0 ? 1 : 0;
                     if (vis[u] != 0 && slane < dk4) {
                         const uint e0 = uint(row) * uint(pc.k_row_stride) + k_head;
-                        k4[u] = nf_fd_k4(e0 + uint(slane * 4), row) * kv_scales[kvh];
+                        k4[u] = nf_fd_k4(e0 + uint(slane * 4), row) * k_scale;
                     }
                 }
             }

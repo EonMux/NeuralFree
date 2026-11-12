@@ -38,10 +38,10 @@ import com.eonmux.neuralfree.gguf.memory.KvDType;
  * portable ones. {@link #decodeGlobal}, {@link #decodePagedGlobal}, {@link #prefillGlobal}, {@link #decodeLocalSize}
  * and {@link #prefillLocalSize} follow the plan's form.
  *
- * <p>The portable paged decode plan also sizes the CUDA grouped-query paged decode {@code LLM_FlashDecodePagedGqa_*}
- * ({@link #gqaDecodeServes}, {@link #gqaDecodeUsable}): one work-group per (sequence, KV head, split) holding every
- * query head of the group, with the split chosen over the launch's work-groups ({@link #decodeGqaSplit}) inside the
- * partial buffer this plan sizes.
+ * <p>The portable paged decode plan also sizes the grouped-query paged decode {@code LLM_FlashDecodePagedGqa_*}
+ * (CUDA, and Vulkan on NVIDIA devices; {@link #gqaDecodeServes}, {@link #gqaDecodeUsable}): one work-group per
+ * (sequence, KV head, split) holding every query head of the group, with the split chosen over the launch's
+ * work-groups ({@link #decodeGqaSplit}) inside the partial buffer this plan sizes.
  */
 public final class FlashAttnTiling {
 
@@ -220,16 +220,18 @@ public final class FlashAttnTiling {
      * Whether the decode kernels' warp fast path ({@code nf_fd_fast_ok} in flash_decode.cl and flash_decode.comp)
      * serves these caches and head dims on a backend that runs it ({@code LlmKernels.decodeWarpPath()}: CUDA and HIP,
      * whose dialect defines {@code NF_HAS_SG_SHUFFLE}, and Vulkan devices whose {@code __sg} modules run on 32-lane
-     * subgroups): plain F32/F16/BF16 cache element types only, head
-     * dims of at most {@link #FAST_DIM} (one coalesced row float4 per lane), and the decode plans'
-     * {@code g_tile} of 1 (at most {@link #PASS2_GROUPS} lane groups of registers). Quantized, FP8 and latent
-     * caches, wider head dims and backends without the warp path run the portable scalar body.
+     * subgroups): F32, F16, BF16 and Q8_0 cache element types only, head
+     * dims of at most {@link #FAST_DIM} (one coalesced row float4 per lane: four values, or four Q8_0 codes and their
+     * block's scale), and the decode plans' {@code g_tile} of 1 (at most {@link #PASS2_GROUPS} lane groups of
+     * registers). Other quantized, FP8 and latent caches, wider head dims and backends without the warp path run the
+     * portable scalar body.
      */
     public static boolean decodeFastPath(boolean warpPath, KvDType typeK, KvDType typeV, int dK, int dV) {
-        return warpPath
-                && (typeK == KvDType.F32 || typeK == KvDType.F16 || typeK == KvDType.BF16)
-                && (typeV == KvDType.F32 || typeV == KvDType.F16 || typeV == KvDType.BF16)
-                && dK <= FAST_DIM && dV <= FAST_DIM;
+        return warpPath && fastPathType(typeK) && fastPathType(typeV) && dK <= FAST_DIM && dV <= FAST_DIM;
+    }
+
+    private static boolean fastPathType(KvDType t) {
+        return t == KvDType.F32 || t == KvDType.F16 || t == KvDType.BF16 || t == KvDType.Q8_0;
     }
 
     /**

@@ -1,14 +1,15 @@
 /* flash_decode_sg.cl - LLM_FlashDecodeSg_<KV> and LLM_FlashDecodePagedSg_<KV> subgroup decode attention (OpenCL only). Requires: common/dialect.h, common/config.h, common/math.h, common/kv_types.h, common/attn_common.h, llm/flash_decode.cl */
 /*
- * The decode attention of LLM_FlashDecode_<KV> / LLM_FlashDecodePaged_<KV> (flash_decode.cl) for plain F32, F16 and
- * BF16 caches, with the same argument lists, layouts, masking, biases, sinks and partial outputs, under a work mapping
+ * The decode attention of LLM_FlashDecode_<KV> / LLM_FlashDecodePaged_<KV> (flash_decode.cl) for plain F32, F16,
+ * BF16 and Q8_0 caches, with the same argument lists, layouts, masking, biases, sinks and partial outputs, under a work mapping
  * built for GPUs whose work-groups are limited by local memory residency and whose loads are limited by the number of
  * load messages (the Intel Xe integrated GPUs):
  *
  * - A work-group is NF_FDS_SUBGROUPS subgroups of NF_SG_ROW_SIZE lanes (pinned by intel_reqd_sub_group_size) and
  *   serves one query head over one key split. Lane l holds the NF_FDS_DPL consecutive dims
  *   [l * NF_FDS_DPL, +NF_FDS_DPL) of q, of the K and V rows and of the output, so one key's K row (and V row) is one
- *   vector load per lane. The per-thread state (q, the output accumulator and one key's K and V rows: 64 of the 128
+ *   vector load per lane (a Q8_0 row: the lane's 8 codes as one 8-byte load and its block's scale, shared by the
+ *   four lanes of the block). The per-thread state (q, the output accumulator and one key's K and V rows: 64 of the 128
  *   32-byte registers of a SIMD16 thread) leaves no room for a second head or a second key in flight without
  *   spilling; the latency of a key's loads is hidden by the other resident threads instead.
  * - Subgroup s scans keys s, s + NF_FDS_SUBGROUPS, ... of the split with an online softmax (running max m, sum l
@@ -24,7 +25,7 @@
  * Grid: global {n_split * NF_FDS_WG, [n_seq *] n_head}, local {NF_FDS_WG, 1}. Plan constraints (FlashAttnTiling's
  * subgroup decode form; a violation writes NaN outputs): g_tile == 1, d_k == d_v,
  * d_k a positive multiple of NF_FDS_DPL of at most NF_FDS_MAX_D, K and V row and head strides multiples of
- * NF_FDS_DPL, n_split >= 1, split_len > 0, direct_out only with
+ * NF_FDS_DPL (of the 32-value block for Q8_0), n_split >= 1, split_len > 0, direct_out only with
  * n_split == 1, the work-group and subgroup sizes above. The softmax is the portable kernel's in another summation
  * order; results are deterministic (fixed key interleave and merge order).
  */
@@ -40,9 +41,12 @@
 #define NF_FDS_STATE (NF_FDS_MAX_D + 2)
 #define NF_FDS_MERGE_FLOATS (NF_FDS_SUBGROUPS * NF_FDS_STATE)
 
-/* Bytes of one plain cache element. */
-NF_INLINE int nf_fds_esize(int kv_type) {
-    return kv_type == NF_KV_F32 ? 4 : 2;
+/* Bytes of the first `elems` values of a cache row (elems a whole number of Q8_0 blocks for Q8_0). */
+NF_INLINE nf_i64 nf_fds_bytes(int kv_type, nf_i64 elems) {
+    if (kv_type == NF_KV_Q8_0) {
+        return (elems >> 5) * Q8_0_BLOCK_BYTES;
+    }
+    return elems * (kv_type == NF_KV_F32 ? 4 : 2);
 }
 
 #if defined(cl_khr_fp16)
@@ -57,9 +61,15 @@ NF_INLINE int nf_fds_esize(int kv_type) {
  * NF_FDS_DPL consecutive values at element dim0 of the cache row starting at row (a uniform pointer: the 64-bit row
  * address is computed once per key in scalar registers, the lane offset is 32-bit). The 2-byte types load as one
  * 16-byte word per lane, which needs 4-byte aligned rows and dims: the plan checks keep every stride and dim0 a
- * multiple of NF_FDS_DPL elements.
+ * multiple of NF_FDS_DPL elements. A Q8_0 row loads the lane's 8 codes of its block (2-byte aligned: the plan keeps
+ * every stride a whole number of blocks) and the block's half scale, as nf_kv_load decodes them (scale * code).
  */
 NF_INLINE float8 nf_fds_load(NF_GLOBAL const uchar* row, int dim0, int kv_type) {
+    if (kv_type == NF_KV_Q8_0) {
+        NF_GLOBAL const uchar* bp = row + (dim0 >> 5) * Q8_0_BLOCK_BYTES;
+        const ushort4 c = vload4(0, (NF_GLOBAL const ushort*)(bp + 2 + (dim0 & 31)));
+        return convert_float8(as_char8(c)) * vload_half(0, (NF_GLOBAL const NF_HALF*)bp);
+    }
     if (kv_type == NF_KV_F16) {
         const uint4 w = vload4(0, (NF_GLOBAL const uint*)((NF_GLOBAL const NF_HALF*)row + dim0));
         return NF_FDS_HALF8(w);
@@ -73,10 +83,13 @@ NF_INLINE float8 nf_fds_load(NF_GLOBAL const uchar* row, int dim0, int kv_type) 
     return vload8(0, (NF_GLOBAL const float*)row + dim0);
 }
 
-/* The stride alignment of nf_fds_load: every row and head offset a multiple of NF_FDS_DPL elements. */
-NF_INLINE int nf_fds_strides_ok(int k_row_stride, int k_head_stride, int v_row_stride, int v_head_stride) {
-    return k_row_stride % NF_FDS_DPL == 0 && k_head_stride % NF_FDS_DPL == 0
-        && v_row_stride % NF_FDS_DPL == 0 && v_head_stride % NF_FDS_DPL == 0;
+/* The stride alignment of nf_fds_load: every row and head offset a multiple of NF_FDS_DPL elements (of a whole
+ * 32-value block for Q8_0). */
+NF_INLINE int nf_fds_strides_ok(int kv_type, int k_row_stride, int k_head_stride, int v_row_stride,
+                                int v_head_stride) {
+    const int unit = kv_type == NF_KV_Q8_0 ? 32 : NF_FDS_DPL;
+    return k_row_stride % unit == 0 && k_head_stride % unit == 0
+        && v_row_stride % unit == 0 && v_head_stride % unit == 0;
 }
 
 /* Index of the lowest set bit of a non-zero mask (CL1.2 has clz but not ctz). */
@@ -89,9 +102,9 @@ NF_INLINE float nf_fds_dot(float8 a, float8 b) {
 }
 
 NF_INLINE int nf_fds_plan_ok(int n_head, int n_head_kv, int d_k, int d_v, int g_tile, int n_split, int split_len,
-                             int direct_out, int k_row_stride, int k_head_stride, int v_row_stride,
+                             int direct_out, int kv_type, int k_row_stride, int k_head_stride, int v_row_stride,
                              int v_head_stride) {
-    return nf_fds_strides_ok(k_row_stride, k_head_stride, v_row_stride, v_head_stride)
+    return nf_fds_strides_ok(kv_type, k_row_stride, k_head_stride, v_row_stride, v_head_stride)
         && n_head > 0 && n_head_kv > 0 && n_head % n_head_kv == 0
         && g_tile == 1
         && d_k == d_v && d_k > 0 && d_k % NF_FDS_DPL == 0 && d_k <= NF_FDS_MAX_D
@@ -140,11 +153,10 @@ NF_INLINE void nf_fds_run(
     /* Plain caches carry one scale per KV head and side (1.0 unless a checkpoint scale was set). */
     const float ks = nf_kv_head_scale(kv_type, kv_scales, 0, kvh, n_head_kv, 0);
     const float vs = nf_kv_head_scale(kv_type, kv_scales, 0, kvh, n_head_kv, 1);
-    const int esize = nf_fds_esize(kv_type);
-    NF_GLOBAL const uchar* k_base = k + (nf_i64)kvh * k_head_stride * esize;
-    NF_GLOBAL const uchar* v_base = v + (nf_i64)kvh * v_head_stride * esize;
-    const nf_i64 k_row_bytes = (nf_i64)k_row_stride * esize;
-    const nf_i64 v_row_bytes = (nf_i64)v_row_stride * esize;
+    NF_GLOBAL const uchar* k_base = k + nf_fds_bytes(kv_type, (nf_i64)kvh * k_head_stride);
+    NF_GLOBAL const uchar* v_base = v + nf_fds_bytes(kv_type, (nf_i64)kvh * v_head_stride);
+    const nf_i64 k_row_bytes = nf_fds_bytes(kv_type, k_row_stride);
+    const nf_i64 v_row_bytes = nf_fds_bytes(kv_type, v_row_stride);
     const ulong tree_bits = tree ? tree_mask[0] : (ulong)0;
 
     float m = -NF_INF;
@@ -262,7 +274,7 @@ NF_FDS_ATTR NF_KERNEL void LLM_FlashDecodeSg_##SFX(                             
 {                                                                                             \
     NF_LOCAL float merge[NF_FDS_MERGE_FLOATS];                                                \
     if (!nf_fds_plan_ok(n_head, n_head_kv, d_k, d_v, g_tile, n_split, split_len,               \
-                        flags & NF_ATTN_FLAG_DIRECT, k_row_stride, k_head_stride,             \
+                        flags & NF_ATTN_FLAG_DIRECT, KV_CODE, k_row_stride, k_head_stride,    \
                         v_row_stride, v_head_stride)) {                                       \
         nf_fd_poison(n_head, d_v, n_split, flags & NF_ATTN_FLAG_DIRECT, out_off, out, partial); \
         return;                                                                               \
@@ -287,7 +299,8 @@ NF_FDS_ATTR NF_KERNEL void LLM_FlashDecodePagedSg_##SFX(                        
     if (!(page_shift >= 0 && page_shift <= 20 && max_pages >= 1 && n_seq >= 1                 \
           && q_seq_stride >= 0 && out_seq_stride >= 0                                         \
           && nf_fds_plan_ok(n_head, n_head_kv, d_k, d_v, g_tile, n_split, split_len, direct,  \
-                            k_row_stride, k_head_stride, v_row_stride, v_head_stride))) {     \
+                            KV_CODE, k_row_stride, k_head_stride, v_row_stride,               \
+                            v_head_stride))) {                                                \
         nf_fd_paged_poison(n_seq, n_head, d_v, n_split, direct, out_off, out, partial);       \
         return;                                                                               \
     }                                                                                         \
@@ -309,8 +322,10 @@ NF_FDS_ATTR NF_KERNEL void LLM_FlashDecodePagedSg_##SFX(                        
 NF_FLASH_DECODE_SG_KERNEL(F32, float, NF_KV_F32)
 NF_FLASH_DECODE_SG_KERNEL(F16, NF_HALF, NF_KV_F16)
 NF_FLASH_DECODE_SG_KERNEL(BF16, ushort, NF_KV_BF16)
+NF_FLASH_DECODE_SG_KERNEL(Q8_0, uchar, NF_KV_Q8_0)
 NF_FLASH_DECODE_PAGED_SG_KERNEL(F32, float, NF_KV_F32)
 NF_FLASH_DECODE_PAGED_SG_KERNEL(F16, NF_HALF, NF_KV_F16)
 NF_FLASH_DECODE_PAGED_SG_KERNEL(BF16, ushort, NF_KV_BF16)
+NF_FLASH_DECODE_PAGED_SG_KERNEL(Q8_0, uchar, NF_KV_Q8_0)
 
 #endif /* USE_SUBGROUPS && cl_intel_required_subgroup_size && NF_SG_ROW_SIZE */

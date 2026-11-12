@@ -7,12 +7,13 @@ import com.eonmux.neuralfree.gguf.memory.KvDType;
 
 /**
  * The subgroup flash attention of {@code kernels/llm/flash_decode_sg.cl} and {@code kernels/llm/flash_prefill_sg.cl}
- * for plain F32, F16 and BF16 caches: the decode kernels {@code LLM_FlashDecodeSg_<KV>} /
+ * for plain F32, F16 and BF16 caches and Q8_0 caches: the decode kernels {@code LLM_FlashDecodeSg_<KV>} /
  * {@code LLM_FlashDecodePagedSg_<KV>} and the prefill kernels {@code LLM_FlashAttnSg_<KV>} /
  * {@code LLM_FlashAttnPagedSg_<KV>}. Each takes the arguments of its portable counterpart ({@code LLM_FlashDecode*},
  * {@code LLM_FlashAttn*}) and writes the same outputs and partials, with work-groups of {@link #SUBGROUPS} 16-lane
  * subgroups that keep their running state per lane ({@link #DIMS_PER_LANE} dims of the output per lane; in the
- * Intel runtime build the decode kernels hold it in registers, the prefill kernels spill part of it):
+ * Intel runtime build the decode kernels hold it in registers, the prefill kernels spill part of it; a Q8_0 lane
+ * reads its 8 codes and their block's scale):
  * <ul>
  *   <li>decode: one query head per work-group; each subgroup scans every {@link #SUBGROUPS}-th key of the split and
  *       the subgroups merge through about 2 KB of local memory;</li>
@@ -71,9 +72,9 @@ final class SubgroupFlashAttention {
 
     /**
      * Whether the subgroup kernels serve a layer with these caches and head dims on {@code kernels}' device: a
-     * backend with the pinned subgroup forms ({@link SubgroupRowForms#served}), equal plain F32, F16 or BF16 K and V
-     * caches, equal head dims that are positive multiples of {@link #DIMS_PER_LANE} of at most {@link #MAX_HEAD_DIM},
-     * and the four kernels of the type (dense and paged decode and prefill) present.
+     * backend with the pinned subgroup forms ({@link SubgroupRowForms#served}), equal F32, F16, BF16 or Q8_0 K and V
+     * caches, equal head dims that are positive multiples of {@link #DIMS_PER_LANE} (of a Q8_0 block for Q8_0) of at
+     * most {@link #MAX_HEAD_DIM}, and the four kernels of the type (dense and paged decode and prefill) present.
      */
     static boolean serves(LlmKernels kernels, KvDType typeK, KvDType typeV, int dK, int dV) {
         return SubgroupRowForms.served(kernels)
@@ -87,8 +88,22 @@ final class SubgroupFlashAttention {
     /** The cache-type and head-dim conditions of {@link #serves}, which the kernels' plan check repeats. */
     static boolean shapeServes(KvDType typeK, KvDType typeV, int dK, int dV) {
         return typeK == typeV
-                && (typeK == KvDType.F32 || typeK == KvDType.F16 || typeK == KvDType.BF16)
-                && dK == dV && dK > 0 && dK % DIMS_PER_LANE == 0 && dK <= MAX_HEAD_DIM;
+                && (typeK == KvDType.F32 || typeK == KvDType.F16 || typeK == KvDType.BF16 || typeK == KvDType.Q8_0)
+                && dK == dV && dK > 0 && dK % strideUnit(typeK) == 0 && dK <= MAX_HEAD_DIM;
+    }
+
+    /**
+     * Whether K and V cache rows of these strides (elements) start where the kernels' loads need them: on whole
+     * {@link #strideUnit} multiples, as the kernels' plan check requires of every row and head offset.
+     */
+    static boolean stridesServe(KvDType type, int kRowStride, int vRowStride) {
+        int unit = strideUnit(type);
+        return kRowStride % unit == 0 && vRowStride % unit == 0;
+    }
+
+    /** The element alignment of the kernels' row loads: {@link #DIMS_PER_LANE}, a whole 32-value block for Q8_0. */
+    static int strideUnit(KvDType type) {
+        return type == KvDType.Q8_0 ? 32 : DIMS_PER_LANE;
     }
 
     /** The dense decode kernel of a cache type. */

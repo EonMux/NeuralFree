@@ -26,9 +26,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * workgroup block each, instead of as separate launches; the results are those of the individual kernels because
  * every task is recorded only for views it proves disjoint from the others.
  *
- * <p>Tasks and their buffers are fixed at {@link #build()}; the token count is the only value that changes per
- * step ({@link #run(int)}), so the prepared dispatch is reused unchanged. A task's row or element count is
- * {@code tokens * perToken}, which lets one descriptor serve decode and prefill steps.</p>
+ * <p>Tasks and their buffers are fixed at {@link #build()}; only the token count changes per step
+ * ({@link #run(int)}). A task's row or element count is {@code tokens * perToken}, which lets one descriptor serve
+ * decode and prefill steps, and the launch is sized to the step's token count: one work-group block per row (or per
+ * local-size chunk of elements) of the widest task at that count ({@link #blocksPerTask(int)}), so a single-token
+ * step does not launch the blocks of a full micro-batch.</p>
  *
  * <p>Each instance owns its descriptor in a scratch temporary whose name is unique for the model's scratch: two
  * launches of one step (there are several per layer) must not share a descriptor, which is read when the launch
@@ -44,12 +46,19 @@ public final class GpuMultiTask implements AutoCloseable {
         final int[] ints = new int[20];
         final float[] floats = new float[8];
         final GpuBuffer[] buffers = new GpuBuffer[12];
-        int kind;
+        final int kind;
+        /** Rows (or elements) of work per token. */
+        long perToken;
+        /** Rows (or elements) one work-group block covers per pass: 1 for row bodies, the local size for elements. */
+        int perBlock;
 
         Task(int kind) {
             this.kind = kind;
         }
     }
+
+    /** The most work-group blocks a launch gives one task; larger tasks loop. */
+    static final int MAX_BLOCKS_PER_TASK = 8192;
 
     /** Distinguishes the descriptors of the launches the model's blocks build. */
     private static final AtomicLong IDS = new AtomicLong();
@@ -62,7 +71,7 @@ public final class GpuMultiTask implements AutoCloseable {
     private ScratchSlot desc;
     private PreparedDispatch dispatch;
     private int blocksPerTask;
-    private long workBlocks;
+    private int lastTokens;
     private boolean built;
     private boolean closed;
 
@@ -137,7 +146,7 @@ public final class GpuMultiTask implements AutoCloseable {
         t.buffers[1] = w;
         t.buffers[2] = b;
         t.buffers[3] = y;
-        add(t, (long) ubatch * Math.max(1, rowsPerToken));
+        add(t, Math.max(1, rowsPerToken), 1);
     }
 
     /**
@@ -197,7 +206,7 @@ public final class GpuMultiTask implements AutoCloseable {
         t.buffers[3] = b;
         t.buffers[4] = x;
         t.buffers[5] = y;
-        add(t, (long) ubatch * nHeads);
+        add(t, nHeads, 1);
     }
 
     /**
@@ -232,8 +241,7 @@ public final class GpuMultiTask implements AutoCloseable {
         t.buffers[4] = gOut;
         t.buffers[5] = betaOut;
         long perHead = kdaMode < 0 ? 1L : Math.max(1, headDim);
-        long elements = (long) ubatch * nVHeads * perHead;
-        add(t, (elements + local - 1) / local);
+        add(t, nVHeads * perHead, local);
     }
 
     /**
@@ -262,16 +270,31 @@ public final class GpuMultiTask implements AutoCloseable {
         t.buffers[0] = w.shard(0);
         t.buffers[1] = x;
         t.buffers[2] = out;
-        add(t, (long) ubatch * rows);
+        add(t, rows, 1);
     }
 
-    private void add(Task t, long work) {
+    private void add(Task t, long perToken, int perBlock) {
         if (tasks.size() >= NF_MT_MAX_TASKS) {
             throw new IllegalStateException(FusedKernels.MULTI_TASK + " records at most " + NF_MT_MAX_TASKS
                     + " tasks per launch");
         }
+        t.perToken = Math.max(1L, perToken);
+        t.perBlock = Math.max(1, perBlock);
         tasks.add(t);
-        workBlocks = Math.max(workBlocks, Math.max(1L, work));
+    }
+
+    /**
+     * The work-group blocks each task of a step over {@code nTokens} tokens gets: one per row (or per local-size
+     * chunk of elements) of the widest task at that count, between 1 and {@value #MAX_BLOCKS_PER_TASK}. The kernel
+     * strides each task's rows by this count, so any positive value covers every row.
+     */
+    public int blocksPerTask(int nTokens) {
+        long blocks = 1;
+        for (Task t : tasks) {
+            long units = (long) nTokens * t.perToken;
+            blocks = Math.max(blocks, (units + t.perBlock - 1) / t.perBlock);
+        }
+        return (int) Math.min(MAX_BLOCKS_PER_TASK, blocks);
     }
 
     private void requireEditable() {
@@ -333,8 +356,8 @@ public final class GpuMultiTask implements AutoCloseable {
         if (event != null) {
             event.close();
         }
-        // One block per row (or per local-size chunk of elements) of the widest task; shorter tasks loop fewer times.
-        blocksPerTask = (int) Math.min(8192L, Math.max(1L, workBlocks));
+        blocksPerTask = blocksPerTask(ubatch);
+        lastTokens = ubatch;
         Object[] args = new Object[4 + FusedKernels.MULTI_TASK_BUFFERS];
         args[0] = ubatch;
         args[1] = tasks.size();
@@ -355,7 +378,7 @@ public final class GpuMultiTask implements AutoCloseable {
     }
 
     /**
-     * Launches the prepared tasks over {@code nTokens} tokens.
+     * Launches the prepared tasks over {@code nTokens} tokens, {@link #blocksPerTask(int)} blocks per task.
      *
      * @throws IllegalStateException    when not built or closed
      * @throws IllegalArgumentException when {@code nTokens} is outside {@code [1, ubatch]}
@@ -371,7 +394,13 @@ public final class GpuMultiTask implements AutoCloseable {
             throw new IllegalArgumentException("multi-task step of " + nTokens + " tokens is outside [1, " + ubatch
                     + "]");
         }
-        dispatch.setInt(0, nTokens);
+        if (nTokens != lastTokens) {
+            blocksPerTask = blocksPerTask(nTokens);
+            dispatch.setInt(0, nTokens);
+            dispatch.setInt(2, blocksPerTask);
+            dispatch.setGlobal((long) tasks.size() * blocksPerTask * local);
+            lastTokens = nTokens;
+        }
         dispatch.dispatch();
     }
 

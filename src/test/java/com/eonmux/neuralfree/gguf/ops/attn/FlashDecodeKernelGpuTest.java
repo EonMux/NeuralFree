@@ -28,12 +28,13 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The dense flash-decode kernel ({@code LLM_FlashDecode_F16}) against the CPU reference at the head dims that
- * surround the warp fast path's limit ({@code NF_FA_FAST_DIM}): one coalesced row float4 per lane covers at
- * most 32 * 4 dims, so d = 128 and the non-multiple-of-128 dims (96, 80) run the fast path on a warp-path backend,
+ * The dense flash-decode kernel ({@code LLM_FlashDecode_F16} and {@code LLM_FlashDecode_Q8_0}) against the CPU
+ * reference at the head dims that surround the warp fast path's limit ({@code NF_FA_FAST_DIM}): one coalesced row
+ * float4 per lane covers at most 32 * 4 dims, so d = 128 and the non-multiple-of-128 dims (96, 80) run the fast path on a warp-path backend,
  * while d = 256 must take the scalar body (one lane cannot hold the row, and the mma plan refuses the shape
- * anyway). Every case checks both step shapes of a decode: a direct launch over one workgroup of keys and a
- * split-K launch with its combine.
+ * anyway). A Q8_0 cache takes the same route at head dims of whole 32-value blocks (64 replaces 80). Every case
+ * checks both step shapes of a decode: a direct launch over one workgroup of keys and a split-K launch with its
+ * combine.
  *
  * <p>Every test repeats over the machine's OpenCL, CUDA and Vulkan devices, so the fast path (CUDA, and Vulkan on
  * 32-lane subgroups) and the scalar body (OpenCL, other Vulkan devices) answer the same reference.</p>
@@ -51,29 +52,37 @@ public class FlashDecodeKernelGpuTest {
     /** One direct step (a single workgroup of keys) and one split-K step. */
     private static final int[] KEY_COUNTS = {5, 200};
 
-    @Parameterized.Parameters(name = "{0} d={1}x{2}")
+    @Parameterized.Parameters(name = "{0} {3} d={1}x{2}")
     public static List<Object[]> cases() {
         List<Object[]> rows = new ArrayList<>();
         for (ComputeBackend.BackendType t : EnumSet.of(ComputeBackend.BackendType.OPENCL,
                 ComputeBackend.BackendType.CUDA, ComputeBackend.BackendType.VULKAN)) {
-            for (int[] dims : DIMS) {
-                rows.add(new Object[]{t, dims[0], dims[1]});
+            for (KvDType type : new KvDType[]{KvDType.F16, KvDType.Q8_0}) {
+                for (int[] dims : DIMS) {
+                    int dK = type == KvDType.Q8_0 && dims[0] % Q8_BLOCK != 0 ? 64 : dims[0];
+                    rows.add(new Object[]{t, dK, dims[1], type});
+                }
             }
         }
         return rows;
     }
 
+    /** Values per Q8_0 block. */
+    private static final int Q8_BLOCK = 32;
+
     private final ComputeBackend.BackendType api;
     private final int dK;
     private final int dV;
+    private final KvDType type;
     private HWAcceleration hw;
     private ComputeBackend backend;
     private LlmKernels kernels;
 
-    public FlashDecodeKernelGpuTest(ComputeBackend.BackendType api, int dK, int dV) {
+    public FlashDecodeKernelGpuTest(ComputeBackend.BackendType api, int dK, int dV, KvDType type) {
         this.api = api;
         this.dK = dK;
         this.dV = dV;
+        this.type = type;
     }
 
     @Before
@@ -122,8 +131,7 @@ public class FlashDecodeKernelGpuTest {
     @Test
     public void decodeMatchesTheCpuReferenceAroundTheFastPathDimLimit() {
         // The plan must mirror the kernel gate: over the 128-dim limit no warp-path backend runs the fast path.
-        boolean expectFast = FlashAttnTiling.decodeFastPath(kernels.decodeWarpPath(), KvDType.F16, KvDType.F16,
-                dK, dV);
+        boolean expectFast = FlashAttnTiling.decodeFastPath(kernels.decodeWarpPath(), type, type, dK, dV);
         FlashAttnTiling tiling = FlashAttnTiling.decode(N_HEAD, N_HEAD_KV, dK, dV, N_KV, kernels.faSmemFloats(),
                 Math.max(1, backend.capabilities().getComputeUnits()), expectFast);
         Assume.assumeTrue("no decode plan for d=" + dK + "x" + dV,
@@ -131,19 +139,9 @@ public class FlashDecodeKernelGpuTest {
 
         Random rnd = new Random(7);
         float scale = (float) (1.0 / Math.sqrt(dK));
-        // K and V rows encoded F16 host-side; the reference decodes the same halves the GPU sees.
-        short[] k16 = new short[N_KV * N_HEAD_KV * dK];
-        short[] v16 = new short[N_KV * N_HEAD_KV * dV];
-        float[] kF = new float[k16.length];
-        float[] vF = new float[v16.length];
-        for (int i = 0; i < k16.length; i++) {
-            kF[i] = rnd.nextFloat() - 0.5f;
-            k16[i] = (short) HalfFloats.floatToHalf(kF[i]);
-        }
-        for (int i = 0; i < v16.length; i++) {
-            vF[i] = rnd.nextFloat() - 0.5f;
-            v16[i] = (short) HalfFloats.floatToHalf(vF[i]);
-        }
+        // K and V rows encoded host-side; the reference decodes the same values the GPU sees.
+        float[] kF = cacheValues(rnd, N_KV * N_HEAD_KV * dK);
+        float[] vF = cacheValues(rnd, N_KV * N_HEAD_KV * dV);
         int[] kvPos = new int[N_KV];
         for (int i = 0; i < N_KV; i++) {
             kvPos[i] = i;
@@ -153,8 +151,8 @@ public class FlashDecodeKernelGpuTest {
         try {
             float[] qHost = randomFloats(rnd, N_HEAD * dK);
             GpuBuffer q = upload(bufs, qHost);
-            GpuBuffer dk = uploadHalfs(bufs, k16);
-            GpuBuffer dv = uploadHalfs(bufs, v16);
+            GpuBuffer dk = uploadCache(bufs, kF);
+            GpuBuffer dv = uploadCache(bufs, vF);
             GpuBuffer dpos = upload(bufs, kvPos);
             GpuBuffer dsinks = upload(bufs, new float[1]);
             GpuBuffer drel = upload(bufs, new float[1]);
@@ -213,7 +211,7 @@ public class FlashDecodeKernelGpuTest {
                 args[AttnKernels.ARG_FD_BUF_PARTIAL] = dpartial;
                 args[AttnKernels.ARG_FD_BUF_KV_SCALES] = dscales;
                 args[AttnKernels.ARG_FD_BUF_TREE_MASK] = dmask;
-                dispatch(AttnKernels.flashDecode(KvDType.F16), tiling.decodeGlobal(split.count()),
+                dispatch(AttnKernels.flashDecode(type), tiling.decodeGlobal(split.count()),
                         FlashAttnTiling.decodeLocal(), args);
                 if (!direct) {
                     Object[] combine = {N_HEAD, dV, split.count(), N_HEAD, 0, 0, dpartial, dsinks, dout};
@@ -222,9 +220,9 @@ public class FlashDecodeKernelGpuTest {
                 }
                 float[] got = readFloats(dout, want.length);
                 for (int i = 0; i < want.length; i++) {
-                    assertTrue(api + " d=" + dK + "x" + dV + " n=" + n + " output " + i + " is not finite: "
-                            + got[i], Float.isFinite(got[i]));
-                    assertEquals(api + " d=" + dK + "x" + dV + " n=" + n + " output " + i, want[i], got[i], TOL);
+                    String what = api + " " + type + " d=" + dK + "x" + dV + " n=" + n + " output " + i;
+                    assertTrue(what + " is not finite: " + got[i], Float.isFinite(got[i]));
+                    assertEquals(what, want[i], got[i], TOL);
                 }
             }
         } finally {
@@ -232,6 +230,49 @@ public class FlashDecodeKernelGpuTest {
                 b.close();
             }
         }
+    }
+
+    /**
+     * {@code n} cache values exactly as the kernels decode them: F16-rounded randoms, or Q8_0 codes in [-127, 127]
+     * times their block's {@link #q8Scale}.
+     */
+    private float[] cacheValues(Random rnd, int n) {
+        float[] v = new float[n];
+        for (int i = 0; i < n; i++) {
+            v[i] = type == KvDType.Q8_0 ? q8Scale(i / Q8_BLOCK) * (rnd.nextInt(255) - 127)
+                    : HalfFloats.halfToFloat(HalfFloats.floatToHalf(rnd.nextFloat() - 0.5f));
+        }
+        return v;
+    }
+
+    /** The scale of Q8_0 block {@code b}: an exact half, so every value is an exact float product. */
+    private static float q8Scale(int b) {
+        return HalfFloats.halfToFloat(HalfFloats.floatToHalf(0.004f * (1 + (b % 7) / 8f)));
+    }
+
+    /** The cache of {@link #cacheValues}: little-endian F16 words, or Q8_0 blocks (half scale, then 32 codes). */
+    private GpuBuffer uploadCache(List<GpuBuffer> bufs, float[] values) {
+        if (type != KvDType.Q8_0) {
+            short[] h = new short[values.length];
+            for (int i = 0; i < values.length; i++) {
+                h[i] = (short) HalfFloats.floatToHalf(values[i]);
+            }
+            return uploadHalfs(bufs, h);
+        }
+        int blockBytes = 2 + Q8_BLOCK;
+        byte[] bytes = new byte[values.length / Q8_BLOCK * blockBytes];
+        for (int b = 0; b < values.length / Q8_BLOCK; b++) {
+            float d = q8Scale(b);
+            int h = HalfFloats.floatToHalf(d);
+            bytes[b * blockBytes] = (byte) h;
+            bytes[b * blockBytes + 1] = (byte) (h >> 8);
+            for (int i = 0; i < Q8_BLOCK; i++) {
+                bytes[b * blockBytes + 2 + i] = (byte) Math.round(values[b * Q8_BLOCK + i] / d);
+            }
+        }
+        GpuBuffer buf = alloc(bufs, bytes.length);
+        close(backend.computeQueue().enqueueWriteBuffer(buf, 0, bytes.length, bytes));
+        return buf;
     }
 
     private static float[] randomFloats(Random rnd, int n) {

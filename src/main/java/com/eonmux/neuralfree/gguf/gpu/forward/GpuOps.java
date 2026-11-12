@@ -769,7 +769,8 @@ public final class GpuOps implements AutoCloseable {
 
     /**
      * Prepares both lanes' stacked Q/K/V matvecs ({@link #stackedQkv}) of attention weights stored as {@code type},
-     * where the backend holds the form and fusion is permitted, so the first decode step does not build them.
+     * where the backend holds the form and fusion is permitted, so the first decode step does not build them: on
+     * CUDA the warp-row stacks (beside a Q6_K V weight too, for Q4_K and Q5_K).
      *
      * @throws UnsupportedOperationException when GpuOps has no kernels for {@code type}
      */

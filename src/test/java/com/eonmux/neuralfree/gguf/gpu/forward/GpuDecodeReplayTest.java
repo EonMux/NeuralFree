@@ -52,8 +52,10 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -87,6 +89,8 @@ public class GpuDecodeReplayTest {
     DeviceCapabilities capabilities;
     /** Further kernel emulations {@link #open} registers, by kernel name. */
     final Map<String, FakeComputeBackend.KernelEmulator> emulators = new HashMap<>();
+    /** Kernels the fake backend {@link #open} makes leaves out of its kernel set. */
+    final Set<String> unavailableKernels = new HashSet<>();
     /** What the rig's mixers answer to {@link GpuMixer#decodeReadsPositionSlot()}. */
     boolean mixerReadsPositionSlot = true;
     /** The LM head rows of the model {@link #open} makes; the token table holds {@link #VOCAB} rows. */
@@ -136,6 +140,7 @@ public class GpuDecodeReplayTest {
             builder.emulate(GpuLogitsHead.ARGMAX, argmaxEmulator);
         }
         emulators.forEach(builder::emulate);
+        builder.unavailableKernels(unavailableKernels.toArray(new String[0]));
         if (capabilities != null) {
             builder.capabilities(capabilities);
         }

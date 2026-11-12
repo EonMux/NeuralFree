@@ -1,25 +1,35 @@
-/* argmax.comp - row-wise argmax and the tree verify's device accept walk. GLSL twins of LLM_Argmax
- * and LLM_TreeAccept in kernels/llm/sampling.cl.
+/* argmax.comp - row-wise argmax (one-pass and split forms) and the tree verify's device accept walk.
+ * GLSL twins of LLM_Argmax, LLM_ArgmaxSplit, LLM_ArgmaxCombine and LLM_TreeAccept in
+ * kernels/llm/sampling.cl.
  * Requires: common/nf_common.glsl.
  *
  * Variants rows:
- *     LLM_Argmax	argmax.comp	OP=OP_ARGMAX
+ *     LLM_Argmax	argmax.comp	OP=OP_ARGMAX	sg
+ *     LLM_ArgmaxSplit	argmax.comp	OP=OP_ARGMAX_SPLIT	sg
+ *     LLM_ArgmaxCombine	argmax.comp	OP=OP_ARGMAX_COMBINE	sg
  *     LLM_TreeAccept	argmax.comp	OP=OP_TREE_ACCEPT
  *
  * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
  *   OP_ARGMAX  (i size, float input, int max_idx, i n_rows)
  *              max_idx[row] = index of the first maximum of input[row * size .. row * size + size)
+ *   OP_ARGMAX_SPLIT  (i size, i n_chunks, float input, int part, i n_rows)
+ *              part[2 g], part[2 g + 1] = rank key and index of the winner of chunk g % n_chunks
+ *              (NF_ARGMAX_UNROLL * L elements) of row g / n_chunks
+ *   OP_ARGMAX_COMBINE  (i n_chunks, int part, int max_idx, i n_rows)
+ *              max_idx[row] = index of the winner among row `row`'s n_chunks chunk winners
  *   OP_TREE_ACCEPT  (i n_nodes, int tree, int argmax, int out)
  *              the tree verify's acceptance walk (LLM_TreeAccept): tree holds 3 ints per node
  *              (token, parent, depth), argmax the verify rows' greedy ids, out the accepted depth,
  *              the first emission, the final draw and the accepted path's node indices.
- * Candidates are ordered as in nf_argmax_better (kernels/llm/sampling.cl): a non-NaN value beats NaN, the
- * larger value wins, equal values go to the lower index. NaN is never selected; a row of only NaN
- * yields 0, and so does size == 0.
+ * Candidates are ordered as in nf_argmax_key / nf_argmax_before (kernels/llm/sampling.cl): a non-NaN
+ * value beats NaN, the larger value wins, equal values (-0 and +0 among them) go to the lower index.
+ * NaN is never selected; a row of only NaN yields 0, and so does size == 0. The order is total, so
+ * the subgroup (__sg) and shared-memory reductions and every split give the same ids.
  *
- * Dispatch: 1-D, global = n_rows * L, local = {L, 1, 1}; one workgroup per row (OP_TREE_ACCEPT:
- * global = local = {L}, exactly one workgroup). Folded group counts are recovered by nf_wg_id();
- * surplus groups exit uniformly. Any L is reduced exactly.
+ * Dispatch: 1-D, global = n_rows * L (OP_ARGMAX_SPLIT: n_rows * n_chunks * L), local = {L, 1, 1};
+ * one workgroup per row or chunk (OP_TREE_ACCEPT: global = local = {L}, exactly one workgroup).
+ * Folded group counts are recovered by nf_wg_id(); surplus groups exit uniformly. Any L is reduced
+ * exactly.
  */
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -28,97 +38,174 @@
 
 #define OP_ARGMAX 131
 #define OP_TREE_ACCEPT 132
+#define OP_ARGMAX_SPLIT 133
+#define OP_ARGMAX_COMBINE 134
 
 #if !defined(OP)
 #error "argmax.comp requires OP"
 #endif
-#if OP != OP_ARGMAX && OP != OP_TREE_ACCEPT
-#error "argmax.comp requires OP=OP_ARGMAX or OP=OP_TREE_ACCEPT"
+#if OP != OP_ARGMAX && OP != OP_TREE_ACCEPT && OP != OP_ARGMAX_SPLIT && OP != OP_ARGMAX_COMBINE
+#error "argmax.comp requires OP=OP_ARGMAX, OP_ARGMAX_SPLIT, OP_ARGMAX_COMBINE or OP_TREE_ACCEPT"
 #endif
 
 #if OP == OP_ARGMAX
 layout(std430, binding = 0) buffer NfAmInput { float x_in[]; };
 layout(std430, binding = 1) buffer NfAmOutput { int max_idx[]; };
+layout(push_constant) uniform NfAmParams { int size; int n_rows; } pc;
+#elif OP == OP_ARGMAX_SPLIT
+layout(std430, binding = 0) buffer NfAmInput { float x_in[]; };
+layout(std430, binding = 1) buffer NfAmPart { int part[]; };
+layout(push_constant) uniform NfAmParams { int size; int n_chunks; int n_rows; } pc;
+#elif OP == OP_ARGMAX_COMBINE
+layout(std430, binding = 0) buffer NfAmPart { int part[]; };
+layout(std430, binding = 1) buffer NfAmOutput { int max_idx[]; };
+layout(push_constant) uniform NfAmParams { int n_chunks; int n_rows; } pc;
 #else
 layout(std430, binding = 0) buffer NfAmTree { int tree[]; };
 layout(std430, binding = 1) buffer NfAmRowIds { int row_ids[]; };
 layout(std430, binding = 2) buffer NfAmAccept { int accept[]; };
-#endif
-#if OP == OP_ARGMAX
-layout(push_constant) uniform NfAmParams { int block0; int block1; } pc;
-#else
 layout(push_constant) uniform NfAmParams { int block0; } pc;
 #endif
 
 /* Index sentinel of an argmax candidate that holds no element. */
 #define NF_ARGMAX_NONE 0x7fffffff
+/* Elements each invocation of an OP_ARGMAX_SPLIT group loads (sampling.cl NF_ARGMAX_UNROLL). */
+#define NF_ARGMAX_UNROLL 8
 
-#if OP == OP_ARGMAX
+#if OP != OP_TREE_ACCEPT
 
-shared float nf_am_v[gl_WorkGroupSize.x];
+shared uint nf_am_k[gl_WorkGroupSize.x];
 shared int nf_am_i[gl_WorkGroupSize.x];
 
-/* NaN test on the bit pattern, independent of the driver's float NaN handling (Vulkan treats
- * NaN operands of float instructions as undefined unless SignedZeroInfNanPreserve is enabled). */
-bool nf_am_isnan(float v) {
-    return (floatBitsToUint(v) & 0x7fffffffu) > 0x7f800000u;
+/* Rank key of a value in the argmax order (sampling.cl nf_argmax_key): NaN 0, -0 as +0, otherwise
+ * the sign-magnitude bits as two's-order bits. Bits only, so the driver's NaN handling of float
+ * instructions never enters the order. */
+uint nf_argmax_key(float v) {
+    const uint u = floatBitsToUint(v);
+    const uint a = u & 0x7fffffffu;
+    if (a > 0x7f800000u) {
+        return 0u;
+    }
+    if (a == 0u) {
+        return 0x80000000u;
+    }
+    return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u);
 }
 
-/* True when candidate (v, i) beats (bv, bi). */
-bool nf_argmax_better(float v, int i, float bv, int bi) {
-    if (nf_am_isnan(v)) {
-        return nf_am_isnan(bv) && i < bi;
-    }
-    if (nf_am_isnan(bv)) {
-        return true;
-    }
-    return v > bv || (v == bv && i < bi);
+/* True when candidate (k, i) beats (bk, bi). */
+bool nf_argmax_before(uint k, int i, uint bk, int bi) {
+    return k > bk || (k == bk && i < bi);
 }
 
-/* Smallest power of two >= the local size; the tree folds the upper half with a bounds check. */
-uint nf_am_span() {
-    const uint n = gl_WorkGroupSize.x;
-    return n <= 1u ? 1u : (1u << uint(findMSB(n - 1u) + 1));
-}
-
-void main() {
-    const uint row = nf_wg_id();
-    if (row >= uint(pc.block1)) {
-        return;
-    }
+/* Work-group reduction of every invocation's candidate; the winner is valid in invocation 0. Every
+ * invocation calls it in uniform control flow. The __sg variant folds each subgroup by subgroupMax of
+ * the keys and subgroupMin of the indices holding the maximum key, then invocation 0 folds the
+ * subgroup winners; the plain variant runs a shared-memory tree. */
+void nf_wg_argmax(inout uint k, inout int i) {
     const uint lid = gl_LocalInvocationID.x;
-    const uint lsize = gl_WorkGroupSize.x;
-    const int size = pc.block0;
-    const uint base = row * uint(size);
-
-    float bv = NF_NAN;
-    int bi = NF_ARGMAX_NONE;
-    for (int i = int(lid); i < size; i += int(lsize)) {
-        const float v = x_in[base + uint(i)];
-        if (nf_argmax_better(v, i, bv, bi)) {
-            bv = v;
-            bi = i;
+#ifdef USE_SUBGROUPS
+    const uint mk = subgroupMax(k);
+    i = subgroupMin(k == mk ? i : NF_ARGMAX_NONE);
+    k = mk;
+    if (subgroupElect()) {
+        nf_am_k[gl_SubgroupID] = k;
+        nf_am_i[gl_SubgroupID] = i;
+    }
+    barrier();
+    if (lid == 0u) {
+        k = nf_am_k[0];
+        i = nf_am_i[0];
+        for (uint w = 1u; w < gl_NumSubgroups; ++w) {
+            if (nf_argmax_before(nf_am_k[w], nf_am_i[w], k, i)) {
+                k = nf_am_k[w];
+                i = nf_am_i[w];
+            }
         }
     }
-    nf_am_v[lid] = bv;
-    nf_am_i[lid] = bi;
+#else
+    const uint lsize = gl_WorkGroupSize.x;
+    nf_am_k[lid] = k;
+    nf_am_i[lid] = i;
     barrier();
-
-    for (uint s = nf_am_span() >> 1; s > 0u; s >>= 1) {
-        if (lid < s && lid + s < lsize) {
-            const float ov = nf_am_v[lid + s];
-            const int oi = nf_am_i[lid + s];
-            if (nf_argmax_better(ov, oi, nf_am_v[lid], nf_am_i[lid])) {
-                nf_am_v[lid] = ov;
-                nf_am_i[lid] = oi;
-            }
+    /* smallest power of two >= the local size; the upper half folds with a bounds check */
+    const uint span = lsize <= 1u ? 1u : (1u << uint(findMSB(lsize - 1u) + 1));
+    for (uint s = span >> 1; s > 0u; s >>= 1) {
+        if (lid < s && lid + s < lsize
+                && nf_argmax_before(nf_am_k[lid + s], nf_am_i[lid + s], nf_am_k[lid], nf_am_i[lid])) {
+            nf_am_k[lid] = nf_am_k[lid + s];
+            nf_am_i[lid] = nf_am_i[lid + s];
         }
         barrier();
     }
+    k = nf_am_k[0];
+    i = nf_am_i[0];
+#endif
+}
 
+void main() {
+    const uint g = nf_wg_id();
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    uint bk = 0u;
+    int bi = NF_ARGMAX_NONE;
+#if OP == OP_ARGMAX
+    if (g >= uint(pc.n_rows)) {
+        return;
+    }
+    const int size = pc.size;
+    const uint base = g * uint(size);
+    for (int i = int(lid); i < size; i += int(lsize)) {
+        const uint k = nf_argmax_key(x_in[base + uint(i)]);
+        if (nf_argmax_before(k, i, bk, bi)) {
+            bk = k;
+            bi = i;
+        }
+    }
+#elif OP == OP_ARGMAX_SPLIT
+    const uint n_chunks = uint(pc.n_chunks);
+    if (g >= uint(pc.n_rows) * n_chunks) {
+        return;
+    }
+    const int size = pc.size;
+    const uint row = g / n_chunks;
+    const uint base = row * uint(size);
+    const int i0 = int((g - row * n_chunks) * (NF_ARGMAX_UNROLL * lsize) + lid);
+    float v[NF_ARGMAX_UNROLL];
+    [[unroll]] for (int u = 0; u < NF_ARGMAX_UNROLL; ++u) {
+        const int i = i0 + u * int(lsize);
+        v[u] = i < size ? x_in[base + uint(i)] : NF_NAN;
+    }
+    [[unroll]] for (int u = 0; u < NF_ARGMAX_UNROLL; ++u) {
+        const int i = i0 + u * int(lsize);
+        const uint k = nf_argmax_key(v[u]);
+        if (i < size && nf_argmax_before(k, i, bk, bi)) {
+            bk = k;
+            bi = i;
+        }
+    }
+#else
+    if (g >= uint(pc.n_rows)) {
+        return;
+    }
+    const int n_chunks = pc.n_chunks;
+    const uint base = 2u * g * uint(n_chunks);
+    for (int c = int(lid); c < n_chunks; c += int(lsize)) {
+        const uint k = uint(part[base + 2u * uint(c)]);
+        const int i = part[base + 2u * uint(c) + 1u];
+        if (nf_argmax_before(k, i, bk, bi)) {
+            bk = k;
+            bi = i;
+        }
+    }
+#endif
+    nf_wg_argmax(bk, bi);
     if (lid == 0u) {
-        const int r = nf_am_i[0];
-        max_idx[row] = (r == NF_ARGMAX_NONE) ? 0 : r;
+#if OP == OP_ARGMAX_SPLIT
+        part[2u * g] = int(bk);
+        part[2u * g + 1u] = bi;
+#else
+        max_idx[g] = (bi == NF_ARGMAX_NONE) ? 0 : bi;
+#endif
     }
 }
 

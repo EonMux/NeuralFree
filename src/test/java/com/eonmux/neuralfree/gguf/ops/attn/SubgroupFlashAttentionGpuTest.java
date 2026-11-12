@@ -29,7 +29,8 @@ import static org.junit.Assert.assertTrue;
  * {@link CpuAttentionCore} on every device whose kernels include them ({@link SubgroupFormBackends}: the OpenCL kernels
  * of kernels/llm/flash_*_sg.cl and their Vulkan ports shaders/llm/flash_*_sg.comp, the Intel GPUs; other devices
  * skip): F32,
- * F16 and BF16 caches at head dims 64 (half the subgroup's lanes idle), 80 and 128 (every lane), GQA groups of 1 to 4
+ * F16, BF16 and Q8_0 caches at head dims 64 (half the subgroup's lanes idle), 80 (not Q8_0, whose rows are whole
+ * 32-value blocks) and 128 (every lane), GQA groups of 1 to 4
  * (3 leaves a partial head tile), empty cache cells, sinks, softcap, the sliding window and bidirectional attention.
  * Each decode case runs the plan's split of the step (split-K merged by {@code LLM_FlashAttn_Combine}, or direct) and
  * a direct launch whose one split scans every key; each prefill case a split-K and a direct launch; the paged cases
@@ -53,7 +54,7 @@ public class SubgroupFlashAttentionGpuTest {
     public static List<Object[]> types() {
         List<Object[]> rows = new ArrayList<>();
         for (BackendType api : new BackendType[]{BackendType.OPENCL, BackendType.VULKAN}) {
-            for (KvDType t : new KvDType[]{KvDType.F32, KvDType.F16, KvDType.BF16}) {
+            for (KvDType t : new KvDType[]{KvDType.F32, KvDType.F16, KvDType.BF16, KvDType.Q8_0}) {
                 rows.add(new Object[]{api, t});
             }
         }
@@ -95,7 +96,7 @@ public class SubgroupFlashAttentionGpuTest {
             String dev = backend.capabilities().getDeviceName();
             CpuAttentionCore.Params causal = CpuAttentionCore.Params.builder(8).scale(0.125f)
                     .window(KvWindow.FULL_CAUSAL).build();
-            for (int d : new int[]{64, 80, 128}) {
+            for (int d : type == KvDType.Q8_0 ? new int[]{64, 128} : new int[]{64, 80, 128}) {
                 runDense(backend, kernels, dev + " causal d=" + d, 8, 2, d, causal, false);
             }
             runDense(backend, kernels, dev + " sinks+softcap", 8, 4, 128, CpuAttentionCore.Params.builder(8)
@@ -138,8 +139,9 @@ public class SubgroupFlashAttentionGpuTest {
             runPrefill(backend, kernels, dev + " swa d=64", false, 8, 2, 64, 150, 40,
                     CpuAttentionCore.Params.builder(8).scale(0.125f)
                             .window(KvWindow.of(SwaType.STANDARD, 33, true)).build(), null);
-            runPrefill(backend, kernels, dev + " partial head tile gqa3 d=80", false, 6, 2, 80, 100, 9, causal(6),
-                    null);
+            int dTile = type == KvDType.Q8_0 ? 64 : 80;
+            runPrefill(backend, kernels, dev + " partial head tile gqa3 d=" + dTile, false, 6, 2, dTile, 100, 9,
+                    causal(6), null);
             runPrefill(backend, kernels, dev + " bidirectional mha", false, 4, 4, 128, 100, 100,
                     CpuAttentionCore.Params.builder(4).scale(0.125f).window(KvWindow.FULL_BIDIRECTIONAL).build(),
                     null);
@@ -564,13 +566,21 @@ public class SubgroupFlashAttentionGpuTest {
         return b.build();
     }
 
-    /** Cache values rounded to {@link #type} as the kernels decode them (F16 nearest-even, BF16 truncated). */
+    /**
+     * Cache values rounded to {@link #type} as the kernels decode them (F16 nearest-even, BF16 truncated; Q8_0 the
+     * code times its block's {@link #q8Scale}, codes in [-127, 127]).
+     */
     private float[] randomCache(Random rnd, int n) {
         float[] v = randomFloats(rnd, n);
         for (int i = 0; i < n; i++) {
-            v[i] = round(type, v[i]);
+            v[i] = type == KvDType.Q8_0 ? q8Scale(i / Q8_BLOCK) * (rnd.nextInt(255) - 127) : round(type, v[i]);
         }
         return v;
+    }
+
+    /** The scale of Q8_0 block {@code b} of a test cache: an exact half, so every value is an exact float product. */
+    private static float q8Scale(int b) {
+        return f32(f16(0.004f * (1 + (b % 7) / 8f)));
     }
 
     private static float round(KvDType t, float f) {
@@ -596,6 +606,11 @@ public class SubgroupFlashAttentionGpuTest {
         Arrays.fill(a, 1f);
         return a;
     }
+
+    /** Values per Q8_0 block. */
+    private static final int Q8_BLOCK = 32;
+    /** Bytes per Q8_0 block: the half scale, then the codes. */
+    private static final int Q8_BLOCK_BYTES = 34;
 
     private static int[] shuffled(int n, Random rnd) {
         int[] p = new int[n];
@@ -677,10 +692,26 @@ public class SubgroupFlashAttentionGpuTest {
             return upload(bytes);
         }
 
-        /** A cache of {@code type}: F32 words, or little-endian F16 / BF16 halves of the already rounded values. */
+        /**
+         * A cache of {@code type}: F32 words, little-endian F16 / BF16 halves of the already rounded values, or the
+         * Q8_0 blocks (half scale, 32 codes) of values {@link #randomCache} made.
+         */
         GpuBuffer uploadCache(KvDType type, float[] data) {
             if (type == KvDType.F32) {
                 return upload(data);
+            }
+            if (type == KvDType.Q8_0) {
+                byte[] blocks = new byte[data.length / Q8_BLOCK * Q8_BLOCK_BYTES];
+                for (int b = 0; b < data.length / Q8_BLOCK; b++) {
+                    float d = q8Scale(b);
+                    short h = f16(d);
+                    blocks[b * Q8_BLOCK_BYTES] = (byte) h;
+                    blocks[b * Q8_BLOCK_BYTES + 1] = (byte) (h >> 8);
+                    for (int i = 0; i < Q8_BLOCK; i++) {
+                        blocks[b * Q8_BLOCK_BYTES + 2 + i] = (byte) Math.round(data[b * Q8_BLOCK + i] / d);
+                    }
+                }
+                return upload(blocks);
             }
             byte[] bytes = new byte[data.length * 2];
             for (int i = 0; i < data.length; i++) {

@@ -1,7 +1,7 @@
 /* flash_prefill_sg.cl - LLM_FlashAttnSg_<KV> and LLM_FlashAttnPagedSg_<KV> subgroup prefill attention (OpenCL only). Requires: common/dialect.h, common/config.h, common/math.h, common/kv_types.h, common/attn_common.h, llm/flash_prefill.cl, llm/flash_decode_sg.cl */
 /*
- * The prefill attention of LLM_FlashAttn_<KV> / LLM_FlashAttnPaged_<KV> (flash_prefill.cl) for plain F32, F16 and
- * BF16 caches, with the same argument lists, layouts, masking, biases, sinks, tree masks and partial outputs, under a
+ * The prefill attention of LLM_FlashAttn_<KV> / LLM_FlashAttnPaged_<KV> (flash_prefill.cl) for plain F32, F16,
+ * BF16 and Q8_0 caches, with the same argument lists, layouts, masking, biases, sinks, tree masks and partial outputs, under a
  * work mapping built for the Intel Xe GPUs (no local-memory tiles, so no residency limit and no barrier in the key
  * loop):
  *
@@ -20,7 +20,7 @@
  * Grid: global {ceil(n_tokens / bq) * NF_FAS_WG, n_head_kv * ceil(G / g_tile), n_split}, local {NF_FAS_WG, 1, 1}.
  * Plan constraints (FlashAttnTiling's subgroup prefill form; a violation writes NaN outputs): g_tile in {1, 2, 4, 8}
  * with bq * g_tile == NF_FAS_WG_ROWS, d_k == d_v a positive multiple of NF_FDS_DPL of at most NF_FDS_MAX_D,
- * K and V row and head strides multiples of NF_FDS_DPL, n_split >= 1, split_len > 0, direct_out only with n_split == 1, the work-group and subgroup sizes above. Results
+ * K and V row and head strides multiples of NF_FDS_DPL (of the 32-value block for Q8_0), n_split >= 1, split_len > 0, direct_out only with n_split == 1, the work-group and subgroup sizes above. Results
  * are deterministic (fixed key order within a row).
  */
 #if defined(USE_SUBGROUPS) && defined(cl_intel_required_subgroup_size) && defined(NF_SG_ROW_SIZE)
@@ -35,9 +35,9 @@
 #define NF_FAS_Q_FLOATS (NF_FAS_WG_ROWS * NF_FDS_MAX_D)
 
 NF_INLINE int nf_fas_plan_ok(int n_head, int n_head_kv, int d_k, int d_v, int bq, int g_tile, int n_split,
-                             int split_len, int direct_out, int k_row_stride, int k_head_stride, int v_row_stride,
-                             int v_head_stride) {
-    return nf_fds_strides_ok(k_row_stride, k_head_stride, v_row_stride, v_head_stride)
+                             int split_len, int direct_out, int kv_type, int k_row_stride, int k_head_stride,
+                             int v_row_stride, int v_head_stride) {
+    return nf_fds_strides_ok(kv_type, k_row_stride, k_head_stride, v_row_stride, v_head_stride)
         && n_head > 0 && n_head_kv > 0 && n_head % n_head_kv == 0
         && (g_tile == 1 || g_tile == 2 || g_tile == 4 || g_tile == 8) && bq * g_tile == NF_FAS_WG_ROWS
         && d_k == d_v && d_k > 0 && d_k % NF_FDS_DPL == 0 && d_k <= NF_FDS_MAX_D
@@ -119,11 +119,10 @@ NF_INLINE void nf_fas_run(
     const float slope_b = alibi ? nf_alibi_slope(hb, n_head, max_bias) : 1.0f;
     const float ks = nf_kv_head_scale(kv_type, kv_scales, 0, kvh, n_head_kv, 0);
     const float vs = nf_kv_head_scale(kv_type, kv_scales, 0, kvh, n_head_kv, 1);
-    const int esize = nf_fds_esize(kv_type);
-    NF_GLOBAL const uchar* k_base = k + (nf_i64)kvh * k_head_stride * esize;
-    NF_GLOBAL const uchar* v_base = v + (nf_i64)kvh * v_head_stride * esize;
-    const nf_i64 k_row_bytes = (nf_i64)k_row_stride * esize;
-    const nf_i64 v_row_bytes = (nf_i64)v_row_stride * esize;
+    NF_GLOBAL const uchar* k_base = k + nf_fds_bytes(kv_type, (nf_i64)kvh * k_head_stride);
+    NF_GLOBAL const uchar* v_base = v + nf_fds_bytes(kv_type, (nf_i64)kvh * v_head_stride);
+    const nf_i64 k_row_bytes = nf_fds_bytes(kv_type, k_row_stride);
+    const nf_i64 v_row_bytes = nf_fds_bytes(kv_type, v_row_stride);
     NF_LOCAL_PTR const float* qa = qs + ra * NF_FDS_MAX_D;
     NF_LOCAL_PTR const float* qb = qs + rb * NF_FDS_MAX_D;
     const int dim0 = lane * NF_FDS_DPL;
@@ -256,7 +255,7 @@ NF_FAS_ATTR NF_KERNEL void LLM_FlashAttnSg_##SFX(                               
 {                                                                                            \
     NF_LOCAL float qs[NF_FAS_Q_FLOATS];                                                      \
     if (!nf_fas_plan_ok(n_head, n_head_kv, d_k, d_v, bq, g_tile, n_split, split_len,          \
-                        flags & NF_ATTN_FLAG_DIRECT, k_row_stride, k_head_stride,            \
+                        flags & NF_ATTN_FLAG_DIRECT, KV_CODE, k_row_stride, k_head_stride,   \
                         v_row_stride, v_head_stride)) {                                      \
         nf_fa_poison(n_tokens, n_head, d_v, n_split, out_row_stride,                          \
                      flags & NF_ATTN_FLAG_DIRECT, out_off, out, partial);                     \
@@ -302,7 +301,7 @@ NF_FAS_ATTR NF_KERNEL void LLM_FlashAttnPagedSg_##SFX(                          
     NF_LOCAL float qs[NF_FAS_Q_FLOATS];                                                       \
     if (!(page_shift >= 0 && page_shift <= 20 && pt_off >= 0                                  \
           && nf_fas_plan_ok(n_head, n_head_kv, d_k, d_v, bq, g_tile, n_split, split_len,      \
-                            flags & NF_ATTN_FLAG_DIRECT, k_row_stride, k_head_stride,         \
+                            flags & NF_ATTN_FLAG_DIRECT, KV_CODE, k_row_stride, k_head_stride, \
                             v_row_stride, v_head_stride))) {                                  \
         nf_fa_poison(n_tokens, n_head, d_v, n_split, out_row_stride,                           \
                      flags & NF_ATTN_FLAG_DIRECT, out_off, out, partial);                      \
@@ -322,8 +321,10 @@ NF_FAS_ATTR NF_KERNEL void LLM_FlashAttnPagedSg_##SFX(                          
 NF_FLASH_PREFILL_SG_KERNEL(F32, float, NF_KV_F32)
 NF_FLASH_PREFILL_SG_KERNEL(F16, NF_HALF, NF_KV_F16)
 NF_FLASH_PREFILL_SG_KERNEL(BF16, ushort, NF_KV_BF16)
+NF_FLASH_PREFILL_SG_KERNEL(Q8_0, uchar, NF_KV_Q8_0)
 NF_FLASH_ATTN_PAGED_SG_KERNEL(F32, float, NF_KV_F32)
 NF_FLASH_ATTN_PAGED_SG_KERNEL(F16, NF_HALF, NF_KV_F16)
 NF_FLASH_ATTN_PAGED_SG_KERNEL(BF16, ushort, NF_KV_BF16)
+NF_FLASH_ATTN_PAGED_SG_KERNEL(Q8_0, uchar, NF_KV_Q8_0)
 
 #endif /* USE_SUBGROUPS && cl_intel_required_subgroup_size && NF_SG_ROW_SIZE */

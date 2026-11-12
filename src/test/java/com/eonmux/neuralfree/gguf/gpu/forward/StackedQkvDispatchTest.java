@@ -29,8 +29,9 @@ import static org.junit.Assert.assertTrue;
 /**
  * Selection and launch of the stacked Q/K/V matvec ({@link GpuOps#stackedQkv}) on faked devices: one launch of
  * {@code {T}_MatVecQKV} for three single-shard weights of one type on Vulkan, its arguments in the kernel's order,
- * the integer-dot form once the three weights together reach the lane's size, and the separate products wherever a
- * condition fails (another backend, mixed types or widths, a sharded or scaled weight, more than one token, fusion
+ * the integer-dot form once the three weights together reach the lane's size; on CUDA the warp-row stack where each
+ * product takes its warp-row twin (also beside a Q6_K V weight); and the separate products wherever a condition
+ * fails (a backend without a form, mixed types or widths, a sharded or scaled weight, more than one token, fusion
  * turned off, batch invariance).
  */
 public class StackedQkvDispatchTest {
@@ -224,9 +225,68 @@ public class StackedQkvDispatchTest {
         assertFalse("fusion off", ops.stackedQkvUsable(weight("q", GGMLType.Q8_0, 96, COLS),
                 weight("k", GGMLType.Q8_0, 32, COLS), weight("v", GGMLType.Q8_0, 64, COLS), 1));
 
+        open(ComputeBackend.BackendType.CUDA, FusedMode.AUTO, 2048);
+        assertFalse("CUDA rows too wide for the one-row forms", ops.stackedQkvUsable(
+                weight("q", GGMLType.Q8_0, 96, 2048), weight("k", GGMLType.Q8_0, 32, 2048),
+                weight("v", GGMLType.Q8_0, 64, 2048), 1));
         open(ComputeBackend.BackendType.CUDA, FusedMode.AUTO, COLS);
+        assertFalse("CUDA Q and K of different types", ops.stackedQkvUsable(weight("q", GGMLType.Q4_K, 96, COLS),
+                weight("k", GGMLType.Q6_K, 32, COLS), weight("v", GGMLType.Q6_K, 64, COLS), 1));
+        assertFalse("CUDA V of a type no stack pairs", ops.stackedQkvUsable(weight("q", GGMLType.Q8_0, 96, COLS),
+                weight("k", GGMLType.Q8_0, 32, COLS), weight("v", GGMLType.Q6_K, 64, COLS), 1));
+        open(ComputeBackend.BackendType.OPENCL, FusedMode.AUTO, COLS);
         assertFalse("a backend without the form", ops.stackedQkvUsable(weight("q", GGMLType.Q8_0, 96, COLS),
                 weight("k", GGMLType.Q8_0, 32, COLS), weight("v", GGMLType.Q8_0, 64, COLS), 1));
+    }
+
+    /**
+     * On CUDA the three single-token products that each take the warp-row twin run as one launch of the warp-row
+     * stack over the Q8_1 row, one warp per output row at the Q/K type's warps per work-group, its arguments in the
+     * kernel's order.
+     */
+    @Test
+    public void cudaWarpRowProductsRunAsOneWarpRowStack() {
+        open(ComputeBackend.BackendType.CUDA, FusedMode.AUTO, 1024);
+        GpuWeight wq = weight("blk.0.attn_q.weight", GGMLType.Q8_0, 2048, 1024);
+        GpuWeight wk = weight("blk.0.attn_k.weight", GGMLType.Q8_0, 1024, 1024);
+        GpuWeight wv = weight("blk.0.attn_v.weight", GGMLType.Q8_0, 1024, 1024);
+        GpuBuffer x = floats(1024);
+        GpuBuffer q = floats(2048);
+        GpuBuffer k = floats(1024);
+        GpuBuffer v = floats(1024);
+        assertTrue(ops.stackedQkvUsable(wq, wk, wv, 1));
+        List<FakeDispatch> ds = run(() -> ops.stackedQkv(wq, wk, wv, x, 0, q, k, v));
+
+        assertEquals(Arrays.asList(GpuOps.QUANTIZE_Q8_1, "Q8_0_MatVecQKVRow_Q8"), names(ds));
+        FakeDispatch d = ds.get(1);
+        assertEquals(2048, d.intArg(0));
+        assertEquals(1024, d.intArg(1));
+        assertEquals(1024, d.intArg(2));
+        assertEquals(1024, d.intArg(3));
+        assertSame(wq.shard(0), d.bufferArg(4));
+        assertSame(wk.shard(0), d.bufferArg(5));
+        assertSame(wv.shard(0), d.bufferArg(6));
+        assertSame(ds.get(0).bufferArg(2), d.bufferArg(7));
+        assertSame(q, d.bufferArg(8));
+        assertSame(k, d.bufferArg(9));
+        assertSame(v, d.bufferArg(10));
+        assertEquals("one warp per row", 4096L * 32, d.global()[0]);
+        assertEquals(32L, d.local()[0]);
+    }
+
+    /** A Q4_K_M layer's Q6_K V weight beside Q4_K Q and K weights takes the mixed stack at Q4_K's two warps. */
+    @Test
+    public void cudaQ6KValueBesideQ4KTakesTheMixedStack() {
+        open(ComputeBackend.BackendType.CUDA, FusedMode.AUTO, 2560);
+        GpuWeight wq = weight("blk.0.attn_q.weight", GGMLType.Q4_K, 4096, 2560);
+        GpuWeight wk = weight("blk.0.attn_k.weight", GGMLType.Q4_K, 1024, 2560);
+        GpuWeight wv = weight("blk.0.attn_v.weight", GGMLType.Q6_K, 1024, 2560);
+        List<FakeDispatch> ds = run(() -> ops.stackedQkv(wq, wk, wv, floats(2560), 0, floats(4096), floats(1024),
+                floats(1024)));
+
+        assertEquals(Arrays.asList(GpuOps.QUANTIZE_Q8_1, "Q4_K_MatVecQKVRowVQ6_K_Q8"), names(ds));
+        assertEquals(6144L / 2 * 64, ds.get(1).global()[0]);
+        assertEquals(64L, ds.get(1).local()[0]);
     }
 
     /**
@@ -234,7 +294,7 @@ public class StackedQkvDispatchTest {
      * not with every projected type's kernels, and only where the backend holds them and fusion is permitted.
      */
     @Test
-    public void prewarmPreparesBothStackedLanesForAttentionTypesOnVulkanOnly() {
+    public void prewarmPreparesTheStackedFormsForAttentionTypesWhereTheBackendHoldsThem() {
         open();
         ops.prewarmWeightKernels(GGMLType.Q8_0, true, false);
         assertFalse(backend.preparedKernels().toString(), backend.preparedKernels().contains("Q8_0_MatVecQKV"));
@@ -249,7 +309,18 @@ public class StackedQkvDispatchTest {
 
         open(ComputeBackend.BackendType.CUDA, FusedMode.AUTO, COLS);
         ops.prewarmStackedQkv(GGMLType.Q8_0);
-        assertFalse(backend.preparedKernels().toString(), backend.preparedKernels().contains("Q8_0_MatVecQKV"));
+        prepared = backend.preparedKernels();
+        assertFalse(prepared.toString(), prepared.contains("Q8_0_MatVecQKV"));
+        assertTrue(prepared.toString(), prepared.contains("Q8_0_MatVecQKVRow_Q8"));
+        ops.prewarmStackedQkv(GGMLType.Q4_K);
+        prepared = backend.preparedKernels();
+        assertTrue(prepared.toString(), prepared.contains("Q4_K_MatVecQKVRow_Q8"));
+        assertTrue(prepared.toString(), prepared.contains("Q4_K_MatVecQKVRowVQ6_K_Q8"));
+
+        open(ComputeBackend.BackendType.CUDA, FusedMode.OFF, COLS);
+        ops.prewarmStackedQkv(GGMLType.Q8_0);
+        assertFalse(backend.preparedKernels().toString(),
+                backend.preparedKernels().contains("Q8_0_MatVecQKVRow_Q8"));
     }
 
     @Test

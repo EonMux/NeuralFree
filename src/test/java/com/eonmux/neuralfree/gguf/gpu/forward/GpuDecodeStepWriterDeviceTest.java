@@ -20,6 +20,8 @@ import org.junit.AfterClass;
 import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -34,11 +36,30 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The CUDA kernel {@value GpuDecodeStepWriter#KERNEL} on the device: a sliding-window ring of step inputs written by
- * it holds, after every one-token step and through the ring's wraps, the {@code cell_idx}, {@code kv_pos},
- * {@code q_pos} and {@code rope_pos} contents that the host uploads leave in a twin ring on the same device.
+ * The kernel {@value GpuDecodeStepWriter#KERNEL} on each device (CUDA, OpenCL and Vulkan on the NVIDIA GPU and the
+ * Intel iGPU, skipping what the machine lacks): a sliding-window ring of step inputs written by it holds, after every
+ * one-token step and through the ring's wraps, the {@code cell_idx}, {@code kv_pos}, {@code q_pos} and
+ * {@code rope_pos} contents that the host uploads leave in a twin ring on the same device.
  */
-public class GpuDecodeStepWriterCudaTest {
+@RunWith(Parameterized.class)
+public class GpuDecodeStepWriterDeviceTest {
+
+    @Parameterized.Parameters(name = "{0} {1}")
+    public static List<Object[]> cases() {
+        return List.of(new Object[]{EngineConfig.BackendMode.CUDA, ""},
+                new Object[]{EngineConfig.BackendMode.OPENCL, "NVIDIA"},
+                new Object[]{EngineConfig.BackendMode.OPENCL, "Intel"},
+                new Object[]{EngineConfig.BackendMode.VULKAN, "NVIDIA"},
+                new Object[]{EngineConfig.BackendMode.VULKAN, "Intel"});
+    }
+
+    private final EngineConfig.BackendMode backend;
+    private final String device;
+
+    public GpuDecodeStepWriterDeviceTest(EngineConfig.BackendMode backend, String device) {
+        this.backend = backend;
+        this.device = device;
+    }
 
     private static final int RING_ROWS = 16;
     private static final int N_SWA = 8;
@@ -61,9 +82,19 @@ public class GpuDecodeStepWriterCudaTest {
 
     @Test
     public void theKernelWritesWhatTheUploadsWriteThroughARingsWraps() throws IOException {
-        Assume.assumeTrue("CUDA not available", GpuTestUtil.isCudaAvailable());
+        switch (backend) {
+            case CUDA:
+                GpuTestUtil.assumeCudaAvailable();
+                break;
+            case OPENCL:
+                GpuTestUtil.assumeOpenCLAvailable();
+                break;
+            default:
+                GpuTestUtil.assumeVulkanAvailable();
+                break;
+        }
         MemoryConfig memory = MemoryConfig.builder().nCtx(64).typeK(KvDType.F32).typeV(KvDType.F32).build();
-        EngineConfig config = EngineConfig.builder().backend(EngineConfig.BackendMode.CUDA)
+        EngineConfig config = EngineConfig.builder().backend(backend).deviceFilter(device)
                 .gpuLayers(EngineConfig.GPU_LAYERS_ALL).memory(memory).build();
         try (EngineModel gpu = LLMModelFactory.open(model.toString(), config)) {
             Assume.assumeTrue("the model runs on the GPU engine", gpu.forwardBackend() instanceof GpuForwardBackend);
@@ -78,7 +109,7 @@ public class GpuDecodeStepWriterCudaTest {
                  DeviceStepInputs written = DeviceStepInputs.allocate(ctx.backend(), queue, List.of(ring), UBATCH,
                          UBATCH, MropeTextPositions.PPP0, writtenSeq, null);
                  GpuDecodeStepWriter writer = GpuDecodeStepWriter.bind(ctx.ops(), written)) {
-                assertNotNull("CUDA provides " + GpuDecodeStepWriter.KERNEL, writer);
+                assertNotNull(backend + " " + device + " provides " + GpuDecodeStepWriter.KERNEL, writer);
                 for (int pos = 0; pos < STEPS; pos++) {
                     uploaded.upload(pos, 1);
                     assertTrue("position " + pos + " is written on the device", written.uploadDecodeStep(pos, writer));

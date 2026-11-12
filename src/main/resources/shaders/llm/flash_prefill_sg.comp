@@ -3,9 +3,9 @@
  * Requires: common/nf_common.glsl, common/act.glsl, common/kv_types.glsl, common/attn_common.glsl,
  * common/flash_sg.glsl.
  *
- * The prefill attention of LLM_FlashAttn_<KV> / LLM_FlashAttnPaged_<KV> (flash_prefill.comp) for plain F32, F16 and
- * BF16 caches, with their argument lists (bk is not read), layouts, masking, biases, sinks, tree masks and partial
- * outputs. Variants rows select KV=NF_KV_F32, NF_KV_F16 or NF_KV_BF16, PAGED=1 for the paged entry points; flag
+ * The prefill attention of LLM_FlashAttn_<KV> / LLM_FlashAttnPaged_<KV> (flash_prefill.comp) for plain F32, F16,
+ * BF16 and Q8_0 caches, with their argument lists (bk is not read), layouts, masking, biases, sinks, tree masks and
+ * partial outputs. Variants rows select KV=NF_KV_F32, NF_KV_F16, NF_KV_BF16 or NF_KV_Q8_0, PAGED=1 for the paged entry points; flag
  * sg16 (the pipeline pins 16-lane full subgroups).
  *
  * - A workgroup is NF_FDS_SUBGROUPS subgroups and owns R = bq * g_tile == NF_FAS_WG_ROWS query rows of one KV head
@@ -19,7 +19,7 @@
  *
  * Dispatch: global {ceil(n_tokens / bq) * 64, n_head_kv * ceil(G / g_tile), n_split}, local {64, 1, 1}. Plan
  * constraints (violations write NaN outputs): g_tile in {1, 2, 4, 8} with bq * g_tile == 8, d_k == d_v a positive
- * multiple of 8 of at most 128, K and V row and head strides multiples of 8, n_split >= 1, split_len > 0, direct_out
+ * multiple of 8 of at most 128, K and V row and head strides multiples of 8 (of 32 for Q8_0), n_split >= 1, split_len > 0, direct_out
  * only with n_split == 1, local size 64 with 16-lane subgroups. Results are deterministic (fixed key order).
  * Shared memory: 8 * 128 floats (4 KiB).
  */

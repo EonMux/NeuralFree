@@ -2,6 +2,7 @@ package com.eonmux.neuralfree.gguf.gpu.forward;
 
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
+import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuStepInputs;
 import com.eonmux.neuralfree.gguf.testutil.FakeGpuBuffer;
@@ -16,10 +17,10 @@ import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 
 /**
- * The one-token step's inputs written on the device ({@value GpuDecodeStepWriter#KERNEL}, CUDA) over the real
- * forward backend on the fake queue, whose emulation of the kernel stores its arguments as the kernel does: on a
- * CUDA backend every decode step writes {@code cell_idx}, its {@code kv_pos} row, {@code q_pos} and
- * {@code rope_pos} with one launch and no host upload, and leaves those buffers holding what the uploads of a
+ * The one-token step's inputs written on the device ({@value GpuDecodeStepWriter#KERNEL}: CUDA, OpenCL and Vulkan)
+ * over the real forward backend on the fake queue, whose emulation of the kernel stores its arguments as the kernel
+ * does: on each of those backends every decode step writes {@code cell_idx}, its {@code kv_pos} row, {@code q_pos}
+ * and {@code rope_pos} with one launch and no host upload, and leaves those buffers holding what the uploads of a
  * backend without the kernel leave, step after step; a multi-row step keeps its uploads.
  */
 public class GpuDecodeStepWriterTest {
@@ -35,14 +36,27 @@ public class GpuDecodeStepWriterTest {
         }
     }
 
-    private GpuDecodeReplayTest rig(ComputeBackend.BackendType type) {
+    /**
+     * A rig of {@code type}; {@code withKernel} false leaves {@value GpuDecodeStepWriter#KERNEL} out of its kernels.
+     */
+    private GpuDecodeReplayTest rig(ComputeBackend.BackendType type, boolean withKernel) {
         GpuDecodeReplayTest rig = new GpuDecodeReplayTest();
         rig.backendType = type;
-        if (type == ComputeBackend.BackendType.CUDA) {
-            rig.capabilities = new DeviceCapabilities.Builder().deviceName("StepInputsDevice").totalVramBytes(8L << 30)
-                    .maxAllocSizeBytes(2L << 30).computeUnits(60).maxClockFrequencyMhz(1500).maxWorkGroupSize(1024)
-                    .driverVersion("fake-1.0").maxLocalMemoryBytes(48L * 1024)
-                    .maxWorkGroupCount(new long[]{65535, 65535, 65535}).computeCapability(120).build();
+        if (!withKernel) {
+            rig.unavailableKernels.add(GpuDecodeStepWriter.KERNEL);
+        }
+        if (type == ComputeBackend.BackendType.CUDA || type == ComputeBackend.BackendType.VULKAN) {
+            DeviceCapabilities.Builder caps = new DeviceCapabilities.Builder().deviceName("StepInputsDevice")
+                    .totalVramBytes(8L << 30).maxAllocSizeBytes(2L << 30).computeUnits(60).maxClockFrequencyMhz(1500)
+                    .maxWorkGroupSize(1024).driverVersion("fake-1.0").maxLocalMemoryBytes(48L * 1024)
+                    .maxWorkGroupCount(new long[]{65535, 65535, 65535});
+            if (type == ComputeBackend.BackendType.CUDA) {
+                caps.computeCapability(120);
+            } else {
+                caps.feature(DeviceFeature.STORAGE_8BIT).feature(DeviceFeature.STORAGE_16BIT)
+                        .feature(DeviceFeature.TIMELINE_SEMAPHORE);
+            }
+            rig.capabilities = caps.build();
         }
         rig.emulators.put(GpuDecodeStepWriter.KERNEL, d -> {
             int row = d.intArg(GpuDecodeStepWriter.ARG_ROW);
@@ -78,40 +92,47 @@ public class GpuDecodeStepWriterTest {
 
     @Test
     public void decodeStepsWriteTheUploadsValuesWithOneLaunch() {
-        GpuDecodeReplayTest cudaRig = rig(ComputeBackend.BackendType.CUDA);
-        GpuDecodeReplayTest uploadRig = rig(ComputeBackend.BackendType.OPENCL);
-        GpuForwardBackend cuda = cudaRig.open(true);
+        for (ComputeBackend.BackendType type : new ComputeBackend.BackendType[]{ComputeBackend.BackendType.CUDA,
+                ComputeBackend.BackendType.OPENCL, ComputeBackend.BackendType.VULKAN}) {
+            decodeStepsWriteTheUploadsValuesWithOneLaunch(type);
+        }
+    }
+
+    private void decodeStepsWriteTheUploadsValuesWithOneLaunch(ComputeBackend.BackendType type) {
+        GpuDecodeReplayTest deviceRig = rig(type, true);
+        GpuDecodeReplayTest uploadRig = rig(ComputeBackend.BackendType.OPENCL, false);
+        GpuForwardBackend device = deviceRig.open(true);
         GpuForwardBackend upload = uploadRig.open(true);
-        GpuStepInputs cudaInputs = cudaRig.memory().stepInputs();
+        GpuStepInputs deviceInputs = deviceRig.memory().stepInputs();
         GpuStepInputs uploadInputs = uploadRig.memory().stepInputs();
 
-        cuda.prefill(new int[]{1, 2, 3}, 0);
+        device.prefill(new int[]{1, 2, 3}, 0);
         upload.prefill(new int[]{1, 2, 3}, 0);
-        long prefillWrites = writesInto(cudaRig, cudaInputs);
+        long prefillWrites = writesInto(deviceRig, deviceInputs);
         assertEquals("a multi-row step uploads its inputs", writesInto(uploadRig, uploadInputs), prefillWrites);
         assertEquals("no launch serves a multi-row step", 0,
-                cudaRig.backend.dispatchedKernelNames().stream().filter(GpuDecodeStepWriter.KERNEL::equals).count());
+                deviceRig.backend.dispatchedKernelNames().stream().filter(GpuDecodeStepWriter.KERNEL::equals).count());
 
         for (int i = 0; i < STEPS; i++) {
-            cuda.decode(4 + i, 3 + i);
+            device.decode(4 + i, 3 + i);
             upload.decode(4 + i, 3 + i);
             int[][] want = contents(uploadInputs);
-            int[][] got = contents(cudaInputs);
+            int[][] got = contents(deviceInputs);
             for (int b = 0; b < want.length; b++) {
                 assertArrayEquals("step " + i + " buffer " + b, want[b], got[b]);
             }
         }
-        assertEquals("the CUDA decode steps upload nothing into the step inputs", prefillWrites,
-                writesInto(cudaRig, cudaInputs));
+        assertEquals("the " + type + " decode steps upload nothing into the step inputs", prefillWrites,
+                writesInto(deviceRig, deviceInputs));
         assertEquals("one launch per decode step", STEPS,
-                cudaRig.backend.dispatchedKernelNames().stream().filter(GpuDecodeStepWriter.KERNEL::equals).count());
+                deviceRig.backend.dispatchedKernelNames().stream().filter(GpuDecodeStepWriter.KERNEL::equals).count());
         assertArrayEquals("both store the same sequence", uploadRig.memory().sequence().tokens(),
-                cudaRig.memory().sequence().tokens());
+                deviceRig.memory().sequence().tokens());
     }
 
     @Test
     public void aBackendWithoutTheKernelKeepsItsUploads() {
-        GpuDecodeReplayTest uploadRig = rig(ComputeBackend.BackendType.OPENCL);
+        GpuDecodeReplayTest uploadRig = rig(ComputeBackend.BackendType.OPENCL, false);
         GpuForwardBackend upload = uploadRig.open(true);
         GpuStepInputs inputs = uploadRig.memory().stepInputs();
         long before = writesInto(uploadRig, inputs);

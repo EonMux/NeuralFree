@@ -12,7 +12,9 @@ LLM_LayerNorm	layernorm.comp	OP=OP_LAYERNORM	sg
 LLM_Batch_LayerNorm	layernorm.comp	OP=OP_BATCH_LAYERNORM	sg
 # sampling.cl
 LLM_Softmax	softmax.comp	OP=OP_SOFTMAX	sg
-LLM_Argmax	argmax.comp	OP=OP_ARGMAX
+LLM_Argmax	argmax.comp	OP=OP_ARGMAX	sg
+LLM_ArgmaxSplit	argmax.comp	OP=OP_ARGMAX_SPLIT	sg
+LLM_ArgmaxCombine	argmax.comp	OP=OP_ARGMAX_COMBINE	sg
 LLM_TreeAccept	argmax.comp	OP=OP_TREE_ACCEPT
 # sampling_topk.cl
 LLM_Row_TopK	row_topk.comp

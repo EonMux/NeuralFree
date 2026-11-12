@@ -9,14 +9,14 @@ import com.eonmux.neuralfree.gguf.spec.AttentionSpec.BiasMode;
  * The flash-attention plans of one softmax-attention layer, made once at bind with
  * {@code smemFloats = LlmKernels.faSmemFloats()}: the decode plan, the prefill plan
  * ({@link FlashAttnTiling.Plan#TILED}, the tensor-core {@link FlashAttnTiling.Plan#MMA} on a backend whose device
- * runs the mma attention ({@link LlmKernels#flashMmaPath()}) with F16 caches, or the per-row decode fallback), the
- * paged decode plan and paged prefill kernel of a paged cache (with the CUDA grouped-query paged decode kernel where
- * it serves the caches), the one-row decode kernel ({@link #rowKernel}: the grouped-query dense decode kernel
- * where it serves the caches, with its own split plan, else the per-head one-row kernel under the decode plan;
- * {@link #rowPlan}) and the split-K partial capacity every plan's launches fit in. The dense and paged decode plans
- * and the tiled prefill plan share one form: the subgroup kernels where {@link SubgroupFlashAttention#serves}
- * holds, the portable ones otherwise, with the kernel names of {@link #decodeKernel}, {@link #pagedDecodeKernel},
- * {@link #tiledKernel} and {@link #pagedPrefillKernel}.
+ * runs the mma attention ({@link LlmKernels#flashMmaPath()}) with F16 or Q8_0 caches, or the per-row decode
+ * fallback), the paged decode plan and paged prefill kernel of a paged cache (with the grouped-query paged decode
+ * kernel where {@link #pagedGqaKernel} serves it), the one-row decode kernel ({@link #rowKernel}: the grouped-query
+ * dense decode kernel where it serves the caches, with its own split plan, else the per-head one-row kernel under
+ * the decode plan; {@link #rowPlan}) and the split-K partial capacity every plan's launches fit in. The dense and
+ * paged decode plans and the tiled prefill plan share one form: the subgroup kernels where
+ * {@link SubgroupFlashAttention#serves} holds, the portable ones otherwise, with the kernel names of
+ * {@link #decodeKernel}, {@link #pagedDecodeKernel}, {@link #tiledKernel} and {@link #pagedPrefillKernel}.
  * Immutable.
  */
 final class FlashPlan {
@@ -84,7 +84,8 @@ final class FlashPlan {
         boolean fast = FlashAttnTiling.decodeFastPath(kernels.decodeWarpPath(),
                 keys.typeK(), keys.typeV(), a.headDimK(), a.headDimV());
         boolean subgroup = SubgroupFlashAttention.serves(kernels, keys.typeK(), keys.typeV(), a.headDimK(),
-                a.headDimV());
+                a.headDimV())
+                && SubgroupFlashAttention.stridesServe(keys.typeK(), keys.kRowStride(), keys.vRowStride());
         FlashAttnTiling decode = subgroup
                 ? FlashAttnTiling.decodeSubgroup(a.nHead(), a.nHeadKv(), a.headDimK(), a.headDimV(), rows, smem, cu)
                 : FlashAttnTiling.decode(a.nHead(), a.nHeadKv(), a.headDimK(), a.headDimV(), rows, smem, cu, fast);
@@ -136,8 +137,8 @@ final class FlashPlan {
             throw new IllegalArgumentException("flash partials of " + cap + " floats exceed one buffer");
         }
         return new FlashPlan(decode, decodeKernel, pagedDecodeKernel, prefill, tiledKernel, mma, paged, pagedPrefill,
-                pagedGqa, cap, row == null && depthRouted(mma, fast, pg != null, a.nHead(), a.nHeadKv()), row,
-                rowPlan);
+                pagedGqa, cap, row == null && depthRouted(mma, fast, keys.typeK(), keys.typeV(), pg != null,
+                a.nHead(), a.nHeadKv()), row, rowPlan);
     }
 
     /**
@@ -249,13 +250,15 @@ final class FlashPlan {
 
     /**
      * The grouped-query paged decode kernel ({@link AttnKernels#flashDecodePagedGqa}) of the paged decode plan when
-     * the backend has it and it serves the caches: one F16, BF16 or Q8_0 type for K and V, no V alias, row strides
-     * of whole 16-byte vectors (whole Q8_0 blocks), and a plan whose geometry and partial buffer it fits
-     * ({@link FlashAttnTiling#gqaDecodeUsable}); null otherwise.
+     * the backend has it, the device takes the one-row decode kernels ({@link LlmKernels#flashDecodeRowPath()}: on
+     * Vulkan the NVIDIA devices they were measured on) and it serves the caches: one F16, BF16 or Q8_0 type for K and
+     * V, no V alias, row strides of whole 16-byte vectors (whole Q8_0 blocks), and a plan whose geometry and partial
+     * buffer it fits ({@link FlashAttnTiling#gqaDecodeUsable}); null otherwise.
      */
     static String pagedGqaKernel(LlmKernels kernels, FlashAttnTiling paged, FlashKeys keys) {
         String name = AttnKernels.flashDecodePagedGqa(keys.typeK(), keys.typeV());
-        if (name == null || keys.vAliasesK() || keys.kRowStride() % AttnKernels.gqaStrideUnit(keys.typeK()) != 0
+        if (name == null || !kernels.flashDecodeRowPath() || keys.vAliasesK()
+                || keys.kRowStride() % AttnKernels.gqaStrideUnit(keys.typeK()) != 0
                 || keys.vRowStride() % AttnKernels.gqaStrideUnit(keys.typeV()) != 0 || !paged.gqaDecodeUsable()) {
             return null;
         }
@@ -344,12 +347,22 @@ final class FlashPlan {
 
     /**
      * Whether the one-row route follows the step's live key count: an mma kernel exists, the decode kernels' shuffle
-     * fast path serves the caches and head dims, the cache is dense (a paged cache's per-sequence key count is not
-     * derivable from the step position) and the GQA group has at most {@link #DEPTH_ROUTE_MAX_GROUP} query heads.
+     * fast path serves the caches and head dims, both caches hold plain F32, F16 or BF16 values, the cache is dense
+     * (a paged cache's per-sequence key count is not derivable from the step position) and the GQA group has at most
+     * {@link #DEPTH_ROUTE_MAX_GROUP} query heads. The bound and the group limit were measured over F16 caches; a
+     * Q8_0 cache's split-K decode takes about as long per key as an F16 one at about half the bytes (CUDA, 32 query
+     * and 8 KV heads of 128 dims over 4096 keys: 279 against 271 us), and no measurement puts it ahead of the Q8_0
+     * MMA prefill, so a Q8_0 cache's one-row step stays on the MMA prefill at every depth.
      * The decode replay recaptures the one trunk whose route flips (at most once per generation, at the bound).
      */
-    static boolean depthRouted(String mmaKernel, boolean decodeFastPath, boolean paged, int nHead, int nHeadKv) {
-        return mmaKernel != null && decodeFastPath && !paged && nHead <= DEPTH_ROUTE_MAX_GROUP * nHeadKv;
+    static boolean depthRouted(String mmaKernel, boolean decodeFastPath, KvDType typeK, KvDType typeV, boolean paged,
+                               int nHead, int nHeadKv) {
+        return mmaKernel != null && decodeFastPath && plainCache(typeK) && plainCache(typeV) && !paged
+                && nHead <= DEPTH_ROUTE_MAX_GROUP * nHeadKv;
+    }
+
+    private static boolean plainCache(KvDType type) {
+        return type == KvDType.F32 || type == KvDType.F16 || type == KvDType.BF16;
     }
 
     /** Whether the one-row route follows the step's live key count ({@link #depthRouted}). */

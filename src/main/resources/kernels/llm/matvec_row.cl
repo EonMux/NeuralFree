@@ -8,6 +8,15 @@
  *   {T}_MatVecAddRow_Q8(i rows, i cols, R uchar weight, R uchar xq, RW float acc)   acc[r] += W[r] . x
  *   {T}_MatVecFusedGateUpRow_Q8(i rows, i cols, R uchar gate, R uchar up, R uchar xq, W float out)
  *                                                                  out[r] = silu(G[r] . x) * (U[r] . x)
+ *   {T}_MatVecQKVRow_Q8 / {T}_MatVecQKVRowV{TV}_Q8(i rows_q, i cols, i rows_k, i rows_v, R uchar wq, R uchar wk,
+ *                         R uchar wv, R uchar xq, W float q, W float k, W float v)
+ *                                                                  q[r] = Wq[r] . x, k[r] = Wk[r] . x, v[r] = Wv[r] . x
+ *
+ * The stacked form is the single-token Q/K/V projection of one input row in one launch (the CUDA twin of the Vulkan
+ * {T}_MatVecQKV stack): warp row r < rows_q computes Q row r, the next rows_k warps the K rows, the last rows_v
+ * warps the V rows. Wq and Wk are of type T; Wv is of type T, or of TV in the ...RowV{TV} forms (a Q4_K_M layer's
+ * Q6_K attn_v). Every row runs the plain form's arithmetic, so the outputs equal three {T}_MatVecRow_Q8 launches
+ * bit for bit; the work-group's warps follow the Q/K weight type (gpu.forward.WarpRowMatvec).
  *
  * xq is one Q8_1 row (ggml block_q8_1: d f16 @0, s f16 @2, qs[32] @4; cols / 32 blocks), the norm's emitted
  * blocks or LLM_QuantizeQ8_1's output. The family forms run one 64-lane work-group per row whose lanes each own
@@ -222,6 +231,61 @@ NF_INLINE void nf_mvr_run(const int rows, const int cols, NF_GLOBAL const uchar*
     }
 }
 
+/* The warp's dot of weight row `row` of type T (cols elements) with the Q8_1 row xq, summed over the warp. */
+template <int T>
+NF_INLINE float nf_mvr_row_dot(NF_GLOBAL const uchar* NF_RESTRICT w, const int row, const int cols,
+                               NF_GLOBAL const uchar* NF_RESTRICT xq, const int lane) {
+    const int lpu = NF_MVR_LPU(T);
+    const int units = cols / NF_MVR_BS(T);
+    NF_GLOBAL const uchar* r = w + (nf_i64)row * units * NF_MVR_BB(T);
+    const int q = lane % lpu;
+    float a = 0.0f, b = 0.0f;
+    for (int u = lane / lpu; u < units; u += 32 / lpu) {
+        if (T == NF_MVR_Q6_K) {
+            nf_mvr_q6k<1>(r, r, xq, u, q, &a, &b);
+        } else {
+            a += nf_mvr_dot<T>(r, xq, u, q);
+        }
+    }
+    return nf_mvr_warp_sum(a);
+}
+
+/* The stacked Q/K/V form: Wq and Wk of type T, Wv of type TV; one warp per output row of the three. */
+template <int T, int TV>
+NF_INLINE void nf_mvr_qkv(const int rows_q, const int cols, const int rows_k, const int rows_v,
+                          NF_GLOBAL const uchar* NF_RESTRICT wq, NF_GLOBAL const uchar* NF_RESTRICT wk,
+                          NF_GLOBAL const uchar* NF_RESTRICT wv, NF_GLOBAL const uchar* NF_RESTRICT xq,
+                          NF_GLOBAL float* NF_RESTRICT q, NF_GLOBAL float* NF_RESTRICT k,
+                          NF_GLOBAL float* NF_RESTRICT v) {
+    const int lane = (int)get_local_id(0) & 31;
+    const int row = (int)get_group_id(0) * ((int)get_local_size(0) >> 5) + ((int)get_local_id(0) >> 5);
+    if (row < rows_q) {
+        const float a = nf_mvr_row_dot<T>(wq, row, cols, xq, lane);
+        if (lane == 0) {
+            q[row] = a;
+        }
+    } else if (row < rows_q + rows_k) {
+        const float a = nf_mvr_row_dot<T>(wk, row - rows_q, cols, xq, lane);
+        if (lane == 0) {
+            k[row - rows_q] = a;
+        }
+    } else if (row < rows_q + rows_k + rows_v) {
+        const float a = nf_mvr_row_dot<TV>(wv, row - rows_q - rows_k, cols, xq, lane);
+        if (lane == 0) {
+            v[row - rows_q - rows_k] = a;
+        }
+    }
+}
+
+#define NF_MVR_QKV_KERNEL(NAME, T, TV)                                                                    \
+NF_KERNEL __launch_bounds__(NF_MVR_MAX_WARPS * 32)                                                       \
+void NAME(const int rows_q, const int cols, const int rows_k, const int rows_v,                          \
+          NF_GLOBAL const uchar* NF_RESTRICT wq, NF_GLOBAL const uchar* NF_RESTRICT wk,                    \
+          NF_GLOBAL const uchar* NF_RESTRICT wv, NF_GLOBAL const uchar* NF_RESTRICT xq,                    \
+          NF_GLOBAL float* NF_RESTRICT q, NF_GLOBAL float* NF_RESTRICT k, NF_GLOBAL float* NF_RESTRICT v) { \
+    nf_mvr_qkv<T, TV>(rows_q, cols, rows_k, rows_v, wq, wk, wv, xq, q, k, v);                            \
+}
+
 #define NF_MVR_KERNELS(N, T)                                                                              \
 NF_KERNEL __launch_bounds__(NF_MVR_MAX_WARPS * 32)                                                       \
 void N##_MatVecRow_Q8(const int rows, const int cols, NF_GLOBAL const uchar* NF_RESTRICT weight,         \
@@ -244,5 +308,11 @@ NF_MVR_KERNELS(Q8_0, NF_MVR_Q8_0)
 NF_MVR_KERNELS(Q4_K, NF_MVR_Q4_K)
 NF_MVR_KERNELS(Q5_K, NF_MVR_Q5_K)
 NF_MVR_KERNELS(Q6_K, NF_MVR_Q6_K)
+NF_MVR_QKV_KERNEL(Q8_0_MatVecQKVRow_Q8, NF_MVR_Q8_0, NF_MVR_Q8_0)
+NF_MVR_QKV_KERNEL(Q4_K_MatVecQKVRow_Q8, NF_MVR_Q4_K, NF_MVR_Q4_K)
+NF_MVR_QKV_KERNEL(Q5_K_MatVecQKVRow_Q8, NF_MVR_Q5_K, NF_MVR_Q5_K)
+NF_MVR_QKV_KERNEL(Q6_K_MatVecQKVRow_Q8, NF_MVR_Q6_K, NF_MVR_Q6_K)
+NF_MVR_QKV_KERNEL(Q4_K_MatVecQKVRowVQ6_K_Q8, NF_MVR_Q4_K, NF_MVR_Q6_K)
+NF_MVR_QKV_KERNEL(Q5_K_MatVecQKVRowVQ6_K_Q8, NF_MVR_Q5_K, NF_MVR_Q6_K)
 
 #endif /* CUDA */

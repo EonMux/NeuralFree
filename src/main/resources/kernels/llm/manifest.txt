@@ -77,7 +77,7 @@ flash_decode.cl
 [opencl] flash_decode_sg.cl
 [cuda] flash_decode_gqa.cl
 [cuda] flash_decode_row.cl
-[cuda] step_inputs.cl
+step_inputs.cl
 flash_prefill.cl
 [opencl] flash_prefill_sg.cl
 [cuda] flash_mma.cl

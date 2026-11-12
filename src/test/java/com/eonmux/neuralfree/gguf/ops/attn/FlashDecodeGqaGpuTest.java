@@ -1,9 +1,10 @@
 package com.eonmux.neuralfree.gguf.ops.attn;
 
+import com.eonmux.neuralfree.acceleration.GpuTestUtil;
 import com.eonmux.neuralfree.acceleration.HWAcceleration;
+import com.eonmux.neuralfree.acceleration.HardwareDevice;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
-import com.eonmux.neuralfree.acceleration.backend.cuda.CudaComputeBackend;
 import com.eonmux.neuralfree.acceleration.kernels.Availability;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
@@ -11,6 +12,8 @@ import org.junit.After;
 import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -24,16 +27,34 @@ import java.util.Random;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The grouped-query paged decode ({@code LLM_FlashDecodePagedGqa_<KV>}, kernels/llm/flash_decode_gqa.cl) against a
+ * The grouped-query paged decode ({@code LLM_FlashDecodePagedGqa_<KV>}: kernels/llm/flash_decode_gqa.cl on CUDA, its
+ * twin shaders/llm/flash_decode_gqa.comp on Vulkan) against a
  * double-precision host attention over the same paged F16, BF16 or Q8_0 cache, and against the paged decode it
  * stands in for ({@code LLM_FlashDecodePaged_<KV>}) on the same arguments: per-sequence key counts (including an empty
  * sequence), shuffled physical pages, unmapped pages, empty cells, causal positions below the cached ones, softcap,
  * and both output forms — the normalized rows of one direct split (with and without sinks) and the (o, m, l)
  * partials of several splits, which the host merges into the normalized rows and which match the paged decode's
  * split by split. Covers query groups of 1, 2 and 4 heads at head dims 64 and 128 and launches of 1 to 16
- * sequences. CUDA only; skipped elsewhere.
+ * sequences. It runs on CUDA and on Vulkan on each device (the NVIDIA GPU and the Intel iGPU); what the machine lacks
+ * is skipped.
  */
+@RunWith(Parameterized.class)
 public class FlashDecodeGqaGpuTest {
+
+    @Parameterized.Parameters(name = "{0} {1}")
+    public static List<Object[]> cases() {
+        return List.of(new Object[]{ComputeBackend.BackendType.CUDA, ""},
+                new Object[]{ComputeBackend.BackendType.VULKAN, "NVIDIA"},
+                new Object[]{ComputeBackend.BackendType.VULKAN, "Intel"});
+    }
+
+    private final ComputeBackend.BackendType api;
+    private final String deviceName;
+
+    public FlashDecodeGqaGpuTest(ComputeBackend.BackendType api, String deviceName) {
+        this.api = api;
+        this.deviceName = deviceName;
+    }
 
     private static final int PAGE_SHIFT = 4;
     private static final int PAGE = 1 << PAGE_SHIFT;
@@ -47,18 +68,27 @@ public class FlashDecodeGqaGpuTest {
 
     @Before
     public void openDevice() {
-        try {
-            HWAcceleration accel = new HWAcceleration(EnumSet.of(ComputeBackend.BackendType.CUDA));
-            hwAccel = accel;
-            Assume.assumeFalse("no CUDA device", accel.getCUDevices().isEmpty());
-            backend = new CudaComputeBackend(accel.getCUDevices().get(0));
-            Availability availability = LlmKernels.availability(backend);
-            Assume.assumeTrue("LLM kernels unavailable: " + availability.reason(), availability.available());
-            kernels = LlmKernels.open(backend);
-        } catch (Throwable e) {
-            closeDevice();
-            Assume.assumeTrue("no usable CUDA GPU: " + e.getMessage(), false);
+        if (api == ComputeBackend.BackendType.CUDA) {
+            GpuTestUtil.assumeCudaAvailable();
+        } else {
+            GpuTestUtil.assumeVulkanAvailable();
         }
+        hwAccel = new HWAcceleration(EnumSet.of(api));
+        List<HardwareDevice> all = new ArrayList<>(api == ComputeBackend.BackendType.CUDA
+                ? hwAccel.getCUDevices() : hwAccel.getVkDevices());
+        for (HardwareDevice d : all) {
+            ComputeBackend b = hwAccel.createBackend(d);
+            String name = b.capabilities().getDeviceName();
+            if (deviceName.isEmpty() || (name != null && name.contains(deviceName))) {
+                backend = b;
+                break;
+            }
+            b.close();
+        }
+        Assume.assumeTrue("no " + api + " " + deviceName + " device enumerated", backend != null);
+        Availability availability = LlmKernels.availability(backend);
+        Assume.assumeTrue("LLM kernels unavailable: " + availability.reason(), availability.available());
+        kernels = LlmKernels.open(backend);
         Assume.assumeTrue("no grouped-query paged decode on this device",
                 kernels.has(AttnKernels.flashDecodePagedGqa(KvDType.F16, KvDType.F16)));
     }

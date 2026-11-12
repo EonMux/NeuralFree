@@ -180,6 +180,15 @@ final class GpuProjections {
         GpuMatmulTap.dense(queue, wk, x.buf, x.off, 1, cols);
         GpuMatmulTap.dense(queue, wv, x.buf, x.off, 1, cols);
         GpuBuffer row = kernel.endsWith("_Q8") ? quantizedRow(x, cols) : x.buf;
+        if (rowForms == RowForms.WARP) {
+            int warps = WarpRowMatvec.warps(wq.type(), qRows, cols);
+            ops.q8.invalidate();
+            queue.enqueueKernelNoEvent(kernels.get(kernel),
+                    new long[]{WarpRowMatvec.globalSize(qRows + kRows + vRows, warps)},
+                    new long[]{WarpRowMatvec.localSize(warps)},
+                    new Object[]{qRows, cols, kRows, vRows, wq.shard(0), wk.shard(0), wv.shard(0), row, q, k, v});
+            return;
+        }
         ops.launchMatvec(kernel, (long) (qRows + kRows + vRows) * matvecLocal, qRows, cols, kRows, vRows,
                 wq.shard(0), wk.shard(0), wv.shard(0), row, q, k, v);
     }
@@ -193,15 +202,19 @@ final class GpuProjections {
      * the float {@code {T}_MatVecQKV}. The integer-dot stack runs one row per work-group, also where the separate
      * products pair their rows ({@link Int8MatvecTuning#pairedIsFaster}).
      * Where a single-token twin would serve one of the projections
-     * ({@link #rowTwinKernel}: the pinned subgroup and warp-row forms) the separate products keep it.
+     * ({@link #rowTwinKernel}: the pinned subgroup and warp-row forms) the separate products keep it, except on
+     * CUDA, where the warp-row stack serves when the twin serves all three ({@link #stackedQkvRowKernel}).
      */
     private String stackedQkvKernel(GpuWeight wq, GpuWeight wk, GpuWeight wv) {
-        if (backend.backendType() != ComputeBackend.BackendType.VULKAN || BatchInvariance.enabled()
-                || !fusedMode.permitsFusion() || matvecLocal % MATVEC_MAX_TPS != 0) {
+        if (BatchInvariance.enabled() || !fusedMode.permitsFusion() || wq == null || wk == null || wv == null
+                || wq.cols() != wk.cols() || wq.cols() != wv.cols() || wq.type() != wk.type()) {
             return null;
         }
-        if (wq == null || wk == null || wv == null || wq.type() != wk.type() || wq.type() != wv.type()
-                || wq.cols() != wk.cols() || wq.cols() != wv.cols()) {
+        if (rowForms == RowForms.WARP) {
+            return stackedQkvRowKernel(wq, wk, wv);
+        }
+        if (backend.backendType() != ComputeBackend.BackendType.VULKAN || matvecLocal % MATVEC_MAX_TPS != 0
+                || wq.type() != wv.type()) {
             return null;
         }
         for (GpuWeight w : new GpuWeight[]{wq, wk, wv}) {
@@ -230,6 +243,27 @@ final class GpuProjections {
         }
         String stacked = stackedQkvName(k.matvec);
         return ops.optionalReady(stacked, matvecLocal) ? stacked : null;
+    }
+
+    /**
+     * The CUDA warp-row Q/K/V stack ({@link WarpRowMatvec#qkvTwinName}) for these weights, or null: each weight is
+     * a single plain shard whose separate single-token product takes its warp-row twin over the Q8_1 row
+     * ({@link #int8LaneUsable} and {@link #rowTwinKernel}), Q and K share a type, and the stack is prepared at the
+     * Q/K type's warps per work-group. Every row then runs its separate twin's arithmetic in one launch.
+     */
+    private String stackedQkvRowKernel(GpuWeight wq, GpuWeight wk, GpuWeight wv) {
+        int cols = GpuOps.cols(wq);
+        for (GpuWeight w : new GpuWeight[]{wq, wk, wv}) {
+            WeightKernels k = ops.family(w);
+            if (!w.isSingleShard() || w.hasScale() || w.hasInputTransform() || w.hadamard() != null
+                    || k.matvecQ8 == null || !int8LaneUsable(k.matvecQ8, w, 1)
+                    || rowTwinKernel(k.matvecQ8, w.type(), GpuOps.rows(w), cols) == null) {
+                return null;
+            }
+        }
+        String name = WarpRowMatvec.qkvTwinName(wq.type(), wv.type());
+        int warps = WarpRowMatvec.warps(wq.type(), GpuOps.rows(wq), cols);
+        return name != null && warps > 0 && ops.optionalReady(name, WarpRowMatvec.localSize(warps), 1) ? name : null;
     }
 
     /** {@code {T}_MatVec} to {@code {T}_MatVecQKV} and {@code {T}_MatVec_Q8} to {@code {T}_MatVecQKV_Q8}. */
@@ -1153,6 +1187,17 @@ final class GpuProjections {
     void prewarmStackedQkv(GGMLType type) {
         ops.ensureOpen();
         Objects.requireNonNull(type, "type");
+        if (rowForms == RowForms.WARP && fusedMode.permitsFusion() && !BatchInvariance.enabled()) {
+            int warps = WarpRowMatvec.warps(type, 1, type.getBlockSize());
+            if (warps > 0) {
+                ops.optionalReady(WarpRowMatvec.qkvTwinName(type, type), WarpRowMatvec.localSize(warps), 1);
+                String mixed = WarpRowMatvec.qkvTwinName(type, GGMLType.Q6_K);
+                if (mixed != null && type != GGMLType.Q6_K) {
+                    ops.optionalReady(mixed, WarpRowMatvec.localSize(warps), 1);
+                }
+            }
+            return;
+        }
         if (backend.backendType() != ComputeBackend.BackendType.VULKAN || !fusedMode.permitsFusion()
                 || matvecLocal % MATVEC_MAX_TPS != 0) {
             return;

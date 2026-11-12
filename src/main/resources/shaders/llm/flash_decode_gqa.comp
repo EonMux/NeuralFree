@@ -1,16 +1,26 @@
-/* flash_decode_gqa.comp - LLM_FlashDecodeGqa_F16 / _BF16 / _Q8_0, the grouped-query dense decode attention: the
- * Vulkan twin of the dense entries of kernels/llm/flash_decode_gqa.cl (a [cuda] entry), with their argument list, grid,
- * outputs and plan constraints (documented there), so the host swaps LLM_FlashDecode_<KV> for it as it does on CUDA.
+/* flash_decode_gqa.comp - LLM_FlashDecodeGqa_F16 / _BF16 / _Q8_0, the grouped-query dense decode attention, and
+ * under PAGED=1 LLM_FlashDecodePagedGqa_F16 / _BF16 / _Q8_0, its paged form: the Vulkan twins of the entries of
+ * kernels/llm/flash_decode_gqa.cl (a [cuda] entry), with their argument lists, grids, outputs and plan constraints
+ * (documented there), so the host swaps LLM_FlashDecode_<KV> and LLM_FlashDecodePaged_<KV> for them as it does on
+ * CUDA.
  * Requires: common/nf_common.glsl, common/act.glsl, common/kv_types.glsl, common/attn_common.glsl.
  *
  * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order), as LLM_FlashDecode_<KV>:
  *   (i n_head, i n_head_kv, i d_k, i d_v, i g_tile, i n_split, i split_len, i kv_start, i kv_end, i q_pos,
  *    i k_row_stride, i k_head_stride, i v_row_stride, i v_head_stride, f scale, f softcap, f max_bias,
  *    i flags, i swa_type, i n_swa, i bias_mode, i n_buckets, i max_distance, i q_off, i out_off,
- *    R q, R k, R v, R<int> kv_pos, R sinks, R rel_bias, W out, W partial, R kv_scales, R<uvec2> tree_mask)
+ *    R q, R k, R v, R<int> kv_pos, R sinks, R rel_bias, W out, W partial,
+ *    | PAGED: i page_shift, i max_pages, i n_seq, i q_seq_stride, i out_seq_stride,
+ *      R<int> page_table, R<int> seq_kv_len, R<int> q_pos_seq,
+ *    R kv_scales, R<uvec2> tree_mask)
  * Variants rows select the cache type with KV=NF_KV_F16, NF_KV_BF16 or NF_KV_Q8_0; g_tile is ignored (the
- * work-group always holds the whole group).
- * Dispatch: 2-D, global {n_split * 128, n_head_kv}, local {128, 1, 1} (gguf.ops.attn.FlashAttnTiling.decodeOnline).
+ * work-group always holds the whole group). Under PAGED the key range and query position are sequence s's:
+ * slots [0, seq_kv_len[s]) clamped to its max_pages pages, slot t at physical row
+ * (page_table[s * max_pages + (t >> page_shift)] << page_shift) | (t & (2^page_shift - 1)) (a negative page id
+ * masks its slots), query position q_pos_seq[s], tree word tree_mask[s], query rows at q_off + s * q_seq_stride,
+ * direct rows at out_off + s * out_seq_stride and partial rows s * n_head + h (kv_start, kv_end and q_pos unused).
+ * Dispatch: 2-D, global {n_split * 128, n_head_kv} (PAGED: {n_split * 128, n_seq * n_head_kv}), local {128, 1, 1}
+ * (gguf.ops.attn.FlashAttnTiling.decodeOnline and decodePaged).
  *
  * Work-group (split, KV head kvh) holds all G = n_head / n_head_kv query heads of the group, so every K and V row of
  * the split is read once for the G heads instead of once per head. As in the CUDA kernel, the keys stream through
@@ -71,8 +81,16 @@ layout(std430, binding = 4) readonly buffer NfFdgSinks { float sinks[]; };
 layout(std430, binding = 5) readonly buffer NfFdgRelBias { float rel_bias[]; };
 layout(std430, binding = 6) writeonly buffer NfFdgOut { float dst[]; };
 layout(std430, binding = 7) writeonly buffer NfFdgPartial { float partial[]; };
+#if defined(PAGED)
+layout(std430, binding = 8) readonly buffer NfFdgPages { int page_table[]; };
+layout(std430, binding = 9) readonly buffer NfFdgSeqKvLen { int seq_kv_len[]; };
+layout(std430, binding = 10) readonly buffer NfFdgQPosSeq { int q_pos_seq[]; };
+layout(std430, binding = 11) readonly buffer NfFdgKvScales { float kv_scales[]; };
+layout(std430, binding = 12) readonly buffer NfFdgTreeMask { uvec2 tree_mask[]; };
+#else
 layout(std430, binding = 8) readonly buffer NfFdgKvScales { float kv_scales[]; };
 layout(std430, binding = 9) readonly buffer NfFdgTreeMask { uvec2 tree_mask[]; };
+#endif
 
 layout(push_constant) uniform NfFdgParams {
     int n_head; int n_head_kv; int d_k; int d_v; int g_tile;
@@ -82,6 +100,9 @@ layout(push_constant) uniform NfFdgParams {
     int flags; int swa_type; int n_swa;
     int bias_mode; int n_buckets; int max_distance;
     int q_off; int out_off;
+#if defined(PAGED)
+    int page_shift; int max_pages; int n_seq; int q_seq_stride; int out_seq_stride;
+#endif
 } pc;
 
 /* Floats of the key loop's tables (one per block of 32 invocations: 32 rows of NF_FDG_PITCH) and its sums. */
@@ -151,9 +172,9 @@ vec4 nf_fdg_values(uvec4 r, bool hi) {
 #endif
 }
 
-/* Position bias of head h (nf_attn_bias of kernels/llm/common/attn_common.h) for the launch's one query row. */
-float nf_fdg_bias(int h, int p_k, float slope) {
-    const int p_q = pc.q_pos;
+/* Position bias of head h (nf_attn_bias of kernels/llm/common/attn_common.h) for the query at position p_q in query
+ * row q_row of the launch (the sequence under PAGED, else 0), which indexes the Inkling table. */
+float nf_fdg_bias(int h, int q_row, int p_q, int p_k, float slope) {
     if (pc.bias_mode == NF_ATTN_BIAS_ALIBI) {
         return slope * (-float(abs(p_q - p_k)));
     }
@@ -167,7 +188,7 @@ float nf_fdg_bias(int h, int p_k, float slope) {
     }
     if (pc.bias_mode == NF_ATTN_BIAS_INKLING) {
         const int dist = p_q - p_k;
-        return dist < 0 || dist >= pc.n_buckets ? 0.0 : rel_bias[h * pc.n_buckets + dist];
+        return dist < 0 || dist >= pc.n_buckets ? 0.0 : rel_bias[(q_row * pc.n_head + h) * pc.n_buckets + dist];
     }
     return 0.0;
 }
@@ -177,13 +198,25 @@ void nf_fdg_poison(bool direct_out) {
     if (gl_WorkGroupID.x != 0u || gl_WorkGroupID.y != 0u || pc.n_head <= 0 || pc.d_v <= 0 || pc.n_split <= 0) {
         return;
     }
+#if defined(PAGED)
+    if (pc.n_seq <= 0) {
+        return;
+    }
+    const int n_seq = pc.n_seq;
+    const int out_seq_stride = pc.out_seq_stride;
+#else
+    const int n_seq = 1;
+    const int out_seq_stride = 0;
+#endif
     const uint lid = gl_LocalInvocationID.x;
     if (direct_out) {
-        for (uint i = lid; i < uint(pc.n_head * pc.d_v); i += uint(NF_FA_WG)) {
-            dst[uint(pc.out_off) + i] = NF_NAN;
+        for (int s = 0; s < n_seq; s++) {
+            for (uint i = lid; i < uint(pc.n_head * pc.d_v); i += uint(NF_FA_WG)) {
+                dst[uint(pc.out_off + s * out_seq_stride) + i] = NF_NAN;
+            }
         }
     } else {
-        const uint n = uint(pc.n_head) * uint(pc.n_split) * uint(pc.d_v + 2);
+        const uint n = uint(n_seq) * uint(pc.n_head) * uint(pc.n_split) * uint(pc.d_v + 2);
         for (uint i = lid; i < n; i += uint(NF_FA_WG)) {
             partial[i] = NF_NAN;
         }
@@ -198,7 +231,23 @@ bool nf_fdg_plan_ok(bool direct_out) {
         && pc.d_k == pc.d_v && (pc.d_k == 64 || pc.d_k == 128)
         && pc.n_split >= 1 && pc.split_len >= 1 && (!direct_out || pc.n_split == 1)
         && ((pc.k_row_stride | pc.k_head_stride | pc.v_row_stride | pc.v_head_stride) & align) == 0
-        && (pc.flags & NF_ATTN_FLAG_V_ALIAS) == 0 && pc.kv_start >= 0;
+        && (pc.flags & NF_ATTN_FLAG_V_ALIAS) == 0
+#if defined(PAGED)
+        && pc.page_shift >= 0 && pc.page_shift <= 20 && pc.max_pages >= 1 && pc.n_seq >= 1
+        && pc.q_seq_stride >= 0 && pc.out_seq_stride >= 0;
+#else
+        && pc.kv_start >= 0;
+#endif
+}
+
+/* The physical row of slot t, or -1 for a slot on a masked page (PAGED; the dense rows are the slots). */
+int nf_fdg_row(int seq, int t) {
+#if defined(PAGED)
+    const int page_id = page_table[uint(seq * pc.max_pages + (t >> pc.page_shift))];
+    return page_id < 0 ? -1 : (page_id << pc.page_shift) | (t & ((1 << pc.page_shift) - 1));
+#else
+    return t;
+#endif
 }
 
 void main() {
@@ -226,13 +275,30 @@ void main() {
     const int grp = int(blk * (uint(NF_FDG_BLOCK) / L) + kgl);
     const uint d0 = (bl % L) * uint(NF_FDG_DS);
     const int split = int(gl_WorkGroupID.x);
+#if defined(PAGED)
+    const int seq = int(gl_WorkGroupID.y) / pc.n_head_kv;
+    const int kvh = int(gl_WorkGroupID.y) - seq * pc.n_head_kv;
+    const int kv_cap = pc.max_pages > (0x7fffffff >> pc.page_shift) ? 0x7fffffff : pc.max_pages << pc.page_shift;
+    const int kv_lo = 0;
+    const int kv_hi = seq_kv_len[seq] < 0 ? 0 : min(seq_kv_len[seq], kv_cap);
+    const int q_pos = q_pos_seq[seq];
+    const int q_row0 = pc.q_off + seq * pc.q_seq_stride;
+    const int out_row0 = pc.out_off + seq * pc.out_seq_stride;
+#else
+    const int seq = 0;
     const int kvh = int(gl_WorkGroupID.y);
+    const int kv_lo = pc.kv_start;
+    const int kv_hi = pc.kv_end;
+    const int q_pos = pc.q_pos;
+    const int q_row0 = pc.q_off;
+    const int out_row0 = pc.out_off;
+#endif
     const int h0 = kvh * G;
     const int causal = pc.flags & NF_ATTN_FLAG_CAUSAL;
     const int n_fresh = nf_attn_flag_fresh(pc.flags);
-    const uvec2 tree_bits = (pc.flags & NF_ATTN_FLAG_TREE) != 0 ? tree_mask[0] : uvec2(0u);
-    const int k_begin = pc.kv_start + split * pc.split_len;
-    const int k_stop = split < pc.n_split ? min(k_begin + pc.split_len, pc.kv_end) : k_begin;
+    const uvec2 tree_bits = (pc.flags & NF_ATTN_FLAG_TREE) != 0 ? tree_mask[seq] : uvec2(0u);
+    const int k_begin = kv_lo + split * pc.split_len;
+    const int k_stop = split < pc.n_split ? min(k_begin + pc.split_len, kv_hi) : k_begin;
     const int n_keys = max(0, k_stop - k_begin);
     const uint k_head = uint(kvh * pc.k_head_stride) + d0;
     const uint v_head = uint(kvh * pc.v_head_stride) + d0;
@@ -260,7 +326,7 @@ void main() {
         l[g] = 0.0;
         slope[g] = 1.0;
         if (g < G) {
-            const uint qi = uint(pc.q_off + (h0 + g) * d) + d0;
+            const uint qi = uint(q_row0 + (h0 + g) * d) + d0;
             qa[g] = vec4(q_in[qi], q_in[qi + 1u], q_in[qi + 2u], q_in[qi + 3u]);
             qb[g] = vec4(q_in[qi + 4u], q_in[qi + 5u], q_in[qi + 6u], q_in[qi + 7u]);
             if (alibi) {
@@ -276,11 +342,11 @@ void main() {
         int pk[NF_FDG_KB];
         [[unroll]] for (int b = 0; b < NF_FDG_KB; b++) {
             const int j = j0 + grp + b * groups;
-            const int row = k_begin + j;
+            const int row = j < n_keys ? nf_fdg_row(seq, k_begin + j) : -1;
             pk[b] = -1;
             kr[b] = uvec4(0u);
             vr[b] = uvec4(0u);
-            if (j < n_keys) {
+            if (row >= 0) {
                 pk[b] = kv_pos[row];
                 kr[b] = nf_fdg_raw(true, uint(row * pc.k_row_stride) + k_head);
                 vr[b] = nf_fdg_raw(false, uint(row * pc.v_row_stride) + v_head);
@@ -315,7 +381,7 @@ void main() {
         /* scores, then one rescale per head and batch; the key's visibility is uniform across the key group */
         bool live[NF_FDG_KB];
         [[unroll]] for (int b = 0; b < NF_FDG_KB; b++) {
-            live[b] = nf_attn_tree_visible(pk[b], tree_bits, pc.kv_end, n_fresh, pc.q_pos, causal, pc.swa_type,
+            live[b] = nf_attn_tree_visible(pk[b], tree_bits, kv_hi, n_fresh, q_pos, causal, pc.swa_type,
                                            pc.n_swa) != 0;
         }
         [[unroll]] for (int g = 0; g < NF_FDG_MAX_G; g++) {
@@ -324,7 +390,7 @@ void main() {
                 [[unroll]] for (int b = 0; b < NF_FDG_KB; b++) {
                     const int i = b * NF_FDG_MAX_G + g;
                     sc[i] = live[b] ? nf_attn_score(sc[i] * k_scale, pc.scale, pc.softcap)
-                                      + nf_fdg_bias(h0 + g, pk[b], slope[g])
+                                      + nf_fdg_bias(h0 + g, seq, q_pos, pk[b], slope[g])
                                     : -NF_INF;
                     mb = max(mb, sc[i]);
                 }
@@ -396,9 +462,9 @@ void main() {
                 const int h = h0 + g;
                 if (direct_out) {
                     const vec2 fl = sinks_on ? nf_attn_sink(mt, lt, sinks[h]) : vec2(1.0, lt);
-                    dst[uint(pc.out_off + h * d + dd)] = fl.y > 0.0 ? o * fl.x / fl.y : 0.0;
+                    dst[uint(out_row0 + h * d + dd)] = fl.y > 0.0 ? o * fl.x / fl.y : 0.0;
                 } else {
-                    const uint pr = (uint(h) * uint(pc.n_split) + uint(split)) * uint(d + 2);
+                    const uint pr = (uint(seq * pc.n_head + h) * uint(pc.n_split) + uint(split)) * uint(d + 2);
                     partial[pr + uint(dd)] = o;
                     if (dd == 0) {
                         partial[pr + uint(d)] = mt;

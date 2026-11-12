@@ -12,6 +12,7 @@ import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuPlaceholders;
 import com.eonmux.neuralfree.gguf.spec.RopeSpec;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -26,7 +27,8 @@ import static org.junit.Assert.assertTrue;
 
 /**
  * Boundary rules of {@link GpuMultiTask} on the host-only fake backend: the kernel's task and buffer limits, the
- * row bodies it runs, and the argument checks of the rotations. Nothing executes on a device.
+ * row bodies it runs, the argument checks of the rotations, and the launch size of each step, which follows the
+ * step's token count rather than the micro-batch the descriptor reserves. Nothing executes on a device.
  */
 public class GpuMultiTaskTest {
 
@@ -169,6 +171,66 @@ public class GpuMultiTaskTest {
             assertThrows(IllegalArgumentException.class, batch::build);
         } finally {
             batch.close();
+        }
+    }
+
+    @Test
+    public void aStepLaunchesTheBlocksOfItsOwnTokenCount() {
+        GpuMultiTask batch = new GpuMultiTask(ops, UBATCH, "test");
+        try {
+            int heads = 3;
+            GpuBuffer b = buffer();
+            batch.normRope(neox(8), 1e-6f, heads, 8, WIDTH, 8, 0, 0, 0, 0, 1, false, placeholders.readOnlyInts(),
+                    placeholders.readOnlyFloats(), placeholders.readOnlyFloats(), placeholders.readOnlyFloats(), b,
+                    b);
+            rowNorm(batch, buffer(), buffer());
+            batch.build();
+            assertEquals(heads, batch.blocksPerTask(1));
+            assertEquals(UBATCH * heads, batch.blocksPerTask(UBATCH));
+
+            backend.clearLog();
+            batch.run(1);
+            batch.run(UBATCH);
+            batch.run(1);
+            List<FakeDispatch> launches = new ArrayList<>();
+            for (FakeDispatch d : backend.dispatches()) {
+                if (d.kernelName().equals(FusedKernels.MULTI_TASK)) {
+                    launches.add(d);
+                }
+            }
+            assertEquals(3, launches.size());
+            int[] tokens = {1, UBATCH, 1};
+            for (int i = 0; i < tokens.length; i++) {
+                FakeDispatch d = launches.get(i);
+                int blocks = tokens[i] * heads;
+                assertEquals("token count of launch " + i, tokens[i], d.args().get(0));
+                assertEquals("blocks per task of launch " + i, blocks, d.args().get(2));
+                assertEquals("global size of launch " + i, 2L * blocks * ops.local(), d.global()[0]);
+            }
+        } finally {
+            batch.close();
+        }
+    }
+
+    @Test
+    public void blocksPerTaskCoverTheElementTasksInLocalChunksUpToTheCap() {
+        GpuMultiTask gate = new GpuMultiTask(ops, UBATCH, "test.gate");
+        GpuMultiTask wide = new GpuMultiTask(ops, 4096, "test.wide");
+        try {
+            int nV = 3;
+            int headDim = ops.local() + 1;
+            gate.gatePrep(nV, 1, 0, 0, headDim, nV, 0, nV, 0, 0f, 1f, buffer(), buffer(), buffer(), buffer(),
+                    buffer(), buffer());
+            assertEquals((nV * headDim + ops.local() - 1) / ops.local(), gate.blocksPerTask(1));
+            assertEquals((UBATCH * nV * headDim + ops.local() - 1) / ops.local(), gate.blocksPerTask(UBATCH));
+
+            wide.rowNorm(16, WIDTH, WIDTH, NormKind.RMS, 0, 1, 0, 0, 1e-6f, buffer(), buffer(),
+                    placeholders.readOnlyFloats(), buffer());
+            assertEquals(16, wide.blocksPerTask(1));
+            assertEquals(GpuMultiTask.MAX_BLOCKS_PER_TASK, wide.blocksPerTask(4096));
+        } finally {
+            gate.close();
+            wide.close();
         }
     }
 

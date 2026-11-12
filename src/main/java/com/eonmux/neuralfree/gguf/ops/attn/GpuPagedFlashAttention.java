@@ -13,11 +13,11 @@ import java.util.Objects;
 /**
  * The paged flash launches of one layer over a paged cache, addressed through the step's page tables
  * ({@link PagedFlashGeometry}): one {@code LLM_FlashDecodePaged_*} launch over the step's decode rows when every
- * segment carries one row (the continuous-batching decode) — on CUDA with an F16 or BF16 cache the grouped-query
- * {@code LLM_FlashDecodePagedGqa_*} ({@link FlashPlan#pagedGqaKernel}), which reads each K and V row once for the
- * whole query-head group and splits the keys over the launch's sequences — else one {@code LLM_FlashAttnPaged_*} (or
- * {@code LLM_FlashAttnMmaPaged_F16}) per segment, or the {@link PagedRowFallback} when the prefill plan has no
- * paged prefill kernel. A non-causal step ({@link GpuStepInputs#stepNonCausal()}, a media chunk) lifts the causal
+ * segment carries one row (the continuous-batching decode) — on CUDA and on Vulkan NVIDIA devices with an F16, BF16
+ * or Q8_0 cache the grouped-query {@code LLM_FlashDecodePagedGqa_*} ({@link FlashPlan#pagedGqaKernel}), which reads
+ * each K and V row once for the whole query-head group and splits the keys over the launch's sequences — else one
+ * {@code LLM_FlashAttnPaged_*} (or {@code LLM_FlashAttnMmaPaged_F16}) per segment, or the {@link PagedRowFallback}
+ * when the prefill plan has no paged prefill kernel. A non-causal step ({@link GpuStepInputs#stepNonCausal()}, a media chunk) lifts the causal
  * mask of its launches; the window rule stays. With batch invariance on, every segment always runs the per-row
  * fallback, so each row's split comes from its own sequence's key count. With a log-sum-exp capture bound
  * ({@code lse}, a context-parallel merge's capture), every launch keeps its partials combined and writes the

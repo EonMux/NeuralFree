@@ -11,7 +11,7 @@ import com.eonmux.neuralfree.gguf.arch.SwaType;
 import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuForwardContext;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuOps;
-import com.eonmux.neuralfree.gguf.gpu.head.GpuLogitsHead;
+import com.eonmux.neuralfree.gguf.gpu.head.GpuArgmax;
 import com.eonmux.neuralfree.gguf.gpu.head.GpuRowTopK;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeights;
@@ -48,7 +48,7 @@ import java.util.Objects;
  * target's queue over device weights and the {@link GpuDflashKvCache}. Injection fuses the target features on the
  * device too ({@code rms(fc . features) * enc.output_norm}, dflash.cpp:856-858) before writing the K/V rows. A noise
  * block reads back only what its readout consumes: the greedy id of every row ({@link #forwardGreedy},
- * {@code LLM_Argmax}), the top candidates, softmax denominators and {@code t_embd} rows of every row
+ * {@link GpuArgmax}), the top candidates, softmax denominators and {@code t_embd} rows of every row
  * ({@link #forwardTopK}, {@code LLM_Row_TopK} — the p_min and LiLiCorr readouts finish on the host over them), the
  * DSpark chain of biased argmax ids ({@link #forwardDspark}, the Markov bias recomputed on the device per row), or
  * the DFlash2 selector's chosen ids ({@link #forwardSelector}: the block runs through the dynamic convolutions
@@ -134,6 +134,10 @@ final class GpuDflashBackbone implements DflashStack, AutoCloseable {
     private final GpuBuffer tEmbd;
     private final GpuBuffer logits;
     private final GpuBuffer ids;
+    /** The greedy readouts' argmax plan over draft-head rows. */
+    private final GpuArgmax argmax;
+    /** The split argmax's chunk winners for {@code blockRows} rows; null when {@link #argmax} does not split. */
+    private final GpuBuffer argmaxParts;
     private final GpuBuffer ropePos;
     private final DflashConv conv;
     private final GpuBuffer convDynamic;
@@ -260,6 +264,8 @@ final class GpuDflashBackbone implements DflashStack, AutoCloseable {
             this.tEmbd = floats((long) blockRows * nEmbd);
             this.logits = floats((long) blockRows * this.output.rows());
             this.ids = floats(blockRows);
+            this.argmax = GpuArgmax.plan(ops, (int) output.rows(), reduceLocal);
+            this.argmaxParts = argmax.split() ? floats(argmax.partialInts(blockRows)) : null;
             this.ropePos = floats((long) maxRows * MAX_POSITION_SECTIONS);
             this.topK = this.topKK > 0 ? GpuRowTopK.bind(ops, backend, logits, blockRows, (int) output.rows(), this.topKK)
                     : null;
@@ -464,13 +470,12 @@ final class GpuDflashBackbone implements DflashStack, AutoCloseable {
     }
 
     /**
-     * The greedy id of every block row in draft-head rows ({@code LLM_Argmax}: the first maximum, NaN never
+     * The greedy id of every block row in draft-head rows ({@link GpuArgmax}: the first maximum, NaN never
      * selected), the only values read back.
      */
     int[] forwardGreedy(int[] tokens, int pos0) {
         int n = run(tokens, pos0);
-        ops.enqueue(GpuLogitsHead.ARGMAX, new long[]{(long) n * reduceLocal}, new long[]{reduceLocal},
-                (int) output.rows(), logits, ids, n);
+        argmax.enqueue(ops, logits, ids, n, argmaxParts);
         byte[] raw = new byte[n * Integer.BYTES];
         GpuEvent e = queue.enqueueReadBuffer(ids, 0, raw.length, raw);
         queue.finish();
@@ -592,8 +597,7 @@ final class GpuDflashBackbone implements DflashStack, AutoCloseable {
             } else {
                 ops.copy(logits, i * vocab, rowBuf, 0, vocab);
             }
-            ops.enqueue(GpuLogitsHead.ARGMAX, new long[]{reduceLocal}, new long[]{reduceLocal}, vocab, rowBuf, ids,
-                    1);
+            argmax.enqueue(ops, rowBuf, ids, 1, argmaxParts);
             GpuEvent e = queue.enqueueReadBuffer(ids, 0, Integer.BYTES, one);
             queue.finish();
             close(e);

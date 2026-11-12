@@ -9,7 +9,8 @@
  *     M-RoPE sections of the rope position, which host uploads would otherwise copy one buffer at a time. The
  *     values ride in the launch's arguments, so the step needs no host-to-device copy.
  *     Dispatch: global = {1}, local = {1}. One work-item; no barriers.
- * Java: gguf.gpu.forward.GpuDecodeStepWriter; host twin: DeviceStepInputs.upload(pos, 1).
+ * Java: gguf.gpu.forward.GpuDecodeStepWriter; host twin: DeviceStepInputs.upload(pos, 1); GLSL twin:
+ * shaders/llm/step_inputs.comp.
  */
 
 NF_KERNEL void LLM_DecodeStepInputs(
