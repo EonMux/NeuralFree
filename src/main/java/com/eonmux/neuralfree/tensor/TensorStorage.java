@@ -22,12 +22,16 @@ import java.util.concurrent.locks.ReentrantLock;
  * the storage length stays exact, so kernels that access sub-word dtypes as 32-bit words stay inside the buffer.
  * A storage of 0 elements owns a 4-byte buffer and has length 0.</p>
  *
- * <p><b>Transfers.</b> Every host transfer runs under the backend's {@link BackendResources#lock} and is complete
- * when the method returns: it is ordered after pending train work ({@link TrainGpu#beforeHostRead}, which also
- * surfaces deferred index errors), the queue is finished, and a write gives the compute queue a dependency on the
- * upload ({@link TrainGpu#afterHostWrite}). The {@code queue} parameters keep their meaning: the transfer is issued on
- * the queue passed. Byte order is {@link ByteOrder#nativeOrder()}. Returned events belong to the caller, are already
- * complete, and should be closed.</p>
+ * <p><b>Transfers.</b> Every host transfer runs under the backend's {@link BackendResources#lock} and is ordered
+ * after pending train work ({@link TrainGpu#beforeHostRead}, which also surfaces deferred index errors). A read is
+ * complete when the method returns (the queue is finished). A write gives the compute queue a dependency on the
+ * upload ({@link TrainGpu#afterHostWrite}) and returns without waiting for it when that dependency was placed (the
+ * backend has an open train context): the queue copied the host data at enqueue, so the caller may reuse its array,
+ * and every later launch on the compute queue and every later transfer on the in-order transfer queue runs after the
+ * upload. A write on a backend without a train context finishes the queue before returning. The {@code queue}
+ * parameters keep their meaning: the transfer is issued on the queue passed. Byte order is
+ * {@link ByteOrder#nativeOrder()}. Returned events belong to the caller and should be closed; a write's event may
+ * still be pending.</p>
  */
 public final class TensorStorage implements AutoCloseable {
     private final RefCountedBuffer refCountedBuffer;
@@ -245,6 +249,34 @@ public final class TensorStorage implements AutoCloseable {
         return new TensorStorage(refCountedBuffer, backend, newOffsetBytes, newLengthBytes, dtype, false);
     }
 
+    /**
+     * One storage over {@code parts} when they lie back to back on one buffer: every part has {@code dtype}, part
+     * {@code i} starts {@code i * partBytes} bytes after part 0 on part 0's buffer and spans at least
+     * {@code partBytes}. The result shares the buffer (a new reference) and spans {@code parts.size() * partBytes}
+     * bytes from part 0's start; null when the parts are not laid out so.
+     *
+     * @throws IllegalArgumentException when {@code parts} is empty or {@code partBytes} is not positive
+     */
+    public static TensorStorage adjacentSpan(List<TensorStorage> parts, long partBytes) {
+        Objects.requireNonNull(parts, "parts must not be null");
+        if (parts.isEmpty() || partBytes <= 0) {
+            throw new IllegalArgumentException("an adjacent span needs parts of a positive size, got " + parts.size()
+                + " parts of " + partBytes + " bytes");
+        }
+        TensorStorage first = parts.get(0);
+        for (int i = 0; i < parts.size(); i++) {
+            TensorStorage part = parts.get(i);
+            part.ensureOpen();
+            if (part.refCountedBuffer != first.refCountedBuffer || part.dtype != first.dtype
+                || part.lengthBytes < partBytes || part.offsetBytes != first.offsetBytes + i * partBytes) {
+                return null;
+            }
+        }
+        first.refCountedBuffer.retain();
+        return new TensorStorage(first.refCountedBuffer, first.backend, first.offsetBytes,
+            Math.multiplyExact(partBytes, (long) parts.size()), first.dtype, false);
+    }
+
     public TensorStorage share() {
         ensureOpen();
         refCountedBuffer.retain();
@@ -333,7 +365,10 @@ public final class TensorStorage implements AutoCloseable {
         return transfer(queue, transfer, false);
     }
 
-    /** A write under the backend lock, ordered after pending train work, complete and ordered before later launches. */
+    /**
+     * A write under the backend lock, ordered after pending train work and before later launches; asynchronous when
+     * the compute queue was given the dependency, otherwise complete on return.
+     */
     private GpuEvent write(ComputeQueue queue, Transfer transfer) {
         return transfer(queue, transfer, true);
     }
@@ -347,9 +382,9 @@ public final class TensorStorage implements AutoCloseable {
             TrainGpu.beforeHostRead(backend, queue, waits);
             GpuEvent event = transfer.enqueue(queue, waits.toArray(new GpuEvent[0]));
             try {
-                queue.finish();
-                if (isWrite) {
-                    TrainGpu.afterHostWrite(backend, event);
+                boolean ordered = isWrite && TrainGpu.afterHostWrite(backend, queue, event);
+                if (!ordered) {
+                    queue.finish();
                 }
             } catch (RuntimeException e) {
                 closeEvent(event);

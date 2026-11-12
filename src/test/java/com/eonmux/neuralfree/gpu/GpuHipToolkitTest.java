@@ -1,12 +1,15 @@
 package com.eonmux.neuralfree.gpu;
 
 import neuralfree.gpu.GpuHipToolkit;
+import neuralfree.gpu.GpuLibraryDefinitions;
+import org.junit.Assume;
 import org.junit.Test;
 
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -15,8 +18,10 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
@@ -53,48 +58,95 @@ public class GpuHipToolkitTest {
     }
 
     /**
-     * The train library's definition in gradle/gpu-kernels.gradle compiles its HIP code objects with
-     * {@code -ffp-contract=off}, and the HIP compile passes each library's flags: training math is not contracted
-     * into fused multiply-adds, as its CUDA build's {@code -fmad=false} keeps it.
+     * The train library's definition (the maps {@link GpuLibraryDefinitions} hands the build script) compiles its HIP
+     * code objects with {@code -ffp-contract=off} and its CUDA units with {@code -fmad=false}, and the HIP compile
+     * passes each library's flags: training math is not contracted into fused multiply-adds on either toolchain.
      */
     @Test
     public void theTrainLibraryDefinitionCompilesWithoutContraction() throws IOException {
+        Map<String, Object> train = GpuLibraryDefinitions.definition("train", 11264);
+        assertEquals(Collections.singletonList("-ffp-contract=off"), train.get("hipFlags"));
+        assertTrue(String.valueOf(train.get("cudaFlags")), ((List<?>) train.get("cudaFlags")).contains("-fmad=false"));
+        assertEquals(Collections.emptyList(), GpuLibraryDefinitions.definition("llm", 11264).get("hipFlags"));
         String script = new String(Files.readAllBytes(
                 new File(GpuKernelBuildCacheTest.projectRoot(), "gradle/gpu-kernels.gradle").toPath()),
                 StandardCharsets.UTF_8);
-        Map<String, List<String>> hipFlags = libraryHipFlags(script);
-        assertEquals(Collections.singletonList("-ffp-contract=off"), hipFlags.get("train"));
-        assertTrue("every library must declare its hipFlags: " + hipFlags, hipFlags.containsKey("llm"));
+        assertTrue("the build script must take its libraries from GpuLibraryDefinitions",
+                script.contains("GpuLibraryDefinitions.definitions("));
         assertTrue("compileHipKernels must compile each unit with its library's hipFlags",
                 script.contains("GpuHipToolkit.compileCommand(hipcc.path, archs.selected(), lib.hipFlags,"));
     }
 
-    /** The hipFlags of every entry of the script's gpuLibraryDefinitions, by library id. */
-    private static Map<String, List<String>> libraryHipFlags(String script) {
-        int start = script.indexOf("def gpuLibraryDefinitions = [");
-        assertTrue("gradle/gpu-kernels.gradle must define gpuLibraryDefinitions", start >= 0);
-        int end = script.indexOf("\n]", start);
-        String[] entries = script.substring(start, end).split("\\[id\\s*:");
-        Pattern id = Pattern.compile("^\\s*'([a-z0-9]+)'");
-        Pattern flags = Pattern.compile("hipFlags\\s*:\\s*\\[([^\\]]*)\\]");
-        Map<String, List<String>> byId = new LinkedHashMap<>();
-        for (int i = 1; i < entries.length; i++) {
-            Matcher idMatch = id.matcher(entries[i]);
-            assertTrue("a library entry without an id: " + entries[i], idMatch.find());
-            Matcher flagMatch = flags.matcher(entries[i]);
-            if (!flagMatch.find()) {
-                continue;
+    /**
+     * The train library's HIP flags keep {@code a * b + c} two roundings in the AMDGPU code clang emits: a probe kernel
+     * compiled for gfx1100 with those flags holds no fused multiply-add, while the same probe with the llm library's
+     * flags (clang's HIP default contracts) holds one, so the probe does detect contraction. Runs where a clang with
+     * the amdgcn target is installed ({@code neuralfree.test.clang}, default {@code /usr/bin/clang}).
+     */
+    @Test
+    public void theTrainHipFlagsKeepMultiplyAndAddApartInTheIsa() throws IOException, InterruptedException {
+        File clang = new File(System.getProperty("neuralfree.test.clang", "/usr/bin/clang"));
+        Assume.assumeTrue("no clang at " + clang, clang.canExecute());
+        Assume.assumeTrue("clang lacks the amdgcn target", targets(clang).contains("amdgcn"));
+        Path dir = Files.createTempDirectory("nf-hip-contract");
+        try {
+            Path probe = dir.resolve("probe.hip");
+            Files.write(probe, Arrays.asList(
+                    "extern \"C\" __attribute__((global)) void probe(float* o, const float* a, const float* b,",
+                    "                                                  const float* c) {",
+                    "    const int i = __builtin_amdgcn_workitem_id_x();",
+                    "    o[i] = a[i] * b[i] + c[i];",
+                    "}"), StandardCharsets.UTF_8);
+            @SuppressWarnings("unchecked")
+            List<String> trainFlags = (List<String>) GpuLibraryDefinitions.definition("train", 11264).get("hipFlags");
+            @SuppressWarnings("unchecked")
+            List<String> llmFlags = (List<String>) GpuLibraryDefinitions.definition("llm", 11264).get("hipFlags");
+            String train = isa(clang, probe, trainFlags, dir.resolve("train.s"));
+            String llm = isa(clang, probe, llmFlags, dir.resolve("llm.s"));
+            assertTrue("the probe must contract without the train flags:\n" + llm, FMA.matcher(llm).find());
+            Matcher fused = FMA.matcher(train);
+            if (fused.find()) {
+                fail("fused multiply-add " + fused.group() + " with the train flags:\n" + train);
             }
-            List<String> values = new ArrayList<>();
-            for (String value : flagMatch.group(1).split(",")) {
-                String v = value.trim();
-                if (!v.isEmpty()) {
-                    values.add(v.substring(1, v.length() - 1));
+        } finally {
+            try (Stream<Path> files = Files.list(dir)) {
+                for (Path f : (Iterable<Path>) files::iterator) {
+                    Files.deleteIfExists(f);
                 }
             }
-            byId.put(idMatch.group(1), values);
+            Files.deleteIfExists(dir);
         }
-        return byId;
+    }
+
+    /** An AMDGPU fused or contracted multiply-add instruction. */
+    private static final Pattern FMA = Pattern.compile("\\bv_(?:pk_)?(?:fma|fmac|fmamk|fmaak|mad|mac)\\w*_f32\\w*");
+
+    /** The AMDGPU assembly clang emits for {@code source} as a HIP device unit for gfx1100 with {@code flags}. */
+    private static String isa(File clang, Path source, List<String> flags, Path out)
+            throws IOException, InterruptedException {
+        List<String> cmd = new ArrayList<>(Arrays.asList(clang.getPath(), "-x", "hip", "-nogpuinc", "-nogpulib",
+                "--cuda-device-only", "--offload-arch=gfx1100", "-std=c++17", "-O3", "-S"));
+        cmd.addAll(flags);
+        cmd.addAll(Arrays.asList(source.toString(), "-o", out.toString()));
+        String log = run(cmd);
+        assertTrue("clang did not write " + out + ":\n" + log, Files.isRegularFile(out));
+        return new String(Files.readAllBytes(out), StandardCharsets.UTF_8);
+    }
+
+    private static String targets(File clang) throws IOException, InterruptedException {
+        return run(Arrays.asList(clang.getPath(), "-print-targets"));
+    }
+
+    private static String run(List<String> cmd) throws IOException, InterruptedException {
+        Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+        byte[] output = p.getInputStream().readAllBytes();
+        if (!p.waitFor(120, TimeUnit.SECONDS)) {
+            p.destroyForcibly();
+            fail("timed out: " + cmd);
+        }
+        String text = new String(output, StandardCharsets.UTF_8);
+        assertEquals("exit status of " + cmd + ":\n" + text, 0, p.exitValue());
+        return text;
     }
 
     @Test

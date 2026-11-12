@@ -63,6 +63,8 @@ public final class TrainOps {
     // ----------------------------------------------------------------- eltwise.cl: TR_Scatter_F32 mode
     public static final int TR_SCATTER_OVERWRITE = 0;
     public static final int TR_SCATTER_ADD = 1;
+    /** Mode bit: one work-item per output element of a fiber instead of one per fiber (same bits). */
+    public static final int TR_SCATTER_TARGETS = 2;
 
     // ----------------------------------------------------------------- reduce.cl: TR_ReduceRows*_F32 op
     public static final int TR_R_SUM = 0;

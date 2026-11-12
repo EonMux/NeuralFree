@@ -52,14 +52,15 @@ public final class FlashAttentionOp {
     /**
      * Attention of {@code query} {@code [B, H, Sq, D]} over {@code key} and {@code value} {@code [B, H, Skv, D]}.
      * The result's {@code output} is {@code [B, H, Sq, D]}, {@code scores} the masked scaled scores
-     * {@code [B, H, Sq, Skv]} (the softmax input) and {@code l} the softmax normalizer {@code [B, H, Sq]}:
-     * {@code sum_j exp(s_ij - max_j s_ij)} over the unmasked keys, 0 for a fully masked row.
+     * {@code [B, H, Sq, Skv]} (the softmax input) and {@link FlashAttentionResult#l()} the softmax normalizer
+     * {@code [B, H, Sq]}: {@code sum_j exp(s_ij - max_j s_ij)} over the unmasked keys, 0 for a fully masked row,
+     * computed from {@code scores} on first request.
      *
      * <p>{@code output} is computed by the recording composition of the class description, so in grad mode with an
      * input that requires grad it is the output of recorded nodes and a backward pass from it delivers the gradients
-     * of {@code query}, {@code key}, {@code value} and a differentiable {@code mask}. {@code scores} and {@code l} are
-     * inspection values: {@code scores} is a {@link Tensor#detach()} handle of the recorded scores and {@code l} is
-     * computed from it, so neither records anything and both stay valid after the backward pass.</p>
+     * of {@code query}, {@code key}, {@code value} and a differentiable {@code mask}. {@code scores} and {@code l()}
+     * are inspection values: {@code scores} is a {@link Tensor#detach()} handle of the recorded scores and
+     * {@code l()} is computed from it, so neither records anything and both stay valid after the backward pass.</p>
      *
      * @throws IllegalArgumentException when the shapes do not form an attention, or the mask is not a FLOAT32 tensor on
      *                                  the same backend that broadcasts to the score shape
@@ -73,8 +74,7 @@ public final class FlashAttentionOp {
              Tensor weights = TensorOps.maskedSoftmax(recordedScores, 3)) {
             output = weightedValues(weights, value);
             scores = recordedScores.detach();
-            Tensor l = normalizer(scores);
-            return new FlashAttentionResult(output, scores, l, query, key, value, scale, causal);
+            return new FlashAttentionResult(output, scores, query, key, value, scale, causal);
         } catch (RuntimeException e) {
             closeAll(e, output, scores);
             throw e;
@@ -160,16 +160,14 @@ public final class FlashAttentionOp {
         return TensorOps.cat(Collections.singletonList(t), 0);
     }
 
-    /** {@code scores} with {@code -inf} at every key position {@code j > i} of query row {@code i} (last two dims). */
+    /**
+     * {@code scores} with {@code -inf} at every key position {@code j > i} of query row {@code i} (last two dims). The
+     * position comparison is the backend's cached mask ({@link CausalMasks}) and {@code -inf} a device fill, so the
+     * step uploads nothing.
+     */
     private static Tensor causalMasked(Tensor scores) {
         Shape shape = scores.shape();
-        int sq = shape.dim(2);
-        int skv = shape.dim(3);
-        try (Tensor rows = Tensor.fromArray(scores.backend(), positions(sq));
-             Tensor rowCol = rows.reshape(Shape.of(sq, 1));
-             Tensor cols = Tensor.fromArray(scores.backend(), positions(skv));
-             Tensor colRow = cols.reshape(Shape.of(1, skv));
-             Tensor future = TensorOps.gt(colRow, rowCol);
+        try (Tensor future = CausalMasks.future(scores.backend(), shape.dim(2), shape.dim(3));
              Tensor futureAll = future.expand(shape);
              Tensor negInf = Tensor.scalar(scores.backend(), Float.NEGATIVE_INFINITY);
              Tensor negInfAll = negInf.expand(shape)) {
@@ -178,7 +176,7 @@ public final class FlashAttentionOp {
     }
 
     /** {@code sum_j exp(s_ij - m_i)} along the last dim with {@code m_i} the row maximum, 0 for an all-masked row. */
-    private static Tensor normalizer(Tensor scores) {
+    static Tensor normalizer(Tensor scores) {
         try (Tensor rowMax = TensorOps.max(scores, 3);
              Tensor negInf = Tensor.scalar(scores.backend(), Float.NEGATIVE_INFINITY);
              Tensor emptyRow = TensorOps.eq(rowMax, negInf);
@@ -190,14 +188,6 @@ public final class FlashAttentionOp {
              Tensor exps = TensorOps.exp(shifted)) {
             return TensorOps.sum(exps, 3);
         }
-    }
-
-    private static float[] positions(int n) {
-        float[] p = new float[n];
-        for (int i = 0; i < n; i++) {
-            p[i] = i;
-        }
-        return p;
     }
 
     private static void requireAttentionShapes(Tensor query, Tensor key, Tensor value) {
@@ -250,28 +240,27 @@ public final class FlashAttentionOp {
     }
 
     /**
-     * The tensors of one {@link #apply} call. {@code output}, {@code scores} and {@code l} are new tensors that
-     * {@link #close()} releases (closing is idempotent); {@code query}, {@code key} and {@code value} are the caller's
-     * inputs and are never closed here. A recorded {@code output} is valid until a loss computed from it is
-     * back-propagated (the backward pass releases it unless it is the root); {@code scores} and {@code l} are detached
-     * and stay valid until {@link #close()}.
+     * The tensors of one {@link #apply} call. {@code output} and {@code scores} are new tensors that {@link #close()}
+     * releases, as is the normalizer once {@link #l()} computed it (closing is idempotent); {@code query}, {@code key}
+     * and {@code value} are the caller's inputs and are never closed here. A recorded {@code output} is valid until a
+     * loss computed from it is back-propagated (the backward pass releases it unless it is the root); {@code scores}
+     * and {@code l()} are detached and stay valid until {@link #close()}. Not thread-safe.
      */
     public static class FlashAttentionResult implements AutoCloseable {
         public final Tensor output;
         public final Tensor scores;
-        public final Tensor l;
         public final Tensor query;
         public final Tensor key;
         public final Tensor value;
         public final float scale;
         public final boolean causal;
+        private Tensor l;
 
-        public FlashAttentionResult(Tensor output, Tensor scores, Tensor l,
+        public FlashAttentionResult(Tensor output, Tensor scores,
                                     Tensor query, Tensor key, Tensor value,
                                     float scale, boolean causal) {
             this.output = output;
             this.scores = scores;
-            this.l = l;
             this.query = query;
             this.key = key;
             this.value = value;
@@ -279,12 +268,25 @@ public final class FlashAttentionOp {
             this.causal = causal;
         }
 
-        /** Closes {@code output}, {@code scores} and {@code l}. */
+        /**
+         * The softmax normalizer {@code [B, H, Sq]} of {@link #scores}: {@code sum_j exp(s_ij - max_j s_ij)}, 0 for a
+         * fully masked row. Computed on the first call and owned by this result.
+         */
+        public Tensor l() {
+            if (l == null) {
+                l = normalizer(scores);
+            }
+            return l;
+        }
+
+        /** Closes {@code output}, {@code scores} and the normalizer when it was computed. */
         @Override
         public void close() {
             output.close();
             scores.close();
-            l.close();
+            if (l != null) {
+                l.close();
+            }
         }
     }
 }

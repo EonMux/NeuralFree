@@ -4794,6 +4794,15 @@ window runs on one backend, so a partial count is refused. The GPU trainer runs 
 and the SILU, GELU_TANH and RELU activations; GELU's exact and quick forms are refused by name (train on the CPU with
 `-ngl 0`).
 
+On the GPU the weights, their gradients and the optimizer state stay on the device for the whole run: AdamW keeps
+its two moments next to the weights and steps every tensor with one kernel launch, and no weight or gradient crosses
+to the host between windows; the weights are read back once, when the output is written. AdamW's device state needs
+the free device memory to cover the moments and gradients (three times the trained weights' float32 size) plus an
+eighth of the device memory for a window's activations; on a smaller device the run logs a warning and steps AdamW on
+the host instead, reading each window's gradients back and uploading the stepped weights. Both updates run AdamW's
+element loop operation by operation: on CUDA the device update has the host loop's bits, while OpenCL and Vulkan may
+round its division and square root inexactly (each within 4 ulp). SGD keeps no state and always steps on the device.
+
 ### nftool split
 
 Split one GGUF into llama.cpp shard files named `<prefix>-00001-of-0000N.gguf` derived from the output path.

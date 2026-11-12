@@ -262,7 +262,14 @@ public final class GpuMatmul {
         }
     }
 
+    /**
+     * Refuses a view that addresses an element twice (a stride of 0 over more than one index); an empty view addresses
+     * none.
+     */
     private static void requireDistinctElements(Tensor c) {
+        if (c.shape().numElements() == 0) {
+            return;
+        }
         long[] strides = c.strides().strides();
         for (int k = 0; k < strides.length; k++) {
             if (strides[k] == 0 && c.shape().dim(k) > 1) {

@@ -57,6 +57,9 @@ public final class ModelSerializer {
     /** Initial capacity, in floats, of the values of a tensor record being read. */
     private static final int INITIAL_FLOAT_CAPACITY = 1 << 20;
 
+    /** The buffer between the deflater's small writes and the file. */
+    private static final int WRITE_BUFFER_BYTES = 1 << 16;
+
     private ModelSerializer() {
     }
 
@@ -81,15 +84,26 @@ public final class ModelSerializer {
             Files.createDirectories(parentDir);
         }
 
-        try (ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(path.toFile()))) {
-            saveModelState(model, zos);
-            saveModelMeta(model, zos);
-            
-            if (optimizer != null) {
-                saveOptimizerState(optimizer, zos);
-            }
-            saveTrainingState(optimizer, zos);
+        try (ZipOutputStream zos = new ZipOutputStream(new BufferedOutputStream(
+                new FileOutputStream(path.toFile()), WRITE_BUFFER_BYTES))) {
+            write(model, optimizer, zos);
         }
+    }
+
+    /**
+     * Writes the checkpoint entries of {@code model} (and of {@code optimizer} when it is not null) into {@code zos},
+     * which stays open: a caller that adds its own entries before or after these writes the whole archive in one
+     * pass ({@code ModelCheckpoint} puts its metadata entry first).
+     */
+    public static void write(Module model, Optimizer optimizer, ZipOutputStream zos) throws IOException {
+        Objects.requireNonNull(model, "Model cannot be null");
+        Objects.requireNonNull(zos, "Zip stream cannot be null");
+        saveModelState(model, zos);
+        saveModelMeta(model, zos);
+        if (optimizer != null) {
+            saveOptimizerState(optimizer, zos);
+        }
+        saveTrainingState(optimizer, zos);
     }
 
     /**

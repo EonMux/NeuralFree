@@ -25,7 +25,8 @@ import static org.junit.Assert.assertThrows;
 
 /**
  * The collectives of {@link SharedMemoryBackend} and {@link TCPBackend} with three ranks, each on its own thread with
- * its own CPU backend: in-place all-reduce (SUM, MEAN, MAX) and broadcast, all-gather, barriers, and repeated rounds
+ * its own CPU backend: in-place all-reduce (SUM, MEAN, MAX), the host-array all-reduce (alone and meeting the tensor
+ * form in one collective) and broadcast, all-gather, barriers, and repeated rounds
  * of one collective; and calls that differ between the ranks (size, op, kind, source rank), which fail on every rank
  * and leave the backend usable. Every expected value is exact in float.
  */
@@ -134,6 +135,13 @@ public class CollectivesTest {
                 allReduce(backend, host, contribution, ReduceOp.MEAN), 0f);
             assertArrayEquals("MAX", new float[]{3f, -1f, 1f}, allReduce(backend, host, contribution, ReduceOp.MAX),
                 0f);
+            float[] kept = contribution.clone();
+            assertArrayEquals("host SUM", new float[]{6f, -6f, 1.5f},
+                backend.allReduce(contribution, ReduceOp.SUM, host), 0f);
+            assertArrayEquals("the host overload leaves its input alone", kept, contribution, 0f);
+            float[] mixed = rank == 0 ? backend.allReduce(contribution, ReduceOp.MEAN, host)
+                : allReduce(backend, host, contribution, ReduceOp.MEAN);
+            assertArrayEquals("host and tensor calls meet in one collective", new float[]{2f, -2f, 0.5f}, mixed, 0f);
 
             try (Tensor values = Tensor.fromArray(host, rank == 1 ? new float[]{7f, 8f} : new float[]{0f, 0f})) {
                 backend.broadcast(values, 1);

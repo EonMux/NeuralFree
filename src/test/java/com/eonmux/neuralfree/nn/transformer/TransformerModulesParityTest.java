@@ -112,7 +112,7 @@ public class TransformerModulesParityTest {
                     }
                 }
                 float[] out = r.output.toFloatArray();
-                float[] l = r.l.toFloatArray();
+                float[] l = r.l().toFloatArray();
                 assertChain("flash output", ref.out, out);
                 assertChain("flash weights", ref.p, p);
                 assertChain("flash normalizer", ref.l, l);
@@ -277,7 +277,7 @@ public class TransformerModulesParityTest {
                     assertSame(gpu, gr.output.backend());
                     assertChain(what + " scores", toDouble(hr.scores.toFloatArray()), gr.scores.toFloatArray());
                     assertChain(what + " output", toDouble(hr.output.toFloatArray()), gr.output.toFloatArray());
-                    assertChain(what + " normalizer", toDouble(hr.l.toFloatArray()), gr.l.toFloatArray());
+                    assertChain(what + " normalizer", toDouble(hr.l().toFloatArray()), gr.l().toFloatArray());
                 }
             }
         }

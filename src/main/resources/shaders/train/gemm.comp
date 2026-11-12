@@ -78,6 +78,24 @@ layout(push_constant) uniform TrGemvParams {
 #error "gemm.comp: unknown OP"
 #endif
 
+/* The products of depth kk of the staged slices onto the invocation's accumulators (TR_GM_APPLY in gemm.cl). */
+#define TR_GM_APPLY(kk)                                                             \
+    {                                                                               \
+        float a_[TR_GM_RB];                                                            \
+        float b_[TR_GM_RB];                                                            \
+        [[unroll]] for (int i_ = 0; i_ < TR_GM_RB; ++i_) {                             \
+            a_[i_] = tr_gm_a[(kk) * TR_GM_PAD + ty + TR_GM_LX * i_];                   \
+        }                                                                           \
+        [[unroll]] for (int j_ = 0; j_ < TR_GM_RB; ++j_) {                             \
+            b_[j_] = tr_gm_b[(kk) * TR_GM_PAD + tx + TR_GM_LX * j_];                   \
+        }                                                                           \
+        [[unroll]] for (int i_ = 0; i_ < TR_GM_RB; ++i_) {                             \
+            [[unroll]] for (int j_ = 0; j_ < TR_GM_RB; ++j_) {                         \
+                acc[i_ * TR_GM_RB + j_] = fma(a_[i_], b_[j_], acc[i_ * TR_GM_RB + j_]);   \
+            }                                                                       \
+        }                                                                           \
+    }
+
 void main() {
 #if OP == GEMM_F32
     const int bi = int(gl_WorkGroupID.z);
@@ -103,48 +121,60 @@ void main() {
         acc[t] = 0.0;
     }
 
-    for (int st = 0; st < stages; ++st) {
-        const int k0 = st * TR_GM_TK;
-        [[unroll]] for (int q = 0; q < TR_GM_RB; ++q) {
-            const int e = lid + q * (TR_GM_LX * TR_GM_LX);
-            const int a_mm = a_m_fast ? (e % TR_GM_TILE) : (e / TR_GM_TK);
-            const int a_kk = a_m_fast ? (e / TR_GM_TILE) : (e % TR_GM_TK);
-            const int am = m0 + a_mm;
-            const int ak = k0 + a_kk;
-            float av = 0.0;
-            if (am < M && ak < K) {
-                av = a_buf[a_base + am * pc.a_rs + ak * pc.a_cs];
-            }
-            tr_gm_a[a_kk * TR_GM_PAD + a_mm] = av;
+    /* Register prefetch of the next stage, as in gemm.cl. */
+    float pa[TR_GM_RB];
+    float pb[TR_GM_RB];
+    for (int st = 0; st <= stages; ++st) {
+        if (st < stages) {
+            const int k0 = st * TR_GM_TK;
+            [[unroll]] for (int q = 0; q < TR_GM_RB; ++q) {
+                const int e = lid + q * (TR_GM_LX * TR_GM_LX);
+                const int a_mm = a_m_fast ? (e % TR_GM_TILE) : (e / TR_GM_TK);
+                const int a_kk = a_m_fast ? (e / TR_GM_TILE) : (e % TR_GM_TK);
+                const int am = m0 + a_mm;
+                const int ak = k0 + a_kk;
+                float av = 0.0;
+                if (am < M && ak < K) {
+                    av = a_buf[a_base + am * pc.a_rs + ak * pc.a_cs];
+                }
+                pa[q] = av;
 
-            const int b_nn = b_k_fast ? (e / TR_GM_TK) : (e % TR_GM_TILE);
-            const int b_kk = b_k_fast ? (e % TR_GM_TK) : (e / TR_GM_TILE);
-            const int bn = n0 + b_nn;
-            const int bk = k0 + b_kk;
-            float bv = 0.0;
-            if (bn < N && bk < K) {
-                bv = b_buf[b_base + bk * pc.b_rs + bn * pc.b_cs];
+                const int b_nn = b_k_fast ? (e / TR_GM_TK) : (e % TR_GM_TILE);
+                const int b_kk = b_k_fast ? (e % TR_GM_TK) : (e / TR_GM_TILE);
+                const int bn = n0 + b_nn;
+                const int bk = k0 + b_kk;
+                float bv = 0.0;
+                if (bn < N && bk < K) {
+                    bv = b_buf[b_base + bk * pc.b_rs + bn * pc.b_cs];
+                }
+                pb[q] = bv;
             }
-            tr_gm_b[b_kk * TR_GM_PAD + b_nn] = bv;
         }
-        barrier();
-        const int depth = min(K - k0, TR_GM_TK);
-        for (int kk = 0; kk < depth; ++kk) {
-            float a[TR_GM_RB];
-            float b[TR_GM_RB];
-            [[unroll]] for (int i = 0; i < TR_GM_RB; ++i) {
-                a[i] = tr_gm_a[kk * TR_GM_PAD + ty + TR_GM_LX * i];
-            }
-            [[unroll]] for (int j = 0; j < TR_GM_RB; ++j) {
-                b[j] = tr_gm_b[kk * TR_GM_PAD + tx + TR_GM_LX * j];
-            }
-            [[unroll]] for (int i = 0; i < TR_GM_RB; ++i) {
-                [[unroll]] for (int j = 0; j < TR_GM_RB; ++j) {
-                    acc[i * TR_GM_RB + j] = fma(a[i], b[j], acc[i * TR_GM_RB + j]);
+        if (st > 0) {
+            const int depth = min(K - (st - 1) * TR_GM_TK, TR_GM_TK);
+            if (depth == TR_GM_TK) {
+                [[unroll]] for (int kk = 0; kk < TR_GM_TK; ++kk) {
+                    TR_GM_APPLY(kk);
+                }
+            } else {
+                for (int kk = 0; kk < depth; ++kk) {
+                    TR_GM_APPLY(kk);
                 }
             }
+            barrier();
         }
-        barrier();
+        if (st < stages) {
+            [[unroll]] for (int q = 0; q < TR_GM_RB; ++q) {
+                const int e = lid + q * (TR_GM_LX * TR_GM_LX);
+                const int a_mm = a_m_fast ? (e % TR_GM_TILE) : (e / TR_GM_TK);
+                const int a_kk = a_m_fast ? (e / TR_GM_TILE) : (e % TR_GM_TK);
+                tr_gm_a[a_kk * TR_GM_PAD + a_mm] = pa[q];
+                const int b_nn = b_k_fast ? (e / TR_GM_TK) : (e % TR_GM_TILE);
+                const int b_kk = b_k_fast ? (e % TR_GM_TK) : (e / TR_GM_TILE);
+                tr_gm_b[b_kk * TR_GM_PAD + b_nn] = pb[q];
+            }
+            barrier();
+        }
     }
 
     const int c_base = pc.c_off + bi * pc.c_bs;

@@ -338,6 +338,53 @@ public class GpuTensorOpsParityTest {
         TrainParity.assertSingleRounding("scatterAdd", expected, out.toFloatArray());
     }
 
+    /**
+     * Both forms of TR_Scatter_F32 against the serial index walk, bit for bit: a rotary-embedding gradient (a pair
+     * swap along the last dim of {@code [tokens, heads, headDim]}) and random indices with repeats, which run one
+     * work-item per output element, and long fibers ({@code len * limit} above the per-target bound), which run one
+     * work-item per fiber.
+     */
+    @Test
+    public void scatterFormsMatchTheIndexWalk() {
+        int[] rope = {8, 4, 16};
+        int[] partner = new int[8 * 4 * 16];
+        for (int i = 0; i < partner.length; i++) {
+            int dd = i % 16;
+            partner[i] = dd < 8 ? dd + 8 : dd - 8;
+        }
+        assertTrue(GpuTensorOps.scatterPerTarget(8 * 4, 16, 16));
+        assertScatterForms("rope pair swap", rope, rope, 2, partner);
+        int[] repeats = {3, 9, 5};
+        assertTrue(GpuTensorOps.scatterPerTarget(3 * 5, 9, 6));
+        assertScatterForms("repeated indices", new int[]{3, 6, 5}, repeats, 1, randomIndices(40, 3 * 9 * 5, 6));
+        int[] longIdx = {2, 300, 3};
+        assertFalse(GpuTensorOps.scatterPerTarget(2 * 3, 300, 280));
+        assertScatterForms("long fibers", new int[]{2, 280, 3}, longIdx, 1, randomIndices(41, 2 * 300 * 3, 280));
+    }
+
+    @Test
+    public void outOfRangeIndexOfThePerTargetScatterThrowsAtReadback() {
+        assertTrue(GpuTensorOps.scatterPerTarget(1, 3, 3));
+        Tensor out = keep(GpuTensorOps.scatterAdd(floats(gpu, new float[]{1f, 2f, 3f}, 3), 0,
+                ints(gpu, new int[]{2, 5, 2}, 3), floats(gpu, new float[]{10f, 20f, 30f}, 3)));
+        assertNotNull(out);
+        assertThrows(IndexOutOfBoundsException.class, out::toFloatArray);
+        TrainParity.assertBitIdentical("after the error", new float[]{1f, 2f, 43f}, out.toFloatArray());
+    }
+
+    private void assertScatterForms(String what, int[] inDims, int[] idxDims, int dim, int[] idx) {
+        int count = (int) Shape.of(inDims).numElements();
+        float[] in = TrainParity.uniform(42, count, -5f, 5f);
+        float[] src = TrainParity.uniform(43, idx.length, -5f, 5f);
+        TrainParity.assertBitIdentical(what + " scatterAdd", scatterAddReference(in, inDims, dim, idx, idxDims, src),
+                keep(GpuTensorOps.scatterAdd(floats(gpu, in, inDims), dim, ints(gpu, idx, idxDims),
+                        floats(gpu, src, idxDims))).toFloatArray());
+        assertSame(what + " scatter", keep(TensorOps.scatter(floats(host, in, inDims), dim, ints(host, idx, idxDims),
+                        floats(host, src, idxDims))),
+                keep(GpuTensorOps.scatter(floats(gpu, in, inDims), dim, ints(gpu, idx, idxDims),
+                        floats(gpu, src, idxDims))), Tolerance.BIT);
+    }
+
     // ------------------------------------------------------------------ in place
 
     @Test

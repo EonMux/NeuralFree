@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.distributed;
 
+import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.tensor.Tensor;
 
 import java.io.IOException;
@@ -125,6 +126,17 @@ public final class SharedMemoryBackend implements DistributedBackend {
         agree(CollectiveDescriptor.allReduce(op, data.length));
         float[][] slots = segment("allreduce", data.length).exchange(data, -1);
         CollectiveTensors.writeBack(tensor, CollectiveTensors.reduce(slots, op));
+    }
+
+    /** The host overload: the same exchange as {@link #allReduce(Tensor, ReduceOp)}, without a tensor. */
+    @Override
+    public synchronized float[] allReduce(float[] values, ReduceOp op, ComputeBackend staging) {
+        ensureOpen();
+        Objects.requireNonNull(op, "ReduceOp cannot be null");
+        Objects.requireNonNull(values, "values cannot be null");
+        agree(CollectiveDescriptor.allReduce(op, values.length));
+        float[][] slots = segment("allreduce", values.length).exchange(values, -1);
+        return CollectiveTensors.reduce(slots, op);
     }
 
     /**

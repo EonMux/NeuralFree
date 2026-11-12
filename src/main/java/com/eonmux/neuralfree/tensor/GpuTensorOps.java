@@ -56,6 +56,11 @@ public final class GpuTensorOps {
     static final String IN_PLACE_WITH_GRAD = "in-place write to a tensor that requires grad while grad mode is "
             + "enabled; wrap it in ComputationGraph.noGrad()";
 
+    /** A scatter of fewer fibers than this may run one work-item per output element ({@link #scatterPerTarget}). */
+    static final long SCATTER_TARGETS_BELOW_FIBERS = 16384;
+    /** Largest {@code len * limit} (indices read per fiber, times outputs per fiber) of the per-target scatter. */
+    static final long SCATTER_TARGETS_MAX_SCAN = 65536;
+
     private GpuTensorOps() {
     }
 
@@ -563,9 +568,10 @@ public final class GpuTensorOps {
 
     /**
      * TR_Scatter_F32 over index dims {@code d} (rank <= 6) into {@code out} of dims {@code od}, which is dense at
-     * element 0 of its buffer and pre-filled; one work-item per fiber (every coordinate except {@code dim}).
-     * {@code errDim} is the caller's dimension, which the deferred out-of-range error reports; it differs from
-     * {@code dim} when the dimensions were merged.
+     * element 0 of its buffer and pre-filled: one work-item per fiber (every coordinate except {@code dim}), or one
+     * per output element of a fiber when {@link #scatterPerTarget} holds (same bits). {@code errDim} is the caller's
+     * dimension, which the deferred out-of-range error reports; it differs from {@code dim} when the dimensions were
+     * merged.
      */
     private static void launchScatter(TrainGpu g, int dim, int mode, int[] d, int[] od, StridedView idx,
                                       StridedView src, Tensor out, int errDim) {
@@ -573,9 +579,22 @@ public final class GpuTensorOps {
         for (int k = 0; k < d.length; k++) {
             fibers *= k == dim ? 1 : d[k];
         }
-        g.launch1d(Kernels.SCATTER_F32, fibers, args(dim, mode, (int) fibers, d.length, slots(d), slots(od),
-                idx.offset(), src.offset(), TrainGpu.ERROR_SLOT_SCATTER, errDim, idx.buffer(), src.buffer(),
-                out.storage().gpuBuffer(), g.errors()));
+        boolean perTarget = scatterPerTarget(fibers, d[dim], od[dim]);
+        long items = perTarget ? fibers * od[dim] : fibers;
+        g.launch1d(Kernels.SCATTER_F32, items, args(dim, perTarget ? mode | TrainOps.TR_SCATTER_TARGETS : mode,
+                (int) fibers, d.length, slots(d), slots(od), idx.offset(), src.offset(), TrainGpu.ERROR_SLOT_SCATTER,
+                errDim, idx.buffer(), src.buffer(), out.storage().gpuBuffer(), g.errors()));
+    }
+
+    /**
+     * Whether a scatter of {@code fibers} fibers of {@code len} indices into {@code limit} outputs each runs one
+     * work-item per output element ({@code TR_SCATTER_TARGETS}): fewer than {@value #SCATTER_TARGETS_BELOW_FIBERS}
+     * fibers leave most of a GPU idle while each walks its indices with a dependent read-modify-write per index, and
+     * each of the {@code limit} items per fiber reads all {@code len} indices, so the form is taken only while
+     * {@code len * limit <= }{@value #SCATTER_TARGETS_MAX_SCAN} (a rotary-embedding gradient: 128 x 128 per head).
+     */
+    static boolean scatterPerTarget(long fibers, int len, int limit) {
+        return fibers < SCATTER_TARGETS_BELOW_FIBERS && limit > 0 && (long) len * limit <= SCATTER_TARGETS_MAX_SCAN;
     }
 
     // ------------------------------------------------------------------ argument checks

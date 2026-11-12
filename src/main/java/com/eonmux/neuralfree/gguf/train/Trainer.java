@@ -6,7 +6,8 @@ import java.util.List;
  * The computations a finetune run needs from a trainer: one window's forward pass and loss, one training step, and the
  * parameter arrays the optimizer steps and the writer saves. Both the host-array trainer ({@link TrainableModel}) and
  * the device trainer ({@link GpuTrainableModel}) implement it, so the runner, the optimizer and the command are the
- * same whichever backend executes the arithmetic.
+ * same whichever backend executes the arithmetic. The parameters' arrays always read as the trainer's current values
+ * and gradients, wherever the trainer keeps the authoritative copy.
  */
 public interface Trainer extends AutoCloseable {
 
@@ -45,6 +46,15 @@ public interface Trainer extends AutoCloseable {
 
     /** Zeroes every parameter's gradient. */
     void zeroGrad();
+
+    /**
+     * The moments and arithmetic of a {@link FinetuneOptimizer} of {@code kind} over {@link #parameters()}, kept where
+     * this trainer keeps its parameters. The default is the host update over the parameter arrays; the caller closes
+     * the result.
+     */
+    default FinetuneOptimizer.Update newUpdate(FinetuneOptimizer.Kind kind, float weightDecay) {
+        return FinetuneOptimizer.hostUpdate(parameters(), kind, weightDecay);
+    }
 
     /**
      * The whole logits table of {@code tokens}: one row per position. Runs a forward pass and leaves the trainer in

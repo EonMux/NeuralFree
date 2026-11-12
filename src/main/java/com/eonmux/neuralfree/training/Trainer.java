@@ -9,8 +9,10 @@ import com.eonmux.neuralfree.nn.loss.LossFunction;
 import com.eonmux.neuralfree.optim.LRScheduler;
 import com.eonmux.neuralfree.optim.Optimizer;
 import com.eonmux.neuralfree.tensor.DType;
+import com.eonmux.neuralfree.tensor.Shape;
 import com.eonmux.neuralfree.tensor.Tensor;
 import com.eonmux.neuralfree.tensor.TensorOps;
+import com.eonmux.neuralfree.tensor.TensorStorage;
 import com.eonmux.neuralfree.utils.LoggingUtil;
 import org.apache.logging.log4j.Logger;
 
@@ -326,7 +328,9 @@ public final class Trainer implements TrainingContext, AutoCloseable {
      * Forward and backward pass of one batch: terms left pending before the batch are dropped
      * ({@link Module#clearAuxiliaryLoss()}), then the loss plus the batch's auxiliary loss terms is back-propagated
      * ({@link #withAuxiliaryLoss}, {@link #backwardToParameters}); the batch, prediction, loss and auxiliary tensors
-     * are closed and every node the batch recorded is removed before returning.
+     * are closed and every node the batch recorded is removed before returning. The loss is read back once the
+     * backward pass is enqueued (through a detached handle the pass does not release), so the device runs the forward
+     * and backward passes without a host wait in between.
      *
      * @return the loss without the auxiliary terms, read back for logging
      * @throws IllegalStateException with {@link #NOT_CONNECTED} when the loss does not require grad, or when the first
@@ -344,14 +348,14 @@ public final class Trainer implements TrainingContext, AutoCloseable {
 
             Tensor prediction = step.keep(model.forward(batchInput));
             Tensor loss = step.keep(lossFunction.compute(prediction, batchTarget));
-
-            float lossValue = loss.toFloatArray()[0];
-            currentLoss = lossValue;
+            Tensor lossReading = step.keep(loss.detach());
 
             Tensor objective = withAuxiliaryLoss(model, loss, step);
             backwardToParameters(objective, appliedParameters(optimizer), !connectionVerified);
             connectionVerified = true;
 
+            float lossValue = lossReading.toFloatArray()[0];
+            currentLoss = lossValue;
             return lossValue;
         }
     }
@@ -393,9 +397,8 @@ public final class Trainer implements TrainingContext, AutoCloseable {
 
     /**
      * Back-propagates {@code objective}, the loss of a training step ({@link Tensor#backward()}). With
-     * {@code verify}, the gradient slots of the parameters of {@code params} that require grad are compared before
-     * and after the pass: at least one must hold a new gradient afterwards (a slot the pass filled or accumulated
-     * into).
+     * {@code verify}, at least one parameter of {@code params} that requires grad must have received a gradient from
+     * the pass ({@link Parameter#reachedByLastBackward()}: a slot the pass filled or accumulated into).
      *
      * @throws IllegalStateException with {@link #NOT_CONNECTED} when {@code objective} does not require grad, or, with
      *                               {@code verify}, when no parameter of {@code params} that requires grad received a
@@ -407,22 +410,12 @@ public final class Trainer implements TrainingContext, AutoCloseable {
         if (!objective.requiresGrad()) {
             throw new IllegalStateException(NOT_CONNECTED);
         }
+        objective.backward();
         if (!verify) {
-            objective.backward();
             return;
         }
-        List<Parameter> trainable = new ArrayList<>(params.size());
-        List<Tensor> before = new ArrayList<>(params.size());
         for (Parameter p : params) {
-            if (p.requiresGrad()) {
-                trainable.add(p);
-                before.add(p.grad());
-            }
-        }
-        objective.backward();
-        for (int i = 0; i < trainable.size(); i++) {
-            Tensor grad = trainable.get(i).grad();
-            if (grad != null && grad != before.get(i)) {
+            if (p.requiresGrad() && p.reachedByLastBackward()) {
                 return;
             }
         }
@@ -493,8 +486,10 @@ public final class Trainer implements TrainingContext, AutoCloseable {
     }
 
     /**
-     * The inputs of a batch stacked along a new leading batch dimension ({@link TensorOps#stack}, a device copy when
-     * the train kernels are available).
+     * The inputs of a batch stacked along a new leading batch dimension. When the inputs are dense tensors that lie
+     * back to back on one buffer and do not require grad (the samples a pinning {@link DataLoader} uploads as one
+     * buffer), the result is a view of that buffer and nothing is copied; otherwise it is {@link TensorOps#stack} (a
+     * device copy when the train kernels are available).
      *
      * @throws IllegalArgumentException when the batch is empty or the inputs differ in shape
      */
@@ -520,7 +515,37 @@ public final class Trainer implements TrainingContext, AutoCloseable {
         for (TensorDataset.Sample sample : batch) {
             parts.add(inputs ? sample.input() : sample.target());
         }
-        return TensorOps.stack(parts, 0);
+        Tensor adjacent = adjacentBatch(parts);
+        return adjacent != null ? adjacent : TensorOps.stack(parts, 0);
+    }
+
+    /**
+     * {@code parts} stacked along a new leading dim as a view of their buffer, when they have one shape and dtype, do
+     * not require grad, are dense from the start of their storages and the storages lie back to back on one buffer;
+     * else null.
+     */
+    private static Tensor adjacentBatch(List<Tensor> parts) {
+        Tensor first = parts.get(0);
+        long elements = first.numElements();
+        if (elements == 0) {
+            return null;
+        }
+        List<TensorStorage> storages = new ArrayList<>(parts.size());
+        for (Tensor part : parts) {
+            if (part.requiresGrad() || part.backend() != first.backend() || part.dtype() != first.dtype()
+                || !part.shape().equals(first.shape()) || !part.isDense() || part.strides().offset() != 0) {
+                return null;
+            }
+            storages.add(part.storage());
+        }
+        TensorStorage span = TensorStorage.adjacentSpan(storages, elements * first.dtype().byteSize());
+        if (span == null) {
+            return null;
+        }
+        int[] dims = new int[first.shape().rank() + 1];
+        dims[0] = parts.size();
+        System.arraycopy(first.shape().dims(), 0, dims, 1, first.shape().rank());
+        return Tensor.fromStorage(first.backend(), Shape.of(dims), first.dtype(), span);
     }
 
     /**

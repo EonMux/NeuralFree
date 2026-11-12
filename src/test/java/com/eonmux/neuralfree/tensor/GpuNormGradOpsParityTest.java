@@ -197,6 +197,39 @@ public class GpuNormGradOpsParityTest {
         }
     }
 
+    /**
+     * The per-head q/k norm shape of a transformer (128 columns over 1024 rows): the weight gradient runs in row
+     * chunks ({@link GpuNormGradOps#columnChunks}) and stays within the reduction class.
+     */
+    @Test
+    public void rmsNormBackwardChunksNarrowAffineColumns() {
+        int rows = 1024;
+        int cols = 128;
+        float eps = 1e-6f;
+        assertTrue("the shape is chunked", GpuNormGradOps.columnChunks(rows, cols) > 1);
+        float[] x = TrainParity.uniform(241, rows * cols, -3f, 3f);
+        float[] gy = TrainParity.uniform(242, rows * cols, -1f, 1f);
+        float[] w = TrainParity.uniform(243, cols, 0.25f, 2f);
+        Layout layout = Layout.rows(rows, cols);
+        Ref ref = Ref.of(x, gy, w, layout, Stats.fromData(x, layout, true, eps), Mode.RMS);
+        NormOps.Gradients g = keep(GpuNormGradOps.rmsNormBackward(upload(gpu, gy, rows, cols),
+                upload(gpu, x, rows, cols), upload(gpu, w, cols), eps, true, true));
+        ref.assertAll("chunked rmsNorm backward", g);
+    }
+
+    /** The chunk rule: tall blocks by 1024-row chunks, narrow blocks toward 16384 work-items, at most 256 chunks. */
+    @Test
+    public void columnChunkRule() {
+        assertEquals(1, GpuNormGradOps.columnChunks(64, 1024));
+        assertEquals(1, GpuNormGradOps.columnChunks(63, 1));
+        assertEquals(16, GpuNormGradOps.columnChunks(1024, 128));
+        assertEquals(8, GpuNormGradOps.columnChunks(512, 128));
+        assertEquals(78, GpuNormGradOps.columnChunks(5000, 6));
+        assertEquals(5, GpuNormGradOps.columnChunks(5000, 4096));
+        assertEquals(256, GpuNormGradOps.columnChunks(1 << 20, 4));
+        assertEquals(1, GpuNormGradOps.columnChunks(4096, 0));
+    }
+
     // ------------------------------------------------------------------ channel normalizations
 
     @Test

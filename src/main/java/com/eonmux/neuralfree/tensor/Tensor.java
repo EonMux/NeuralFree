@@ -97,9 +97,23 @@ public final class Tensor implements AutoCloseable {
         if (dtype != DType.FLOAT32) {
             throw new UnsupportedOperationException("ones() supports FLOAT32 only, got dtype: " + dtype);
         }
-        float[] onesData = new float[hostArrayLength(shape.numElements(), "ones() elements")];
-        Arrays.fill(onesData, 1.0f);
-        return hostFloats(backend, shape, onesData);
+        return full(backend, shape, 1.0f);
+    }
+
+    /**
+     * A FLOAT32 tensor with every element {@code value}: filled on the device when the train kernels are available
+     * ({@link GpuCoreOps#full}), otherwise uploaded.
+     */
+    public static Tensor full(ComputeBackend backend, Shape shape, float value) {
+        Objects.requireNonNull(backend, "Backend cannot be null");
+        Objects.requireNonNull(shape, "Shape cannot be null");
+        Tensor device = GpuCoreOps.full(backend, shape, value);
+        if (device != null) {
+            return device;
+        }
+        float[] data = new float[hostArrayLength(shape.numElements(), "full() elements")];
+        Arrays.fill(data, value);
+        return hostFloats(backend, shape, data);
     }
 
     public static Tensor rand(ComputeBackend backend, Shape shape) {
@@ -306,9 +320,9 @@ public final class Tensor implements AutoCloseable {
         return new Tensor(shape, DType.FLOAT32, Strides.contiguous(shape), storage, backend, false);
     }
 
+    /** A rank-0 FLOAT32 tensor holding {@code value}, filled as {@link #full} fills. */
     public static Tensor scalar(ComputeBackend backend, float value) {
-        Objects.requireNonNull(backend, "Backend cannot be null");
-        return hostFloats(backend, Shape.scalar(), new float[]{value});
+        return full(backend, Shape.scalar(), value);
     }
 
     // ------------------------------------------------------------------ views (recorded; see the class description)

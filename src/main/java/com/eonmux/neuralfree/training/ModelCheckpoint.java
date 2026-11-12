@@ -21,7 +21,6 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.Enumeration;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -92,6 +91,8 @@ public final class ModelCheckpoint implements Callback {
     public static final String METADATA_ENTRY = "checkpoint.properties";
 
     private static final int METADATA_VERSION = 1;
+    /** The buffer between the deflater's small writes and the file channel. */
+    private static final int WRITE_BUFFER_BYTES = 1 << 16;
     private static final String EPOCH = "epoch";
     private static final String TRAIN_LOSS = "trainLoss";
     private static final String VAL_LOSS = "valLoss";
@@ -388,10 +389,9 @@ public final class ModelCheckpoint implements Callback {
     }
 
     /**
-     * Writes {@code file} atomically: the {@link ModelSerializer} checkpoint goes to a staging file, which is copied
-     * after the metadata entry into a temporary file that is forced to the device and renamed over {@code file}
-     * ({@link #syncDirectory} then forces the directory). Both scratch files live next to {@code file} and are deleted
-     * on success and failure.
+     * Writes {@code file} atomically in one pass: the metadata entry and then the {@link ModelSerializer} entries go to
+     * a temporary file next to {@code file}, which is forced to the device and renamed over it
+     * ({@link #syncDirectory} then forces the directory). The temporary file is deleted on failure.
      */
     private void writeCheckpointFile(Path file, Properties metadata, Optimizer optimizer) {
         try {
@@ -400,42 +400,31 @@ public final class ModelCheckpoint implements Callback {
             throw new UncheckedIOException("Cannot create checkpoint directory " + directory + " for " + file + ": "
                 + e.getMessage(), e);
         }
-        String scratch = "." + file.getFileName() + "." + UUID.randomUUID();
-        Path staged = directory.resolve(scratch + ".stage");
-        Path temporary = directory.resolve(scratch + ".tmp");
+        Path temporary = directory.resolve("." + file.getFileName() + "." + UUID.randomUUID() + ".tmp");
         try {
-            ModelSerializer.save(trainer.model(), optimizer, staged);
-            writeWithMetadata(staged, temporary, metadata);
-            Files.delete(staged);
+            writeArchive(temporary, metadata, trainer.model(), optimizer);
             Files.move(temporary, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
         } catch (IOException e) {
             UncheckedIOException failure = new UncheckedIOException("Cannot write checkpoint " + file + ": "
                 + e.getMessage(), e);
-            deleteScratch(failure, staged, temporary);
+            deleteScratch(failure, temporary);
             throw failure;
         } catch (RuntimeException e) {
-            deleteScratch(e, staged, temporary);
+            deleteScratch(e, temporary);
             throw e;
         }
     }
 
-    private static void writeWithMetadata(Path staged, Path temporary, Properties metadata) throws IOException {
+    private static void writeArchive(Path temporary, Properties metadata, Module model, Optimizer optimizer)
+            throws IOException {
         try (FileChannel channel = FileChannel.open(temporary, StandardOpenOption.CREATE_NEW,
                 StandardOpenOption.WRITE);
-             ZipFile source = new ZipFile(staged.toFile());
-             ZipOutputStream zip = new ZipOutputStream(new BufferedOutputStream(Channels.newOutputStream(channel)))) {
+             ZipOutputStream zip = new ZipOutputStream(new BufferedOutputStream(Channels.newOutputStream(channel),
+                     WRITE_BUFFER_BYTES))) {
             zip.putNextEntry(new ZipEntry(METADATA_ENTRY));
             metadata.store(zip, "NeuralFree ModelCheckpoint");
             zip.closeEntry();
-            Enumeration<? extends ZipEntry> entries = source.entries();
-            while (entries.hasMoreElements()) {
-                ZipEntry entry = entries.nextElement();
-                zip.putNextEntry(new ZipEntry(entry.getName()));
-                try (InputStream in = source.getInputStream(entry)) {
-                    in.transferTo(zip);
-                }
-                zip.closeEntry();
-            }
+            ModelSerializer.write(model, optimizer, zip);
             zip.finish();
             zip.flush();
             channel.force(true);

@@ -99,6 +99,11 @@ public final class TrainGpu implements AutoCloseable {
     private boolean errorsArmed;
     private volatile boolean closed;
 
+    /** Bytes one check of the deferred index-error slots reads from the device ({@link #checkErrors}). */
+    public static long errorSlotBytes() {
+        return ERROR_BYTES;
+    }
+
     /**
      * Message of the {@link IndexOutOfBoundsException} for gather index {@code index} outside {@code [0, size)} of
      * dimension {@code dim}: the CPU path's whole message and the device path's text for {@link #ERROR_SLOT_GATHER}.
@@ -160,7 +165,8 @@ public final class TrainGpu implements AutoCloseable {
     /**
      * Orders a host transfer of tensor data on {@code q} after the train work already enqueued: checks the
      * deferred error slots when a kernel armed them (which drains the compute queue and may throw), then, when train
-     * work is pending and {@code q} is not the compute queue, appends a compute-queue marker to {@code waits}. The
+     * work is pending and {@code q} is not the compute queue, appends a compute-queue marker to {@code waits} and
+     * flushes the compute queue (OpenCL requires the producing queue of a cross-queue wait event to be flushed). The
      * caller passes {@code waits} to its transfer, finishes {@code q}, and closes the appended events. Never opens the
      * library; does nothing for a backend without a context. The caller holds {@link BackendResources#lock}.
      *
@@ -177,20 +183,23 @@ public final class TrainGpu implements AutoCloseable {
     }
 
     /**
-     * Gives the compute queue a device-side dependency on a finished host upload: enqueues a compute-queue marker
-     * that waits on {@code uploadEvent}, so every later train launch is ordered after the upload (on Vulkan the
-     * cross-queue wait is a timeline-semaphore wait). The event stays owned by the caller. Does nothing for a null
-     * event or a backend without a context. The caller holds {@link BackendResources#lock}.
+     * Gives the compute queue a device-side dependency on a host upload enqueued on {@code q}: flushes {@code q} when
+     * it is not the compute queue (OpenCL requires the producing queue of a cross-queue wait event to be flushed
+     * before another queue waits on it), then enqueues a compute-queue marker that waits on {@code uploadEvent}, so
+     * every later launch on the compute queue is ordered after the upload (on Vulkan the cross-queue wait is a
+     * timeline-semaphore wait). The event stays owned by the caller, who may close it once this returns. Does nothing
+     * for a null event or a backend without an open context. The caller holds {@link BackendResources#lock}.
+     *
+     * @return whether the compute queue now waits for the upload, so the caller need not wait for it on the host
      */
-    public static void afterHostWrite(ComputeBackend b, GpuEvent uploadEvent) {
+    public static boolean afterHostWrite(ComputeBackend b, ComputeQueue q, GpuEvent uploadEvent) {
         Objects.requireNonNull(b, "backend must not be null");
+        Objects.requireNonNull(q, "queue must not be null");
         if (uploadEvent == null) {
-            return;
+            return false;
         }
         TrainGpu g = existing(b);
-        if (g != null) {
-            g.orderAfterUpload(uploadEvent);
-        }
+        return g != null && g.orderAfterUpload(q, uploadEvent);
     }
 
     private static Slot slot(ComputeBackend b) {
@@ -433,6 +442,7 @@ public final class TrainGpu implements AutoCloseable {
                 GpuEvent marker = compute.enqueueMarker();
                 if (marker != null) {
                     waits.add(marker);
+                    compute.flush();
                 }
             }
         } finally {
@@ -440,16 +450,20 @@ public final class TrainGpu implements AutoCloseable {
         }
     }
 
-    private void orderAfterUpload(GpuEvent uploadEvent) {
+    private boolean orderAfterUpload(ComputeQueue q, GpuEvent uploadEvent) {
         lock.lock();
         try {
             if (closed) {
-                return;
+                return false;
+            }
+            if (q != compute) {
+                q.flush();
             }
             GpuEvent marker = compute.enqueueMarker(uploadEvent);
             if (marker != null) {
                 marker.close();
             }
+            return true;
         } finally {
             lock.unlock();
         }

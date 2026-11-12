@@ -254,7 +254,7 @@ com.eonmux.neuralfree
 ├── optim/            Optimizers and learning-rate schedulers
 ├── training/         Trainer, callbacks, checkpoints
 ├── data/             DataLoader, datasets, samplers, transforms
-├── inference/        InferenceEngine, speculative decoding, graph optimizer
+├── inference/        InferenceEngine, speculative decoding
 ├── precision/        Mixed precision, quantizer, QAT
 ├── distributed/      Data-parallel, pipeline-parallel and federated training
 ├── ml/  rl/  meta/   Classical ML, reinforcement learning, meta-learning

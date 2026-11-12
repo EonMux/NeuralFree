@@ -10,7 +10,8 @@ import static org.junit.Assert.*;
 /**
  * Bounds and reuse policy of the OpenCL staging pool: buffers are aligned, native-order and
  * direct; buffers retained up to a ticket are reused before the cycle ends; large buffers are pooled
- * only while reused; small free buffers stay within their count and byte budget, keeping the
+ * only while reused and, besides the largest, within their own byte bound, so a transfer above that
+ * bound keeps its buffer; small free buffers stay within their count and byte budget, keeping the
  * smallest however many are trimmed at once.
  */
 public class OclStagingPoolTest {
@@ -169,6 +170,89 @@ public class OclStagingPoolTest {
         pool.recycleInFlight();
         assertEquals(2, pool.freeCount());
         assertEquals(512, pool.freeBytes());
+    }
+
+    /**
+     * Large buffers recycled before the cycle ends that no later request fits (a run of growing uploads) do not
+     * accumulate: the free large buffers besides the largest stay within their byte bound, the longest-free dropped
+     * first.
+     */
+    @Test
+    public void largeFreeBuffersStayWithinTheirByteBound() {
+        OclStagingPool pool = new OclStagingPool(32, 1024, 1 << 20, 4096);
+        ByteBuffer a = pool.acquire(2048);
+        pool.retain(a);
+        ByteBuffer b = pool.acquire(2304);
+        pool.retain(b);
+        ByteBuffer c = pool.acquire(2560);
+        pool.retain(c);
+        ByteBuffer d = pool.acquire(2816);
+        long last = pool.retain(d);
+        pool.recycleThrough(last);
+        assertEquals(2, pool.freeCount());
+        assertEquals(2560 + 2816, pool.freeBytes());
+        assertSame(c, pool.acquire(2048));
+        assertSame(d, pool.acquire(2048));
+    }
+
+    /**
+     * A transfer above the large-buffer budget repeated every cycle, as the read of a gradient and the write of the
+     * stepped weights of one tensor are, reuses one buffer: freed mid-cycle together with a smaller transfer's buffer
+     * (a read that completed), and at every finish.
+     */
+    @Test
+    public void repeatedTransferAboveTheLargeBudgetReusesItsBufferAcrossFinishes() {
+        OclStagingPool pool = new OclStagingPool();
+        int big = (int) OclStagingPool.MAX_LARGE_FREE_BYTES + (32 << 20);
+        int chunk = 12 << 20;
+        ByteBuffer first = pool.acquire(big);
+        pool.retain(first);
+        pool.recycleInFlight();
+        for (int cycle = 0; cycle < 3; cycle++) {
+            assertSame("cycle " + cycle + ": the read reuses the buffer", first, pool.acquire(big));
+            pool.retain(first);
+            pool.recycleThrough(pool.retain(pool.acquire(chunk)));
+            assertEquals("cycle " + cycle + ": both buffers freed mid-cycle stay",
+                    (long) big + chunk, pool.freeBytes());
+            assertSame("cycle " + cycle + ": the write reuses the buffer", first, pool.acquire(big));
+            pool.retain(first);
+            pool.retain(pool.acquire(chunk));
+            pool.recycleInFlight();
+            assertEquals("cycle " + cycle + ": the finish keeps both buffers", 2, pool.freeCount());
+            assertEquals((long) big + chunk, pool.freeBytes());
+        }
+        pool.recycleInFlight();
+        assertEquals("the idle-cycle rule still drops them once the transfers stop", 0, pool.freeCount());
+    }
+
+    @Test
+    public void aLargeWriteFreedBeforeTheFinishIsReusedInTheNextCycle() {
+        OclStagingPool pool = new OclStagingPool();
+        int big = (int) OclStagingPool.MAX_LARGE_FREE_BYTES + (32 << 20);
+        int small = 4096;
+        ByteBuffer first = pool.acquire(big);
+        for (int cycle = 0; cycle < 3; cycle++) {
+            if (cycle > 0) {
+                assertSame("cycle " + cycle + ": the write reuses the buffer", first, pool.acquire(big));
+            }
+            long bigTicket = pool.retain(first);
+            ByteBuffer tail = pool.acquire(small);
+            pool.recycleThrough(bigTicket);
+            pool.retain(tail);
+            pool.recycleInFlight();
+            assertEquals("cycle " + cycle + ": the finish keeps the write's buffer",
+                    (long) big + tail.capacity(), pool.freeBytes());
+        }
+        pool.recycleInFlight();
+        assertEquals("an idle cycle drops the large buffer", 1, pool.freeCount());
+    }
+
+    @Test
+    public void capacityRoundsUpToTheAlignment() {
+        assertEquals(0, OclStagingPool.capacityFor(0));
+        assertEquals(OclStagingPool.ALIGNMENT, OclStagingPool.capacityFor(1));
+        assertEquals(OclStagingPool.ALIGNMENT * 2, OclStagingPool.capacityFor(OclStagingPool.ALIGNMENT + 1));
+        assertEquals(Integer.MAX_VALUE, OclStagingPool.capacityFor(Integer.MAX_VALUE));
     }
 
     @Test

@@ -77,6 +77,11 @@ public final class TrainableModel implements Trainer {
      * One trainable tensor: its stored GGUF name, type and shape, its float32 master values and its accumulated
      * gradient. A tensor stored as F16 or BF16 keeps float32 master values; the stored type is what a save writes the
      * trained values back as.
+     *
+     * <p>A trainer that keeps the authoritative copy elsewhere (the device trainer keeps its masters, gradients and
+     * optimizer state in device memory) hands out parameters bound to a {@link HostMirror}: every accessor that
+     * returns an array first brings it up to date from that copy, so the arrays read the same as the host trainer's
+     * at any point.</p>
      */
     public static final class Parameter {
         private final String name;
@@ -86,15 +91,28 @@ public final class TrainableModel implements Trainer {
         private final int cols;
         private final float[] value;
         private final float[] grad;
+        private final HostMirror mirror;
 
         Parameter(String name, GGMLType storedType, long[] ne, int rows, int cols, float[] value) {
+            this(name, storedType, ne, rows, cols, value, new float[value.length], null);
+        }
+
+        private Parameter(String name, GGMLType storedType, long[] ne, int rows, int cols, float[] value,
+                          float[] grad, HostMirror mirror) {
             this.name = name;
             this.storedType = storedType;
             this.ne = ne;
             this.rows = rows;
             this.cols = cols;
             this.value = value;
-            this.grad = new float[value.length];
+            this.grad = grad;
+            this.mirror = mirror;
+        }
+
+        /** This parameter's arrays, kept current from the copy {@code mirror} manages. */
+        Parameter mirroredBy(HostMirror mirror) {
+            return new Parameter(name, storedType, ne, rows, cols, value, grad,
+                    Objects.requireNonNull(mirror, "mirror"));
         }
 
         /** Stored GGUF tensor name. */
@@ -127,18 +145,31 @@ public final class TrainableModel implements Trainer {
             return value.length;
         }
 
-        /** The values (not a copy; the optimizer updates this array). */
+        /**
+         * The values (not a copy; a host optimizer updates this array). On a mirrored parameter the array is first
+         * brought up to date, and the caller may write it: the next window of the trainer that owns the mirror runs
+         * with what the array then holds.
+         */
         public float[] value() {
+            if (mirror != null) {
+                mirror.beforeValues(name, true);
+            }
             return value;
         }
 
         /** The accumulated gradient of the last backward pass. */
         public float[] grad() {
+            if (mirror != null) {
+                mirror.beforeGrad(name);
+            }
             return grad;
         }
 
         /** A copy of the current values. */
         public float[] values() {
+            if (mirror != null) {
+                mirror.beforeValues(name, false);
+            }
             return value.clone();
         }
 
@@ -150,6 +181,21 @@ public final class TrainableModel implements Trainer {
         public String toString() {
             return name + " [" + rows + " x " + cols + "]";
         }
+    }
+
+    /**
+     * The other copy a mirrored {@link Parameter}'s arrays follow: called before an accessor hands an array out, by
+     * the parameter's stored name.
+     */
+    interface HostMirror {
+        /**
+         * Brings the values of {@code name} up to date; {@code mayWrite} when the caller receives the live array and
+         * may change it.
+         */
+        void beforeValues(String name, boolean mayWrite);
+
+        /** Brings the gradient of {@code name} up to date. */
+        void beforeGrad(String name);
     }
 
     /** The tensors and RoPE table of one block, bound to its parameters. */

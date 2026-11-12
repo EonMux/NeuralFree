@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.distributed;
 
+import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.tensor.Tensor;
 import com.eonmux.neuralfree.utils.LoggingUtil;
 import org.apache.logging.log4j.Logger;
@@ -292,9 +293,21 @@ public final class TCPBackend implements DistributedBackend {
         ensureOpen();
         Objects.requireNonNull(op, "ReduceOp cannot be null");
         CollectiveTensors.requireWritable(tensor);
-        float[] data = CollectiveTensors.read(tensor);
+        CollectiveTensors.writeBack(tensor, reduceOnHost(CollectiveTensors.read(tensor), op));
+    }
+
+    /** The host overload: the same exchange as {@link #allReduce(Tensor, ReduceOp)}, without a tensor. */
+    @Override
+    public synchronized float[] allReduce(float[] values, ReduceOp op, ComputeBackend staging) {
+        ensureOpen();
+        Objects.requireNonNull(op, "ReduceOp cannot be null");
+        Objects.requireNonNull(values, "values cannot be null");
+        return reduceOnHost(values, op);
+    }
+
+    private float[] reduceOnHost(float[] data, ReduceOp op) {
         float[][] perRank = agree(CollectiveDescriptor.allReduce(op, data.length), data);
-        float[] reduced = guarded(() -> {
+        return guarded(() -> {
             if (rank != 0) {
                 return receiveFloats(0, data.length);
             }
@@ -304,7 +317,6 @@ public final class TCPBackend implements DistributedBackend {
             }
             return result;
         });
-        CollectiveTensors.writeBack(tensor, reduced);
     }
 
     /**

@@ -726,6 +726,101 @@ public final class GradFunctions {
         }
     }
 
+    /**
+     * {@code linear(x, w, bias) = x @ w^T + bias} with {@code w} of shape {@code [out, in]}: {@code gx = gy @ w};
+     * {@code gw = gy2^T @ x2}, where {@code gy2} and {@code x2} are {@code gy} and {@code x} with their leading dims
+     * flattened, computed in {@code w}'s {@code [out, in]} layout (no transposed copy of the weight gradient);
+     * {@code gbias} is {@code gy} summed over its leading dims. The bias entry exists only when the node has a bias
+     * input. A weight of no rows ({@code out == 0}) gives zero gradients of the shapes of {@code x} and {@code w},
+     * and an input of no rows a zero weight gradient: the products' sums are empty.
+     */
+    public static class LinearGrad extends ComposedGradFn {
+        private final boolean needX;
+        private final boolean needW;
+        private final boolean hasBias;
+        private final boolean needBias;
+
+        /**
+         * {@code hasBias}: whether the node has a bias input; {@code needX}, {@code needW}, {@code needBias}: whether
+         * that operand requires a gradient (else its entry is null).
+         */
+        public LinearGrad(boolean needX, boolean needW, boolean hasBias, boolean needBias) {
+            this.needX = needX;
+            this.needW = needW;
+            this.hasBias = hasBias;
+            this.needBias = hasBias && needBias;
+        }
+
+        public void saveForBackward(Tensor x, Tensor w) {
+            save(x, w);
+        }
+
+        @Override
+        public List<Tensor> backward(Tensor gradOutput) {
+            Tensor x = saved(0);
+            Tensor w = saved(1);
+            List<Tensor> grads = new ArrayList<>(3);
+            try {
+                grads.add(needX ? inputGrad(gradOutput, x, w) : null);
+                grads.add(needW ? weightGrad(gradOutput, x, w.shape()) : null);
+                if (hasBias) {
+                    grads.add(needBias ? biasGrad(gradOutput) : null);
+                }
+                return grads;
+            } catch (RuntimeException e) {
+                List<Tensor> made = new ArrayList<>();
+                for (Tensor g : grads) {
+                    if (g != null && g != gradOutput) {
+                        made.add(g);
+                    }
+                }
+                throw closeAfterFailure(made, e);
+            }
+        }
+
+        private static Tensor inputGrad(Tensor gy, Tensor x, Tensor w) {
+            if (w.shape().dim(0) == 0) {
+                return Tensor.zeros(x.backend(), x.shape(), x.dtype());
+            }
+            return TensorOps.matmul(gy, w);
+        }
+
+        private static Tensor weightGrad(Tensor gy, Tensor x, Shape weightShape) {
+            int out = weightShape.dim(0);
+            int in = weightShape.dim(1);
+            int rows = leadingRows(x.shape());
+            if (out == 0 || rows == 0) {
+                return Tensor.zeros(x.backend(), weightShape, x.dtype());
+            }
+            try (Tensor gy2 = gy.reshape(Shape.of(rows, out));
+                 Tensor x2 = x.reshape(Shape.of(rows, in));
+                 Tensor gyT = gy2.transpose()) {
+                return TensorOps.matmul(gyT, x2);
+            }
+        }
+
+        /** The rows a {@code [..., features]} shape flattens to: the product of every dim but the last. */
+        private static int leadingRows(Shape shape) {
+            int rows = 1;
+            for (int d = 0; d < shape.rank() - 1; d++) {
+                rows = Math.multiplyExact(rows, shape.dim(d));
+            }
+            return rows;
+        }
+
+        private static Tensor biasGrad(Tensor gy) {
+            int rank = gy.shape().rank();
+            if (rank == 1) {
+                return gy;
+            }
+            int[] leading = new int[rank - 1];
+            for (int d = 0; d < leading.length; d++) {
+                leading[d] = d;
+            }
+            return TensorOps.sum(gy, leading);
+        }
+    }
+
     /** {@code bmm(a, b)} for {@code [B, M, K] @ [B, K, N]}: {@code ga = bmm(gy, b^T)}, {@code gb = bmm(a^T, gy)}. */
     public static class BmmGrad extends ComposedGradFn {
         private final boolean needA;

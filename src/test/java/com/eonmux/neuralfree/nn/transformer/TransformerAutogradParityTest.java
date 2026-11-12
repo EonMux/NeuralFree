@@ -79,7 +79,7 @@ public class TransformerAutogradParityTest {
                     assertTrue(what + " output is recorded", r.output.requiresGrad());
                     assertNotNull(what + " output has a gradient function", r.output.gradFn());
                     assertFalse(what + " scores are detached", r.scores.requiresGrad());
-                    assertFalse(what + " normalizer is detached", r.l.requiresGrad());
+                    assertFalse(what + " normalizer is detached", r.l().requiresGrad());
                     float[] scores = r.scores.toFloatArray();
 
                     r.output.backward(g);

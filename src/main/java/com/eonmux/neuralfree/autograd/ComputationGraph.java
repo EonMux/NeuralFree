@@ -32,8 +32,11 @@ import java.util.Set;
  * node outputs are summed per output, handed to the node's gradient function and closed. Leaves accumulate their
  * gradient in {@link Tensor#grad()}; a backward from a leaf accumulates the seed into its own slot. A first-order pass
  * runs with grad mode off, so gradient functions that call recording operations record nothing. By default the
- * traversed part of the graph is released afterwards; {@code retainGraph = true} keeps it, with its saved tensors,
- * for a further backward pass. Backward through a released non-leaf throws.</p>
+ * traversed part of the graph is released as the pass goes: a node whose gradient function has run drops its saved
+ * tensors and closes its output at once (every consumer of that output ran before it), so the activations of a step
+ * are freed while the gradients are being allocated rather than after; the traversed nodes no gradient reached are
+ * released when the pass ends. {@code retainGraph = true} keeps the traversed graph, with its saved tensors, for a
+ * further backward pass. Backward through a released non-leaf throws.</p>
  *
  * <p><b>Create graph.</b> With {@code createGraph = true} (which implies {@code retainGraph}) the pass runs with grad
  * mode on and the create-graph flag set, so the gradients it computes are recorded and can be differentiated again.
@@ -47,7 +50,9 @@ import java.util.Set;
  * <ul>
  *   <li>Every gradient tensor the pass creates or receives from a gradient function belongs to the graph. A leaf's
  *   gradient belongs to that leaf's gradient slot: every slot gets its own tensor object (views of one buffer stay
- *   alive through the storage reference count), and accumulating into a slot closes the gradient it replaces.</li>
+ *   alive through the storage reference count). Accumulating into a slot sums into the slot's tensor in place when the
+ *   slot owns it exclusively (see {@link BackwardPass}); otherwise the sum replaces it and the replaced gradient is
+ *   closed. {@link #reachedByLastBackward} tells which leaves a pass delivered to either way.</li>
  *   <li>A tensor a gradient function returns that is the incoming gradient, an input, the output or a saved tensor of
  *   its node, or an output the graph owns, is never taken over; its slot gets a new reference to it.</li>
  *   <li>Releasing nodes (after a backward pass, or {@link #release(Tensor)} without one) drops their saved tensors
@@ -81,12 +86,17 @@ public final class ComputationGraph {
     private final Map<Tensor, GraphNode> tensorToNode;
     /** The leaves this graph gave gradients to, held weakly: the graph never keeps a parameter reachable. */
     private final Set<Tensor> gradientLeaves;
+    /** The leaves the most recent backward pass delivered a gradient to, held weakly. */
+    private final Set<Tensor> lastReached;
+    /** Backward passes running on this thread: a checkpoint recompute runs one inside the pass that reached it. */
+    private int backwardDepth;
     private long nextSequence;
 
     private ComputationGraph() {
         this.nodes = new ArrayList<>();
         this.tensorToNode = new IdentityHashMap<>();
         this.gradientLeaves = new WeakIdentitySet<>();
+        this.lastReached = new WeakIdentitySet<>();
     }
 
     public static ComputationGraph current() {
@@ -201,7 +211,9 @@ public final class ComputationGraph {
      * that other nodes still in the graph depend on are kept. With {@code createGraph} the pass records the gradient
      * computation (grad mode on even inside {@link #noGrad}), the graph is retained, and the nodes the pass recorded
      * follow the lifetime rule of the class description. When a gradient function fails, the gradients of the pass
-     * that were not yet handed to leaves are closed and the traversed graph is left as it was.
+     * that were not yet handed to leaves are closed; a pass that releases the graph releases the traversed graph as
+     * it would have on success (some of its nodes were already released as their gradient functions ran, so the pass
+     * could not be repeated from {@code loss} anyway), and a retaining pass leaves the traversed graph as it was.
      *
      * @throws IllegalArgumentException      when {@code loss} is null, or {@code gradOutput} or a computed gradient
      *                                       does not have the shape of its tensor
@@ -223,20 +235,46 @@ public final class ComputationGraph {
         }
         pruneGradientLeaves();
         List<GraphNode> producersFirst = rootNode == null ? Collections.emptyList() : producersFirst(rootNode);
-        if (!createGraph) {
-            try (PassScope scope = new PassScope(false)) {
-                BackwardPass.run(this, producersFirst, loss, gradOutput, gradientLeaves, false);
-            }
-            if (!retainGraph && rootNode != null) {
-                release(producersFirst, only(loss));
-            }
-            return;
+        if (backwardDepth == 0) {
+            lastReached.clear();
         }
+        backwardDepth++;
+        try {
+            if (!createGraph) {
+                firstOrderPass(producersFirst, loss, gradOutput,
+                    retainGraph || rootNode == null ? null : new Release(producersFirst, only(loss)));
+                return;
+            }
+            createGraphPass(producersFirst, loss, gradOutput);
+        } finally {
+            backwardDepth--;
+        }
+    }
+
+    /**
+     * A first-order pass that, with a {@code release}, releases each node as soon as its gradient function ran and
+     * the rest of the traversed nodes when the pass ends, whether it succeeded or failed.
+     */
+    private void firstOrderPass(List<GraphNode> producersFirst, Tensor loss, Tensor gradOutput, Release release) {
+        try (PassScope scope = new PassScope(false)) {
+            BackwardPass.run(this, producersFirst, loss, gradOutput, gradientLeaves, false, lastReached, release);
+        } catch (RuntimeException e) {
+            if (release != null) {
+                release.abandon(producersFirst, e);
+            }
+            throw e;
+        }
+        if (release != null) {
+            release.finish(producersFirst);
+        }
+    }
+
+    private void createGraphPass(List<GraphNode> producersFirst, Tensor loss, Tensor gradOutput) {
         requireCreateGraphSupport(producersFirst, null);
         long passMark = mark();
         RuntimeException failure = null;
         try (PassScope scope = new PassScope(true)) {
-            BackwardPass.run(this, producersFirst, loss, gradOutput, gradientLeaves, true);
+            BackwardPass.run(this, producersFirst, loss, gradOutput, gradientLeaves, true, lastReached, null);
         } catch (RuntimeException e) {
             failure = e;
             throw e;
@@ -491,24 +529,51 @@ public final class ComputationGraph {
      * is closed even as a root, since nobody else holds it.
      */
     private void release(List<GraphNode> traversed, Set<Tensor> roots) {
-        Set<GraphNode> released = identitySet();
-        released.addAll(traversed);
-        keepDependenciesOfRemainingNodes(released);
+        new Release(traversed, roots).finish(traversed);
+    }
 
-        Set<Tensor> stillUsed = slotGradients();
-        for (GraphNode node : nodes) {
-            if (!released.contains(node)) {
-                stillUsed.add(node.output);
-                stillUsed.addAll(node.inputs);
-                stillUsed.addAll(BackwardPass.savedTensors(node));
+    /**
+     * The release of a traversed part of the graph, node by node. The released set is the traversed nodes minus
+     * those a node outside it depends on; an output is closed unless it is a root the node does not own, is used by a
+     * node that stays (as output, input or saved tensor), is in a gradient slot, or is its node's own input. An
+     * output that a released node lists among its saved tensors itself (a custom {@link GradientFunction} that keeps
+     * another node's output object rather than a detached handle) is closed only when the whole set is released
+     * ({@link #finish} or {@link #abandon}), because the saving node may run after the output's own node. A node is
+     * released at most once; failures of dropping saved tensors or closing outputs are collected and thrown by
+     * {@link #finish} (or added to the pass failure by {@link #abandon}).
+     */
+    final class Release {
+        private final Set<GraphNode> released;
+        private final Set<Tensor> stillUsed;
+        private final Set<Tensor> savedByReleased;
+        private final Set<Tensor> roots;
+        private final Set<GraphNode> done;
+        private final List<Tensor> deferred = new ArrayList<>();
+        private RuntimeException failure;
+
+        private Release(List<GraphNode> traversed, Set<Tensor> roots) {
+            this.roots = roots;
+            this.released = identitySet();
+            released.addAll(traversed);
+            keepDependenciesOfRemainingNodes(released);
+            this.stillUsed = slotGradients();
+            this.savedByReleased = identitySet();
+            for (GraphNode node : nodes) {
+                if (!released.contains(node)) {
+                    stillUsed.add(node.output);
+                    stillUsed.addAll(node.inputs);
+                    stillUsed.addAll(BackwardPass.savedTensors(node));
+                } else {
+                    savedByReleased.addAll(BackwardPass.savedTensors(node));
+                }
             }
+            this.done = identitySet();
         }
 
-        List<Tensor> outputs = new ArrayList<>();
-        RuntimeException failure = null;
-        for (GraphNode node : traversed) {
-            if (!released.contains(node)) {
-                continue;
+        /** Releases {@code node} if it is in the released set: its gradient function ran and is not needed again. */
+        void afterVisit(GraphNode node) {
+            if (!released.contains(node) || !done.add(node)) {
+                return;
             }
             try {
                 node.gradFn.clearSavedTensors();
@@ -518,14 +583,52 @@ public final class ComputationGraph {
             tensorToNode.remove(node.output, node);
             boolean kept = (roots.contains(node.output) && !node.ownsOutput) || stillUsed.contains(node.output)
                 || containsIdentity(node.inputs, node.output);
-            if (!kept) {
-                outputs.add(node.output);
+            if (kept) {
+                return;
+            }
+            if (savedByReleased.contains(node.output)) {
+                deferred.add(node.output);
+                return;
+            }
+            close(node.output);
+        }
+
+        /** Releases the rest of the released set and removes every released node from the graph. */
+        void finish(List<GraphNode> traversed) {
+            releaseRest(traversed);
+            if (failure != null) {
+                throw failure;
             }
         }
-        nodes.removeIf(released::contains);
-        BackwardPass.closeAll(outputs, failure);
-        if (failure != null) {
-            throw failure;
+
+        /**
+         * After a failed pass: releases the rest of the released set as {@link #finish} does, so no node of the pass
+         * stays behind unreachable from its root, and adds release failures to {@code passFailure}.
+         */
+        void abandon(List<GraphNode> traversed, RuntimeException passFailure) {
+            releaseRest(traversed);
+            if (failure != null) {
+                passFailure.addSuppressed(failure);
+            }
+        }
+
+        private void releaseRest(List<GraphNode> traversed) {
+            for (GraphNode node : traversed) {
+                afterVisit(node);
+            }
+            for (Tensor output : deferred) {
+                close(output);
+            }
+            deferred.clear();
+            nodes.removeIf(done::contains);
+        }
+
+        private void close(Tensor output) {
+            try {
+                output.close();
+            } catch (RuntimeException e) {
+                failure = BackwardPass.collect(failure, e);
+            }
         }
     }
 
@@ -682,6 +785,15 @@ public final class ComputationGraph {
      */
     public StepScope step() {
         return new StepScope(this);
+    }
+
+    /**
+     * Whether the most recent {@link #backward} on this thread delivered a gradient to {@code leaf}: a new tensor in
+     * its slot or a contribution summed into the one it held. A pass that failed part way counts the leaves it
+     * reached before failing.
+     */
+    public boolean reachedByLastBackward(Tensor leaf) {
+        return leaf != null && lastReached.contains(leaf);
     }
 
     /** Forgets the leaves whose gradient was cleared outside this graph, such as by an optimizer's zeroGrad. */

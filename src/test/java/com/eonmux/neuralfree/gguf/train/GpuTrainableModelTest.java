@@ -133,9 +133,9 @@ public class GpuTrainableModelTest {
     @Test
     public void oneOptimizerStepLeavesTheSameWeights() throws IOException {
         try (TrainableModel host = TrainableModel.open(model, N_CTX);
-             GpuTrainableModel gpu = GpuTrainableModel.open(model, N_CTX, backend)) {
-            FinetuneOptimizer hostOptimizer = new FinetuneOptimizer(host, FinetuneOptimizer.Kind.ADAMW, 0.1f);
-            FinetuneOptimizer gpuOptimizer = new FinetuneOptimizer(gpu, FinetuneOptimizer.Kind.ADAMW, 0.1f);
+             GpuTrainableModel gpu = GpuTrainableModel.open(model, N_CTX, backend);
+             FinetuneOptimizer hostOptimizer = new FinetuneOptimizer(host, FinetuneOptimizer.Kind.ADAMW, 0.1f);
+             FinetuneOptimizer gpuOptimizer = new FinetuneOptimizer(gpu, FinetuneOptimizer.Kind.ADAMW, 0.1f)) {
             host.zeroGrad();
             host.step(TOKENS, LABELS);
             hostOptimizer.step(1e-3f);

@@ -36,6 +36,7 @@ import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.fail;
 
 /**
@@ -225,7 +226,7 @@ public class TensorLifetimeTest {
         assertArrayEquals(new float[]{8f, 10f, 12f}, x.grad().toFloatArray(), 0f);
         assertArrayEquals(new float[]{2f, 4f, 6f}, w.grad().toFloatArray(), 0f);
 
-        assertClosed("the gradient replaced by accumulation", firstGrad);
+        assertSame("the slot's own gradient takes the second contribution in place", firstGrad, x.grad());
         assertClosed("the released intermediate", product);
         assertArrayEquals("the root stays open", new float[]{32f}, loss.toFloatArray(), 0f);
     }

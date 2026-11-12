@@ -157,15 +157,19 @@ int tr_wg_imin(const int v) {
 }
 
 /* Element offset of row-major linear index i (last dim fastest) in a view with dims d[0..rank) and strides
- * s[0..rank). Preconditions: 0 <= i < product of the dims, every dim >= 1, rank <= TR_MAX_RANK. */
+ * s[0..rank). Preconditions: 0 <= i < product of the dims, every dim >= 1, rank <= TR_MAX_RANK. The
+ * outermost coordinate is what is left of i after the inner dims are divided out (i < d[0] by the
+ * precondition), so it takes no division. */
 int tr_coord_offset(int i, const int rank, const int d[TR_MAX_RANK], const int s[TR_MAX_RANK]) {
+    const int r = min(rank, TR_MAX_RANK);
+    if (r <= 0) return 0;
     int off = 0;
-    for (int k = min(rank, TR_MAX_RANK) - 1; k >= 0; --k) {
+    for (int k = r - 1; k > 0; --k) {
         const int c = i % d[k];
         i = i / d[k];
         off += c * s[k];
     }
-    return off;
+    return off + i * s[0];
 }
 
 /* Byte byte_index & 3 of a little-endian 32-bit word (BOOL storage: element e lives in word e >> 2). */

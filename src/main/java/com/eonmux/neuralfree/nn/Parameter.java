@@ -121,6 +121,15 @@ public final class Parameter implements AutoCloseable {
     }
 
     /**
+     * Whether the most recent backward pass on this thread delivered a gradient to the owned tensor
+     * ({@link ComputationGraph#reachedByLastBackward}), whether it filled the gradient slot or summed into it.
+     */
+    public boolean reachedByLastBackward() {
+        ensureOpen();
+        return ComputationGraph.current().reachedByLastBackward(tensor);
+    }
+
+    /**
      * Makes {@code grad} (null for none) the owned tensor's gradient, taking it over, and closes the gradient it
      * replaces unless that is {@code grad} itself. Clearing the gradient of a frozen parameter does nothing.
      *

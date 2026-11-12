@@ -25,6 +25,13 @@ import com.eonmux.neuralfree.tensor.gpu.TrainOps.Kernels;
  * otherwise the direct kernels run. A chunk holds {@code min(B, budget / columnBytesPerImage)} images. The choice
  * and the chunk size depend only on the shapes.</p>
  *
+ * <p><b>Pointwise.</b> A {@code 1x1} convolution with stride 1 and no padding ({@link Plan#pointwise}) has columns
+ * equal to its input image ({@code [C, H*W]}, already dense), so the forward and the weight gradient read the input
+ * as the GEMM operand and run no {@code TR_Im2col_F32}, and the transposed direction writes its GEMM straight into the
+ * output (over the bias pre-filled by the caller, {@code beta = 1}) with no {@code TR_Col2im_F32}. The column copy
+ * and the single-tap sum it skips are exact, so the result has the bits of the column path; the column budget does
+ * not apply, and one chunk holds every image.</p>
+ *
  * <p><b>Accumulation.</b> Forward: each output sums its {@code (C/groups)*KH*KW} products in ascending
  * {@code (ic, kh, kw)} order with {@code fma} from {@code +0}, then adds the bias (the output is pre-filled with the
  * bias and the GEMM runs with {@code beta = 1}). Transposed: the GEMM sums each tap's products over the group's input
@@ -96,11 +103,20 @@ final class GpuIm2col {
         final int imagesPerChunk;
         /** Column-buffer elements per image. */
         final int columnsPerImage;
+        /** The columns are the input image itself (see the class description): no column buffer is used. */
+        final boolean pointwise;
 
-        private Plan(int imagesPerChunk, int columnsPerImage) {
+        private Plan(int imagesPerChunk, int columnsPerImage, boolean pointwise) {
             this.imagesPerChunk = imagesPerChunk;
             this.columnsPerImage = columnsPerImage;
+            this.pointwise = pointwise;
         }
+    }
+
+    /** Whether {@code geo} is a {@code 1x1} convolution with stride 1 and no padding, whose output grid is its input's. */
+    static boolean isPointwise(ConvGeometry geo) {
+        return geo.kh == 1 && geo.kw == 1 && geo.sh == 1 && geo.sw == 1 && geo.ph == 0 && geo.pw == 0
+                && geo.oh == geo.h && geo.ow == geo.w;
     }
 
     // ------------------------------------------------------------------ planning
@@ -112,7 +128,7 @@ final class GpuIm2col {
     static Plan planForward(ConvGeometry geo, Strategy s) {
         long taps = (long) (geo.c / geo.groups) * geo.kh * geo.kw;
         return plan(geo.b, (long) geo.c * geo.kh * geo.kw, (long) geo.oh * geo.ow, taps, geo.oc / geo.groups,
-                (long) geo.oh * geo.ow, s, "conv2d");
+                (long) geo.oh * geo.ow, isPointwise(geo), s, "conv2d");
     }
 
     /**
@@ -122,7 +138,7 @@ final class GpuIm2col {
     static Plan planWeightGrad(ConvGeometry geo, Strategy s) {
         long taps = (long) (geo.c / geo.groups) * geo.kh * geo.kw;
         return plan(geo.b, (long) geo.c * geo.kh * geo.kw, (long) geo.oh * geo.ow, taps, geo.oc / geo.groups, taps,
-                s, "conv2d weight gradient");
+                isPointwise(geo), s, "conv2d weight gradient");
     }
 
     /**
@@ -134,28 +150,32 @@ final class GpuIm2col {
         long taps = (long) (geo.c / geo.groups) * geo.kh * geo.kw;
         long rowsPerGroup = (long) (geo.oc / geo.groups) * geo.kh * geo.kw;
         return plan(geo.b, rowsPerGroup * geo.groups, (long) geo.h * geo.w, taps, rowsPerGroup,
-                (long) geo.h * geo.w, s, "convTranspose2d");
+                (long) geo.h * geo.w, isPointwise(geo), s, "convTranspose2d");
     }
 
-    private static Plan plan(int images, long rows, long cols, long taps, long gemmM, long gemmN, Strategy s,
-                             String op) {
+    private static Plan plan(int images, long rows, long cols, long taps, long gemmM, long gemmN, boolean pointwise,
+                             Strategy s, String op) {
         if (s.mode == Mode.DIRECT) {
             return null;
         }
         long budget = s.budgetBytes / Float.BYTES;
         long perImage = rows * cols;
-        boolean fits = perImage >= 1 && perImage <= budget && tiles(gemmM) <= GpuMatmul.MAX_GROUPS
-                && tiles(gemmN) <= GpuMatmul.MAX_GROUPS;
+        boolean tilesFit = tiles(gemmM) <= GpuMatmul.MAX_GROUPS && tiles(gemmN) <= GpuMatmul.MAX_GROUPS;
+        if (pointwise && tilesFit && perImage >= 1 && perImage <= Integer.MAX_VALUE
+                && (s.mode == Mode.IM2COL || taps >= MIN_TAPS)) {
+            return new Plan(images, (int) perImage, true);
+        }
+        boolean fits = perImage >= 1 && perImage <= budget && tilesFit;
         if (s.mode == Mode.AUTO) {
-            return fits && taps >= MIN_TAPS ? new Plan((int) Math.min(images, budget / perImage), (int) perImage)
-                    : null;
+            return fits && taps >= MIN_TAPS
+                    ? new Plan((int) Math.min(images, budget / perImage), (int) perImage, false) : null;
         }
         if (!fits) {
             throw new IllegalArgumentException(op + " cannot run as im2col + GEMM: " + perImage + " column elements"
                     + " per image against a budget of " + budget + ", GEMM " + gemmM + " x " + gemmN + " against "
                     + GpuMatmul.MAX_GROUPS + " tiles of " + TrainOps.GEMM_TILE + " per dimension");
         }
-        return new Plan((int) Math.min(images, budget / perImage), (int) perImage);
+        return new Plan((int) Math.min(images, budget / perImage), (int) perImage, false);
     }
 
     // ------------------------------------------------------------------ sequences
@@ -172,13 +192,20 @@ final class GpuIm2col {
         int positions = geo.oh * geo.ow;
         long imageIn = (long) geo.c * geo.h * geo.w;
         g.exclusive(() -> {
-            GpuBuffer cols = columns(g, plan);
+            GpuBuffer cols = plan.pointwise ? null : columns(g, plan);
             for (int b0 = 0; b0 < geo.b; b0 += plan.imagesPerChunk) {
                 int count = Math.min(plan.imagesPerChunk, geo.b - b0);
-                im2col(g, geo, count, in.buffer(), in.offset() + b0 * imageIn, cols);
+                Side columns;
+                if (plan.pointwise) {
+                    columns = new Side(in.buffer(), in.offset() + b0 * imageIn, positions, 1, imageIn,
+                            (long) taps * positions);
+                } else {
+                    im2col(g, geo, count, in.buffer(), in.offset() + b0 * imageIn, cols);
+                    columns = new Side(cols, 0, positions, 1, plan.columnsPerImage, (long) taps * positions);
+                }
                 gemm(g, ocg, positions, taps,
                         new Side(w.buffer(), w.offset(), taps, 1, 0, (long) ocg * taps),
-                        new Side(cols, 0, positions, 1, plan.columnsPerImage, (long) taps * positions),
+                        columns,
                         new Side(out, (long) b0 * geo.oc * positions, positions, 1, (long) geo.oc * positions,
                                 (long) ocg * positions),
                         count, geo.groups, accumulate ? 1.0f : 0.0f);
@@ -190,7 +217,8 @@ final class GpuIm2col {
     /**
      * The transposed convolution {@code out = convTranspose(in, w) + bias} over its own geometry: per chunk and group
      * the GEMM {@code W_g^T x in_g} into columns, then {@code TR_Col2im_F32} into the dense {@code [B, OC, OH, OW]}
-     * result at element offset 0. {@code bias} is null without bias.
+     * result at element offset 0. {@code bias} is null without bias. A {@link Plan#pointwise} plan runs the GEMM
+     * straight into {@code out}, which then must already hold the bias rows when {@code bias} is not null.
      */
     static void transposed(TrainGpu g, Plan plan, ConvGeometry geo, StridedView in, StridedView w, StridedView bias,
                            GpuBuffer out) {
@@ -198,6 +226,18 @@ final class GpuIm2col {
         int rowsPerGroup = (geo.oc / geo.groups) * geo.kh * geo.kw;
         int positions = geo.h * geo.w;
         long imageOut = (long) geo.oc * geo.oh * geo.ow;
+        if (plan.pointwise) {
+            g.exclusive(() -> {
+                gemm(g, rowsPerGroup, positions, cg,
+                        new Side(w.buffer(), w.offset(), 1, rowsPerGroup, 0, (long) cg * rowsPerGroup),
+                        new Side(in.buffer(), in.offset(), positions, 1, (long) geo.c * positions,
+                                (long) cg * positions),
+                        new Side(out, 0, positions, 1, imageOut, (long) rowsPerGroup * positions),
+                        geo.b, geo.groups, bias == null ? 0.0f : 1.0f);
+                return null;
+            });
+            return;
+        }
         g.exclusive(() -> {
             GpuBuffer cols = columns(g, plan);
             for (int b0 = 0; b0 < geo.b; b0 += plan.imagesPerChunk) {
@@ -230,15 +270,22 @@ final class GpuIm2col {
         long imageIn = (long) geo.c * geo.h * geo.w;
         long imageGy = (long) geo.oc * positions;
         g.exclusive(() -> {
-            GpuBuffer cols = columns(g, plan);
+            GpuBuffer cols = plan.pointwise ? null : columns(g, plan);
             for (int b0 = 0; b0 < geo.b; b0 += plan.imagesPerChunk) {
                 int count = Math.min(plan.imagesPerChunk, geo.b - b0);
-                im2col(g, geo, count, x.buffer(), x.offset() + b0 * imageIn, cols);
+                if (!plan.pointwise) {
+                    im2col(g, geo, count, x.buffer(), x.offset() + b0 * imageIn, cols);
+                }
                 for (int i = 0; i < count; i++) {
+                    Side columns = plan.pointwise
+                            ? new Side(x.buffer(), x.offset() + (b0 + i) * imageIn, 1, positions, 0,
+                                    (long) taps * positions)
+                            : new Side(cols, (long) i * plan.columnsPerImage, 1, positions, 0,
+                                    (long) taps * positions);
                     gemm(g, ocg, taps, positions,
                             new Side(gy.buffer(), gy.offset() + (b0 + i) * imageGy, positions, 1, 0,
                                     (long) ocg * positions),
-                            new Side(cols, (long) i * plan.columnsPerImage, 1, positions, 0, (long) taps * positions),
+                            columns,
                             new Side(gw, 0, taps, 1, 0, (long) ocg * taps),
                             1, geo.groups, b0 + i == 0 ? 0.0f : 1.0f);
                 }

@@ -308,7 +308,8 @@ public final class MixedPrecisionTrainer implements TrainingContext, AutoCloseab
     /**
      * Forward and scaled backward pass of one batch; the batch tensors, the rounded input, the prediction, the loss,
      * the auxiliary terms and the scaled loss are closed before returning (the collated input as soon as its rounded
-     * copy exists), and every node the batch recorded is removed.
+     * copy exists), and every node the batch recorded is removed. The loss is read back once the backward pass is
+     * enqueued, through a detached handle.
      *
      * @return the unscaled loss without the auxiliary terms, read back for logging and the overflow decision
      * @throws IllegalStateException with {@link Trainer#NOT_CONNECTED} as {@link Trainer#backwardToParameters} throws
@@ -327,15 +328,14 @@ public final class MixedPrecisionTrainer implements TrainingContext, AutoCloseab
 
             Tensor prediction = step.keep(model.forward(input));
             Tensor loss = step.keep(lossFunction.compute(prediction, batchTarget));
-
-            float lossValue = loss.toFloatArray()[0];
+            Tensor lossReading = step.keep(loss.detach());
 
             Tensor objective = Trainer.withAuxiliaryLoss(model, loss, step);
             Tensor scaledLoss = step.keep(scaleLoss(objective, currentLossScale));
             Trainer.backwardToParameters(scaledLoss, Trainer.appliedParameters(optimizer), !connectionVerified);
             connectionVerified = true;
 
-            return lossValue;
+            return lossReading.toFloatArray()[0];
         }
     }
 

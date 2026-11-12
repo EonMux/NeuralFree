@@ -17,8 +17,9 @@ import java.util.function.Consumer;
  * epoch and drops to {@code lrMin} for the rest. Windows run in corpus order, as llama.cpp trains its samples.</p>
  *
  * <p>The step of one window is one optimizer update: the gradients of the previous window are cleared, the window's
- * loss and gradients are computed by {@link TrainableModel#step}, and the weights move. Nothing is retained between
- * epochs, so the run needs one window's activations and the optimizer's moment buffers.</p>
+ * loss and gradients are computed by {@link Trainer#step}, and the weights move. Nothing is retained between
+ * epochs, so the run needs one window's activations and the optimizer's moment buffers, which live where the trainer
+ * places them ({@link Trainer#newUpdate}) and are released when the run ends.</p>
  *
  * <p>Not thread-safe; the caller owns the model, the optimizer and the dataset.</p>
  */
@@ -199,13 +200,14 @@ public final class FinetuneRunner {
         Objects.requireNonNull(model, "model");
         Objects.requireNonNull(data, "data");
         Objects.requireNonNull(config, "config");
-        FinetuneOptimizer optimizer = new FinetuneOptimizer(model, config.optimizer(), config.weightDecay());
         List<EpochStats> epochs = new ArrayList<>(config.epochs());
-        for (int epoch = 0; epoch < config.epochs(); epoch++) {
-            EpochStats stats = trainEpoch(model, data, config, optimizer, epoch + 1);
-            epochs.add(stats);
-            if (listener != null) {
-                listener.accept(stats);
+        try (FinetuneOptimizer optimizer = new FinetuneOptimizer(model, config.optimizer(), config.weightDecay())) {
+            for (int epoch = 0; epoch < config.epochs(); epoch++) {
+                EpochStats stats = trainEpoch(model, data, config, optimizer, epoch + 1);
+                epochs.add(stats);
+                if (listener != null) {
+                    listener.accept(stats);
+                }
             }
         }
         return epochs;

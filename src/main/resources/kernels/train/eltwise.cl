@@ -50,8 +50,15 @@
  *     TR_SCATTER_ADD: out[linear(c, v)] += src[src_off + lin(c, j)] (CpuIndexing.java scatter order, which
  *     GatherGrad uses). Two index elements that hit one output element lie in one fiber, so the result is
  *     deterministic and needs no float atomics. An index v outside [0, od[dim]) is skipped and reports
- *     {v, err_dim, od[dim]} in slot err_slot as TR_Gather_F32 does. Preconditions (dispatcher):
- *     0 <= dim < rank, d[k] <= od[k] for k != dim, mode is one of the two ids.
+ *     {v, err_dim, od[dim]} in slot err_slot as TR_Gather_F32 does.
+ *     With the TR_SCATTER_TARGETS bit in mode, one work-item per output element of a fiber (fibers *
+ *     od[dim] items, the target t fastest) walks the same j = 0 .. d[dim]-1 and applies to a register copy
+ *     of its element exactly the updates the fiber walk applies to it (those with v == t, in ascending j),
+ *     then stores it: the same operations in the same order, so the same bits, with od[dim] times the
+ *     parallelism for short, few fibers (each item reads the fiber's indices, so the host takes this form
+ *     only for small d[dim] * od[dim]). Only the t == 0 item reports index errors. Preconditions
+ *     (dispatcher): 0 <= dim < rank, d[k] <= od[k] for k != dim, mode is one of the two ids, optionally
+ *     with the TR_SCATTER_TARGETS bit, and fibers * od[dim] fits an int when the bit is set.
  * TR_UnaryBackward_F32(i op, i n, f p0, f p1, i x_off, i y_off, i gy_off, i gx_off, R x, R y, R gy, W gx)
  *     gx[gx_off + i] = gy[gy_off + i] * f'_op (tensor/CpuElementwise.java backward order). The op is the
  *     TR_Unary_F32 id of the forward function: TR_E_RELU, GELU, SILU, SIGMOID (from y), TANH (from y),
@@ -69,7 +76,7 @@
  * their pointers carry no NF_RESTRICT. Compare, where, gather and scatter outputs never alias an input.
  *
  * Dispatch: 1-D, local TR_LOCAL, global = n rounded up, except TR_Compare_F32 (ceil(n/4) items) and
- * TR_Scatter_F32 (fibers items). No barriers.
+ * TR_Scatter_F32 (fibers items, or fibers * od[dim] with TR_SCATTER_TARGETS). No barriers.
  */
 
 /* TR_Unary_F32 op ids (tensor/gpu/TrainOps). */
@@ -115,6 +122,7 @@
 /* TR_Scatter_F32 modes. */
 #define TR_SCATTER_OVERWRITE 0
 #define TR_SCATTER_ADD       1
+#define TR_SCATTER_TARGETS   2      /* mode bit: one work-item per output element (see TR_Scatter_F32) */
 
 /* ---- Java float predicates on bit patterns ---- */
 
@@ -502,10 +510,14 @@ NF_KERNEL void TR_Scatter_F32(
     NF_GLOBAL float* NF_RESTRICT out,
     NF_GLOBAL int* NF_RESTRICT err)
 {
-    const int f = tr_gid(fibers);
-    if (f < 0) return;
     const int d[TR_MAX_RANK] = { d0, d1, d2, d3, d4, d5 };
     const int od[TR_MAX_RANK] = { od0, od1, od2, od3, od4, od5 };
+    const int limit = od[dim];
+    const int targets = (mode & TR_SCATTER_TARGETS) != 0;
+    const int add = (mode & TR_SCATTER_ADD) != 0;
+    const int item = tr_gid(targets ? fibers * limit : fibers);
+    if (item < 0) return;
+    const int f = targets ? item / limit : item;
     int rem = f;
     int ibase = 0;
     int obase = 0;
@@ -527,7 +539,22 @@ NF_KERNEL void TR_Scatter_F32(
         ostride *= od[k];
     }
     const int len = d[dim];
-    const int limit = od[dim];
+    if (targets) {
+        const int t = item - f * limit;
+        const int o = obase + t * ostep;
+        float r = out[o];
+        for (int j = 0; j < len; ++j) {
+            const int lin = ibase + j * istep;
+            const int v = idx[idx_off + lin];
+            if (v < 0 || v >= limit) {
+                if (t == 0) tr_report_index_error(err, err_slot, v, err_dim, limit);
+                continue;
+            }
+            if (v == t) r = add ? r + src[src_off + lin] : src[src_off + lin];
+        }
+        out[o] = r;
+        return;
+    }
     for (int j = 0; j < len; ++j) {
         const int lin = ibase + j * istep;
         const int v = idx[idx_off + lin];
@@ -536,7 +563,7 @@ NF_KERNEL void TR_Scatter_F32(
             continue;
         }
         const int o = obase + v * ostep;
-        if (mode == TR_SCATTER_ADD) {
+        if (add) {
             out[o] = out[o] + src[src_off + lin];
         } else {
             out[o] = src[src_off + lin];

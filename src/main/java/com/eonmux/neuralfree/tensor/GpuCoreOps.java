@@ -113,6 +113,29 @@ public final class GpuCoreOps {
     }
 
     /**
+     * A contiguous FLOAT32 tensor with every element {@code value},
+     * filled on the device by {@code TR_Fill_F32}, or null when the library is unavailable.
+     */
+    public static Tensor full(ComputeBackend b, Shape s, float value) {
+        Objects.requireNonNull(b, "backend must not be null");
+        Objects.requireNonNull(s, "shape must not be null");
+        TrainGpu g = TrainGpu.forBackend(b);
+        if (g == null) {
+            return null;
+        }
+        TensorStorage storage = g.allocate(s.numElements(), DType.FLOAT32);
+        try {
+            if (s.numElements() > 0) {
+                g.fill(storage.gpuBuffer(), 0, s.numElements(), value);
+            }
+        } catch (RuntimeException e) {
+            storage.close();
+            throw e;
+        }
+        return Tensor.wrap(s, DType.FLOAT32, Strides.contiguous(s), storage, b, false);
+    }
+
+    /**
      * A zero-filled contiguous tensor (every byte 0: {@code +0.0f}, {@code 0}, {@code false}), filled on the device,
      * or null when the library is unavailable or the dtype is not FLOAT32, INT32 or BOOL.
      */

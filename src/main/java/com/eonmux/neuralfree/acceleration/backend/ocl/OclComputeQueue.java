@@ -33,8 +33,11 @@ import static org.jocl.CL.*;
  * buffer retained up to such a read is free again and every dispatch timed before it has its
  * timestamps, and a run of transfers that never calls {@link #finish()} (chained decode steps that
  * wait only on their reads' events) holds only the buffers of the reads still in flight.
- * {@link #finish()} recycles the rest. Host arrays must cover the transfer size, and float
- * transfers must be whole floats.</p>
+ * {@link #finish()} recycles the rest. Writes are also bounded without reads: a write that would
+ * take the staging of the writes in flight above {@link OclPendingWrites#MAX_BYTES} first waits
+ * for the oldest of them (and the callbacks of the reads enqueued before it) and recycles their
+ * buffers, so a run of uploads that never reads or finishes holds a bounded amount of direct
+ * memory. Host arrays must cover the transfer size, and float transfers must be whole floats.</p>
  *
  * <p><b>Errors.</b> Every driver failure is translated by {@link OclErrors}: exhausted memory becomes
  * {@code GpuOutOfMemoryException}, every other status a {@code GpuBackendException} naming the call.</p>
@@ -84,6 +87,8 @@ public final class OclComputeQueue implements ComputeQueue {
     /** Dispatch timings tracked since the queue was made ({@link #trackTiming}). */
     private long timingsTracked;
     private final OclStagingPool staging = new OclStagingPool();
+    /** Writes whose staging may still be in flight, kept under {@link OclPendingWrites#MAX_BYTES}. */
+    private final OclPendingWrites pendingWrites = new OclPendingWrites();
 
     private Capture capture = Capture.NONE;
     private long captureBuffer;
@@ -178,7 +183,7 @@ public final class OclComputeQueue implements ComputeQueue {
         cl_mem mem = extractClMem(dstBuffer);
         cl_event[] waitList = extractWaitList(waitOnEvents);
 
-        ByteBuffer buf = stage(sizeInBytes);
+        ByteBuffer buf = stageWrite(sizeInBytes);
         buf.put(srcData, 0, (int) sizeInBytes);
         buf.flip();
         return enqueueStagedWrite(mem, dstOffset, sizeInBytes, buf, waitList);
@@ -198,7 +203,7 @@ public final class OclComputeQueue implements ComputeQueue {
         cl_mem mem = extractClMem(dstBuffer);
         cl_event[] waitList = extractWaitList(waitOnEvents);
 
-        ByteBuffer buf = stage(sizeInBytes);
+        ByteBuffer buf = stageWrite(sizeInBytes);
         buf.asFloatBuffer().put(srcData, 0, (int) (sizeInBytes / Float.BYTES));
         return enqueueStagedWrite(mem, dstOffset, sizeInBytes, buf, waitList);
     }
@@ -220,7 +225,7 @@ public final class OclComputeQueue implements ComputeQueue {
         cl_mem mem = extractClMem(dstBuffer);
         cl_event[] waitList = extractWaitList(waitOnEvents);
 
-        ByteBuffer buf = stage(sizeInBytes);
+        ByteBuffer buf = stageWrite(sizeInBytes);
         ByteBuffer view = srcData.duplicate();
         view.clear();
         view.limit((int) sizeInBytes);
@@ -917,6 +922,7 @@ public final class OclComputeQueue implements ComputeQueue {
                 throw new IllegalStateException("interrupted while waiting for OpenCL read callbacks", e);
             }
         }
+        pendingWrites.releaseAll();
         staging.recycleInFlight();
 
         RuntimeException failure = null;
@@ -974,6 +980,7 @@ public final class OclComputeQueue implements ComputeQueue {
                 synchronized (pendingReads) {
                     pendingReads.clear();
                 }
+                pendingWrites.releaseAll();
                 staging.clear();
             }
         }
@@ -1032,7 +1039,14 @@ public final class OclComputeQueue implements ComputeQueue {
             staging.release(buf);
             throw e;
         }
-        staging.retain(buf);
+        long ticket = staging.retain(buf);
+        try {
+            OclErrors.check("clRetainEvent", "write of " + sizeInBytes + " bytes", () -> clRetainEvent(event));
+        } catch (RuntimeException e) {
+            releaseQuietly(event);
+            throw e;
+        }
+        pendingWrites.add(event, ticket, buf.capacity());
         return new OclGpuEvent(event, null, profiled, owner);
     }
 
@@ -1081,6 +1095,59 @@ public final class OclComputeQueue implements ComputeQueue {
     }
 
     /**
+     * A staging buffer for a write: as {@link #stage}, after waiting for the oldest writes in flight while this one
+     * would take their staging above {@link OclPendingWrites#MAX_BYTES}, so their buffers can serve it.
+     */
+    private ByteBuffer stageWrite(long sizeInBytes) {
+        retireCompletedReads();
+        long capacity = OclStagingPool.capacityFor((int) sizeInBytes);
+        while (pendingWrites.overBudgetWith(capacity)) {
+            awaitOldestWrite();
+        }
+        return staging.acquire((int) sizeInBytes);
+    }
+
+    /**
+     * Waits for the oldest write in flight and recycles the staging buffers retained up to it. The queue runs in
+     * order, so every command enqueued before that write completed too; the reads among them have their callbacks
+     * awaited first, because a callback still copies out of its staging buffer.
+     *
+     * @throws com.eonmux.neuralfree.acceleration.GpuBackendException when the write or a command before it failed
+     */
+    private void awaitOldestWrite() {
+        OclPendingWrites.Write oldest = pendingWrites.pollOldest();
+        cl_event[] waitList = {oldest.event};
+        try {
+            OclErrors.checkWait("clWaitForEvents", "write of " + oldest.stagingBytes + " staged bytes",
+                    () -> clWaitForEvents(1, waitList));
+        } finally {
+            OclPendingWrites.release(oldest.event);
+        }
+        awaitReadCallbacksBefore(oldest.ticket);
+        staging.recycleThrough(oldest.ticket);
+        retireCompletedReads();
+    }
+
+    /** Waits until the callback of every pending read retained before {@code ticket} has run. */
+    private void awaitReadCallbacksBefore(long ticket) {
+        List<OclReadCompletion> reads;
+        synchronized (pendingReads) {
+            reads = new ArrayList<>(pendingReads);
+        }
+        for (OclReadCompletion read : reads) {
+            if (read.stagingTicket() >= ticket) {
+                return;
+            }
+            try {
+                read.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("interrupted while waiting for OpenCL read callbacks", e);
+            }
+        }
+    }
+
+    /**
      * Retires the oldest pending reads whose callbacks ran for a read that completed normally: the
      * queue runs in order, so every command enqueued up to such a read completed, its staging
      * buffers return to the pool and its dispatch timings move to the report. Stops at the first
@@ -1095,6 +1162,7 @@ public final class OclComputeQueue implements ComputeQueue {
         }
         if (through != null) {
             staging.recycleThrough(through.stagingTicket());
+            pendingWrites.releaseThrough(through.stagingTicket());
             drainTiming(through.timingMark());
         }
     }
@@ -1109,6 +1177,11 @@ public final class OclComputeQueue implements ComputeQueue {
     /** Staging buffers the driver may still access, for diagnostics and tests. */
     public int stagingBuffersInFlight() {
         return staging.inFlightCount();
+    }
+
+    /** Staging bytes of the writes that may still be in flight, for diagnostics and tests. */
+    public long writeStagingBytesInFlight() {
+        return pendingWrites.bytes();
     }
 
     /** Reads not yet retired by a later transfer or a finish, for diagnostics and tests. */

@@ -371,6 +371,74 @@ public final class TensorOps {
                         f -> f.saveForBackward(a, b)));
     }
 
+    /**
+     * {@code x @ w^T + bias} over the last dim of {@code x}, with {@code w} of shape {@code [out, in]} and {@code bias}
+     * a vector of {@code out} elements or null: the product of {@link #matmul} with {@code w}'s transpose, plus
+     * {@code bias} as {@link #add} adds it. Recorded as one node with {@code LinearGrad}, saving {@code x} and
+     * {@code w}, whose weight gradient is computed in {@code w}'s layout. On a GPU the bias rows are written first and
+     * the GEMM accumulates onto them ({@code 1 * s + 1 * bias}, one rounding of the sum), which gives the bits of the
+     * separate product and add without the intermediate product.
+     *
+     * @throws IllegalArgumentException when the backends differ, {@code w} is not a matrix, the last dim of {@code x}
+     *                                  is not {@code in}, or {@code bias} is not a vector of {@code out} elements
+     */
+    public static Tensor linear(Tensor x, Tensor w, Tensor bias) {
+        checkPair(x, w);
+        if (w.shape().rank() != 2) {
+            throw new IllegalArgumentException("linear weight must be [out, in], got " + w.shape());
+        }
+        int in = w.shape().dim(1);
+        int out = w.shape().dim(0);
+        if (x.shape().rank() < 1 || x.shape().dim(x.shape().rank() - 1) != in) {
+            throw new IllegalArgumentException("linear input " + x.shape() + " does not end in " + in + " features");
+        }
+        if (bias != null) {
+            CpuShapeOps.requireSameBackend(x, bias);
+            if (bias.shape().rank() != 1 || bias.shape().dim(0) != out) {
+                throw new IllegalArgumentException("linear bias must be a vector of " + out + ", got " + bias.shape());
+            }
+        }
+        List<Tensor> inputs = bias == null ? Arrays.asList(x, w) : Arrays.asList(x, w, bias);
+        Supplier<Tensor> raw = () -> linearRaw(x, w, bias);
+        if (!Autograd.needsGrad(inputs)) {
+            return raw.get();
+        }
+        return recordOver(raw, inputs, result -> saving(new GradFunctions.LinearGrad(x.requiresGrad(),
+                w.requiresGrad(), bias != null, bias != null && bias.requiresGrad()), f -> f.saveForBackward(x, w)));
+    }
+
+    private static Tensor linearRaw(Tensor x, Tensor w, Tensor bias) {
+        try (Tensor wT = w.transpose()) {
+            if (bias == null) {
+                return orCpu(GpuMatmul.matmul(x, wT), () -> CpuLinalg.matmul(x, wT));
+            }
+            Tensor rows = GpuMatmul.shouldUseGpu(x, wT) && bias.dtype() == DType.FLOAT32 ? biasRows(x, w, bias) : null;
+            if (rows != null) {
+                try {
+                    if (GpuMatmul.gemm(x, wT, 1.0f, 1.0f, rows)) {
+                        return rows;
+                    }
+                } catch (RuntimeException e) {
+                    rows.close();
+                    throw e;
+                }
+                rows.close();
+            }
+            try (Tensor product = orCpu(GpuMatmul.matmul(x, wT), () -> CpuLinalg.matmul(x, wT))) {
+                return add(product, bias);
+            }
+        }
+    }
+
+    /** A new dense tensor of the shape of {@code x @ w^T} whose every row is {@code bias}; null off the GPU. */
+    private static Tensor biasRows(Tensor x, Tensor w, Tensor bias) {
+        int[] dims = x.shape().dims().clone();
+        dims[dims.length - 1] = w.shape().dim(0);
+        try (Tensor expanded = bias.expand(Shape.of(dims))) {
+            return GpuCoreOps.contiguous(expanded);
+        }
+    }
+
     // ------------------------------------------------------------------ reductions
 
     /** Sum over {@code dims} (reduced dims removed); no dims gives a scalar. Recorded with {@code SumGrad}. */

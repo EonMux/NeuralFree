@@ -80,9 +80,9 @@ public final class Linear extends Module {
     }
 
     /**
-     * {@code input @ weight^T + bias} over the last dimension of {@code input}. The transposed weight is a recorded
-     * view ({@code TransposeGrad}) and the product and bias sum record {@code MatmulGrad} and {@code AddGrad}, so in
-     * grad mode the gradient reaches the weight and bias leaves.
+     * {@code input @ weight^T + bias} over the last dimension of {@code input}, one recorded {@link TensorOps#linear}
+     * node, so in grad mode the gradient reaches the weight and bias leaves (the weight gradient in the weight's
+     * {@code [out, in]} layout).
      */
     @Override
     public Tensor forward(Tensor input) {
@@ -100,18 +100,7 @@ public final class Linear extends Module {
                 ", got " + lastDim);
         }
         
-        Tensor product;
-        try (Tensor weightT = weight.tensor().transpose()) {
-            product = TensorOps.matmul(input, weightT);
-        }
-        if (!useBias) {
-            return product;
-        }
-        try {
-            return TensorOps.add(product, bias.tensor());
-        } finally {
-            product.close();
-        }
+        return TensorOps.linear(input, weight.tensor(), useBias ? bias.tensor() : null);
     }
 
     private void ensureInitialized() {

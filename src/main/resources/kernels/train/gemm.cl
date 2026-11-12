@@ -30,10 +30,11 @@
  *     Tiling: K is consumed in 16-deep stages. Per stage the group stages the 64 x 16 A slice and the
  *     16 x 64 B slice in local memory (4 elements per item each, zero outside M, N and K), then each item
  *     applies the stage's products to its 4 x 4 accumulators in ascending k; only the K - k0 valid depths
- *     of the last stage are applied, so every output sums exactly its K products. Loads walk the operand's
- *     unit-stride dimension across neighbouring items when it has one (k for A unless only m is unit
- *     stride; n for B unless only k is unit stride); the choice is uniform per launch and does not affect
- *     the result.
+ *     of the last stage are applied, so every output sums exactly its K products. The loads of the next
+ *     stage are issued into registers before the current stage's products, so global latency overlaps
+ *     arithmetic; the order of every output's products is unchanged. Loads walk the operand's unit-stride
+ *     dimension across neighbouring items when it has one (k for A unless only m is unit stride; n for B
+ *     unless only k is unit stride); the choice is uniform per launch and does not affect the result.
  *
  * TR_Gemv_F32(i M, i K, i a_off, i a_rs, i a_cs, i x_off, i x_s, i y_off, f alpha, f beta,
  *             R A, R x, RW y)
@@ -52,6 +53,25 @@
 #define TR_GM_LX    16                  /* items per tile dimension (local size {16, 16, 1}) */
 #define TR_GM_RB    4                   /* outputs per item in each tile dimension (64 / 16) */
 #define TR_GM_PAD   (TR_GM_TILE + 1)    /* padded stride of one depth row of a staged slice */
+
+/* The products of depth kk of the staged slices onto the item's accumulators, ascending i then j. A full
+ * stage applies it with a compile-time depth (unrolled), the last partial stage with its valid depth. */
+#define TR_GM_APPLY(kk)                                                         \
+    do {                                                                        \
+        float a_[TR_GM_RB];                                                     \
+        float b_[TR_GM_RB];                                                     \
+        for (int i_ = 0; i_ < TR_GM_RB; ++i_) {                                 \
+            a_[i_] = a_tile[(kk) * TR_GM_PAD + ty + TR_GM_LX * i_];             \
+        }                                                                       \
+        for (int j_ = 0; j_ < TR_GM_RB; ++j_) {                                 \
+            b_[j_] = b_tile[(kk) * TR_GM_PAD + tx + TR_GM_LX * j_];             \
+        }                                                                       \
+        for (int i_ = 0; i_ < TR_GM_RB; ++i_) {                                 \
+            for (int j_ = 0; j_ < TR_GM_RB; ++j_) {                             \
+                acc[i_][j_] = fma(a_[i_], b_[j_], acc[i_][j_]);                 \
+            }                                                                   \
+        }                                                                       \
+    } while (0)
 
 NF_KERNEL void TR_Gemm_F32(
     const int M,
@@ -97,44 +117,54 @@ NF_KERNEL void TR_Gemm_F32(
         }
     }
 
-    for (int st = 0; st < stages; ++st) {
-        const int k0 = st * TR_GM_TK;
-        for (int q = 0; q < TR_GM_RB; ++q) {
-            const int e = lid + q * (TR_GM_LX * TR_GM_LX);
-            const int a_mm = a_m_fast ? (e % TR_GM_TILE) : (e / TR_GM_TK);
-            const int a_kk = a_m_fast ? (e / TR_GM_TILE) : (e % TR_GM_TK);
-            const int am = m0 + a_mm;
-            const int ak = k0 + a_kk;
-            float av = 0.0f;
-            if (am < M && ak < K) av = A[a_base + am * a_rs + ak * a_cs];
-            a_tile[a_kk * TR_GM_PAD + a_mm] = av;
-
-            const int b_nn = b_k_fast ? (e / TR_GM_TK) : (e % TR_GM_TILE);
-            const int b_kk = b_k_fast ? (e % TR_GM_TK) : (e / TR_GM_TILE);
-            const int bn = n0 + b_nn;
-            const int bk = k0 + b_kk;
-            float bv = 0.0f;
-            if (bn < N && bk < K) bv = B[b_base + bk * b_rs + bn * b_cs];
-            b_tile[b_kk * TR_GM_PAD + b_nn] = bv;
+    /* Stage st's slices are fetched into registers while stage st - 1 is applied from local memory, so the
+     * global loads of a stage overlap the products of the previous one. */
+    float pa[TR_GM_RB];
+    float pb[TR_GM_RB];
+    for (int st = 0; st <= stages; ++st) {
+        if (st < stages) {
+            const int k0 = st * TR_GM_TK;
+            for (int q = 0; q < TR_GM_RB; ++q) {
+                const int e = lid + q * (TR_GM_LX * TR_GM_LX);
+                const int a_mm = a_m_fast ? (e % TR_GM_TILE) : (e / TR_GM_TK);
+                const int a_kk = a_m_fast ? (e / TR_GM_TILE) : (e % TR_GM_TK);
+                const int am = m0 + a_mm;
+                const int ak = k0 + a_kk;
+                pa[q] = (am < M && ak < K) ? A[a_base + am * a_rs + ak * a_cs] : 0.0f;
+                const int b_nn = b_k_fast ? (e / TR_GM_TK) : (e % TR_GM_TILE);
+                const int b_kk = b_k_fast ? (e % TR_GM_TK) : (e / TR_GM_TILE);
+                const int bn = n0 + b_nn;
+                const int bk = k0 + b_kk;
+                pb[q] = (bn < N && bk < K) ? B[b_base + bk * b_rs + bn * b_cs] : 0.0f;
+            }
         }
-        barrier(CLK_LOCAL_MEM_FENCE);
-        const int depth = (K - k0) < TR_GM_TK ? (K - k0) : TR_GM_TK;
-        for (int kk = 0; kk < depth; ++kk) {
-            float a[TR_GM_RB];
-            float b[TR_GM_RB];
-            for (int i = 0; i < TR_GM_RB; ++i) {
-                a[i] = a_tile[kk * TR_GM_PAD + ty + TR_GM_LX * i];
-            }
-            for (int j = 0; j < TR_GM_RB; ++j) {
-                b[j] = b_tile[kk * TR_GM_PAD + tx + TR_GM_LX * j];
-            }
-            for (int i = 0; i < TR_GM_RB; ++i) {
-                for (int j = 0; j < TR_GM_RB; ++j) {
-                    acc[i][j] = fma(a[i], b[j], acc[i][j]);
+        if (st > 0) {
+            const int k0 = (st - 1) * TR_GM_TK;
+            const int depth = (K - k0) < TR_GM_TK ? (K - k0) : TR_GM_TK;
+            if (depth == TR_GM_TK) {
+#pragma unroll
+                for (int kk = 0; kk < TR_GM_TK; ++kk) {
+                    TR_GM_APPLY(kk);
+                }
+            } else {
+                for (int kk = 0; kk < depth; ++kk) {
+                    TR_GM_APPLY(kk);
                 }
             }
+            barrier(CLK_LOCAL_MEM_FENCE);
         }
-        barrier(CLK_LOCAL_MEM_FENCE);
+        if (st < stages) {
+            for (int q = 0; q < TR_GM_RB; ++q) {
+                const int e = lid + q * (TR_GM_LX * TR_GM_LX);
+                const int a_mm = a_m_fast ? (e % TR_GM_TILE) : (e / TR_GM_TK);
+                const int a_kk = a_m_fast ? (e / TR_GM_TILE) : (e % TR_GM_TK);
+                a_tile[a_kk * TR_GM_PAD + a_mm] = pa[q];
+                const int b_nn = b_k_fast ? (e / TR_GM_TK) : (e % TR_GM_TILE);
+                const int b_kk = b_k_fast ? (e % TR_GM_TK) : (e / TR_GM_TILE);
+                b_tile[b_kk * TR_GM_PAD + b_nn] = pb[q];
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
     }
 
     const int c_base = c_off + bi * c_bs;

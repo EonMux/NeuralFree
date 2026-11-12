@@ -199,11 +199,7 @@ public final class DistributedDataParallel implements AutoCloseable {
                 flat[flags + i] = 1f;
             }
         }
-        float[] reduced;
-        try (Tensor carrier = Tensor.fromArray(members.get(0).backend(), flat)) {
-            backend.allReduce(carrier, ReduceOp.MEAN);
-            reduced = carrier.toFloatArray();
-        }
+        float[] reduced = backend.allReduce(flat, ReduceOp.MEAN, members.get(0).backend());
         for (int i = 0; i < members.size(); i++) {
             Parameter param = members.get(i);
             Tensor grad = param.grad();

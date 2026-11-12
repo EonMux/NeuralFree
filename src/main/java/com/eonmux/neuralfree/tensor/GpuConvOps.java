@@ -329,6 +329,9 @@ public final class GpuConvOps {
                  Operand b = bias == null ? null : Operand.of(bias)) {
                 GpuBuffer outBuffer = out.storage().gpuBuffer();
                 if (plan != null && transposed) {
+                    if (plan.pointwise && bias != null) {
+                        fillBias(g, out, bias, outShape);
+                    }
                     GpuIm2col.transposed(g, plan, geo, in.view, w.view, b == null ? null : b.view, outBuffer);
                     return out;
                 }

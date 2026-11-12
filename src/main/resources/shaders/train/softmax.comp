@@ -16,6 +16,8 @@
 /* Flags of TR_SoftmaxRows_F32, identical to softmax.cl. */
 #define TR_SM_LOG    1
 #define TR_SM_MASKED 2
+/* Columns per lane held in registers, identical to softmax.cl. */
+#define TR_SM_CACHE  8
 
 #define SOFTMAX_ROWS_F32           1
 #define SOFTMAX_ROWS_BACKWARD_F32  2
@@ -70,6 +72,58 @@ void main() {
     const bool masked = (pc.flags & TR_SM_MASKED) != 0;
     const int ib = pc.in_off + row * pc.cols;
     const int ob = pc.out_off + row * pc.cols;
+
+    if (pc.cols <= TR_LOCAL * TR_SM_CACHE) {
+        float v[TR_SM_CACHE];
+        uint skip = 0u;
+        float cmx = -NF_INF;
+        for (int j = 0; j < TR_SM_CACHE; ++j) {
+            const int c = int(lid) + j * TR_LOCAL;
+            v[j] = c < pc.cols ? in_f[ib + c] : -NF_INF;
+            if (c < pc.cols) {
+                cmx = tr_jmax(cmx, v[j]);
+            }
+        }
+        cmx = tr_wg_max(cmx);
+
+        const bool log_mode = (pc.flags & TR_SM_LOG) != 0;
+        precise float cs = 0.0;
+        for (int j = 0; j < TR_SM_CACHE; ++j) {
+            const int c = int(lid) + j * TR_LOCAL;
+            if (c < pc.cols) {
+                if (masked && tr_sm_is_neginf(v[j])) {
+                    skip |= 1u << uint(j);
+                } else {
+                    const float e = exp(v[j] - cmx);
+                    cs = cs + e;
+                    if (!log_mode) {
+                        v[j] = e;
+                    }
+                }
+            }
+        }
+        const float ctotal = tr_wg_sum(cs);
+
+        if (log_mode) {
+            precise float log_sum = cmx + log(ctotal);
+            for (int j = 0; j < TR_SM_CACHE; ++j) {
+                const int c = int(lid) + j * TR_LOCAL;
+                if (c < pc.cols) {
+                    precise float r = v[j] - log_sum;
+                    out_f[ob + c] = ((skip >> uint(j)) & 1u) != 0u ? -NF_INF : r;
+                }
+            }
+        } else {
+            for (int j = 0; j < TR_SM_CACHE; ++j) {
+                const int c = int(lid) + j * TR_LOCAL;
+                if (c < pc.cols) {
+                    precise float r = v[j] / ctotal;
+                    out_f[ob + c] = ((skip >> uint(j)) & 1u) != 0u ? 0.0 : r;
+                }
+            }
+        }
+        return;
+    }
 
     float mx = -NF_INF;
     for (uint c = lid; c < cols; c += TR_LOCAL) {

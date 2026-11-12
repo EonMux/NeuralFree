@@ -279,6 +279,80 @@ public class GpuConvOpsParityTest {
         }
     }
 
+    /**
+     * A pointwise convolution (1x1, stride 1, no padding) reads its input as the GEMM columns and writes the transposed
+     * GEMM straight into the output; the column path computes the same products in the same order, which the 1x1
+     * convolution with one ring of padding still takes. Its interior outputs, its weight gradient over a gradient that
+     * is zero on the ring, and the transposed convolution cropped by that padding are therefore the pointwise results
+     * bit for bit.
+     */
+    @Test
+    public void pointwiseConvolutionsHaveTheBitsOfTheColumnPath() {
+        int b = 3, c = 32, h = 5, w = 7, oc = 6, groups = 2;
+        int[] one = {1, 1}, none = {0, 0}, ring = {1, 1};
+        float[] x = TrainParity.uniform(341, b * c * h * w, -3f, 3f);
+        float[] wt = TrainParity.uniform(342, oc * (c / groups), -1f, 1f);
+        float[] bias = TrainParity.uniform(343, oc, -2f, 2f);
+        assertTrue(GpuIm2col.planForward(new GpuConvOps.ConvGeometry(b, c, h, w, oc, h, w, 1, 1, 1, 1, 0, 0, 1, 1,
+                groups), GpuIm2col.Strategy.AUTO).pointwise);
+        assertFalse(GpuIm2col.planForward(new GpuConvOps.ConvGeometry(b, c, h, w, oc, h + 2, w + 2, 1, 1, 1, 1, 1, 1,
+                1, 1, groups), GpuIm2col.Strategy.AUTO).pointwise);
+
+        Tensor input = upload(gpu, x, b, c, h, w);
+        Tensor weight = upload(gpu, wt, oc, c / groups, 1, 1);
+        Tensor bv = upload(gpu, bias, oc);
+        float[] pointwise = keep(GpuConvOps.conv2dForward(input, weight, bv, one, one, none, one, groups))
+                .toFloatArray();
+        float[] padded = keep(GpuConvOps.conv2dForward(input, weight, bv, one, one, ring, one, groups)).toFloatArray();
+        for (int i = 0; i < b * oc; i++) {
+            for (int y = 0; y < h; y++) {
+                for (int z = 0; z < w; z++) {
+                    assertEquals("forward " + i + "," + y + "," + z,
+                            Float.floatToRawIntBits(padded[(i * (h + 2) + y + 1) * (w + 2) + z + 1]),
+                            Float.floatToRawIntBits(pointwise[(i * h + y) * w + z]));
+                }
+            }
+        }
+
+        float[] gy = TrainParity.uniform(344, b * oc * h * w, -2f, 2f);
+        float[] gyRing = new float[b * oc * (h + 2) * (w + 2)];
+        for (int i = 0; i < b * oc; i++) {
+            for (int y = 0; y < h; y++) {
+                System.arraycopy(gy, (i * h + y) * w, gyRing, (i * (h + 2) + y + 1) * (w + 2) + 1, w);
+            }
+        }
+        Shape weightShape = Shape.of(oc, c / groups, 1, 1);
+        float[] gwPointwise = keep(GpuConvGradOps.conv2dWeightGrad(input, upload(gpu, gy, b, oc, h, w), weightShape,
+                one, none, one, groups)).toFloatArray();
+        float[] gwPadded = keep(GpuConvGradOps.conv2dWeightGrad(input, upload(gpu, gyRing, b, oc, h + 2, w + 2),
+                weightShape, one, ring, one, groups)).toFloatArray();
+        for (int i = 0; i < gwPointwise.length; i++) {
+            assertEquals("weight gradient " + i, Float.floatToRawIntBits(gwPadded[i]),
+                    Float.floatToRawIntBits(gwPointwise[i]));
+        }
+
+        int ocg = 3;
+        float[] wtT = TrainParity.uniform(345, c * ocg, -1f, 1f);
+        float[] biasT = TrainParity.uniform(346, ocg * groups, -2f, 2f);
+        Tensor weightT = upload(gpu, wtT, c, ocg, 1, 1);
+        Tensor biasTv = upload(gpu, biasT, ocg * groups);
+        int[] noOutputPadding = {0, 0};
+        float[] full = keep(GpuConvOps.convTranspose2dForward(input, weightT, biasTv, one, one, none, noOutputPadding,
+                one, groups)).toFloatArray();
+        float[] cropped = keep(GpuConvOps.convTranspose2dForward(input, weightT, biasTv, one, one, ring,
+                noOutputPadding, one, groups)).toFloatArray();
+        int toc = ocg * groups;
+        for (int i = 0; i < b * toc; i++) {
+            for (int y = 0; y < h - 2; y++) {
+                for (int z = 0; z < w - 2; z++) {
+                    assertEquals("transposed " + i + "," + y + "," + z,
+                            Float.floatToRawIntBits(full[(i * h + y + 1) * w + z + 1]),
+                            Float.floatToRawIntBits(cropped[(i * (h - 2) + y) * (w - 2) + z]));
+                }
+            }
+        }
+    }
+
     @Test
     public void algorithmSelectionDependsOnlyOnTheShape() {
         // 16 taps (C/groups = 4, 2x2) select im2col; 12 taps (3, 2x2) and depthwise 3x3 stay direct.

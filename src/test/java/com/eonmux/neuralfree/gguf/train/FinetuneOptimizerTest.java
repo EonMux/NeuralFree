@@ -14,6 +14,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
@@ -153,6 +154,43 @@ public class FinetuneOptimizerTest {
                 assertTrue(expected.getMessage().contains("weight decay"));
             }
         }
+    }
+
+    @Test
+    public void theHostUpdateSplitOverThePoolMatchesTheSequentialLoopBitForBit() {
+        int n = 300_001;
+        float[] values = new float[n];
+        java.util.Random random = new java.util.Random(5);
+        for (int i = 0; i < n; i++) {
+            values[i] = random.nextFloat() - 0.5f;
+        }
+        TrainableModel.Parameter p = new TrainableModel.Parameter("w", com.eonmux.neuralfree.gguf.GGMLType.F32,
+                new long[]{n}, 1, n, values.clone());
+        float[] w = values.clone();
+        float[] m = new float[n];
+        float[] v = new float[n];
+        float lr = 3e-3f;
+        float wd = 0.05f;
+        try (FinetuneOptimizer.Update update = FinetuneOptimizer.hostUpdate(java.util.Collections.singletonList(p),
+                FinetuneOptimizer.Kind.ADAMW, wd)) {
+            for (int step = 1; step <= 3; step++) {
+                for (int i = 0; i < n; i++) {
+                    p.grad()[i] = (float) Math.sin(i * 0.37 + step);
+                }
+                float bc1 = 1f - (float) Math.pow(FinetuneOptimizer.BETA1, step);
+                float bc2 = 1f - (float) Math.pow(FinetuneOptimizer.BETA2, step);
+                update.apply(lr, bc1, bc2);
+                float stepSize = lr / bc1;
+                for (int i = 0; i < n; i++) {
+                    float g = p.grad()[i];
+                    w[i] -= lr * wd * w[i];
+                    m[i] = FinetuneOptimizer.BETA1 * m[i] + (1f - FinetuneOptimizer.BETA1) * g;
+                    v[i] = FinetuneOptimizer.BETA2 * v[i] + (1f - FinetuneOptimizer.BETA2) * g * g;
+                    w[i] -= stepSize * m[i] / ((float) Math.sqrt(v[i] / bc2) + FinetuneOptimizer.EPS);
+                }
+            }
+        }
+        assertArrayEquals(w, p.value(), 0f);
     }
 
     @Test

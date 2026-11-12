@@ -28,12 +28,19 @@
  *       log-softmax (CpuReductions.java softmaxBackward in log mode, used by GradFunctions.java LogSoftmaxGrad):
  *         s = sum of gy;                          gx = gy - exp(y) * s
  *
+ * Register cache: a row of at most TR_LOCAL * TR_SM_CACHE columns is read once into TR_SM_CACHE registers
+ * per lane, and softmax keeps each exp(x - mx) it summed for the output, so the row costs one read of in and
+ * one exp per element. Longer rows read in three times and evaluate the exp again for the output. Both paths
+ * evaluate the same operations on the same values in the same order, so they write the same bits.
+ *
  * Dispatch: 1-D, local TR_LOCAL, rows groups. Groups past the last row return as a whole (uniform control
  * flow), so a rounded or folded launch is harmless. Inputs and outputs never alias.
  */
 
 #define TR_SM_LOG    1
 #define TR_SM_MASKED 2
+/* Columns per lane held in registers (see the register cache above). */
+#define TR_SM_CACHE  8
 
 /* True when x is -inf by bit pattern (the CPU's x == Float.NEGATIVE_INFINITY). */
 NF_INLINE int tr_sm_is_neginf(const float x) {
@@ -56,6 +63,52 @@ NF_KERNEL void TR_SoftmaxRows_F32(
     const int masked = (flags & TR_SM_MASKED) != 0;
     const int ib = in_off + row * cols;
     const int ob = out_off + row * cols;
+
+    if (cols <= TR_LOCAL * TR_SM_CACHE) {
+        float v[TR_SM_CACHE];
+        uint skip = 0u;
+        float mx = -NF_INF;
+#pragma unroll
+        for (int j = 0; j < TR_SM_CACHE; ++j) {
+            const int c = (int)lid + j * TR_LOCAL;
+            v[j] = c < cols ? in[ib + c] : -NF_INF;
+            if (c < cols) mx = tr_jmax(mx, v[j]);
+        }
+        mx = tr_wg_max(buf, mx);
+
+        const int log_mode = (flags & TR_SM_LOG) != 0;
+        float s = 0.0f;
+#pragma unroll
+        for (int j = 0; j < TR_SM_CACHE; ++j) {
+            const int c = (int)lid + j * TR_LOCAL;
+            if (c < cols) {
+                if (masked && tr_sm_is_neginf(v[j])) {
+                    skip |= 1u << (uint)j;
+                } else {
+                    const float e = exp(v[j] - mx);
+                    s = s + e;
+                    if (!log_mode) v[j] = e;
+                }
+            }
+        }
+        s = tr_wg_sum(buf, s);
+
+        if (log_mode) {
+            const float log_sum = mx + log(s);
+#pragma unroll
+            for (int j = 0; j < TR_SM_CACHE; ++j) {
+                const int c = (int)lid + j * TR_LOCAL;
+                if (c < cols) out[ob + c] = ((skip >> (uint)j) & 1u) != 0u ? -NF_INF : v[j] - log_sum;
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < TR_SM_CACHE; ++j) {
+                const int c = (int)lid + j * TR_LOCAL;
+                if (c < cols) out[ob + c] = ((skip >> (uint)j) & 1u) != 0u ? 0.0f : v[j] / s;
+            }
+        }
+        return;
+    }
 
     float mx = -NF_INF;
     for (uint c = lid; c < (uint)cols; c += TR_LOCAL) {

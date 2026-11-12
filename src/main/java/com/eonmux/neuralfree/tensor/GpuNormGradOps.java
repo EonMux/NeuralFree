@@ -37,15 +37,21 @@ import java.util.Objects;
  * <p><b>Tolerance</b> ({@linkplain com.eonmux.neuralfree.tensor.gpu numerical contract}): every gradient is in the
  * reduction class, with K the longest sum it depends on (the normalized row or group, the batch of a channel, or the
  * rows of an affine column). The affine-parameter gradients of LayerNorm and RMSNorm sum their columns in ascending row
- * order per chunk ({@code TR_ReduceCols_F32} partition and chunk rule), so the gamma gradient and the beta gradient
- * each have one fixed order.</p>
+ * order per chunk ({@code TR_ReduceCols_F32} partition, chunk count {@link #columnChunks} of the block's shape), then
+ * over the chunk sums in chunk order, so the gamma gradient and the beta gradient each have one fixed order.</p>
  */
 public final class GpuNormGradOps {
 
-    /** Affine column sums are chunked above this many rows ({@code TR_ReduceCols_F32} shape rule). */
+    /** Affine column sums are chunked above this many rows into chunks of COL_CHUNK_ROWS ({@link #columnChunks}). */
     private static final int COL_CHUNK_ROWS_ABOVE = 4096;
     private static final int COL_MAX_CHUNKS = 256;
     private static final int COL_CHUNK_ROWS = 1024;
+    /**
+     * Narrow blocks are chunked until about COL_TARGET_ITEMS work-items run, with chunks of at least COL_MIN_CHUNK_ROWS
+     * rows ({@link #columnChunks}).
+     */
+    private static final int COL_TARGET_ITEMS = 16384;
+    private static final int COL_MIN_CHUNK_ROWS = 64;
 
     private GpuNormGradOps() {
     }
@@ -340,7 +346,7 @@ public final class GpuNormGradOps {
         if (cols == 0) {
             return;
         }
-        int chunks = columnChunks(rows);
+        int chunks = columnChunks(rows, cols);
         int plane = chunks * cols;
         GpuBuffer partials = s.temp(gb != null ? 2 * plane : plane);
         g.launch1d(Kernels.NORM_AFFINE_GRAD_COLS_F32, plane,
@@ -372,7 +378,7 @@ public final class GpuNormGradOps {
             return;
         }
         GpuBuffer dst = out.storage().gpuBuffer();
-        int chunks = columnChunks(rows);
+        int chunks = columnChunks(rows, cols);
         if (chunks == 1) {
             g.launch1d(Kernels.REDUCE_COLS_F32, cols, rows, cols, 1, gyv.offset(), 0, gyv.buffer(), dst);
             return;
@@ -383,14 +389,26 @@ public final class GpuNormGradOps {
         g.launch1d(Kernels.REDUCE_COLS_F32, cols, chunks, cols, 1, 0, 0, partials, dst);
     }
 
-    /** Chunk count of the affine column sums: {@code rows > 4096 ? min(256, ceil(rows / 1024)) : 1}. */
-    private static int columnChunks(int rows) {
-        return rows > COL_CHUNK_ROWS_ABOVE ? Math.min(COL_MAX_CHUNKS, ceilDiv(rows, COL_CHUNK_ROWS)) : 1;
+    /**
+     * Chunk count of the affine column sums of a {@code [rows, cols]} block:
+     * {@code min(256, max(1, tall, narrow))} with {@code tall = rows > 4096 ? ceil(rows / 1024) : 1} and
+     * {@code narrow = min(ceil(16384 / cols), floor(rows / 64))}. The narrow term chunks every block of fewer than
+     * 16384 columns and at least 128 rows: the per-head q/k norms of a transformer (128 columns over thousands of
+     * rows) and the ordinary model-width norms alike (1024 columns over 256 rows give 4 chunks, over 4096 rows 16).
+     * Unchunked, such a block runs one work-item per column, each walking every row in one serial chain; chunks of at
+     * least 64 rows give it about 16384 work-items and a second pass over the chunk sums. On the RTX 5080 Laptop
+     * (CUDA) the chunked LayerNorm affine gradient takes 32 us against 189 us unchunked at 1024 x 1024, 28 against
+     * 374 us at 2048 x 768 and 44 against 57 us at 256 x 1024.
+     */
+    static int columnChunks(int rows, int cols) {
+        int tall = rows > COL_CHUNK_ROWS_ABOVE ? ceilDiv(rows, COL_CHUNK_ROWS) : 1;
+        int narrow = cols > 0 ? Math.min(ceilDiv(COL_TARGET_ITEMS, cols), rows / COL_MIN_CHUNK_ROWS) : 1;
+        return Math.min(COL_MAX_CHUNKS, Math.max(1, Math.max(tall, narrow)));
     }
 
     /** Whether the two planes of {@code TR_NormAffineGradCols_F32} fit the kernel's {@code int} indexing. */
     private static boolean fitsTwoPlanes(int rows, int cols) {
-        return 2L * columnChunks(rows) * cols <= Integer.MAX_VALUE;
+        return 2L * columnChunks(rows, cols) * cols <= Integer.MAX_VALUE;
     }
 
     // ------------------------------------------------------------------ validation (shared with NormOps)

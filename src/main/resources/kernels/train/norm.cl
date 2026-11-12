@@ -64,7 +64,8 @@
  *       stats of the matching row-backward kernel); accg = fma(gy, xhat, accg); accb = accb + gy;
  *       out[out_off + c*cols + col] = accg; out[out_off + (chunks + c)*cols + col] = accb when has_beta.
  *     With chunks == 1 these are the gradients; else the host sums each [chunks, cols] plane with
- *     TR_ReduceCols_F32 (rows = chunks). Host shape rule: chunks = rows > 4096 ? min(256, ceil(rows/1024)) : 1.
+ *     TR_ReduceCols_F32 (rows = chunks). Host shape rule (GpuNormGradOps.columnChunks): chunks =
+ *     min(256, max(1, rows > 4096 ? ceil(rows/1024) : 1, min(ceil(16384/cols), rows/64))).
  * TR_ChannelGradSums_F32(i B, i C, i HW, i G, f eps, i x_off, i gy_off, i sums_off, R x, R mean, R var, R gy,
  *                        W sums)
  *     Per channel c over its B*HW elements e = (b*C + c)*HW + s, in TR_ChannelStats_F32's lane order:

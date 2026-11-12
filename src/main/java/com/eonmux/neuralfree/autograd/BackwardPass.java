@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.autograd;
 
 import com.eonmux.neuralfree.autograd.ComputationGraph.GraphNode;
+import com.eonmux.neuralfree.tensor.DType;
 import com.eonmux.neuralfree.tensor.Tensor;
 import com.eonmux.neuralfree.tensor.TensorOps;
 
@@ -26,6 +27,14 @@ import java.util.Set;
  * <p>In a create-graph pass the caller has grad mode and the create-graph flag on, so the gradient functions record
  * their computation; every second handle of a gradient the pass makes is then a recorded identity node
  * ({@link Autograd#secondHandle}), so gradients keep their path to the tensors they were computed from.</p>
+ *
+ * <p><b>Accumulation.</b> A gradient arriving where one is already held (a node output used twice, a leaf reached
+ * twice or again in a later pass, a target captured twice) is summed into the held tensor in place
+ * ({@link TensorOps#addInPlace}) when that tensor is exclusively the pass's or the slot's: a first-order pass, a
+ * dense FLOAT32 tensor that does not require grad, and storage no other tensor references
+ * ({@link com.eonmux.neuralfree.tensor.TensorStorage#refCount()} of 1). The sum is the one {@link TensorOps#add}
+ * computes ({@code a + 1 * b}, one rounding), so only allocation changes. Otherwise a new sum replaces the held
+ * tensor, which is closed.</p>
  */
 final class BackwardPass {
     private final ComputationGraph graph;
@@ -34,6 +43,10 @@ final class BackwardPass {
     private final Set<Tensor> gradientLeaves;
     private final Map<Tensor, Tensor> pending;
     private final boolean creating;
+    /** Backward mode: the leaves the pass delivered a gradient to. */
+    private final Set<Tensor> reached;
+    /** Backward mode: releases each node once its gradient function ran; null when the graph is kept. */
+    private final ComputationGraph.Release release;
     /** Capture mode: the nodes that run (null in backward mode: all of them). */
     private final Set<GraphNode> mask;
     /** Capture mode: each target's position in the result (its first position when listed twice). */
@@ -41,8 +54,10 @@ final class BackwardPass {
     private final Tensor[] captured;
 
     private BackwardPass(ComputationGraph graph, List<GraphNode> producersFirst, Set<Tensor> gradientLeaves,
-                         boolean creating, Set<GraphNode> mask, List<Tensor> targets) {
+                         boolean creating, Set<GraphNode> mask, List<Tensor> targets,
+                         ComputationGraph.Release release) {
         this.graph = graph;
+        this.release = release;
         this.producersFirst = producersFirst;
         this.gradientLeaves = gradientLeaves;
         this.creating = creating;
@@ -52,6 +67,7 @@ final class BackwardPass {
             producers.put(node.output(), node);
         }
         this.pending = new IdentityHashMap<>();
+        this.reached = identitySet();
         if (targets == null) {
             this.targetIndex = null;
             this.captured = null;
@@ -67,11 +83,19 @@ final class BackwardPass {
     /**
      * Propagates from {@code root}, the output of the last node of {@code producersFirst} (every node listed after the
      * nodes that produced its inputs), or a leaf when {@code producersFirst} is empty, seeded with a new reference to
-     * {@code gradOutput} or with ones. Every leaf that receives a gradient is added to {@code gradientLeaves}.
+     * {@code gradOutput} or with ones. Every leaf that receives a gradient is added to {@code gradientLeaves} and to
+     * {@code reached}, also when the pass fails part way. With a {@code release}, each node is handed to it right after
+     * its gradient function ran.
      */
     static void run(ComputationGraph graph, List<GraphNode> producersFirst, Tensor root, Tensor gradOutput,
-                    Set<Tensor> gradientLeaves, boolean creating) {
-        new BackwardPass(graph, producersFirst, gradientLeaves, creating, null, null).propagate(root, gradOutput);
+                    Set<Tensor> gradientLeaves, boolean creating, Set<Tensor> reached,
+                    ComputationGraph.Release release) {
+        BackwardPass pass = new BackwardPass(graph, producersFirst, gradientLeaves, creating, null, null, release);
+        try {
+            pass.propagate(root, gradOutput);
+        } finally {
+            reached.addAll(pass.reached);
+        }
     }
 
     /**
@@ -81,7 +105,7 @@ final class BackwardPass {
      */
     static List<Tensor> capture(ComputationGraph graph, List<GraphNode> producersFirst, Set<GraphNode> mask,
                                 Tensor root, Tensor gradOutput, List<Tensor> targets, boolean creating) {
-        BackwardPass pass = new BackwardPass(graph, producersFirst, null, creating, mask, targets);
+        BackwardPass pass = new BackwardPass(graph, producersFirst, null, creating, mask, targets, null);
         try {
             pass.propagate(root, gradOutput);
             for (int i = 0; i < targets.size(); i++) {
@@ -117,6 +141,9 @@ final class BackwardPass {
                 Tensor grad = pending.remove(node.output());
                 if (grad != null) {
                     visit(node, grad);
+                    if (release != null) {
+                        release.afterVisit(node);
+                    }
                 }
             }
         } catch (RuntimeException e) {
@@ -279,6 +306,10 @@ final class BackwardPass {
             pending.put(input, grad);
             return;
         }
+        if (accumulatesInPlace(existing, grad)) {
+            addInto(existing, grad);
+            return;
+        }
         pending.put(input, add(existing, grad));
         closeAll(Collections.singletonList(existing), null);
     }
@@ -298,6 +329,10 @@ final class BackwardPass {
             return;
         }
         Tensor existing = captured[index];
+        if (existing != null && accumulatesInPlace(existing, grad)) {
+            addInto(existing, grad);
+            return;
+        }
         captured[index] = existing == null ? grad : add(existing, grad);
         if (existing != null) {
             closeAll(Collections.singletonList(existing), null);
@@ -310,6 +345,12 @@ final class BackwardPass {
      */
     private void accumulateLeaf(Tensor leaf, Tensor grad) {
         Tensor existing = leaf.grad();
+        if (existing != null && accumulatesInPlace(existing, grad)) {
+            addInto(existing, grad);
+            gradientLeaves.add(leaf);
+            reached.add(leaf);
+            return;
+        }
         Tensor next = existing == null ? grad : add(existing, grad);
         try {
             leaf.setGrad(next);
@@ -318,9 +359,27 @@ final class BackwardPass {
             throw e;
         }
         gradientLeaves.add(leaf);
+        reached.add(leaf);
         if (existing != null) {
             closeAll(Collections.singletonList(existing), null);
         }
+    }
+
+    /** Whether a held gradient may take {@code grad} in place (see the class description). */
+    private boolean accumulatesInPlace(Tensor held, Tensor grad) {
+        return !creating && !held.requiresGrad() && held.dtype() == DType.FLOAT32 && grad.dtype() == DType.FLOAT32
+            && held.backend() == grad.backend() && held.isDense() && held.storage().refCount() == 1;
+    }
+
+    /** {@code held += grad} in place; closes {@code grad}, which the caller handed over. */
+    private static void addInto(Tensor held, Tensor grad) {
+        try {
+            TensorOps.addInPlace(held, grad, 1.0f);
+        } catch (RuntimeException e) {
+            closeAll(Collections.singletonList(grad), e);
+            throw e;
+        }
+        closeAll(Collections.singletonList(grad), null);
     }
 
     /** {@code existing + grad} as a new tensor; closes {@code grad}, which the caller handed over. */

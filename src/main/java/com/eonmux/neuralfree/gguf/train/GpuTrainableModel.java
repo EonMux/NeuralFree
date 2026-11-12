@@ -18,7 +18,6 @@ import com.eonmux.neuralfree.tensor.TensorOps;
 
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -28,15 +27,23 @@ import java.util.Objects;
  * differentiated through the project's tensor GPU stack.
  *
  * <p>The tensor binding, the {@link FinetunePlan} and the host float arrays are the ones {@link TrainableModel}
- * builds, so a parameter's name, shape and master values are identical on both trainers and the optimizer and the
- * GGUF writer need no device awareness. This class owns one device {@link Tensor} per parameter and expresses the
- * model with the differentiable {@link TensorOps} and {@link NormOps} operations; those dispatch to the project's
+ * builds, so a parameter's name, shape and master values are identical on both trainers and the GGUF writer needs no
+ * device awareness. This class owns one device {@link Tensor} per parameter ({@link DeviceParameters}) and expresses
+ * the model with the differentiable {@link TensorOps} and {@link NormOps} operations; those dispatch to the project's
  * {@code train} kernel library on a GPU backend (matmul, row norms, softmax, the SiLU/GELU/ReLU family, row gather
  * and scatter, elementwise arithmetic) and to the CPU reference when a kernel is unavailable. The backward pass is the
  * autograd backward of that graph, computed on the same backend.</p>
  *
- * <p>Each window is recorded as one {@link ComputationGraph} step; closing the step releases its activations and the
- * step's gradients are copied into the parameters' host arrays before they are released. Every {@link
+ * <p><b>Residency.</b> The device tensors are the authoritative values and gradients: a window computes with them,
+ * its backward pass leaves the gradients on the device, and the optimizer {@link #newUpdate} provides steps them
+ * there with its moments on the device ({@link DeviceFinetuneUpdate}), so a run moves no weight or gradient between
+ * host and device per window. The host arrays of {@link #parameters()} are a mirror read back when accessed; a host
+ * optimizer (the fallback when the moments do not fit the device) writes them and they are uploaded before the next
+ * window.</p>
+ *
+ * <p>Each window is recorded as one {@link ComputationGraph} step; closing the step releases its activations. The
+ * loss and the argmax count are read after the backward pass is enqueued, so the device runs the whole step without
+ * waiting for the host in between. Every {@link
  * TrainableModel.StepResult} and every gradient computes the formulas of {@link TrainMath}: the residual scaling,
  * sandwich norms, RoPE, grouped-query causal (and sliding-window) attention with its soft and logit soft-caps, dense
  * and routed-expert feed-forward blocks with their gating, the embedding scale and the tied output head are the
@@ -58,8 +65,9 @@ public final class GpuTrainableModel implements Trainer {
     private final int nEmbd;
     private final int nVocab;
     private final FinetunePlan plan;
-    private final Map<String, Tensor> parameters;
-    private final List<Tensor> owned = new ArrayList<>();
+    private final DeviceParameters parameters;
+    /** The device updates handed out, closed with the trainer if their optimizer was not closed first. */
+    private final List<DeviceFinetuneUpdate> updates = new ArrayList<>();
     private final Map<String, Tensor> cachedConstants = new HashMap<>();
     private final Map<Integer, RopeFreqTable> ropeTables = new HashMap<>();
     private boolean closed;
@@ -72,11 +80,7 @@ public final class GpuTrainableModel implements Trainer {
         this.nEmbd = host.nEmbd();
         this.nVocab = host.nVocab();
         checkRepresentable(plan);
-        Map<String, Tensor> tensors = new LinkedHashMap<>();
-        for (TrainableModel.Parameter p : host.parameters()) {
-            tensors.put(p.name(), upload(p));
-        }
-        this.parameters = tensors;
+        this.parameters = DeviceParameters.upload(backend, host.parameters());
     }
 
     /**
@@ -134,40 +138,8 @@ public final class GpuTrainableModel implements Trainer {
 
     // ------------------------------------------------------------------ parameters
 
-    private Tensor upload(TrainableModel.Parameter p) {
-        Shape shape = p.ne().length == 1 ? Shape.of(p.cols()) : Shape.of(p.rows(), p.cols());
-        Tensor flat = Tensor.fromArray(backend, p.values());
-        Tensor shaped = flat.shape().equals(shape) ? flat : flat.reshape(shape);
-        if (shaped != flat) {
-            flat.close();
-        }
-        Tensor leaf = shaped.withRequiresGrad(true);
-        if (leaf != shaped) {
-            shaped.close();
-        }
-        owned.add(leaf);
-        return leaf;
-    }
-
-    /** Copies the host master values into the parameters' device tensors, as the optimizer leaves them. */
-    private void uploadValues() {
-        try (ComputationGraph.NoGradScope noGrad = ComputationGraph.noGrad()) {
-            for (TrainableModel.Parameter p : host.parameters()) {
-                Tensor t = parameters.get(p.name());
-                var done = t.storage().copyFromHostFloat(p.value(), t.backend().transferQueue());
-                if (done != null) {
-                    done.close();
-                }
-            }
-        }
-    }
-
     private Tensor deviceTensor(String name) {
-        Tensor t = parameters.get(name);
-        if (t == null) {
-            throw new IllegalArgumentException("the model has no trainable tensor '" + name + "'");
-        }
-        return t;
+        return parameters.tensor(name);
     }
 
     // ------------------------------------------------------------------ accessors
@@ -194,12 +166,12 @@ public final class GpuTrainableModel implements Trainer {
 
     @Override
     public List<TrainableModel.Parameter> parameters() {
-        return host.parameters();
+        return parameters.parameters();
     }
 
     @Override
     public TrainableModel.Parameter parameter(String name) {
-        return host.parameter(name);
+        return parameters.parameter(name);
     }
 
     // ------------------------------------------------------------------ steps
@@ -216,16 +188,32 @@ public final class GpuTrainableModel implements Trainer {
 
     @Override
     public void zeroGrad() {
-        for (TrainableModel.Parameter p : host.parameters()) {
-            java.util.Arrays.fill(p.grad(), 0f);
+        parameters.zeroGrad();
+    }
+
+    /**
+     * The device update ({@link DeviceFinetuneUpdate}) when its memory plan places AdamW's moments on the device or
+     * the optimizer is SGD; otherwise the host update over the mirrored parameter arrays.
+     */
+    @Override
+    public FinetuneOptimizer.Update newUpdate(FinetuneOptimizer.Kind kind, float weightDecay) {
+        DeviceFinetuneUpdate device = DeviceFinetuneUpdate.open(parameters, backend, kind, weightDecay);
+        if (device == null) {
+            return FinetuneOptimizer.hostUpdate(parameters(), kind, weightDecay);
         }
-        ComputationGraph.current().zeroGrad();
+        updates.add(device);
+        return device;
+    }
+
+    /** The bytes of parameter values and gradients moved between host and device since the trainer opened. */
+    long hostTransferBytes() {
+        return parameters.transferredBytes();
     }
 
     @Override
     public float[][] logits(int[] tokens) {
         checkWindow(tokens);
-        uploadValues();
+        parameters.syncDevice();
         Ctx ctx = new Ctx();
         try (ComputationGraph.StepScope scope = ComputationGraph.current().step()) {
             Tensor rows = head(tokens.length, blockStack(tokens.length, tokens, ctx));
@@ -235,45 +223,36 @@ public final class GpuTrainableModel implements Trainer {
         }
     }
 
-    /** One window, training (records a graph and backpropagates) or evaluating under the same graph shape. */
+    /**
+     * One window, training (records a graph and backpropagates, accumulating into the device gradients) or
+     * evaluating under the same graph shape. The labels go up with the tokens, before the first kernel of the window:
+     * an upload after an index-validating kernel (the embedding gather) would first drain the compute queue to check
+     * its index errors ({@code TrainGpu.beforeHostRead}). The loss and the predictions are read once the whole step
+     * is enqueued, the window's one host synchronization.
+     */
     private TrainableModel.StepResult run(int[] tokens, int[] labels, boolean training) {
         checkWindow(tokens, labels);
-        uploadValues();
+        parameters.syncDevice();
         int n = tokens.length;
         Ctx ctx = new Ctx();
-        try {
-            TrainableModel.StepResult result;
-            try (ComputationGraph.StepScope scope = ComputationGraph.current().step()) {
-                Tensor stream = blockStack(n, tokens, ctx);
-                Tensor logits = head(n, stream);
-                Tensor lossTensor = lossTensor(logits, labels, n, ctx);
-                float loss = lossTensor.toFloatArray()[0];
-                int correct = correct(logits, labels, n);
-                result = new TrainableModel.StepResult(loss, correct, n);
+        try (ComputationGraph.StepScope scope = ComputationGraph.current().step()) {
+            Tensor labelIds = ctx.ints(labels, n, 1);
+            Tensor stream = blockStack(n, tokens, ctx);
+            Tensor logits = head(n, stream);
+            Tensor lossTensor = lossTensor(logits, labelIds);
+            try (Tensor predicted = TensorOps.argmax(logits, 1)) {
                 if (training) {
-                    lossTensor.backward();
-                    copyGradients();
+                    try {
+                        lossTensor.backward();
+                    } finally {
+                        parameters.deviceGradientsChanged();
+                    }
                 }
+                float loss = lossTensor.toFloatArray()[0];
+                return new TrainableModel.StepResult(loss, correct(predicted, labels, n), n);
             }
-            return result;
         } finally {
             ctx.closeTransient();
-            if (training) {
-                ComputationGraph.current().zeroGrad();
-            }
-        }
-    }
-
-    private void copyGradients() {
-        for (TrainableModel.Parameter p : host.parameters()) {
-            Tensor g = parameters.get(p.name()).grad();
-            float[] target = p.grad();
-            if (g == null) {
-                java.util.Arrays.fill(target, 0f);
-            } else {
-                float[] values = g.toFloatArray();
-                System.arraycopy(values, 0, target, 0, target.length);
-            }
         }
     }
 
@@ -349,7 +328,7 @@ public final class GpuTrainableModel implements Trainer {
             q = qkNorm(l.qkNorm().query(), q, n, l.nHead(), l.headDimK());
             k = qkNorm(l.qkNorm().key(), k, n, l.nHeadKv(), l.headDimK());
         }
-        Tensor attn = attention(l, q, k, v, n, ctx);
+        Tensor attn = attention(l, q, k, v, n);
         Tensor proj = linear(attn, l.attnOut(), l.attnOutBias());
         Tensor attnBranch = l.postAttnNorm() != null ? norm(l.postAttnNorm(), proj, nEmbd) : proj;
         Tensor x2 = TensorOps.add(x, scaled(attnBranch, scale));
@@ -365,13 +344,7 @@ public final class GpuTrainableModel implements Trainer {
 
     /** {@code y = x W^T + b}, the row-major GGUF matrix convention. */
     private Tensor linear(Tensor x, String weight, String bias) {
-        Tensor w = deviceTensor(weight);
-        Tensor y = TensorOps.matmul(x, w.transpose());
-        if (bias != null) {
-            Tensor b = deviceTensor(bias);
-            y = TensorOps.add(y, b.reshape(1, (int) b.numElements()));
-        }
-        return y;
+        return TensorOps.linear(x, deviceTensor(weight), bias == null ? null : deviceTensor(bias));
     }
 
     /**
@@ -417,15 +390,15 @@ public final class GpuTrainableModel implements Trainer {
     // ------------------------------------------------------------------ attention
 
     /** Causal (or sliding-window) grouped-query attention with the layer's scale and soft-cap. */
-    private Tensor attention(FinetunePlan.Layer l, Tensor q, Tensor k, Tensor v, int n, Ctx ctx) {
+    private Tensor attention(FinetunePlan.Layer l, Tensor q, Tensor k, Tensor v, int n) {
         int nHead = l.nHead();
         int nHeadKv = l.nHeadKv();
         Tensor qT = q.permute(1, 0, 2);
         Tensor kT = k.permute(1, 0, 2);
         Tensor vT = v.permute(1, 0, 2);
         if (nHeadKv != nHead) {
-            kT = expandHeads(kT, nHeadKv, nHead, l.headDimK(), n, ctx);
-            vT = expandHeads(vT, nHeadKv, nHead, l.headDimV(), n, ctx);
+            kT = expandHeads(kT, nHeadKv, nHead, l.headDimK(), n);
+            vT = expandHeads(vT, nHeadKv, nHead, l.headDimV(), n);
         }
         Tensor scores = TensorOps.bmm(qT, kT.transpose(0, 2, 1));
         scores = TensorOps.mul(scores, l.scoreScale());
@@ -442,15 +415,27 @@ public final class GpuTrainableModel implements Trainer {
     }
 
     /** Copies each KV head to the {@code group} query heads that read it. */
-    private Tensor expandHeads(Tensor x, int nHeadKv, int nHead, int headDim, int n, Ctx ctx) {
-        int group = nHead / nHeadKv;
+    private Tensor expandHeads(Tensor x, int nHeadKv, int nHead, int headDim, int n) {
         Tensor table = x.reshape(nHeadKv, n * headDim);
+        Tensor gathered = TensorOps.indexSelectRows(table, headIndex(nHeadKv, nHead), false);
+        return gathered.reshape(nHead, n, headDim);
+    }
+
+    /** The KV head each query head reads, {@code h / (nHead / nHeadKv)}, cached per grouping. */
+    private Tensor headIndex(int nHeadKv, int nHead) {
+        String key = "heads:" + nHeadKv + ":" + nHead;
+        Tensor cached = cachedConstants.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        int group = nHead / nHeadKv;
         int[] index = new int[nHead];
         for (int h = 0; h < nHead; h++) {
             index[h] = h / group;
         }
-        Tensor gathered = TensorOps.indexSelectRows(table, ctx.ints(index, nHead), false);
-        return gathered.reshape(nHead, n, headDim);
+        Tensor table = intConstant(index, nHead);
+        cachedConstants.put(key, table);
+        return table;
     }
 
     /** The additive causal mask of a window, cached per length. */
@@ -590,16 +575,15 @@ public final class GpuTrainableModel implements Trainer {
         Tensor downExps = deviceTensor(m.downExps()).reshape(experts, nEmbd, ff);
         Tensor out = null;
         for (int e = 0; e < experts; e++) {
-            Tensor up = TensorOps.matmul(x, sliceMatrix(upExps, e, ff, nEmbd).transpose());
+            Tensor up = TensorOps.linear(x, sliceMatrix(upExps, e, ff, nEmbd), null);
             Tensor act;
             if (gateExps != null) {
-                Tensor gate = TensorOps.matmul(x, sliceMatrix(gateExps, e, ff, nEmbd).transpose());
+                Tensor gate = TensorOps.linear(x, sliceMatrix(gateExps, e, ff, nEmbd), null);
                 act = glu(m.glu(), gate, up);
             } else {
                 act = activation(m.act(), up);
             }
-            Tensor down = sliceMatrix(downExps, e, nEmbd, ff);
-            Tensor y = TensorOps.matmul(act, down.transpose());
+            Tensor y = TensorOps.linear(act, sliceMatrix(downExps, e, nEmbd, ff), null);
             Tensor term = TensorOps.mul(y, weights.slice(1, e, e + 1));
             out = out == null ? term : TensorOps.add(out, term);
         }
@@ -665,26 +649,23 @@ public final class GpuTrainableModel implements Trainer {
 
     // ------------------------------------------------------------------ loss and readings
 
-    private Tensor lossTensor(Tensor logits, int[] labels, int n, Ctx ctx) {
+    /** The mean negative log-likelihood of the label ids ({@code [n, 1]}) under the logits' softmax. */
+    private static Tensor lossTensor(Tensor logits, Tensor labelIds) {
         Tensor logp = TensorOps.logSoftmax(logits, 1);
-        Tensor picked = TensorOps.gather(logp, 1, ctx.ints(labels, n, 1));
+        Tensor picked = TensorOps.gather(logp, 1, labelIds);
         return TensorOps.neg(TensorOps.mean(picked));
     }
 
-    private int correct(Tensor logits, int[] labels, int n) {
-        Tensor am = TensorOps.argmax(logits, 1);
-        try {
-            int[] predicted = am.toIntArray();
-            int correct = 0;
-            for (int t = 0; t < n; t++) {
-                if (predicted[t] == labels[t]) {
-                    correct++;
-                }
+    /** The positions whose predicted token is the label. */
+    private static int correct(Tensor predicted, int[] labels, int n) {
+        int[] tokens = predicted.toIntArray();
+        int correct = 0;
+        for (int t = 0; t < n; t++) {
+            if (tokens[t] == labels[t]) {
+                correct++;
             }
-            return correct;
-        } finally {
-            am.close();
         }
+        return correct;
     }
 
     private float[][] toRows(Tensor logits, int n) {
@@ -749,12 +730,18 @@ public final class GpuTrainableModel implements Trainer {
         }
         closed = true;
         RuntimeException failure = null;
-        for (Tensor t : owned) {
+        for (DeviceFinetuneUpdate update : updates) {
             try {
-                t.close();
+                update.close();
             } catch (RuntimeException e) {
                 failure = e;
             }
+        }
+        updates.clear();
+        try {
+            parameters.close();
+        } catch (RuntimeException e) {
+            failure = e;
         }
         for (Tensor t : cachedConstants.values()) {
             try {
@@ -763,7 +750,6 @@ public final class GpuTrainableModel implements Trainer {
                 failure = e;
             }
         }
-        owned.clear();
         cachedConstants.clear();
         ropeTables.clear();
         host.close();

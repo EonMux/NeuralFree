@@ -74,6 +74,7 @@
 /* TR_Scatter_F32 modes. */
 #define TR_SCATTER_OVERWRITE 0
 #define TR_SCATTER_ADD       1
+#define TR_SCATTER_TARGETS   2
 
 #ifndef OP
 #error "eltwise.comp requires OP"
@@ -578,12 +579,16 @@ void main() {
     out_u[i] = in_u[pc.in_off + src];
 
 #elif OP == ELT_SCATTER
-    const int f = tr_gid(pc.fibers);
-    if (f < 0) {
-        return;
-    }
     const int d[TR_MAX_RANK] = int[TR_MAX_RANK](pc.d0, pc.d1, pc.d2, pc.d3, pc.d4, pc.d5);
     const int od[TR_MAX_RANK] = int[TR_MAX_RANK](pc.od0, pc.od1, pc.od2, pc.od3, pc.od4, pc.od5);
+    const int limit = od[pc.dim];
+    const bool targets = (pc.mode & TR_SCATTER_TARGETS) != 0;
+    const bool add = (pc.mode & TR_SCATTER_ADD) != 0;
+    const int item = tr_gid(targets ? pc.fibers * limit : pc.fibers);
+    if (item < 0) {
+        return;
+    }
+    const int f = targets ? item / limit : item;
     int rem = f;
     int ibase = 0;
     int obase = 0;
@@ -605,7 +610,26 @@ void main() {
         ostride *= od[k];
     }
     const int len = d[pc.dim];
-    const int limit = od[pc.dim];
+    if (targets) {
+        const int t = item - f * limit;
+        const int o = obase + t * ostep;
+        precise float r = out_f[o];
+        for (int j = 0; j < len; ++j) {
+            const int lin = ibase + j * istep;
+            const int v = idx_i[pc.idx_off + lin];
+            if (v < 0 || v >= limit) {
+                if (t == 0) {
+                    tr_report_index_error(err_i, pc.err_slot, v, pc.err_dim, limit);
+                }
+                continue;
+            }
+            if (v == t) {
+                r = add ? r + src_f[pc.src_off + lin] : src_f[pc.src_off + lin];
+            }
+        }
+        out_f[o] = r;
+        return;
+    }
     for (int j = 0; j < len; ++j) {
         const int lin = ibase + j * istep;
         const int v = idx_i[pc.idx_off + lin];
@@ -614,7 +638,7 @@ void main() {
             continue;
         }
         const int o = obase + v * ostep;
-        if (pc.mode == TR_SCATTER_ADD) {
+        if (add) {
             precise float r = out_f[o] + src_f[pc.src_off + lin];
             out_f[o] = r;
         } else {

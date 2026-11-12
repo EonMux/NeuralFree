@@ -102,7 +102,7 @@ optimizer.step();
 | `ComputationGraph.current().backward(loss, gradOutput, retainGraph, createGraph)` | With `createGraph`, records the gradient computation so it can be differentiated again (implies `retainGraph`); a null `gradOutput` seeds with ones |
 | `Autograd.grad(output, inputs, gradOutput, retainGraph, createGraph)` | `torch.autograd.grad`: returns the gradients with respect to `inputs` as new tensors the caller owns (null where none arrives) and writes no gradient slot |
 
-Leaves accumulate their gradients in `grad()` across backward passes until `zeroGrad()`. A second backward through a released graph throws `IllegalStateException` with "the graph that produced this tensor was released or recorded on another thread; pass retainGraph=true to backpropagate twice, or detach() it". A create-graph pass, and `Autograd.grad` with `createGraph`, throw `UnsupportedOperationException` before computing anything when a node of the pass has no differentiable backward.
+Leaves accumulate their gradients in `grad()` across backward passes until `zeroGrad()`; a gradient the leaf's slot holds exclusively (no other handle shares its storage) takes the next contribution in place, otherwise the sum replaces it. `Parameter.reachedByLastBackward()` (and `ComputationGraph.current().reachedByLastBackward(leaf)`) tells whether the latest pass delivered a gradient to a leaf. A pass that releases the graph frees it as it goes: each node drops its saved tensors and closes its output as soon as its gradient function has run, so activations are freed while the gradients are allocated; when a gradient function throws, the pass still releases the traversed graph (with `retainGraph` it is kept). A second backward through a released graph throws `IllegalStateException` with "the graph that produced this tensor was released or recorded on another thread; pass retainGraph=true to backpropagate twice, or detach() it". A create-graph pass, and `Autograd.grad` with `createGraph`, throw `UnsupportedOperationException` before computing anything when a node of the pass has no differentiable backward.
 
 ```java
 import com.eonmux.neuralfree.autograd.Autograd;
@@ -173,7 +173,7 @@ static Tensor triple(Tensor a) {
 }
 ```
 
-`GradientFunction` documents the rules a backward follows: it must not close `gradOutput`, returns one entry per input (null where none is needed), computes only with the public op facades so the CPU fallback and create-graph work, and saves tensors through detached handles.
+`GradientFunction` documents the rules a backward follows: it must not close `gradOutput`, returns one entry per input (null where none is needed), computes only with the public op facades so the CPU fallback and create-graph work, and saves tensors through detached handles. A function that lists another node's output object among its `savedTensors()` without taking it as an input still finds it open in its backward: the pass closes such an output only once the whole traversed graph is released, not when the output's own node has run.
 
 ### Gradient checkpointing
 
@@ -230,7 +230,7 @@ GradientCheckUtil.GradientCheckResult p = GradientCheckUtil.gradCheckParametersF
 - **Backends.** The reference can live on any backend; a host backend is fastest. It must return a FLOAT64 tensor.
 - **FLOAT64 ops.** These forward ops take operands that are all FLOAT64 and compute them on the host in double precision:
   - arithmetic and the unary functions and activations
-  - `sum`, `mean`, `matmul`, `bmm`, `cat`
+  - `sum`, `mean`, `matmul`, `linear`, `bmm`, `cat`
   - `ConvOps` convolutions and pooling
   - `NormOps.batchNorm`
 
@@ -328,6 +328,8 @@ A module whose forward pass computes an extra loss term (a mixture of experts' l
 
 Recurrent states returned by a cell are outputs of recorded nodes; to carry a state past the backward pass that closes them (truncated back-propagation through time), take its `detach()` first.
 
+`FlashAttentionOp.apply(query, key, value, scale, causal, mask)` returns a `FlashAttentionResult` that the caller closes. Its fields `output` (recorded) and `scores` (the masked scaled scores, detached) are computed by `apply`; the softmax normalizer is the method `l()`, computed from `scores` on its first call and closed with the result.
+
 ## Optimizers and schedulers
 
 Optimizers take `(List<Parameter> params, float lr, ...)` and update the parameters in place on their backend:
@@ -415,7 +417,7 @@ try (DataLoader.Pass<TensorDataset.Sample> pass = loader.pass()) {
 }
 ```
 
-- **Loader options.** `batchSize`, `shuffle` or a `sampler` (`SequentialSampler`, `RandomSampler([seed])`, `WeightedRandomSampler(weights, numSamples, replacement[, seed])`), `numWorkers` (load ahead on background threads), `dropLast`, and `pinMemory` with a `backend`, which copies samples from another backend to the loader's.
+- **Loader options.** `batchSize`, `shuffle` or a `sampler` (`SequentialSampler`, `RandomSampler([seed])`, `WeightedRandomSampler(weights, numSamples, replacement[, seed])`), `numWorkers` (load ahead on background threads), `dropLast`, and `pinMemory` with a `backend`, which copies samples from another backend to the loader's. A batch whose inputs (or targets) share one shape and dtype is uploaded as one buffer, each sample a slice of it, and `Trainer.collateInputs` / `collateTargets` view such adjacent samples as the batch without a copy.
 - **Passes.** A consumer that leaves a pass before its last batch closes that pass (`Pass.close()`), which releases the batches loaded ahead; `loader.close()` ends every pass.
 - **Sample ownership.** `new TensorDataset(Tensor[], Tensor[])` keeps the caller's tensors, which stay the caller's to close. `new TensorDataset(inputBatch, targetBatch)` creates one view per row, owned by the dataset and released by `close()`. Samples a `pinMemory` loader copied are owned by the sample: close each with `Sample.close()`, a no-op for a sample that owns nothing.
 - **Other datasets.** `CSVDataset.builder()` (`csvPath`, `backend`, `hasHeader`, `delimiter`, `featureColumns`, `targetColumns`, `normalizeFeatures`, `oneHotEncodeTargets`), `ImageFolderDataset.builder()` (`rootPath`, `backend`, `targetSize`, `imagenetNormalization`, `grayscale`) and `TextFileDataset.builder()` (`filePath`, `backend`, tokenizer, `maxSequenceLength`). Their `get` creates new tensors the caller closes. The trainers take `DataLoader<TensorDataset.Sample>`, so build a `TensorDataset` from their tensors.
@@ -655,7 +657,7 @@ try (Tensor sample = Tensor.randn(backend, Shape.of(1, 3, 224, 224))) {
 }
 ```
 
-`inference` also holds `SpeculativeDecoder`, `GraphOptimizer` and the configs `QuantizationConfig`, `KVCacheConfig` and `InferenceConfig`. Batched serving of LLMs is not a separate class here: it is the GGUF engine's `ForwardBackend.forwardBatch` contract (`gguf/engine/ForwardBackend`), which the CPU and GPU backends implement and a backend without it refuses by name (see LLM-INFERENCE.md).
+`inference` also holds `SpeculativeDecoder` and the configs `QuantizationConfig`, `KVCacheConfig` and `InferenceConfig`. Batched serving of LLMs is not a separate class here: it is the GGUF engine's `ForwardBackend.forwardBatch` contract (`gguf/engine/ForwardBackend`), which the CPU and GPU backends implement and a backend without it refuses by name (see LLM-INFERENCE.md).
 
 ### Post-training quantization
 

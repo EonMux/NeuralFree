@@ -304,6 +304,37 @@ public class GpuReduceOpsParityTest {
         }
     }
 
+    /**
+     * Rows on both sides of the kernel's register-cache bound (2048 columns) match the CPU, and a row the cache holds
+     * gives the same bits as the streamed path: a masked row of 2048 columns against the same row with a masked
+     * 2049th column, which every lane skips.
+     */
+    @Test
+    public void softmaxRowsAroundTheRegisterCacheBoundMatchTheCpuAndEachOther() {
+        for (int cols : new int[]{255, 2047, 2048, 2049, 3000}) {
+            float[] x = TrainParity.uniform(12 + cols, 2 * cols, -10f, 10f);
+            Tensor hostX = floats(host, x, 2, cols);
+            Tensor devX = floats(gpu, x, 2, cols);
+            TrainParity.assertTranscendental("softmax of " + cols + " columns",
+                    keep(TensorOps.softmax(hostX, 1)).toFloatArray(), keep(GpuReduceOps.softmax(devX, 1)).toFloatArray());
+            TrainParity.assertTranscendental("logSoftmax of " + cols + " columns",
+                    keep(TensorOps.logSoftmax(hostX, 1)).toFloatArray(),
+                    keep(GpuReduceOps.logSoftmax(devX, 1)).toFloatArray());
+        }
+        int cols = 2048;
+        float[] held = TrainParity.uniform(13, cols, -10f, 10f);
+        for (int c = 0; c < cols; c += 5) {
+            held[c] = Float.NEGATIVE_INFINITY;
+        }
+        float[] streamed = Arrays.copyOf(held, cols + 1);
+        streamed[cols] = Float.NEGATIVE_INFINITY;
+        float[] cached = keep(GpuReduceOps.maskedSoftmax(floats(gpu, held, 1, cols), 1)).toFloatArray();
+        float[] uncached = keep(GpuReduceOps.maskedSoftmax(floats(gpu, streamed, 1, cols + 1), 1)).toFloatArray();
+        TrainParity.assertBitIdentical("cached and streamed masked softmax", cached,
+                Arrays.copyOf(uncached, cols));
+        assertEquals("the masked extra column", 0, Float.floatToRawIntBits(uncached[cols]));
+    }
+
     /** {@code MultiHeadAttention}'s masked softmax over the last dim of a {@code [rows, cols]} array. */
     private static float[] maskedReference(float[] x, int rows, int cols) {
         float[] out = new float[x.length];

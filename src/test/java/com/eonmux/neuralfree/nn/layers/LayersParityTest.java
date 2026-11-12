@@ -616,7 +616,7 @@ public class LayersParityTest {
             float[] x = {1f, 2f, 3f, 4f, 0.5f, -1f, 2f, 0f, -2f, 1f, 0.25f, 3f};
             int before = ComputationGraph.current().size();
             Tensor out = fx.keep(layer.forward(fx.upload(b, x, 3, 4)));
-            assertTrue(what + "Linear records AddGrad last", out.gradFn() instanceof GradFunctions.AddGrad);
+            assertTrue(what + "Linear records LinearGrad", out.gradFn() instanceof GradFunctions.LinearGrad);
             backwardOfSum(out, before, what + "Linear");
             float[] columnSums = {-0.5f, 2f, 5.25f, 7f};
             TrainParity.assertBitIdentical(what + "Linear weight gradient", concat(columnSums, columnSums),

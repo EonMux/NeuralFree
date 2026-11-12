@@ -67,12 +67,13 @@ public class TrainOpIdParityTest {
     }
 
     /**
-     * Tiling constants of gemm.cl and gemm.comp without a public Java counterpart. The host never passes them;
-     * {@link #gemmTilingConstantsAreConsistent} checks them against each other and against the launch geometry
-     * of {@code TR_GM_LX} and {@code TR_GM_TILE}.
+     * Kernel-internal layout constants without a public Java counterpart, which the host never passes: the tiling
+     * constants of gemm.cl and gemm.comp ({@link #gemmTilingConstantsAreConsistent} checks them against each other
+     * and against the launch geometry of {@code TR_GM_LX} and {@code TR_GM_TILE}) and the per-lane register cache of
+     * softmax.cl and softmax.comp.
      */
     private static final Set<String> KERNEL_INTERNAL = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(
-            "TR_GM_TK", "TR_GM_RB", "TR_GM_PAD")));
+            "TR_GM_TK", "TR_GM_RB", "TR_GM_PAD", "TR_SM_CACHE")));
 
     /**
      * Mode selectors of the backward kernels, each led by the manifest source whose kernels switch on it:

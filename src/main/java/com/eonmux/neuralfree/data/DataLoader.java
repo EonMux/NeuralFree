@@ -4,6 +4,8 @@ import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.tensor.Tensor;
 import com.eonmux.neuralfree.tensor.TensorStorage;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -36,6 +38,8 @@ import java.util.concurrent.TimeUnit;
 public final class DataLoader<T> implements Iterable<List<T>>, AutoCloseable {
     /** Idle time after which a worker thread of an abandoned pass exits. */
     private static final long WORKER_KEEP_ALIVE_SECONDS = 30;
+    /** Most bytes one role of a batch uploads as one buffer: the capacity of the heap buffer that gathers them. */
+    static final long MAX_BATCH_UPLOAD_BYTES = Integer.MAX_VALUE;
 
     private final Dataset<T> dataset;
     private final int batchSize;
@@ -44,6 +48,7 @@ public final class DataLoader<T> implements Iterable<List<T>>, AutoCloseable {
     private final boolean pinMemory;
     private final ComputeBackend backend;
     private final boolean dropLast;
+    private final long maxBatchUploadBytes;
     private final Set<AsyncDataIterator> openIterators = ConcurrentHashMap.newKeySet();
 
     /**
@@ -69,6 +74,11 @@ public final class DataLoader<T> implements Iterable<List<T>>, AutoCloseable {
 
     public DataLoader(Dataset<T> dataset, int batchSize, Sampler sampler, 
                       int numWorkers, boolean pinMemory, ComputeBackend backend, boolean dropLast) {
+        this(dataset, batchSize, sampler, numWorkers, pinMemory, backend, dropLast, MAX_BATCH_UPLOAD_BYTES);
+    }
+
+    private DataLoader(Dataset<T> dataset, int batchSize, Sampler sampler, int numWorkers, boolean pinMemory,
+                       ComputeBackend backend, boolean dropLast, long maxBatchUploadBytes) {
         Objects.requireNonNull(dataset, "Dataset cannot be null");
         if (batchSize <= 0) {
             throw new IllegalArgumentException("Batch size must be positive, got: " + batchSize);
@@ -80,6 +90,10 @@ public final class DataLoader<T> implements Iterable<List<T>>, AutoCloseable {
         if (pinMemory && backend == null) {
             throw new IllegalArgumentException("Backend must be provided when pinMemory is true");
         }
+        if (maxBatchUploadBytes <= 0 || maxBatchUploadBytes > MAX_BATCH_UPLOAD_BYTES) {
+            throw new IllegalArgumentException("the batch upload limit must be in [1, " + MAX_BATCH_UPLOAD_BYTES
+                + "] bytes, got " + maxBatchUploadBytes);
+        }
 
         this.dataset = dataset;
         this.batchSize = batchSize;
@@ -88,6 +102,7 @@ public final class DataLoader<T> implements Iterable<List<T>>, AutoCloseable {
         this.pinMemory = pinMemory;
         this.backend = backend;
         this.dropLast = dropLast;
+        this.maxBatchUploadBytes = maxBatchUploadBytes;
     }
 
     public int batchSize() {
@@ -158,11 +173,10 @@ public final class DataLoader<T> implements Iterable<List<T>>, AutoCloseable {
         List<T> batch = new ArrayList<>(end - start);
         try {
             for (int i = start; i < end; i++) {
-                T item = dataset.get(indices.get(i));
-                if (pinMemory && item instanceof TensorDataset.Sample) {
-                    item = pinSample((TensorDataset.Sample) item);
-                }
-                batch.add(item);
+                batch.add(dataset.get(indices.get(i)));
+            }
+            if (pinMemory && backend != null) {
+                batch = pinBatch(batch);
             }
         } catch (RuntimeException e) {
             try {
@@ -407,27 +421,104 @@ public final class DataLoader<T> implements Iterable<List<T>>, AutoCloseable {
     }
 
     /**
-     * {@code sample} with its tensors on the loader's backend: a tensor already there is kept, any other is copied,
-     * and the returned sample owns the copies ({@link TensorDataset.Sample#close()}).
+     * {@code batch} with the tensors of its samples on the loader's backend; items that are not samples are kept. A
+     * tensor already there is kept; the others are uploaded per role (inputs, targets): when every sample's tensor of a
+     * role needs the upload, all have one shape and dtype and their bytes together fit
+     * {@link #MAX_BATCH_UPLOAD_BYTES}, they go up as one buffer and each sample gets a slice of it, laid out back to back so that {@link com.eonmux.neuralfree.training.Trainer#collateInputs} views them
+     * without a copy; otherwise each is copied on its own. The returned samples own the copies
+     * ({@link TensorDataset.Sample#close()}); on failure every copy made is closed.
      */
     @SuppressWarnings("unchecked")
-    private T pinSample(TensorDataset.Sample sample) {
-        if (backend == null) {
-            return (T) sample;
-        }
-
-        Tensor pinnedInput = pinTensor(sample.input());
-        Tensor pinnedTarget;
-        try {
-            pinnedTarget = pinTensor(sample.target());
-        } catch (RuntimeException e) {
-            if (pinnedInput != sample.input()) {
-                pinnedInput.close();
+    private List<T> pinBatch(List<T> batch) {
+        List<Integer> slots = new ArrayList<>(batch.size());
+        List<Tensor> inputs = new ArrayList<>(batch.size());
+        List<Tensor> targets = new ArrayList<>(batch.size());
+        for (int i = 0; i < batch.size(); i++) {
+            if (batch.get(i) instanceof TensorDataset.Sample) {
+                TensorDataset.Sample sample = (TensorDataset.Sample) batch.get(i);
+                slots.add(i);
+                inputs.add(sample.input());
+                targets.add(sample.target());
             }
+        }
+        if (slots.isEmpty()) {
+            return batch;
+        }
+        List<Tensor> pinnedInputs = pinAll(inputs);
+        List<Tensor> pinnedTargets;
+        try {
+            pinnedTargets = pinAll(targets);
+        } catch (RuntimeException e) {
+            closeCopies(pinnedInputs, inputs, e);
             throw e;
         }
-        return (T) new TensorDataset.Sample(pinnedInput, pinnedTarget, pinnedInput != sample.input(),
-            pinnedTarget != sample.target());
+        List<T> pinned = new ArrayList<>(batch);
+        for (int k = 0; k < slots.size(); k++) {
+            Tensor input = pinnedInputs.get(k);
+            Tensor target = pinnedTargets.get(k);
+            pinned.set(slots.get(k), (T) new TensorDataset.Sample(input, target, input != inputs.get(k),
+                target != targets.get(k)));
+        }
+        return pinned;
+    }
+
+    /**
+     * {@code tensors} on the loader's backend (see {@link #pinBatch}): one upload of their bytes back to back when
+     * every one needs the upload, all share shape and dtype and the bytes fit one upload ({@link #fitsOneUpload}),
+     * else one copy per tensor not yet there.
+     */
+    private List<Tensor> pinAll(List<Tensor> tensors) {
+        Tensor first = tensors.get(0);
+        long elements = first.numElements();
+        long partBytes = elements * first.dtype().byteSize();
+        boolean together = tensors.size() > 1 && elements > 0
+            && fitsOneUpload(partBytes, tensors.size(), maxBatchUploadBytes);
+        for (Tensor t : tensors) {
+            together &= t.backend() != backend && t.dtype() == first.dtype() && t.shape().equals(first.shape());
+        }
+        List<Tensor> pinned = new ArrayList<>(tensors.size());
+        try {
+            if (!together) {
+                for (Tensor t : tensors) {
+                    pinned.add(pinTensor(t));
+                }
+                return pinned;
+            }
+            ByteBuffer bytes = ByteBuffer.allocate(Math.toIntExact(Math.multiplyExact(partBytes, (long) tensors.size())))
+                .order(ByteOrder.nativeOrder());
+            for (Tensor t : tensors) {
+                bytes.put(t.toByteBuffer().duplicate().order(ByteOrder.nativeOrder()));
+            }
+            bytes.flip();
+            try (TensorStorage whole = TensorStorage.fromHost(backend, bytes, first.dtype())) {
+                for (int i = 0; i < tensors.size(); i++) {
+                    pinned.add(Tensor.fromStorage(backend, first.shape(), first.dtype(),
+                        whole.slice(i * elements, elements)));
+                }
+            }
+            return pinned;
+        } catch (RuntimeException e) {
+            closeCopies(pinned, tensors, e);
+            throw e;
+        }
+    }
+
+    /** Whether {@code parts} tensors of {@code partBytes} bytes each fit one upload of at most {@code limit} bytes. */
+    static boolean fitsOneUpload(long partBytes, int parts, long limit) {
+        return parts > 0 && partBytes <= limit / parts;
+    }
+
+    /** Closes the tensors of {@code pinned} that are copies (not the tensor of {@code originals} at their index). */
+    private static void closeCopies(List<Tensor> pinned, List<Tensor> originals, RuntimeException failure) {
+        for (int i = 0; i < pinned.size(); i++) {
+            if (pinned.get(i) != originals.get(i)) {
+                try {
+                    pinned.get(i).close();
+                } catch (RuntimeException e) {
+                    failure.addSuppressed(e);
+                }
+            }
+        }
     }
 
     /** {@code tensor} when it lives on the loader's backend, else a contiguous copy there with the same dtype. */
@@ -485,6 +576,7 @@ public final class DataLoader<T> implements Iterable<List<T>>, AutoCloseable {
         private boolean pinMemory = false;
         private ComputeBackend backend;
         private boolean dropLast = false;
+        private long maxBatchUploadBytes = MAX_BATCH_UPLOAD_BYTES;
 
         public Builder(Dataset<T> dataset) {
             this.dataset = Objects.requireNonNull(dataset, "Dataset cannot be null");
@@ -533,11 +625,18 @@ public final class DataLoader<T> implements Iterable<List<T>>, AutoCloseable {
             return this;
         }
 
+        /** The most bytes one role of a batch uploads as one buffer (at most {@link #MAX_BATCH_UPLOAD_BYTES}). */
+        Builder<T> maxBatchUploadBytes(long maxBatchUploadBytes) {
+            this.maxBatchUploadBytes = maxBatchUploadBytes;
+            return this;
+        }
+
         public DataLoader<T> build() {
             if (sampler == null) {
                 sampler = shuffle ? new RandomSampler() : new SequentialSampler();
             }
-            return new DataLoader<>(dataset, batchSize, sampler, numWorkers, pinMemory, backend, dropLast);
+            return new DataLoader<>(dataset, batchSize, sampler, numWorkers, pinMemory, backend, dropLast,
+                maxBatchUploadBytes);
         }
     }
 }

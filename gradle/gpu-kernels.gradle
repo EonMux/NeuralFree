@@ -108,6 +108,7 @@ import neuralfree.gpu.GpuCudaToolkit
 import neuralfree.gpu.GpuHipToolkit
 import neuralfree.gpu.GpuInventory
 import neuralfree.gpu.GpuKernelLibrary
+import neuralfree.gpu.GpuLibraryDefinitions
 import neuralfree.gpu.GpuKernelSources
 import neuralfree.gpu.GpuShaderVariants
 import neuralfree.gpu.GpuSpirvSignature
@@ -191,18 +192,10 @@ def gpuMetalTool = { ->
 }
 def gpuMetalToolFingerprint = { -> ((List<File>) gpuMetalTool().jars).collect { it.name }.sort().join(',') }
 
-/** Every kernel library, with the roots its KernelLibraries config registers. cudaFlags set the nvcc math mode,
- *  hipFlags the clang one of the HIP code objects; faSmemFloats adds -DNF_FA_SMEM_FLOATS to the library's CUDA units and records it in build.properties. */
-def gpuLibraryDefinitions = [
-        [id              : 'llm', kernelRoot: 'kernels/llm', cudaDir: 'kernels/llm/cuda', shaderRoot: 'shaders/llm',
-         cudaFlags       : ['-ftz=true', '-prec-div=false', '-prec-sqrt=false', '-fmad=true'], faSmemFloats: gpuCudaSmemFloats,
-         hipFlags        : [], subgroupVariants: true, compareKinds: true,
-         // The MMQ, FP8 and W4A8 GEMMs and their activation staging: register-resident pipelines by design.
-         stackFreeCudaModules: ['matmul_mmq', 'matmul_mmq_stream', 'matmul_fp8', 'quant_mmq_q8_1', 'quant_mmq_warp']],
-        [id              : 'train', kernelRoot: 'kernels/train', cudaDir: 'kernels/train/cuda', shaderRoot: 'shaders/train',
-         cudaFlags       : ['-ftz=false', '-prec-div=true', '-prec-sqrt=true', '-fmad=false'],
-         hipFlags        : ['-ffp-contract=off'], subgroupVariants: false, compareKinds: true]
-]
+/** Every kernel library, with the roots its KernelLibraries config registers (buildSrc GpuLibraryDefinitions: cudaFlags
+ *  set the nvcc math mode, hipFlags the clang one of the HIP code objects; faSmemFloats adds -DNF_FA_SMEM_FLOATS to the
+ *  library's CUDA units and records it in build.properties). */
+def gpuLibraryDefinitions = GpuLibraryDefinitions.definitions(gpuCudaSmemFloats)
 def gpuAllLibraries = gpuLibraryDefinitions.collect { Map spec -> new GpuKernelLibrary(spec, gpuResources, projectDir) }
 ['id', 'kernelRootPath', 'cudaDir', 'shaderRootPath'].each { String field ->
     List<String> values = gpuAllLibraries.collect { it."${field}" as String }
