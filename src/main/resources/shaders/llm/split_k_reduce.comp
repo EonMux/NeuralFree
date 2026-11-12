@@ -11,13 +11,16 @@
  * `partial` holds `splits` consecutive planes of ne = M * N floats, plane element (t, r) at
  * plane_start + t * M + r; the reduce scatters each summed element to its row of the strided output.
  *
- * Dispatch: 1-D, global = {roundUp(ceil(ne / 4), 256), 1, 1}, local = {256, 1, 1}; each invocation
- * sums four consecutive elements, guarded past ne.
+ * Dispatch: 1-D, global = {roundUp(ceil(ne / 4), L), 1, 1}, local = {L, 1, 1}; each invocation sums four
+ * elements, guarded past ne. A work-group owns 4 * L consecutive elements and takes them in four passes of L,
+ * invocation i reading element i of each pass, so every plane load of a subgroup reads one contiguous run.
  */
 #version 450
 #extension GL_GOOGLE_include_directive : require
 
 #include "common/nf_common.glsl"
+
+#define NF_SKR_PER_ITEM 4u                 /* elements per invocation */
 
 layout(std430, binding = 0) readonly buffer NfSkPartial { float partial_in[]; };
 layout(std430, binding = 1) writeonly buffer NfSkOutput { float y_out[]; };
@@ -26,16 +29,19 @@ layout(push_constant) uniform NfSkParams {
 } pc;
 
 void main() {
-    const uint e0 = gl_GlobalInvocationID.x * 4u;
-    for (uint j = 0u; j < 4u; ++j) {
-        const uint e = e0 + j;
-        if (e >= uint(pc.ne)) {
+    const uint ne = uint(pc.ne);
+    const uint m = uint(pc.M);
+    const uint local_size = gl_WorkGroupSize.x;
+    const uint base = gl_WorkGroupID.x * (local_size * NF_SKR_PER_ITEM) + gl_LocalInvocationID.x;
+    for (uint j = 0u; j < NF_SKR_PER_ITEM; ++j) {
+        const uint e = base + j * local_size;
+        if (e >= ne) {
             return;
         }
         float sum = 0.0;
         for (int s = 0; s < pc.splits; ++s) {
-            sum += partial_in[uint(s) * uint(pc.ne) + e];
+            sum += partial_in[uint(s) * ne + e];
         }
-        y_out[uint(pc.y_off) + (e / uint(pc.M)) * uint(pc.y_stride) + (e % uint(pc.M))] = sum;
+        y_out[uint(pc.y_off) + (e / m) * uint(pc.y_stride) + (e % m)] = sum;
     }
 }

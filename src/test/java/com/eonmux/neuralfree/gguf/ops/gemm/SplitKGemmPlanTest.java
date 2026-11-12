@@ -31,15 +31,41 @@ public class SplitKGemmPlanTest {
         assertEquals(1, SplitKGemmPlan.splitsFor(4, 3, 1, 4096));
     }
 
-    /** The CM2 launches split only grids that keep their slices in one wave: the 16-tile grid of a 1024-row
-     * projection over 512 tokens on 60 units splits by 3, the 40-tile grid of a 2560-row one stays whole. */
+    /** The CM2 launches take llama.cpp's coopmat2 rule, two-thirds band included: on 60 units the 16-tile grid of
+     * a 1024-row projection over 512 tokens and the 40-tile grid of a 2560-row one both split by 3. */
     @Test
-    public void theCm2HeuristicKeepsOnlyTheSingleWaveBand() {
-        assertEquals(3, SplitKGemmPlan.cm2SplitsFor(60, 8, 2, 3072));
-        assertEquals(1, SplitKGemmPlan.cm2SplitsFor(60, 20, 2, 9728));
-        assertEquals("the general heuristic splits that grid by 3", 3, SplitKGemmPlan.splitsFor(60, 20, 2, 9728));
-        assertEquals("small K never splits", 1, SplitKGemmPlan.cm2SplitsFor(60, 1, 1, 2047));
-        assertEquals(SplitKGemmPlan.MAX_SPLITS, SplitKGemmPlan.cm2SplitsFor(60, 1, 1, 4096));
+    public void theCm2HeuristicSplitsTheTwoThirdsBand() {
+        SplitKGemmPlan narrow = SplitKGemmPlan.of(Cm2GemmPlan.contiguous(GGMLType.Q8_0, 1024, 3072, 512), 60, 256);
+        assertNotNull(narrow);
+        assertEquals(3, narrow.splits());
+        SplitKGemmPlan wide = SplitKGemmPlan.of(Cm2GemmPlan.contiguous(GGMLType.Q8_0, 2560, 9728, 512), 60, 256);
+        assertNotNull(wide);
+        assertEquals("the 40-tile grid fills two thirds of 60 units", 3, wide.splits());
+        assertEquals("ceil(9728 / 3) rounds up to whole 256-element groups", 3328, wide.kSlice());
+        assertNull("past two thirds of 59 units the grid runs whole",
+                SplitKGemmPlan.of(Cm2GemmPlan.contiguous(GGMLType.Q8_0, 2560, 9728, 512), 59, 256));
+        assertNull("small K never splits",
+                SplitKGemmPlan.of(Cm2GemmPlan.contiguous(GGMLType.Q8_0, 128, 2047 / 32 * 32, 256), 60, 256));
+    }
+
+    /** The CM2 split rounds its slices up to whole {@link Cm2GemmPlan#SPLIT_SLICE_ALIGN}-element groups, so a
+     * K-quant slice starts on a super-block (the interior path) and the slice count steps down where the rounding
+     * would empty the last slice. */
+    @Test
+    public void cm2SlicesStartOnWholeSuperBlocks() {
+        SplitKGemmPlan q4k = SplitKGemmPlan.of(Cm2GemmPlan.contiguous(GGMLType.Q4_K, 1024, 2560, 512), 60, 256);
+        assertNotNull(q4k);
+        assertEquals(3, q4k.splits());
+        assertEquals("ceil(2560 / 3) rounds up to 1024, not to the 896 of whole 64-deep stages", 1024, q4k.kSlice());
+        SplitKGemmPlan q80 = SplitKGemmPlan.of(Cm2GemmPlan.contiguous(GGMLType.Q8_0, 1024, 2048, 512), 60, 256);
+        assertNotNull(q80);
+        assertEquals(768, q80.kSlice());
+        assertEquals(0, q80.kSlice() % Cm2GemmPlan.SPLIT_SLICE_ALIGN);
+        SplitKGemmPlan single = SplitKGemmPlan.of(Cm2GemmPlan.contiguous(GGMLType.Q4_K, 128, 2304, 256), 60, 256);
+        assertNotNull(single);
+        assertEquals("nine super-blocks over eight slices step down to the five that rounding keeps non-empty", 5,
+                single.splits());
+        assertEquals(512, single.kSlice());
     }
 
     /** The 16-token band of the small-token-tile heuristic splits a staged grid up to about 1.3

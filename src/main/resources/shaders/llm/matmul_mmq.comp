@@ -18,24 +18,32 @@
  * quant_mmq.comp (per token and K-step chunk: codes, chunk scale, 16-half code sums); q_stride is
  * the record stride between tokens.
  *
- * The weight stays quantized: each stage (16 deep) stages the raw integer code of every tile
- * element plus one (scale, offset) pair per weight row, and reads the staged codes, chunk scale and
- * code sums of its tokens from q8, so the exact dot is d * (scale * sum(c*q) + offset * sum(q)) up
- * to the 8-bit activation error of the staging pass. Codes and (scale, offset) come from
- * mmq_code/mmq_scale/mmq_off (common/quant_mmq.glsl, the GLSL twins of the per-type macros of
- * kernels/llm/matmul_mmq.cl, value = scale * code + offset); IQ types read their grids through the
- * nf_iq* accessors, so main() fills the shared grid first.
+ * The weight stays quantized: each stage (16 deep) stages the raw integer codes of every tile row as four packed
+ * int8 words plus one (scale, offset) pair per weight row, and reads the staged code words, chunk scale and code sum
+ * of its tokens from q8, so the exact dot is d * (scale * sum(c*q) + offset * sum(q)) up to the 8-bit activation
+ * error of the staging pass. Codes and (scale, offset) come from mmq_code/mmq_scale/mmq_off (common/quant_mmq.glsl,
+ * the GLSL twins of the per-type macros of kernels/llm/matmul_mmq.cl, value = scale * code + offset; every code fits
+ * a signed byte, as the C family's packed-dot path requires); IQ types read their grids through the nf_iq*
+ * accessors, so main() fills the shared grid first.
  *
- * Tiling equals the C family's packed-dot path: a workgroup of 256 invocations computes 64 weight
- * rows x 16 tokens in 16-deep stages; invocation lid owns rows tx + 16*i (i < 4) and the one token
- * ty, tx = lid % 16, ty = lid / 16, and takes the integer dot products over its 4 rows. Rows past
- * M and tokens past N contribute 0.
+ * Tiling equals the C family's packed-dot path: a workgroup of 256 invocations computes 64 weight rows x 16 tokens in
+ * 16-deep stages; invocation lid owns rows tx + 16*i (i < 4) and the one token ty, tx = lid % 16, ty = lid / 16, and
+ * takes each row's integer dot as four dotPacked4x8EXT (dp4a) of a 16-byte shared row against the token's four
+ * staged code words, which it keeps packed. The code sum of the weights, which only an asymmetric record (zero point
+ * unit != 0) needs, is taken only then. Rows past M and tokens past N contribute 0.
+ *
+ * Pipeline: invocation lid stages code word lid % 4 of row lid / 4 of the tile (4 codes) and, for lid % 4 == 0, that
+ * row's scale and offset. The codes, scales and token record of stage s + 1 are read into registers before stage s's
+ * dots, which hide their global-memory latency, and stored into the other half of the double-buffered shared tile
+ * after them, so a stage costs one barrier.
  *
  * Dispatch: 2-D (never folded), global = {ceil(M / 64) * 256, ceil(N / 16), 1}, local = {256, 1, 1}.
- * Shared memory: 64*16 code ints and 2*64 scale floats.
+ * Shared memory: 2 x 64 code ivec4 and 2 x 64 (scale, offset) vec2 (3 KiB). Requires shaderIntegerDotProduct (the
+ * Vulkan program cache refuses the module on a device without it, and the dispatcher keeps the tiled GEMM there).
  */
 #version 450
 #extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_integer_dot_product : require
 
 #include "common/nf_common.glsl"
 
@@ -70,17 +78,59 @@ layout(push_constant) uniform NfMmqParams {
 #define NF_MMQ_TK 16                          /* reduction depth of one stage */
 #define NF_MMQ_RM 4                           /* rows per invocation */
 #define NF_MMQ_TX (NF_MMQ_TM / NF_MMQ_RM)     /* 16 row lanes */
-#define NF_MMQ_QS (NF_MMQ_TK / 4)             /* code ints of one chunk record */
+#define NF_MMQ_QS (NF_MMQ_TK / 4)             /* code words of one chunk record */
 #define NF_MMQ_RC (NF_MMQ_QS + 2 + NF_MMQ_TK / 16)
 
-shared int nf_mmq_w[NF_MMQ_TM * NF_MMQ_TK];
-shared float nf_mmq_ws[NF_MMQ_TM];
-shared float nf_mmq_wo[NF_MMQ_TM];
+const int NF_MMQ_ONES = 0x01010101;           /* four bytes valued 1: the dot that sums a word's signed bytes */
 
-/* The signed code in byte b of a staged code word. */
-int nf_mmq_q(uint word, uint b) {
-    const uint v = (word >> (8u * b)) & 0xFFu;
-    return int(v) - int((v & 0x80u) << 1u);
+shared ivec4 nf_mmq_w4[2 * NF_MMQ_TM];
+shared vec2 nf_mmq_so[2 * NF_MMQ_TM];
+
+/* The staged state of one stage for this invocation: its code word of the weight tile, its row's (scale, offset)
+ * (lid % 4 == 0 only), and its token's code words, chunk scale, code sum and zero point. */
+int nf_mmq_cw;
+vec2 nf_mmq_cso;
+ivec4 nf_mmq_xw;
+float nf_mmq_xd;
+int nf_mmq_xs;
+int nf_mmq_zp;
+
+/* Reads stage k0 into the registers above: codes k0 + 4u .. k0 + 4u + 3 of row sr (base byte wr, 0 past M) and the
+ * token's record c = k0 / NF_MMQ_TK. */
+void nf_mmq_fetch(const int k0, const uint wr, const bool wok, const int u, const bool so_lane, const uint rec0,
+                  const bool tokok) {
+    const uint blk = uint(k0 / MMQ_BS) * uint(MMQ_BB);
+    const uint e0 = uint(k0 + 4 * u) % uint(MMQ_BS);
+    int word = 0;
+    if (wok) {
+        [[unroll]] for (uint b = 0u; b < 4u; ++b) {
+            word |= (mmq_code(NF_WS_A, wr + blk, e0 + b) & 0xFF) << (8u * b);
+        }
+    }
+    nf_mmq_cw = word;
+    nf_mmq_cso = wok && so_lane ? vec2(mmq_scale(NF_WS_A, wr + blk, uint(k0)), mmq_off(NF_WS_A, wr + blk, uint(k0)))
+                                : vec2(0.0);
+    const uint rec = rec0 + uint(k0 / NF_MMQ_TK) * uint(NF_MMQ_RC);
+    if (tokok) {
+        nf_mmq_xw = ivec4(q8_in[rec], q8_in[rec + 1u], q8_in[rec + 2u], q8_in[rec + 3u]);
+        nf_mmq_xd = uintBitsToFloat(q8_in[rec + uint(NF_MMQ_QS)]);
+        nf_mmq_xs = int(q8_in[rec + uint(NF_MMQ_QS + 1)]);
+        /* the asymmetric int8 scheme's zero point (0 for every symmetric record) */
+        nf_mmq_zp = int(q8_in[rec + uint(NF_MMQ_RC - 1)]);
+    } else {
+        nf_mmq_xw = ivec4(0);
+        nf_mmq_xd = 0.0;
+        nf_mmq_xs = 0;
+        nf_mmq_zp = 0;
+    }
+}
+
+/* Stores this invocation's fetched code word and (scale, offset) into the shared tile half at buf. */
+void nf_mmq_store(const uint buf, const int sr, const int u, const bool so_lane) {
+    nf_mmq_w4[buf + uint(sr)][u] = nf_mmq_cw;
+    if (so_lane) {
+        nf_mmq_so[buf + uint(sr)] = nf_mmq_cso;
+    }
 }
 
 void main() {
@@ -107,66 +157,56 @@ void main() {
     const int tok = n0 + ty;
     const bool tokok = tok < N;
     const uint row_bytes = uint(K / MMQ_BS) * uint(MMQ_BB);
+    const uint rec0 = tokok ? uint(pc.q_off) + uint(tok) * uint(pc.q_stride) * uint(NF_MMQ_RC) : 0u;
 
-    uint wrow[NF_MMQ_RM];
-    bool wok[NF_MMQ_RM];
-    for (int q = 0; q < NF_MMQ_RM; ++q) {
-        const int r = m0 + tx + NF_MMQ_TX * q;
-        wok[q] = r < M;
-        wrow[q] = wok[q] ? uint(r) * row_bytes : 0u;
-    }
+    /* The staging role: code word su of tile row sr. */
+    const int sr = int(lid) / NF_MMQ_QS;
+    const int su = int(lid) % NF_MMQ_QS;
+    const bool so_lane = su == 0;
+    const bool wok = m0 + sr < M;
+    const uint wr = wok ? uint(m0 + sr) * row_bytes : 0u;
 
     float acc[NF_MMQ_RM];
-    for (int q = 0; q < NF_MMQ_RM; ++q) {
+    [[unroll]] for (int q = 0; q < NF_MMQ_RM; ++q) {
         acc[q] = 0.0;
     }
 
-    for (int k0 = kb; k0 < ke; k0 += NF_MMQ_TK) {
-        const int c = k0 / NF_MMQ_TK;
-        const uint blk = uint(k0 / MMQ_BS) * uint(MMQ_BB);
-        /* weight codes: depth lanes are the token lanes */
-        for (int q = 0; q < NF_MMQ_RM; ++q) {
-            nf_mmq_w[(tx + NF_MMQ_TX * q) * NF_MMQ_TK + ty] =
-                wok[q] ? mmq_code(NF_WS_A, wrow[q] + blk, uint(k0 + ty) % uint(MMQ_BS)) : 0;
-        }
-        /* per-row stage scale and offset: the ty < 4 invocations cover rows tx + 16*ty */
-        if (ty < NF_MMQ_TM / NF_MMQ_TN) {
-            const int sr = tx + NF_MMQ_TX * ty;
-            const bool sok = m0 + sr < M;
-            const uint sbp = (sok ? uint(m0 + sr) * row_bytes : 0u) + blk;
-            nf_mmq_ws[sr] = sok ? mmq_scale(NF_WS_A, sbp, k0) : 0.0;
-            nf_mmq_wo[sr] = sok ? mmq_off(NF_WS_A, sbp, k0) : 0.0;
-        }
+    if (kb < ke) {
+        nf_mmq_fetch(kb, wr, wok, su, so_lane, rec0, tokok);
+        nf_mmq_store(0u, sr, su, so_lane);
         barrier();
-        /* the token's staged codes, chunk scale and code sum (invocation-private) */
-        float xd = 0.0;
-        int xs = 0;
-        int zp = 0;
-        int xq[NF_MMQ_TK];
-        {
-            const uint rec = uint(pc.q_off) + (uint(tok) * uint(pc.q_stride) + uint(c)) * uint(NF_MMQ_RC);
-            for (int u = 0; u < NF_MMQ_QS; ++u) {
-                const uint word = tokok ? q8_in[rec + uint(u)] : 0u;
-                for (int b = 0; b < 4; ++b) {
-                    xq[4 * u + b] = nf_mmq_q(word, uint(b));
-                }
-            }
-            xd = tokok ? uintBitsToFloat(q8_in[rec + uint(NF_MMQ_QS)]) : 0.0;
-            xs = tokok ? int(q8_in[rec + uint(NF_MMQ_QS + 1)]) : 0;
-            /* the asymmetric int8 scheme's zero point (0 for every symmetric record) */
-            zp = tokok ? int(q8_in[rec + uint(NF_MMQ_RC - 1)]) : 0;
+    }
+    uint buf = 0u;
+    for (int k0 = kb; k0 < ke; k0 += NF_MMQ_TK) {
+        const ivec4 xw = nf_mmq_xw;
+        const float xd = nf_mmq_xd;
+        const int xs = nf_mmq_xs;
+        const int zp = nf_mmq_zp;
+        const bool more = k0 + NF_MMQ_TK < ke;
+        if (more) {
+            nf_mmq_fetch(k0 + NF_MMQ_TK, wr, wok, su, so_lane, rec0, tokok);
         }
-        for (int q = 0; q < NF_MMQ_RM; ++q) {
-            const int sr = tx + NF_MMQ_TX * q;
-            int ib = 0;
-            int wsum = 0;
-            for (int kk = 0; kk < NF_MMQ_TK; ++kk) {
-                const int wc = nf_mmq_w[sr * NF_MMQ_TK + kk];
-                ib += wc * xq[kk];
-                wsum += wc;
+        [[unroll]] for (int q = 0; q < NF_MMQ_RM; ++q) {
+            const uint r = buf + uint(tx + NF_MMQ_TX * q);
+            const ivec4 wv = nf_mmq_w4[r];
+            const vec2 so = nf_mmq_so[r];
+            int ib = dotPacked4x8EXT(wv.x, xw.x);
+            ib = dotPacked4x8EXT(wv.y, xw.y) + ib;
+            ib = dotPacked4x8EXT(wv.z, xw.z) + ib;
+            ib = dotPacked4x8EXT(wv.w, xw.w) + ib;
+            float t = so.x * float(ib) + so.y * float(xs);
+            if (zp != 0) {
+                int wsum = dotPacked4x8EXT(wv.x, NF_MMQ_ONES);
+                wsum = dotPacked4x8EXT(wv.y, NF_MMQ_ONES) + wsum;
+                wsum = dotPacked4x8EXT(wv.z, NF_MMQ_ONES) + wsum;
+                wsum = dotPacked4x8EXT(wv.w, NF_MMQ_ONES) + wsum;
+                t -= float(zp) * (so.x * float(wsum) + so.y * float(NF_MMQ_TK));
             }
-            acc[q] += xd * (nf_mmq_ws[sr] * float(ib) + nf_mmq_wo[sr] * float(xs)
-                    - float(zp) * (nf_mmq_ws[sr] * float(wsum) + nf_mmq_wo[sr] * float(NF_MMQ_TK)));
+            acc[q] += xd * t;
+        }
+        buf ^= uint(NF_MMQ_TM);
+        if (more) {
+            nf_mmq_store(buf, sr, su, so_lane);
         }
         barrier();
     }
@@ -182,7 +222,7 @@ void main() {
     }
     const uint ybase = uint(pc.y_off) + uint(tok) * uint(pc.y_stride);
 #endif
-    for (int q = 0; q < NF_MMQ_RM; ++q) {
+    [[unroll]] for (int q = 0; q < NF_MMQ_RM; ++q) {
         const int r = m0 + tx + NF_MMQ_TX * q;
         if (r < M) {
             NF_MMQ_OUT[ybase + uint(r)] = acc[q];

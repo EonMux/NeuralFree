@@ -73,16 +73,25 @@ public class VulkanCm2DispatchTest {
     }
 
     private void open(boolean cm2, int cols) {
+        open(cm2, false, cols);
+    }
+
+    private void open(boolean cm2, boolean decodeVector, int cols) {
+        open(cm2, decodeVector, cols, UBATCH);
+    }
+
+    private void open(boolean cm2, boolean decodeVector, int cols, int ubatch, String... unavailable) {
         close();
         backend = FakeComputeBackend.builder().backendType(ComputeBackend.BackendType.VULKAN).strictLlmArgs(true)
-                .capabilities(vulkanNvidia(cm2)).build();
-        scratch = GpuScratch.builder(backend, UBATCH).slot(ScratchSlots.X, (long) UBATCH * cols).build();
+                .capabilities(vulkanNvidia(cm2, decodeVector)).unavailableKernels(unavailable).build();
+        scratch = GpuScratch.builder(backend, ubatch).slot(ScratchSlots.X, (long) ubatch * cols).build();
         placeholders = GpuPlaceholders.allocate(backend, backend.computeQueue());
         ops = new GpuOps(backend.computeQueue(), LlmKernels.open(backend), scratch, placeholders);
     }
 
-    /** An RTX-class Vulkan device: the KHR cooperative matrices, and the NV workgroup-scope ones when asked. */
-    private static DeviceCapabilities vulkanNvidia(boolean cm2) {
+    /** An RTX-class Vulkan device: the KHR cooperative matrices, and the NV workgroup-scope ones and their
+     *  four-element decode callbacks when asked. */
+    private static DeviceCapabilities vulkanNvidia(boolean cm2, boolean decodeVector) {
         DeviceCapabilities.Builder b = new DeviceCapabilities.Builder()
                 .deviceName("Cm2Device")
                 .totalVramBytes(8L << 30)
@@ -102,6 +111,9 @@ public class VulkanCm2DispatchTest {
         if (cm2) {
             b.feature(DeviceFeature.COOPERATIVE_MATRIX_2);
         }
+        if (decodeVector) {
+            b.feature(DeviceFeature.COOPERATIVE_MATRIX_2_DECODE_VECTOR);
+        }
         return b.build();
     }
 
@@ -111,12 +123,24 @@ public class VulkanCm2DispatchTest {
     }
 
     private List<String> project(int cols) {
-        GpuWeight f16 = f16Weight("blk.0.attn_q.weight", cols);
-        GpuBuffer in = backend.allocateBuffer((long) TOKENS * cols * Float.BYTES);
-        GpuBuffer out = backend.allocateBuffer((long) TOKENS * ROWS * Float.BYTES);
+        return project(f16Weight("blk.0.attn_q.weight", cols), cols, TOKENS);
+    }
+
+    private List<String> project(GpuWeight w, int cols, int tokens) {
+        return names(projectDispatches(w, cols, tokens));
+    }
+
+    private List<FakeDispatch> projectDispatches(GpuWeight w, int cols, int tokens) {
+        GpuBuffer in = backend.allocateBuffer((long) tokens * cols * Float.BYTES);
+        GpuBuffer out = backend.allocateBuffer((long) tokens * GpuOps.rows(w) * Float.BYTES);
         backend.clearLog();
-        ops.matmul(f16, in, 0, out, 0, TOKENS);
-        return names(backend.dispatches());
+        ops.matmul(w, in, 0, out, 0, tokens);
+        return backend.dispatches();
+    }
+
+    private GpuWeight q8Weight(String name, int rows, int cols) {
+        return GpuWeight.of(name, GGMLType.Q8_0, new long[]{cols, rows},
+                backend.allocateBuffer((long) rows * (cols / 32) * 34, true));
     }
 
     private static List<String> names(List<FakeDispatch> ds) {
@@ -179,6 +203,77 @@ public class VulkanCm2DispatchTest {
         assertFalse(Cm2GemmPlan.denseShapeServes(cols));
         open(true, cols);
         assertEquals(Arrays.asList("F16_MatMul_MMA"), project(cols));
+    }
+
+    /** A quantized weight takes the four-element decode form where the device reports decode vectors, and the
+     *  per-element form elsewhere; the dense F16 GEMM has no decode callback and keeps its one form. */
+    @Test
+    public void quantizedWeightsTakeTheDecodeVectorFormWhereTheDeviceReportsIt() {
+        int cols = 256;
+        open(true, true, cols);
+        assertEquals(Arrays.asList(Cm2GemmPlan.STAGE_KERNEL, "Q8_0_MatMul_CM2V"),
+                project(q8Weight("blk.0.attn_q.weight", ROWS, cols), cols, UBATCH));
+        assertEquals(Arrays.asList(Cm2GemmPlan.STAGE_KERNEL, "F16_MatMul_CM2"), project(cols));
+        open(true, false, cols);
+        assertEquals(Arrays.asList(Cm2GemmPlan.STAGE_KERNEL, "Q8_0_MatMul_CM2"),
+                project(q8Weight("blk.0.attn_q.weight", ROWS, cols), cols, UBATCH));
+    }
+
+    /** A device that reports decode vectors but cannot build the {@code _CM2V} pipeline keeps the cooperative-matrix2
+     *  lane on the per-element form, which computes the same values, for the whole and the split launch alike. */
+    @Test
+    public void aDecodeVectorKernelThatCannotBuildFallsBackToThePerElementForm() {
+        open(true, true, 4096, UBATCH, "Q8_0_MatMul_CM2V");
+        assertEquals(Arrays.asList(Cm2GemmPlan.STAGE_KERNEL, "Q8_0_MatMul_CM2"),
+                project(q8Weight("blk.0.attn_q.weight", ROWS, 256), 256, UBATCH));
+        assertEquals(Arrays.asList(Cm2GemmPlan.STAGE_KERNEL, "Q8_0_MatMul_CM2_KSplit", GemmKernels.SPLIT_K_REDUCE),
+                project(q8Weight("blk.0.ffn_down.weight", ROWS, 4096), 4096, UBATCH));
+    }
+
+    /** A tall-skinny reduction splits through the split-K twin of the form the device runs. */
+    @Test
+    public void theSplitLaunchRunsTheTwinOfTheDecodeVectorForm() {
+        int cols = 4096;
+        open(true, true, cols);
+        assertEquals(Arrays.asList(Cm2GemmPlan.STAGE_KERNEL, "Q8_0_MatMul_CM2V_KSplit", GemmKernels.SPLIT_K_REDUCE),
+                project(q8Weight("blk.0.ffn_down.weight", ROWS, cols), cols, UBATCH));
+        open(true, false, cols);
+        assertEquals(Arrays.asList(Cm2GemmPlan.STAGE_KERNEL, "Q8_0_MatMul_CM2_KSplit", GemmKernels.SPLIT_K_REDUCE),
+                project(q8Weight("blk.0.ffn_down.weight", ROWS, cols), cols, UBATCH));
+    }
+
+    /**
+     * On the 60-unit device a 512-token launch over 1024 rows (16 tiles of 256 tokens, at most half the device) whose
+     * 1024-element reduction split-K keeps whole runs the 128-token tile, over twice the token groups; 2048 rows
+     * (32 tiles) keep the 256-token tile, and a 2048-element reduction of 1024 rows splits on the 256-token tile's
+     * twin instead.
+     */
+    @Test
+    public void aSmallGridThatDoesNotSplitRunsTheMediumTile() {
+        int tokens = 512;
+        open(true, true, 2048, tokens);
+        List<FakeDispatch> medium = projectDispatches(q8Weight("blk.0.attn_k.weight", 1024, 1024), 1024, tokens);
+        assertEquals(Arrays.asList(Cm2GemmPlan.STAGE_KERNEL, "Q8_0_MatMul_CM2V_N128"), names(medium));
+        assertEquals(tokens / Cm2GemmPlan.MEDIUM_TILE_TOKENS, medium.get(1).global()[1]);
+        assertEquals(Arrays.asList(Cm2GemmPlan.STAGE_KERNEL, "Q8_0_MatMul_CM2V"),
+                project(q8Weight("blk.0.attn_q.weight", 2048, 1024), 1024, tokens));
+        assertEquals(Arrays.asList(Cm2GemmPlan.STAGE_KERNEL, "Q8_0_MatMul_CM2V_KSplit", GemmKernels.SPLIT_K_REDUCE),
+                project(q8Weight("blk.0.attn_output.weight", 1024, 2048), 2048, tokens));
+        assertEquals(Arrays.asList(Cm2GemmPlan.STAGE_KERNEL, "F16_MatMul_CM2_N128"),
+                project(GpuWeight.of("blk.0.attn_v.weight", GGMLType.F16, new long[]{1024, 1024},
+                        backend.allocateBuffer(1024L * 1024 * Short.BYTES, true)), 1024, tokens));
+    }
+
+    @Test
+    public void prewarmPreparesTheDecodeVectorPair() {
+        open(true, true, 256);
+        ops.prewarmWeightKernels(GGMLType.Q8_0, true, false);
+        List<String> prepared = backend.preparedKernels();
+        for (String kernel : new String[]{"Q8_0_MatMul_CM2V", "Q8_0_MatMul_CM2V_KSplit", "Q8_0_MatMul_CM2V_N128",
+                Cm2GemmPlan.STAGE_KERNEL}) {
+            assertTrue(prepared.toString(), prepared.contains(kernel));
+        }
+        assertFalse(prepared.toString(), prepared.contains("Q8_0_MatMul_CM2"));
     }
 
     @Test

@@ -8,7 +8,9 @@
 # split-K twin (shaders/llm/matmul_mmq_cm.comp; their portable scalar rows are kernels/llm/matmul_cm.cl),
 # the split-K reduce (kernels/llm/split_k_reduce.cl), and the workgroup-scope cooperative-matrix GEMM of
 # VK_NV_cooperative_matrix2 over the quantized types and dense F16 (shaders/llm/matmul_mmq_cm2.comp; the
-# F16 rows load the halves directly, NF_CM2_DENSE) with its fp16 activation staging
+# F16 rows load the halves directly, NF_CM2_DENSE; the _CM2V rows decode four weight elements per callback through
+# VK_NV_cooperative_matrix_decode_vector, NF_CM2_DECODE_VECTOR; the _N128 rows run the 128-token tile, NF_CM2_BN=128,
+# without a split-K twin) with its fp16 activation staging
 # (shaders/llm/stage_f16.comp). Both are Vulkan-only (flag vulkan: no OpenCL twin, no Metal translation,
 # exempt from the inventory and coverage checks); vk13 compiles a row for the Vulkan 1.3 environment,
 # and noopt keeps the CM2 modules as glslc emits them: spirv-opt flattens their unrolled tensor loads and
@@ -198,5 +200,50 @@ Q6_K_MatMul_CM2	matmul_mmq_cm2.comp	QTYPE=QT_Q6_K	vk13,vulkan,noopt
 Q6_K_MatMul_CM2_KSplit	matmul_mmq_cm2.comp	NF_SPLIT_K=1 QTYPE=QT_Q6_K	vk13,vulkan,noopt
 I8_B128_MatMul_CM2	matmul_mmq_cm2.comp	QTYPE=QT_I8_B128	vk13,vulkan,noopt
 I8_B128_MatMul_CM2_KSplit	matmul_mmq_cm2.comp	NF_SPLIT_K=1 QTYPE=QT_I8_B128	vk13,vulkan,noopt
+Q4_0_MatMul_CM2V	matmul_mmq_cm2.comp	QTYPE=QT_Q4_0 NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+Q4_0_MatMul_CM2V_KSplit	matmul_mmq_cm2.comp	NF_SPLIT_K=1 QTYPE=QT_Q4_0 NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+Q4_0_MatMul_CM2_N128	matmul_mmq_cm2.comp	QTYPE=QT_Q4_0 NF_CM2_BN=128	vk13,vulkan,noopt
+Q4_0_MatMul_CM2V_N128	matmul_mmq_cm2.comp	QTYPE=QT_Q4_0 NF_CM2_DECODE_VECTOR=1 NF_CM2_BN=128	vk13,vulkan,noopt
+Q4_1_MatMul_CM2V	matmul_mmq_cm2.comp	QTYPE=QT_Q4_1 NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+Q4_1_MatMul_CM2V_KSplit	matmul_mmq_cm2.comp	NF_SPLIT_K=1 QTYPE=QT_Q4_1 NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+Q4_1_MatMul_CM2_N128	matmul_mmq_cm2.comp	QTYPE=QT_Q4_1 NF_CM2_BN=128	vk13,vulkan,noopt
+Q4_1_MatMul_CM2V_N128	matmul_mmq_cm2.comp	QTYPE=QT_Q4_1 NF_CM2_DECODE_VECTOR=1 NF_CM2_BN=128	vk13,vulkan,noopt
+Q5_0_MatMul_CM2V	matmul_mmq_cm2.comp	QTYPE=QT_Q5_0 NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+Q5_0_MatMul_CM2V_KSplit	matmul_mmq_cm2.comp	NF_SPLIT_K=1 QTYPE=QT_Q5_0 NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+Q5_0_MatMul_CM2_N128	matmul_mmq_cm2.comp	QTYPE=QT_Q5_0 NF_CM2_BN=128	vk13,vulkan,noopt
+Q5_0_MatMul_CM2V_N128	matmul_mmq_cm2.comp	QTYPE=QT_Q5_0 NF_CM2_DECODE_VECTOR=1 NF_CM2_BN=128	vk13,vulkan,noopt
+Q5_1_MatMul_CM2V	matmul_mmq_cm2.comp	QTYPE=QT_Q5_1 NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+Q5_1_MatMul_CM2V_KSplit	matmul_mmq_cm2.comp	NF_SPLIT_K=1 QTYPE=QT_Q5_1 NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+Q5_1_MatMul_CM2_N128	matmul_mmq_cm2.comp	QTYPE=QT_Q5_1 NF_CM2_BN=128	vk13,vulkan,noopt
+Q5_1_MatMul_CM2V_N128	matmul_mmq_cm2.comp	QTYPE=QT_Q5_1 NF_CM2_DECODE_VECTOR=1 NF_CM2_BN=128	vk13,vulkan,noopt
+Q8_0_MatMul_CM2V	matmul_mmq_cm2.comp	QTYPE=QT_Q8_0 NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+Q8_0_MatMul_CM2V_KSplit	matmul_mmq_cm2.comp	NF_SPLIT_K=1 QTYPE=QT_Q8_0 NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+Q8_0_MatMul_CM2_N128	matmul_mmq_cm2.comp	QTYPE=QT_Q8_0 NF_CM2_BN=128	vk13,vulkan,noopt
+Q8_0_MatMul_CM2V_N128	matmul_mmq_cm2.comp	QTYPE=QT_Q8_0 NF_CM2_DECODE_VECTOR=1 NF_CM2_BN=128	vk13,vulkan,noopt
+Q2_K_MatMul_CM2V	matmul_mmq_cm2.comp	QTYPE=QT_Q2_K NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+Q2_K_MatMul_CM2V_KSplit	matmul_mmq_cm2.comp	NF_SPLIT_K=1 QTYPE=QT_Q2_K NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+Q2_K_MatMul_CM2_N128	matmul_mmq_cm2.comp	QTYPE=QT_Q2_K NF_CM2_BN=128	vk13,vulkan,noopt
+Q2_K_MatMul_CM2V_N128	matmul_mmq_cm2.comp	QTYPE=QT_Q2_K NF_CM2_DECODE_VECTOR=1 NF_CM2_BN=128	vk13,vulkan,noopt
+Q3_K_MatMul_CM2V	matmul_mmq_cm2.comp	QTYPE=QT_Q3_K NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+Q3_K_MatMul_CM2V_KSplit	matmul_mmq_cm2.comp	NF_SPLIT_K=1 QTYPE=QT_Q3_K NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+Q3_K_MatMul_CM2_N128	matmul_mmq_cm2.comp	QTYPE=QT_Q3_K NF_CM2_BN=128	vk13,vulkan,noopt
+Q3_K_MatMul_CM2V_N128	matmul_mmq_cm2.comp	QTYPE=QT_Q3_K NF_CM2_DECODE_VECTOR=1 NF_CM2_BN=128	vk13,vulkan,noopt
+Q4_K_MatMul_CM2V	matmul_mmq_cm2.comp	QTYPE=QT_Q4_K NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+Q4_K_MatMul_CM2V_KSplit	matmul_mmq_cm2.comp	NF_SPLIT_K=1 QTYPE=QT_Q4_K NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+Q4_K_MatMul_CM2_N128	matmul_mmq_cm2.comp	QTYPE=QT_Q4_K NF_CM2_BN=128	vk13,vulkan,noopt
+Q4_K_MatMul_CM2V_N128	matmul_mmq_cm2.comp	QTYPE=QT_Q4_K NF_CM2_DECODE_VECTOR=1 NF_CM2_BN=128	vk13,vulkan,noopt
+Q5_K_MatMul_CM2V	matmul_mmq_cm2.comp	QTYPE=QT_Q5_K NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+Q5_K_MatMul_CM2V_KSplit	matmul_mmq_cm2.comp	NF_SPLIT_K=1 QTYPE=QT_Q5_K NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+Q5_K_MatMul_CM2_N128	matmul_mmq_cm2.comp	QTYPE=QT_Q5_K NF_CM2_BN=128	vk13,vulkan,noopt
+Q5_K_MatMul_CM2V_N128	matmul_mmq_cm2.comp	QTYPE=QT_Q5_K NF_CM2_DECODE_VECTOR=1 NF_CM2_BN=128	vk13,vulkan,noopt
+Q6_K_MatMul_CM2V	matmul_mmq_cm2.comp	QTYPE=QT_Q6_K NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+Q6_K_MatMul_CM2V_KSplit	matmul_mmq_cm2.comp	NF_SPLIT_K=1 QTYPE=QT_Q6_K NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+Q6_K_MatMul_CM2_N128	matmul_mmq_cm2.comp	QTYPE=QT_Q6_K NF_CM2_BN=128	vk13,vulkan,noopt
+Q6_K_MatMul_CM2V_N128	matmul_mmq_cm2.comp	QTYPE=QT_Q6_K NF_CM2_DECODE_VECTOR=1 NF_CM2_BN=128	vk13,vulkan,noopt
+I8_B128_MatMul_CM2V	matmul_mmq_cm2.comp	QTYPE=QT_I8_B128 NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+I8_B128_MatMul_CM2V_KSplit	matmul_mmq_cm2.comp	NF_SPLIT_K=1 QTYPE=QT_I8_B128 NF_CM2_DECODE_VECTOR=1	vk13,vulkan,noopt
+I8_B128_MatMul_CM2_N128	matmul_mmq_cm2.comp	QTYPE=QT_I8_B128 NF_CM2_BN=128	vk13,vulkan,noopt
+I8_B128_MatMul_CM2V_N128	matmul_mmq_cm2.comp	QTYPE=QT_I8_B128 NF_CM2_DECODE_VECTOR=1 NF_CM2_BN=128	vk13,vulkan,noopt
 F16_MatMul_CM2	matmul_mmq_cm2.comp	QTYPE=QT_F16 NF_CM2_DENSE=1	vk13,vulkan,noopt
 F16_MatMul_CM2_KSplit	matmul_mmq_cm2.comp	NF_SPLIT_K=1 QTYPE=QT_F16 NF_CM2_DENSE=1	vk13,vulkan,noopt
+F16_MatMul_CM2_N128	matmul_mmq_cm2.comp	QTYPE=QT_F16 NF_CM2_DENSE=1 NF_CM2_BN=128	vk13,vulkan,noopt

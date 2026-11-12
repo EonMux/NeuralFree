@@ -32,22 +32,24 @@ import static org.junit.Assert.assertTrue;
  * {@link SubgroupMmqGemm#TYPES}, on every device whose kernels include it ({@link SubgroupFormBackends}): the OpenCL
  * kernel of kernels/llm/matmul_mmq_sg.cl and its Vulkan port shaders/llm/matmul_mmq_sg.comp (the Intel GPUs; other
  * devices skip). Each case hand-builds weight rows of the type (Q8_0: codes over the full -128..127 range and f16
- * scales; Q4_0: every nibble, f16 scales; Q4_K: random 6-bit scales and minimums in the packed 12-byte table, f16 d and
- * dmin, every nibble; Q5_K: the same with every fifth bit; Q6_K: every 6-bit code, int8 sub-block scales over
- * -128..127, f16 d, and 210-byte blocks that leave rows and odd blocks 2 bytes off a word) and staged 16-deep Q8_1
+ * scales; Q4_0: every nibble, f16 scales; Q4_1, Q5_0, Q5_1: every nibble and fifth bit, f16 scales and negative
+ * minimums; Q4_K: random 6-bit scales and minimums in the packed 12-byte table, f16 d and dmin, every nibble; Q5_K:
+ * the same with every fifth bit; Q6_K: every 6-bit code, int8 sub-block scales over -128..127, f16 d, and 210-byte
+ * blocks that leave rows and odd blocks 2 bytes off a word) and staged 16-deep Q8_1
  * records (codes, scale, code sum, zero point 0) at a record offset and row stride, runs the kernel at its launch
  * geometry and requires:
  * <ul>
  *   <li>every output within the fp32 summation bound of the exact reference computed in double from the same
- *       bytes (the -8 code offset of Q4_0, the K-quant scales decoded as ggml does: get_scale_min_k4 for Q4_K and
- *       Q5_K, the int8 scales and the -32 code offset for Q6_K), and within twice that bound of the portable
+ *       bytes (the -8 code offset of Q4_0, -16 of Q5_0, the added minimum of Q4_1 and Q5_1, the K-quant scales
+ *       decoded as ggml does: get_scale_min_k4 for Q4_K and Q5_K, the int8 scales and the -32 code offset for Q6_K),
+ *       and within twice that bound of the portable
  *       {@code {T}_MatMul_MMQ} over the same records;</li>
  *   <li>output cells outside the {@code [y_off, y_off + (N-1) y_stride + M)} rows and the gaps of a wide
  *       {@code y_stride} untouched;</li>
  *   <li>bit-identical results across two launches, and a token's outputs bit-identical whether it runs alone or in
  *       a wide launch (the tile position does not change a row's summation order).</li>
  * </ul>
- * The shapes cover partial row tiles, one and several stages and super-blocks (Q8_0 and Q4_0 K 64, 192, 1024; the
+ * The shapes cover partial row tiles, one and several stages and super-blocks (32-element types K 64, 192, 1024; the
  * K-quants K 256, 512, 768, 2560), and token counts on both sides of the 32-token tile (1, 5, 31, 32, 33, 77). The
  * split-K twin {@code {T}_MatMulSg_MMQ_KSplit} (OpenCL) must hold each slice's exact product in its plane.
  *
@@ -120,7 +122,7 @@ public class SubgroupMmqGemmGpuTest {
         Assume.assumeTrue("no " + api + " device builds " + SubgroupMmqGemm.kernel(type), served > 0);
     }
 
-    /** Whether a stage of the type is a 32-element block pair (Q8_0, Q4_0) rather than a super-block quarter. */
+    /** Whether a stage of the type is a 32-element block pair rather than a super-block quarter. */
     private boolean pairStaged() {
         return type.getBlockSize() == 32;
     }
@@ -414,8 +416,8 @@ public class SubgroupMmqGemmGpuTest {
     }
 
     /**
-     * The terms whose sum is weight element e of the row at byte rowBase: the scaled code and, for Q4_K and Q5_K, the
-     * negated minimum (kept apart so the magnitude bound sees both).
+     * The terms whose sum is weight element e of the row at byte rowBase: the scaled code and, for Q4_1 and Q5_1, the
+     * minimum, for Q4_K and Q5_K the negated minimum (kept apart so the magnitude bound sees both).
      */
     private static double[] weightTerms(GGMLType type, byte[] w, long rowBase, int e) {
         switch (type) {
@@ -428,6 +430,24 @@ public class SubgroupMmqGemmGpuTest {
                 int qs = w[base + 2 + e % 16] & 0xFF;
                 int code = (e % 32) < 16 ? qs & 0xF : qs >>> 4;
                 return new double[]{f16(u16(w, base)) * (code - 8)};
+            }
+            case Q4_1: {
+                int base = (int) (rowBase + (long) (e / 32) * 20);
+                int qs = w[base + 4 + e % 16] & 0xFF;
+                int code = (e % 32) < 16 ? qs & 0xF : qs >>> 4;
+                return new double[]{f16(u16(w, base)) * code, f16(u16(w, base + 2))};
+            }
+            case Q5_0: {
+                int base = (int) (rowBase + (long) (e / 32) * 22);
+                int qs = w[base + 6 + e % 16] & 0xFF;
+                int code = ((e % 32) < 16 ? qs & 0xF : qs >>> 4) | (qhBit(w, base + 2, e % 32) << 4);
+                return new double[]{f16(u16(w, base)) * (code - 16)};
+            }
+            case Q5_1: {
+                int base = (int) (rowBase + (long) (e / 32) * 24);
+                int qs = w[base + 8 + e % 16] & 0xFF;
+                int code = ((e % 32) < 16 ? qs & 0xF : qs >>> 4) | (qhBit(w, base + 4, e % 32) << 4);
+                return new double[]{f16(u16(w, base)) * code, f16(u16(w, base + 2))};
             }
             case Q5_K: {
                 int base = (int) (rowBase + (long) (e / 256) * 176);
@@ -463,6 +483,11 @@ public class SubgroupMmqGemmGpuTest {
             default:
                 throw new IllegalArgumentException("no reference for " + type);
         }
+    }
+
+    /** Bit j of the little-endian 32-bit qh word at q (the fifth bit of element j of a Q5_0 or Q5_1 block). */
+    private static int qhBit(byte[] w, int q, int j) {
+        return ((w[q + j / 8] & 0xFF) >>> (j % 8)) & 1;
     }
 
     /** {scale, min} of Q4_K sub-block j from the 12-byte table at q, as ggml's get_scale_min_k4. */
@@ -573,9 +598,10 @@ public class SubgroupMmqGemmGpuTest {
     }
 
     /**
-     * One block at base. Q8_0: f16 scale 2^-6 (1 + j/64), codes over -128..127 with both extremes forced. Q4_0: the
-     * same scale, the 16 code bytes uniformly random. Q4_K and Q5_K: f16 d and dmin of the same form, the 12 scale
-     * bytes and the code bytes (and Q5_K's 32 qh bytes) uniformly random (every 6-bit scale and minimum, every
+     * One block at base. Q8_0: f16 scale 2^-6 (1 + j/64), codes over -128..127 with both extremes forced. Q4_0 and
+     * Q5_0: the same scale, the code (and Q5_0 qh) bytes uniformly random. Q4_1 and Q5_1: the same scale, a negative
+     * f16 minimum -2^-7 (1 + j/64), the code (and qh) bytes uniformly random. Q4_K and Q5_K: f16 d and dmin of the
+     * same form, the 12 scale bytes and the code bytes (and Q5_K's 32 qh bytes) uniformly random (every 6-bit scale and minimum, every
      * code). Q6_K: ql and qh uniformly random (every 6-bit code), int8 scales over -128..127 with
      * both extremes forced, f16 d 2^-9 (1 + j/64).
      */
@@ -590,8 +616,17 @@ public class SubgroupMmqGemmGpuTest {
                 b[base + 3] = (byte) 127;
                 break;
             case Q4_0:
+            case Q5_0:
                 putF16(b, base, (9 << 10) | (rnd.nextInt(64) << 4));
-                for (int i = 2; i < 18; i++) {
+                for (int i = 2; i < type.getTypeSize(); i++) {
+                    b[base + i] = (byte) rnd.nextInt(256);
+                }
+                break;
+            case Q4_1:
+            case Q5_1:
+                putF16(b, base, (9 << 10) | (rnd.nextInt(64) << 4));
+                putF16(b, base + 2, 0x8000 | (8 << 10) | (rnd.nextInt(64) << 4));
+                for (int i = 4; i < type.getTypeSize(); i++) {
                     b[base + i] = (byte) rnd.nextInt(256);
                 }
                 break;

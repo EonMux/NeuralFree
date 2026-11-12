@@ -12,6 +12,16 @@
  * OpenCL names with a _CM2 suffix, e.g.
  *     Q4_K_MatMul_CM2	matmul_mmq_cm2.comp	QTYPE=QT_Q4_K	vk13,vulkan
  *     Q4_K_MatMul_CM2_KSplit	matmul_mmq_cm2.comp	NF_SPLIT_K=1 QTYPE=QT_Q4_K	vk13,vulkan
+ * With NF_CM2_DECODE_VECTOR=1 (kernel suffix _CM2V) a quantized weight tile also passes the four-element decode
+ * callback mmq_ref_decode4 (VK_NV_cooperative_matrix_decode_vector, GL_NV_cooperative_matrix_decode_vector, as
+ * llama.cpp's dequantFuncA_v): the driver decodes four consecutive elements of a row per call instead of one, the
+ * block header and code word read once for the four. Its values equal the per-element callback's element for
+ * element, so the two forms store the same outputs; the host runs it on devices that report
+ * DeviceFeature.COOPERATIVE_MATRIX_2_DECODE_VECTOR.
+ * With NF_CM2_BN=128 (kernel suffix _N128, no split-K twin) the tile spans 128 tokens instead of 256, as llama.cpp's
+ * medium coopmat2 tile: twice the workgroups over the same rows, for a grid too small to fill the device that split-K
+ * does not widen. Every output element accumulates over the same stages as in the 256-token tile, so the two store
+ * the same values.
  *
  * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
  *   plain:  (i M, i K, i N, i x_stride, i x_off, i y_stride, i y_off, R weight, R half x, W float y)
@@ -20,7 +30,8 @@
  *   the fp16 activation rows of LLM_Stage_F16_Rows: offsets and strides in halves, both multiples of 8
  *   (16-byte aligned rows), and ceil(N / NF_CM2_BN) * NF_CM2_BN rows, the ones past N zero. The split-K
  *   twin writes partial[(slice * N + t) * M + r] for k in slice * k_slice .. +k_slice (k_slice a
- *   multiple of NF_CM2_BK), slice taken from the work-group id, and LLM_SplitK_Reduce sums the planes.
+ *   multiple of NF_CM2_BK; the host's are multiples of NF_CM2_START_ALIGN), slice taken from the work-group id, and
+ *   LLM_SplitK_Reduce sums the planes.
  *
  * Compute: fp16 x fp16 cooperative matrix products of NF_CM2_BK reduction elements per stage
  * over an NF_CM2_BM x NF_CM2_BN (rows x tokens) tile. The weight tile decodes through
@@ -57,6 +68,9 @@
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_NV_cooperative_matrix2 : require
 #extension GL_EXT_buffer_reference : require
+#ifdef NF_CM2_DECODE_VECTOR
+#extension GL_NV_cooperative_matrix_decode_vector : require
+#endif
 
 #include "common/nf_common.glsl"
 
@@ -65,10 +79,16 @@
 #endif
 
 #define NF_CM2_BM 128                         /* weight rows per workgroup tile */
+#ifndef NF_CM2_BN
 #define NF_CM2_BN 256                         /* tokens per workgroup tile */
+#endif
 #define NF_CM2_BK 64                          /* reduction depth of one stage */
 #define NF_CM2_WG 256u                        /* invocations per workgroup: the dispatch's local size */
 #define MMQ_REF_SCALE_ROWS uint(NF_CM2_BM)    /* Q4_K and Q5_K stage their scales per tile row */
+/* Alignment of an interior tile's k range start, in reduction elements (Cm2GemmPlan.SPLIT_SLICE_ALIGN): a K-quant
+ * super-block and a multiple of every block size, so the split-K slices the host rounds to it take the aligned
+ * unclamped loads; a slice starting elsewhere takes the clamped stage-by-stage loads. */
+#define NF_CM2_START_ALIGN 256u
 
 #ifdef NF_CM2_DENSE
 /* Dense fp16 weights: the tensor layout reads the halves directly, one element per layout "block". The rows
@@ -175,12 +195,7 @@ void main() {
     const uint stride_d = uint(pc.y_stride);
 #endif
     const uint n0 = gl_WorkGroupID.y * NF_CM2_BN;
-#ifdef MMQ_REF_STAGED
-    const bool block_start = kb % uint(MMQ_BS) == 0u;
-#else
-    const bool block_start = true;
-#endif
-    const bool interior = m0 + NF_CM2_BM <= M && (ke - kb) % NF_CM2_BK == 0u && block_start;
+    const bool interior = m0 + NF_CM2_BM <= M && (ke - kb) % NF_CM2_BK == 0u && kb % NF_CM2_START_ALIGN == 0u;
     if (n0 + NF_CM2_BN / 4u >= N) {
         nf_cm2_tile_quarter(m0, n0, kb, ke, pos_d, stride_d, interior);
     } else if (n0 + NF_CM2_BN / 2u >= N) {

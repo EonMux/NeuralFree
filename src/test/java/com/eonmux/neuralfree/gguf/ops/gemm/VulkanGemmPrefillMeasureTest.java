@@ -24,10 +24,10 @@ import java.util.Locale;
  * the Vulkan device whose name contains {@code -Dneuralfree.test.vk.gemm.measure.device} (default NVIDIA). Per
  * weight type and decoder projection shape it interleaves rounds of the lanes the dispatch can pick at
  * {@value #TOKENS} tokens — the int8 MMQ GEMM with its activation staging, the fp16-tile KHR CM GEMM and the
- * VK_NV_cooperative_matrix2 CM2 GEMM with its activation staging, whole and as the split-K launch the dispatch's
- * heuristic ({@link SplitKGemmPlan#of(Cm2GemmPlan, int, int)}) makes of it where it splits — and prints the median
- * microseconds per launch with the achieved TFLOPS. Asserts nothing; the numbers set the lane, the tile and the
- * split.
+ * VK_NV_cooperative_matrix2 CM2 GEMM with its activation staging (and its four-element decode form CM2V), whole, on
+ * its 128-token tile, as the split-K launch the dispatch's heuristic ({@link SplitKGemmPlan#of(Cm2GemmPlan, int, int)})
+ * makes of it where it splits and at fixed slice counts — and prints the median microseconds per launch with the
+ * achieved TFLOPS. Asserts nothing; the numbers set the lane, the tile and the split.
  */
 public class VulkanGemmPrefillMeasureTest {
 
@@ -35,16 +35,28 @@ public class VulkanGemmPrefillMeasureTest {
     public static final String MEASURE_PROPERTY = "neuralfree.test.vk.gemm.measure";
     /** System property naming a substring of the measured device. */
     public static final String DEVICE_PROPERTY = "neuralfree.test.vk.gemm.measure.device";
+    /** System property listing the measured weight types, comma-separated (default {@link #TYPES}). */
+    public static final String TYPES_PROPERTY = "neuralfree.test.vk.gemm.measure.types";
+    /** System property listing the measured shapes as comma-separated {@code ROWSxCOLS} (default {@link #SHAPES}). */
+    public static final String SHAPES_PROPERTY = "neuralfree.test.vk.gemm.measure.shapes";
+    /** System property that adds, per fixed split lane, its partial launch alone and the whole-K kernel over one
+     *  slice's depth: the split's own cost against the work each of its slices does. */
+    public static final String DIAGNOSE_PROPERTY = "neuralfree.test.vk.gemm.measure.diagnose";
     private static final int TOKENS = 512;
     private static final int ROUNDS = 7;
     private static final int RUNS_PER_ROUND = 20;
     private static final int CLOCK_WARMUP_LAUNCHES = 400;
-    /** 0.6B and 4B decoder shapes {rows, cols}: q, kv, ffn in, ffn out. */
+    /** 0.6B and 4B decoder shapes {rows, cols}: q, kv, attention out, ffn in, ffn out. */
     private static final int[][] SHAPES = {
-        {2048, 1024}, {1024, 1024}, {3072, 1024}, {1024, 3072},
-        {4096, 2560}, {1024, 2560}, {9728, 2560}, {2560, 9728},
+        {2048, 1024}, {1024, 1024}, {1024, 2048}, {3072, 1024}, {1024, 3072},
+        {4096, 2560}, {1024, 2560}, {2560, 4096}, {9728, 2560}, {2560, 9728},
     };
     private static final GGMLType[] TYPES = {GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K};
+    /** Slice counts of the fixed CM2 split lanes, whose slices round up to {@value #SPLIT_SLICE_ALIGN} elements. */
+    private static final int[] MEASURED_SPLITS = {2, 3, 4};
+    private static final int MAX_MEASURED_SPLITS = 4;
+    /** Slice rounding of the fixed split lanes: llama.cpp's ggml_vk_matmul k_split rounding. */
+    private static final int SPLIT_SLICE_ALIGN = 256;
 
     private VkComputeBackend backend;
     private LlmKernels kernels;
@@ -83,16 +95,46 @@ public class VulkanGemmPrefillMeasureTest {
     public void measurePrefillLanes() throws InterruptedException {
         boolean cm = backend.capabilities().hasFeature(DeviceFeature.COOPERATIVE_MATRIX);
         boolean cm2 = backend.capabilities().hasFeature(DeviceFeature.COOPERATIVE_MATRIX_2);
-        System.out.printf(Locale.ROOT, "device %s: cooperative matrix %s, cooperative matrix 2 %s, %d tokens%n",
-                backend.capabilities().getDeviceName(), cm, cm2, TOKENS);
-        for (GGMLType type : TYPES) {
-            for (int[] shape : SHAPES) {
-                measureShape(type, shape[0], shape[1], cm, cm2);
+        boolean cm2v = backend.capabilities().hasFeature(DeviceFeature.COOPERATIVE_MATRIX_2_DECODE_VECTOR);
+        System.out.printf(Locale.ROOT, "device %s: cooperative matrix %s, cooperative matrix 2 %s (decode vector %s),"
+                + " %d tokens%n", backend.capabilities().getDeviceName(), cm, cm2, cm2v, TOKENS);
+        for (GGMLType type : measuredTypes()) {
+            for (int[] shape : measuredShapes()) {
+                measureShape(type, shape[0], shape[1], cm, cm2, cm2v);
             }
         }
     }
 
-    private void measureShape(GGMLType type, int m, int k, boolean cm, boolean cm2) throws InterruptedException {
+    private static List<GGMLType> measuredTypes() {
+        String value = System.getProperty(TYPES_PROPERTY, "").trim();
+        if (value.isEmpty()) {
+            return Arrays.asList(TYPES);
+        }
+        List<GGMLType> types = new ArrayList<>();
+        for (String name : value.split(",")) {
+            types.add(GGMLType.valueOf(name.trim()));
+        }
+        return types;
+    }
+
+    private static List<int[]> measuredShapes() {
+        String value = System.getProperty(SHAPES_PROPERTY, "").trim();
+        if (value.isEmpty()) {
+            return Arrays.asList(SHAPES);
+        }
+        List<int[]> shapes = new ArrayList<>();
+        for (String shape : value.split(",")) {
+            String[] dims = shape.trim().split("x");
+            if (dims.length != 2) {
+                throw new IllegalArgumentException(SHAPES_PROPERTY + " takes ROWSxCOLS entries, got '" + shape + "'");
+            }
+            shapes.add(new int[]{Integer.parseInt(dims[0]), Integer.parseInt(dims[1])});
+        }
+        return shapes;
+    }
+
+    private void measureShape(GGMLType type, int m, int k, boolean cm, boolean cm2, boolean cm2v)
+            throws InterruptedException {
         int n = TOKENS;
         byte[] weight = OpenClMmqGemmParityTest.buildWeight(type, m, k);
         float[] x = OpenClMmqGemmParityTest.buildX(n, k);
@@ -103,9 +145,12 @@ public class VulkanGemmPrefillMeasureTest {
         MmqGemmPlan mmq = MmqGemmPlan.contiguous(mmqConfig, type, m, k, n);
         GpuBuffer qbuf = backend.allocateBuffer(mmq.q8ElementsRequired() * Integer.BYTES);
         GpuBuffer ybuf = backend.allocateBuffer((long) n * m * Float.BYTES);
-        SplitKGemmPlan split = cm2Plan == null ? null
-                : SplitKGemmPlan.of(cm2Plan, backend.capabilities().getComputeUnits(), kernels.rowReduceLocal());
-        GpuBuffer pbuf = backend.allocateBuffer(split == null ? 4 : split.partialElements() * Float.BYTES);
+        /* the heuristic's split of the form the dispatch runs: the decode-vector form where the device has it */
+        Cm2GemmPlan dispatched = cm2Plan == null || !(cm2v && GemmKernels.hasCm2DecodeVector(type)) ? cm2Plan
+                : Cm2GemmPlan.of(type, true, m, k, n, k, 0, m, 0);
+        SplitKGemmPlan split = dispatched == null ? null
+                : SplitKGemmPlan.of(dispatched, backend.capabilities().getComputeUnits(), kernels.rowReduceLocal());
+        GpuBuffer pbuf = backend.allocateBuffer(partialBufferFloats(split, n, m) * Float.BYTES);
         try {
             try (GpuEvent wv = queue.enqueueWriteBuffer(wbuf, 0, weight.length, weight);
                  GpuEvent xv = queue.enqueueWriteBuffer(xbuf, 0, (long) x.length * Float.BYTES, x, wv)) {
@@ -136,8 +181,19 @@ public class VulkanGemmPrefillMeasureTest {
                     queue.enqueueKernelNoEvent(kernels.get(cm2Plan.kernelName()), cm2Plan.globalWorkSize(),
                             cm2Plan.localWorkSize(), cm2Plan.args(wbuf, hbuf, ybuf));
                 });
+                if (cm2v && GemmKernels.hasCm2DecodeVector(type)) {
+                    Cm2GemmPlan vector = Cm2GemmPlan.of(type, true, m, k, n, k, 0, m, 0);
+                    names.add("CM2V+stage");
+                    lanes.add(() -> {
+                        queue.enqueueKernelNoEvent(kernels.get(Cm2GemmPlan.STAGE_KERNEL),
+                                cm2Plan.stageGlobalWorkSize(), Cm2GemmPlan.stageLocalWorkSize(),
+                                cm2Plan.stageArgs(xbuf, hbuf));
+                        queue.enqueueKernelNoEvent(kernels.get(vector.kernelName()), vector.globalWorkSize(),
+                                vector.localWorkSize(), vector.args(wbuf, hbuf, ybuf));
+                    });
+                }
                 if (split != null && kernels.has(split.kernelName())) {
-                    names.add("CM2x" + split.splits() + "+stage");
+                    names.add(split.family() + "x" + split.splits() + "+stage");
                     lanes.add(() -> {
                         queue.enqueueKernelNoEvent(kernels.get(Cm2GemmPlan.STAGE_KERNEL),
                                 cm2Plan.stageGlobalWorkSize(), Cm2GemmPlan.stageLocalWorkSize(),
@@ -149,6 +205,8 @@ public class VulkanGemmPrefillMeasureTest {
                                 split.reduceArgs(pbuf, ybuf, m, 0));
                     });
                 }
+                addAlignedSplits(type, m, k, cm2Plan, cm2v, names, lanes, wbuf, xbuf, hbuf, pbuf, ybuf);
+                addMediumTile(type, m, k, cm2Plan, cm2v, names, lanes, wbuf, xbuf, hbuf, ybuf);
             }
             for (int i = 0; i < CLOCK_WARMUP_LAUNCHES / lanes.size(); i++) {
                 for (Runnable lane : lanes) {
@@ -185,5 +243,89 @@ public class VulkanGemmPrefillMeasureTest {
             ybuf.close();
             pbuf.close();
         }
+    }
+
+    /**
+     * Floats of the slice planes buffer every split lane of an {@code m x n} shape writes: the fixed lanes' up to
+     * {@link #MAX_MEASURED_SPLITS} planes, and the heuristic's ({@code heuristic}, null when the shape has no CM2
+     * lane), which splits a small grid into up to {@link SplitKGemmPlan#MAX_SPLITS} slices.
+     */
+    static long partialBufferFloats(SplitKGemmPlan heuristic, int n, int m) {
+        int planes = Math.max(MAX_MEASURED_SPLITS, heuristic == null ? 1 : heuristic.splits());
+        return (long) planes * n * m;
+    }
+
+    /**
+     * Lanes of the CM2 split-K launch at fixed slice counts ({@link #MEASURED_SPLITS}) whose slices round up to
+     * {@value #SPLIT_SLICE_ALIGN} reduction elements, as llama.cpp's coopmat2 split rounds its k_split, in both decode
+     * forms where the device has the four-element one: they set the CM2 split rule against the heuristic's lane.
+     */
+    private void addAlignedSplits(GGMLType type, int m, int k, Cm2GemmPlan cm2Plan, boolean cm2v, List<String> names,
+                                  List<Runnable> lanes, GpuBuffer wbuf, GpuBuffer xbuf, GpuBuffer hbuf,
+                                  GpuBuffer pbuf, GpuBuffer ybuf) {
+        if (k < SplitKGemmPlan.MIN_SPLIT_K) {
+            return;
+        }
+        List<SplitKGemmPlan.Family> families = new ArrayList<>();
+        families.add(SplitKGemmPlan.Family.CM2);
+        if (cm2v && GemmKernels.hasCm2DecodeVector(type)) {
+            families.add(SplitKGemmPlan.Family.CM2V);
+        }
+        for (int splits : MEASURED_SPLITS) {
+            for (int align : new int[]{SPLIT_SLICE_ALIGN, Cm2GemmPlan.TILE_DEPTH}) {
+                addSplit(type, m, k, splits, align, align == SPLIT_SLICE_ALIGN ? families
+                        : List.of(SplitKGemmPlan.Family.CM2), cm2Plan, names, lanes, wbuf, xbuf, hbuf, pbuf, ybuf);
+            }
+        }
+    }
+
+    private void addSplit(GGMLType type, int m, int k, int splits, int align, List<SplitKGemmPlan.Family> families,
+                          Cm2GemmPlan cm2Plan, List<String> names, List<Runnable> lanes, GpuBuffer wbuf,
+                          GpuBuffer xbuf, GpuBuffer hbuf, GpuBuffer pbuf, GpuBuffer ybuf) {
+        int slice = SplitKGemmPlan.sliceLength(k, splits, align);
+        if ((long) slice * (splits - 1) >= k) {
+            return;
+        }
+        boolean diagnose = Boolean.getBoolean(DIAGNOSE_PROPERTY);
+        for (SplitKGemmPlan.Family family : families) {
+            SplitKGemmPlan plan = SplitKGemmPlan.of(family, type, m, k, TOKENS, k, 0, splits, slice,
+                    Cm2GemmPlan.TILE_TOKENS, kernels.rowReduceLocal());
+            names.add(family + "x" + splits + "/" + align + "+stage");
+            lanes.add(() -> {
+                queue.enqueueKernelNoEvent(kernels.get(Cm2GemmPlan.STAGE_KERNEL), cm2Plan.stageGlobalWorkSize(),
+                        Cm2GemmPlan.stageLocalWorkSize(), cm2Plan.stageArgs(xbuf, hbuf));
+                queue.enqueueKernelNoEvent(kernels.get(plan.kernelName()), plan.partialGlobalWorkSize(),
+                        plan.partialLocalWorkSize(), plan.partialArgs(wbuf, hbuf, pbuf));
+                queue.enqueueKernelNoEvent(kernels.get(GemmKernels.SPLIT_K_REDUCE), plan.reduceGlobalWorkSize(),
+                        plan.reduceLocalWorkSize(), plan.reduceArgs(pbuf, ybuf, m, 0));
+            });
+            if (diagnose) {
+                names.add(family + "x" + splits + "/" + align + " partial");
+                lanes.add(() -> queue.enqueueKernelNoEvent(kernels.get(plan.kernelName()),
+                        plan.partialGlobalWorkSize(), plan.partialLocalWorkSize(), plan.partialArgs(wbuf, hbuf, pbuf)));
+                Cm2GemmPlan first = Cm2GemmPlan.of(type, family == SplitKGemmPlan.Family.CM2V, m, slice, TOKENS, k, 0,
+                        m, 0);
+                names.add(family + " k=" + slice);
+                lanes.add(() -> queue.enqueueKernelNoEvent(kernels.get(first.kernelName()), first.globalWorkSize(),
+                        first.localWorkSize(), first.args(wbuf, hbuf, ybuf)));
+            }
+        }
+    }
+
+    /** The lane of the 128-token CM2 tile ({@code _N128}) in the form the device runs, whole. */
+    private void addMediumTile(GGMLType type, int m, int k, Cm2GemmPlan cm2Plan, boolean cm2v, List<String> names,
+                               List<Runnable> lanes, GpuBuffer wbuf, GpuBuffer xbuf, GpuBuffer hbuf, GpuBuffer ybuf) {
+        boolean vector = cm2v && GemmKernels.hasCm2DecodeVector(type);
+        Cm2GemmPlan medium = Cm2GemmPlan.of(type, vector, Cm2GemmPlan.MEDIUM_TILE_TOKENS, m, k, TOKENS, k, 0, m, 0);
+        if (!kernels.has(medium.kernelName())) {
+            return;
+        }
+        names.add((vector ? "CM2V" : "CM2") + "/N128+stage");
+        lanes.add(() -> {
+            queue.enqueueKernelNoEvent(kernels.get(Cm2GemmPlan.STAGE_KERNEL), cm2Plan.stageGlobalWorkSize(),
+                    Cm2GemmPlan.stageLocalWorkSize(), cm2Plan.stageArgs(xbuf, hbuf));
+            queue.enqueueKernelNoEvent(kernels.get(medium.kernelName()), medium.globalWorkSize(),
+                    medium.localWorkSize(), medium.args(wbuf, hbuf, ybuf));
+        });
     }
 }

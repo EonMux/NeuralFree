@@ -7,9 +7,12 @@ import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
 import com.eonmux.neuralfree.acceleration.backend.cuda.CudaComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.ocl.OclComputeBackend;
+import com.eonmux.neuralfree.acceleration.backend.vulkan.VkComputeBackend;
 import com.eonmux.neuralfree.acceleration.cuda.CUDevice;
 import com.eonmux.neuralfree.acceleration.kernels.Availability;
 import com.eonmux.neuralfree.acceleration.ocl.CLDevice;
+import com.eonmux.neuralfree.acceleration.vulkan.VkInstanceManager;
+import com.eonmux.neuralfree.acceleration.vulkan.VkPhysicalDeviceInfo;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.quant.ActFakeQuant;
@@ -19,6 +22,8 @@ import org.junit.After;
 import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
+
+import java.util.List;
 
 import static org.junit.Assert.assertTrue;
 
@@ -90,6 +95,72 @@ public class Int8AsymStagingParityTest {
             }
         }
         assertTrue("failed types: " + bad, bad.length() == 0);
+    }
+
+    /**
+     * Every weight type's asymmetric combine in the Vulkan int8 MMQ GEMM ({@code <T>_MatMul_MMQ}, matmul_mmq.comp,
+     * whose stage dots are packed int8 dots that take the weight code sums only for a record with a zero point), on
+     * every Vulkan device whose LLM kernels load and that runs the module (it needs shaderIntegerDotProduct).
+     */
+    @Test
+    public void vulkanAsymStagingMatchesForEveryMmqTypeOnEveryDevice() throws Exception {
+        List<VkPhysicalDeviceInfo> devices;
+        VkInstanceManager manager;
+        try {
+            manager = VkInstanceManager.acquire();
+            devices = manager.devices();
+        } catch (RuntimeException | UnsatisfiedLinkError e) {
+            Assume.assumeTrue("Vulkan unavailable: " + e.getMessage(), false);
+            return;
+        }
+        StringBuilder bad = new StringBuilder();
+        int checked = 0;
+        try {
+            for (VkPhysicalDeviceInfo info : devices) {
+                checked += checkVulkanDevice(manager, info, bad);
+            }
+        } finally {
+            manager.release();
+        }
+        Assume.assumeTrue("no Vulkan device runs the int8 MMQ GEMM", checked > 0);
+        assertTrue("failed: " + bad, bad.length() == 0);
+    }
+
+    /** Checks every MMQ type on one device into {@code bad}; returns how many types ran. */
+    private int checkVulkanDevice(VkInstanceManager manager, VkPhysicalDeviceInfo info, StringBuilder bad)
+            throws Exception {
+        VkComputeBackend b;
+        try {
+            b = new VkComputeBackend(manager, info);
+        } catch (RuntimeException e) {
+            return 0;
+        }
+        backend = b;
+        try {
+            if (!LlmKernels.availability(b).available()) {
+                return 0;
+            }
+            queue = b.computeQueue();
+            kernels = LlmKernels.open(b);
+            MmqConfig config = MmqConfig.forDevice(b.backendType(), b.capabilities().getComputeCapability());
+            int ran = 0;
+            for (GGMLType type : GemmKernels.MMQ_TYPES) {
+                if (kernels.tryGet(GemmKernels.matmulMmq(type)) == null) {
+                    continue;
+                }
+                try {
+                    check(config, type, WIDE_M, WIDE_N);
+                    ran++;
+                } catch (AssertionError e) {
+                    bad.append(b.capabilities().getDeviceName()).append(' ').append(type).append(": ")
+                            .append(e.getMessage()).append(";\n");
+                }
+            }
+            return ran;
+        } finally {
+            backend = null;
+            b.close();
+        }
     }
 
     private void openOpenCl() {

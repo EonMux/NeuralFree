@@ -1,4 +1,4 @@
-/* matmul_mmq_sg.cl - subgroup-row int8 MMQ GEMM of Q8_0, Q4_0, Q4_K, Q5_K and Q6_K weights (OpenCL only). Requires: common/dialect.h, common/matmul_mmq_config.h */
+/* matmul_mmq_sg.cl - subgroup-row int8 MMQ GEMM of Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K and Q6_K weights (OpenCL only). Requires: common/dialect.h, common/matmul_mmq_config.h */
 /*
  * Q8_0_MatMulSg_MMQ computes what Q8_0_MatMul_MMQ (common/matmul_mmq_family.h) computes, with its argument list
  * and the same staged Q8_1 activation records (LLM_Quant_MMQ_Q8_1, NF_Q8_REC(16) units per 16-deep record), under
@@ -17,15 +17,16 @@
  *   words are shared across the lanes by constant-index shuffles, so each lane's 8 dp4a per block against that
  *   token cost no per-lane local traffic. One barrier per stage.
  *
- * Q4_0_MatMulSg_MMQ, Q4_K_MatMulSg_MMQ, Q5_K_MatMulSg_MMQ and Q6_K_MatMulSg_MMQ (below) compute what their
- * {T}_MatMul_MMQ twins compute under the same mapping, launch and records, a Q4_0 stage being a block pair and a
- * K-quant stage a quarter of a 256-element super-block.
+ * The Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K and Q6_K forms {T}_MatMulSg_MMQ (below) compute what their
+ * {T}_MatMul_MMQ twins compute under the same mapping, launch and records, a stage of a 32-element block type being
+ * a block pair and a K-quant stage a quarter of a 256-element super-block.
  *
  * Each output is one lane's fixed-order float sum over K, independent of N and of the tile position, so results
  * are deterministic; only the float summation order differs from the portable {T}_MatMul_MMQ's.
  *
- * Preconditions the host checks: K is a multiple of 64 (of 256 for the K-quants), so every Q8_0 and Q4_0 block pair
- * starts 4-byte aligned, the weight buffer starts 4-byte aligned, the records are symmetric (zero point unit 0) and
+ * Preconditions the host checks: K is a multiple of 64 (of 256 for the K-quants), so every block pair of the
+ * 32-element types starts 4-byte aligned, the weight buffer starts 4-byte aligned, the records are symmetric (zero
+ * point unit 0) and
  * 16 deep (NF_MMQ_TK == 16). The kernels exist only when the host defines NF_SG_ROW_SIZE (16) for a subgroup program
  * and the compiler offers subgroup block reads of local memory (cl_intel_subgroup_local_block_io).
  */
@@ -156,13 +157,13 @@ NF_INLINE void nf_sgm_q8_0(
 }
 
 
-/* ---- Offset forms: Q4_0_MatMulSg_MMQ, Q4_K_MatMulSg_MMQ, Q5_K_MatMulSg_MMQ and Q6_K_MatMulSg_MMQ. ----
+/* ---- Offset and minimum forms: {T}_MatMulSg_MMQ, T = Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K. ----
  *
  * The same work mapping, launch geometry and record consumption as Q8_0_MatMulSg_MMQ, with a 64-deep stage that is
- * a Q4_0 block pair, or quarter q = s % 4 of super-block s / 4 (K is a multiple of 256). The record gather of these
- * forms rewrites unit 6 (the zero point, 0 for the symmetric records the host admits) in local memory with the
- * activation side of the type's offset term, so the per-token work stays 8 dp4a per 32-deep half and no per-token
- * offset arithmetic:
+ * a block pair of a 32-element type, or quarter q = s % 4 of super-block s / 4 (K is a multiple of 256). The
+ * record gather of these forms rewrites unit 6 (the zero point, 0 for the symmetric records the host admits) in
+ * local memory with the activation side of the type's offset term, so the per-token work stays 8 dp4a per 32-deep
+ * half and no per-token offset arithmetic:
  * - Q4_K: W = d * sc * c - dmin * m with 4-bit codes c, so a 16-deep record r contributes
  *   dx_r * (d * sc * idot_r - dmin * m * sum_r). Unit 6 of both records of each 32-deep sub-block pair holds
  *   dx_r * sum_r + dx_(r+1) * sum_(r+1) (the pair is summed across adjacent lanes of the gather).
@@ -171,7 +172,9 @@ NF_INLINE void nf_sgm_q8_0(
  *   d * sc_r * dx_r * (idot_r - 32 * sum_r). Unit 6 holds -32 * sum_r, the initial value of the record's exact
  *   integer dot.
  * - Q4_0: W = d * (c - 8) with 4-bit codes c, so record r contributes d * dx_r * (idot_r - 8 * sum_r); unit 6
- *   holds -8 * sum_r, as for Q6_K.
+ *   holds -8 * sum_r, as for Q6_K; Q5_0 the same with 5-bit codes and -16 * sum_r.
+ * - Q4_1 and Q5_1: W = d * c + m, the Q4_K form over a 32-element block (a record pair) with d * sc = d and
+ *   -dmin * m = m.
  */
 
 /* Words of a 144-byte Q4_K block and bytes of a 210-byte Q6_K block. */
@@ -381,6 +384,119 @@ NF_INLINE void nf_sgm_q4_0(
     NF_SGM_STORE
 }
 
+/*
+ * The other 32-element block types, one block pair per stage like Q4_0, through one frame (NF_SGM_PAIR_FORM):
+ * - Q5_0 (22-byte blocks: d, qh[4], qs[16]): W = d * (c - 16) with 5-bit codes c, a nibble and one qh bit, so the
+ *   offset form serves it with unit 6 holding -16 * sum. The 44-byte pair is 11 words: block A's d is the low half
+ *   of word 0, its qh (w_0 >> 16) | (w_1 << 16) and its code word i (w_{1+i} >> 16) | (w_{2+i} << 16); block B's d
+ *   is the high half of word 5, its qh word 6 and its code words words 7..10.
+ * - Q4_1 (20-byte blocks: d, m, qs[16]): W = d * c + m with 4-bit codes, the Q4_K minimum form with d * sc = d and
+ *   -dmin * m = m over a 32-element block, a record pair. The 40-byte pair is 10 words: block A's header word 0
+ *   (d low, m high) and code words 1..4, block B's header word 5 and code words 6..9.
+ * - Q5_1 (24-byte blocks: d, m, qh[4], qs[16]): the Q4_1 form with 5-bit codes. The 48-byte pair is 12 words: block
+ *   A's header word 0, qh word 1 and code words 2..5, block B's header word 6, qh word 7 and code words 8..11.
+ * As in every block the low nibbles of a code word hold record r (elements 0..15) and the high nibbles record r + 1,
+ * so qh bits 0..15 complete record r and bits 16..31 record r + 1.
+ */
+
+/* qh bits 0..3 of h as bit 4 of the four bytes of a code word. */
+#define NF_SGM_FIFTH(h) (((((h) & 1u) | (((h) & 2u) << 7) | (((h) & 4u) << 14) | (((h) & 8u) << 21))) << 4)
+
+/* The 5-bit codes of a block's records: code words q0..q3 with the qh word h. */
+#define NF_SGM_CODES5(q0, q1, q2, q3, h) \
+    {(q0 & NF_SGM_NIB) | NF_SGM_FIFTH(h), (q1 & NF_SGM_NIB) | NF_SGM_FIFTH((h) >> 4), \
+     (q2 & NF_SGM_NIB) | NF_SGM_FIFTH((h) >> 8), (q3 & NF_SGM_NIB) | NF_SGM_FIFTH((h) >> 12), \
+     ((q0 >> 4) & NF_SGM_NIB) | NF_SGM_FIFTH((h) >> 16), ((q1 >> 4) & NF_SGM_NIB) | NF_SGM_FIFTH((h) >> 20), \
+     ((q2 >> 4) & NF_SGM_NIB) | NF_SGM_FIFTH((h) >> 24), ((q3 >> 4) & NF_SGM_NIB) | NF_SGM_FIFTH((h) >> 28)}
+
+/* The 4-bit codes of a block's records: code words q0..q3. */
+#define NF_SGM_CODES4(q0, q1, q2, q3) \
+    {q0 & NF_SGM_NIB, q1 & NF_SGM_NIB, q2 & NF_SGM_NIB, q3 & NF_SGM_NIB, (q0 >> 4) & NF_SGM_NIB, \
+     (q1 >> 4) & NF_SGM_NIB, (q2 >> 4) & NF_SGM_NIB, (q3 >> 4) & NF_SGM_NIB}
+
+/* Q5_0 unit 6: -16 * sum. */
+#define NF_SGM_Q50_FIX(g1) ((uint)(-16 * (int)(g1).y))
+
+#define NF_SGM_Q50_WORDS 11
+#define NF_SGM_Q50_A(xb, p) \
+    { \
+        const uint4 a = vload4(0, p); \
+        const uint2 e = vload2(0, p + 4); \
+        const uint h = (a.x >> 16) | (a.y << 16); \
+        const uint q0 = (a.y >> 16) | (a.z << 16), q1 = (a.z >> 16) | (a.w << 16); \
+        const uint q2 = (a.w >> 16) | (e.x << 16), q3 = (e.x >> 16) | (e.y << 16); \
+        const uint c[8] = NF_SGM_CODES5(q0, q1, q2, q3, h); \
+        const float dw = nf_sgm_half(a.x); \
+        NF_SGM_BLOCK_Q6K(xb, c, dw, dw) \
+    }
+#define NF_SGM_Q50_B(xb, p) \
+    { \
+        const uint4 b = vload4(0, p + 7); \
+        const uint h = p[6]; \
+        const uint c[8] = NF_SGM_CODES5(b.x, b.y, b.z, b.w, h); \
+        const float dw = nf_sgm_half(p[5] >> 16); \
+        NF_SGM_BLOCK_Q6K(xb, c, dw, dw) \
+    }
+
+#define NF_SGM_Q41_WORDS 10
+#define NF_SGM_Q41_HALF(xb, p, hw, cw) \
+    { \
+        const uint hd = p[hw]; \
+        const uint4 b = vload4(0, p + (cw)); \
+        const uint c[8] = NF_SGM_CODES4(b.x, b.y, b.z, b.w); \
+        NF_SGM_BLOCK_Q4K(xb, c, nf_sgm_half(hd), nf_sgm_half(hd >> 16)) \
+    }
+#define NF_SGM_Q41_A(xb, p) NF_SGM_Q41_HALF(xb, p, 0, 1)
+#define NF_SGM_Q41_B(xb, p) NF_SGM_Q41_HALF(xb, p, 5, 6)
+
+#define NF_SGM_Q51_WORDS 12
+#define NF_SGM_Q51_HALF(xb, p, hw) \
+    { \
+        const uint hd = p[hw], h = p[(hw) + 1]; \
+        const uint4 b = vload4(0, p + (hw) + 2); \
+        const uint c[8] = NF_SGM_CODES5(b.x, b.y, b.z, b.w, h); \
+        NF_SGM_BLOCK_Q4K(xb, c, nf_sgm_half(hd), nf_sgm_half(hd >> 16)) \
+    }
+#define NF_SGM_Q51_A(xb, p) NF_SGM_Q51_HALF(xb, p, 0)
+#define NF_SGM_Q51_B(xb, p) NF_SGM_Q51_HALF(xb, p, 6)
+
+/* The body of a block-pair form: WORDS words per pair, the gather's unit-6 rewrite FIX, and the two blocks of a
+ * stage BLOCK_A / BLOCK_B (segment, pair words), the next stage's gather issued between them as in Q4_0. */
+#define NF_SGM_PAIR_FORM(NAME, WORDS, FIX, BLOCK_A, BLOCK_B) \
+NF_INLINE void NAME( \
+    const int M, const int K, const int N, const int q_stride, const int q_off, const int m0, const int n0, \
+    const int s0, const int s1, NF_GLOBAL const uchar* NF_RESTRICT weight, NF_GLOBAL const uint* NF_RESTRICT q8, \
+    NF_GLOBAL float* NF_RESTRICT y, const int y_stride, const nf_i64 y_off, NF_LOCAL uint* xs) { \
+    const int lid = (int)get_local_id(0); \
+    const uint row_words = (uint)(K / NF_SGM_TK) * (WORDS); \
+    NF_GLOBAL const uint* wbase = (NF_GLOBAL const uint*)weight + (nf_i64)m0 * row_words; \
+    uint woff = (uint)min(lid, M - 1 - m0) * row_words + (uint)s0 * (WORDS); \
+    NF_GLOBAL const uint* qbase = q8 + (nf_i64)q_off + (nf_i64)n0 * q_stride * NF_SGM_RC; \
+    const int gt = lid >> 2, gc = lid & 3; \
+    const bool glive = n0 + gt < N; \
+    const uint goff = ((uint)gt * (uint)q_stride + (uint)gc) * NF_SGM_RC; \
+    const int gdst = gt * NF_SGM_XT + (gc >> 1) * 16 + (gc & 1) * NF_SGM_RC; \
+    float acc[NF_SGM_TN]; \
+    NF_SGM_ACC_ZERO \
+    NF_SGM_GATHER_KQ(xs + (s0 & 1) * NF_SGM_XBUF, s0, FIX) \
+    barrier(CLK_LOCAL_MEM_FENCE); \
+    for (int s = s0; s < s1; s++, woff += (WORDS)) { \
+        NF_LOCAL const uint* xb = xs + (s & 1) * NF_SGM_XBUF; \
+        NF_GLOBAL const uint* p = wbase + woff; \
+        BLOCK_A(xb, p) \
+        if (s + 1 < s1) { \
+            NF_SGM_GATHER_KQ(xs + ((s + 1) & 1) * NF_SGM_XBUF, s + 1, FIX) \
+        } \
+        BLOCK_B(xb + 16, p) \
+        barrier(CLK_LOCAL_MEM_FENCE); \
+    } \
+    NF_SGM_STORE \
+}
+
+NF_SGM_PAIR_FORM(nf_sgm_q5_0, NF_SGM_Q50_WORDS, NF_SGM_Q50_FIX, NF_SGM_Q50_A, NF_SGM_Q50_B)
+NF_SGM_PAIR_FORM(nf_sgm_q4_1, NF_SGM_Q41_WORDS, NF_SGM_Q4K_FIX, NF_SGM_Q41_A, NF_SGM_Q41_B)
+NF_SGM_PAIR_FORM(nf_sgm_q5_1, NF_SGM_Q51_WORDS, NF_SGM_Q4K_FIX, NF_SGM_Q51_A, NF_SGM_Q51_B)
+
 /* Words of a 176-byte Q5_K block: header at 0 (d, dmin, scales[12]), qh at 4, the 128 code bytes at 12. */
 #define NF_SGM_Q5K_WORDS 44
 /* Bit 0 of every byte of a word. */
@@ -557,6 +673,9 @@ NF_KERNEL void T##_MatMulSg_MMQ_KSplit(const int M, const int K, const int N, co
 
 NF_SGM_KERNELS(Q8_0, nf_sgm_q8_0)
 NF_SGM_KERNELS(Q4_0, nf_sgm_q4_0)
+NF_SGM_KERNELS(Q4_1, nf_sgm_q4_1)
+NF_SGM_KERNELS(Q5_0, nf_sgm_q5_0)
+NF_SGM_KERNELS(Q5_1, nf_sgm_q5_1)
 NF_SGM_KERNELS(Q4_K, nf_sgm_q4_k)
 NF_SGM_KERNELS(Q5_K, nf_sgm_q5_k)
 NF_SGM_KERNELS(Q6_K, nf_sgm_q6_k)

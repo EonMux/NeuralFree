@@ -348,7 +348,7 @@ On an OpenCL device that also accepts a required subgroup size of 16 (the Intel 
 | Source | Kernels | Replaces | Arrow Lake iGPU |
 |---|---|---|---|
 | `matvec_sg.cl` | `{T}_MatVecSg_Q8`, `{T}_MatVecAddSg_Q8`, `{T}_MatVecFusedGateUpSg_Q8` (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K) | the one-token integer-dot matvecs | weights stream at 41-61 GB/s against 5-12 (Q4_0 and Q5_K: 34-51 against 4-9, measured with the CPU cores loaded) |
-| `matmul_mmq_sg.cl` | `{T}_MatMulSg_MMQ` (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K) | `{T}_MatMul_MMQ`, and its split-K twin `{T}_MatMulSg_MMQ_KSplit` the portable split | 0.8-2.0 TFLOPS at 512 tokens, 4-6x the portable kernel (Q4_0 1.7-2.2, Q5_K 1.4-1.7, 5-8x) |
+| `matmul_mmq_sg.cl` | `{T}_MatMulSg_MMQ` (Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K) | `{T}_MatMul_MMQ`, and its split-K twin `{T}_MatMulSg_MMQ_KSplit` the portable split | 0.8-2.0 TFLOPS at 512 tokens, 4-6x the portable kernel (Q4_0 1.7-2.2, Q5_K 1.4-1.7, 5-8x; Q4_1, Q5_0, Q5_1 1.7-2.2) |
 | `flash_decode_sg.cl` | `LLM_FlashDecodeSg_<KV>`, `LLM_FlashDecodePagedSg_<KV>` (F32, F16, BF16, Q8_0; head dim a multiple of 8 up to 128, of 32 for Q8_0) | the decode flash attention | 38 us per layer on Qwen3-Embedding 0.6B against 253 |
 | `flash_prefill_sg.cl` | `LLM_FlashAttnSg_<KV>`, `LLM_FlashAttnPagedSg_<KV>` (same caches and head dims) | the tiled prefill flash attention | 2.6 ms per layer at 512 tokens on Qwen3-Embedding 0.6B against 417 |
 
@@ -568,9 +568,9 @@ for Qwen3 0.6B in Q8_0 (llama.cpp 34100).
 
 | Weights | Fast lane | Where | Rounding vs. the exact tiled GEMM |
 |---|---|---|---|
-| Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, I8_B128 | int8 MMQ GEMM (`<T>_MatMul_MMQ`) | every backend: int8 tensor cores (`mma.m16n8k32` / `m16n8k16` s8) on CUDA sm_80+, dp4a or scalar int dots elsewhere | activations are rounded to 8-bit codes per 32-element (tensor) or 16-element chunk, as in llama.cpp `mmq.cuh`; with an `--act-quant checkpoint` int8 scheme they are the checkpoint's own codes |
-| same types | cooperative-matrix GEMM: `<T>_MatMul_CM2` (workgroup-scope `VK_NV_cooperative_matrix2`, 128x256 tiles, fp16 accumulation saturated at +-65504, as llama.cpp `mul_mm_cm2.comp`; Q4_K and Q5_K decode each tile's block scales into shared memory once per block, fetched a block ahead, as its `fetch_scales` / `store_scales`), otherwise `<T>_MatMul_CM` (`VK_KHR_cooperative_matrix`) | Vulkan devices with the extension (default `auto` mode) | activations staged as fp16 rows; the weights decode to fp16 in the tensor loads |
-| F16 | tensor-core GEMM (`F16_MatMul_MMA`; on CUDA a launch of 64 or more tokens that split-K leaves unsplit runs its 128 × 64 large tile `F16_MatMul_MMA_L`, which gives the same bits); on Vulkan devices with `VK_NV_cooperative_matrix2` the workgroup-scope `F16_MatMul_CM2` (128x256 tiles over the fp16 weights as stored, for a reduction length that is a multiple of 8; any other keeps the MMA GEMM) | CUDA sm_80+, Vulkan with cooperative matrices | activations rounded to fp16; fp32 accumulation (`F16_MatMul_CM2` too: unlike the quantized CM2 GEMM it stores sums past the fp16 range unclipped, which F16 checkpoints such as pplx-embed-v1 0.6B reach) |
+| Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, I8_B128 | int8 MMQ GEMM (`<T>_MatMul_MMQ`) | every backend: int8 tensor cores (`mma.m16n8k32` / `m16n8k16` s8) on CUDA sm_80+; elsewhere packed int8 dots (`__dp4a`, an OpenCL compiler's native packed dot, Vulkan `dotPacked4x8EXT`, which needs `shaderIntegerDotProduct`: a Vulkan device without it keeps the exact tiled GEMM) or scalar int dots (HIP, other OpenCL compilers) | activations are rounded to 8-bit codes per 32-element (tensor) or 16-element chunk, as in llama.cpp `mmq.cuh`; with an `--act-quant checkpoint` int8 scheme they are the checkpoint's own codes |
+| same types | cooperative-matrix GEMM: `<T>_MatMul_CM2` (workgroup-scope `VK_NV_cooperative_matrix2`, 128x256 tiles, fp16 accumulation saturated at +-65504, as llama.cpp `mul_mm_cm2.comp`; Q4_K and Q5_K decode each tile's block scales into shared memory once per block, fetched a block ahead, as its `fetch_scales` / `store_scales`; where the device also reports `VK_NV_cooperative_matrix_decode_vector` the `<T>_MatMul_CM2V` form, whose tensor loads decode four consecutive elements per callback, as llama.cpp's `dequantFuncA_v`, to the same values; a launch whose 128x256 grid fills at most half the device's compute units, that does not split along K and spans more than one token tile runs the 128x128 tile `<T>_MatMul_CM2_N128` / `<T>_MatMul_CM2V_N128`, twice the workgroups over the same staged rows), otherwise `<T>_MatMul_CM` (`VK_KHR_cooperative_matrix`) | Vulkan devices with the extension (default `auto` mode) | activations staged as fp16 rows; the weights decode to fp16 in the tensor loads |
+| F16 | tensor-core GEMM (`F16_MatMul_MMA`; on CUDA a launch of 64 or more tokens that split-K leaves unsplit runs its 128 × 64 large tile `F16_MatMul_MMA_L`, which gives the same bits); on Vulkan devices with `VK_NV_cooperative_matrix2` the workgroup-scope `F16_MatMul_CM2` (128x256 tiles over the fp16 weights as stored, 128x128 `F16_MatMul_CM2_N128` on the small grids the quantized CM2 GEMM runs that tile on, for a reduction length that is a multiple of 8; any other keeps the MMA GEMM) | CUDA sm_80+, Vulkan with cooperative matrices | activations rounded to fp16; fp32 accumulation (`F16_MatMul_CM2` too: unlike the quantized CM2 GEMM it stores sums past the fp16 range unclipped, which F16 checkpoints such as pplx-embed-v1 0.6B reach) |
 | BF16 | tensor-core GEMM (`BF16_MatMul_MMA`, bf16 `mma`; the large tile `BF16_MatMul_MMA_L` as for F16) | CUDA sm_80+ (Vulkan keeps the tiled GEMM for BF16) | activations rounded to bf16; fp32 accumulation |
 | F8_E4M3, F8_E4M3_B32, F8_E4M3_B128, MXFP8 | E4M3 GEMM over the checkpoint's own activation codes (`<T>_MatMul_MMQ`) | CUDA sm_89+ (`mma.sync` `e4m3.e4m3.f32`); elsewhere the exact tiled GEMM | activations staged as E4M3 codes with one scale per 32-element chunk; fp32 accumulation |
 | MXFP4, NVFP4, IQ4_NL, IQ4_XS | E4M3 GEMM over E4M3-mapped 4-bit weight codes (`<T>_MatMul_W4A8`) | CUDA sm_89+ | weight codes are E4M3 (exact for the E2M1 codebooks, one E4M3 rounding for the IQ4 codebooks and the NVFP4 per-16 weight scales); activations staged as E4M3 |
@@ -667,13 +667,28 @@ weights off `F16_MatMul_CM2`, on the `F16_MatMul_MMA` GEMM.
 
 #### Split-K for tall-skinny projections
 
-F16/BF16 (`<T>_MatMul_MMA_KSplit`), int8 MMQ (`<T>_MatMul_MMQ_KSplit`) and cooperative-matrix
-(`<T>_MatMul_CM_KSplit`) projections with K ≥ 2048 whose tile grid fills less than about two
+F16/BF16 (`<T>_MatMul_MMA_KSplit`), int8 MMQ (`<T>_MatMul_MMQ_KSplit`), cooperative-matrix
+(`<T>_MatMul_CM_KSplit`) and workgroup-scope cooperative-matrix (`<T>_MatMul_CM2_KSplit`,
+`<T>_MatMul_CM2V_KSplit`) projections with K ≥ 2048 whose tile grid fills less than about two
 thirds of the GPU's compute units are split along K into up to 8 slices, using llama.cpp's
-Vulkan split-K heuristic. Quantized-weight slices always cover whole weight blocks. The slice
-partials are then summed in fp32 by `LLM_SplitK_Reduce`. Results differ from the unsplit kernel
-only by fp32 addition order: the MMQ slices read the same staged 8-bit codes as the unsplit
-kernel, and the CM slices the same fp32 activations.
+Vulkan split-K heuristic. Quantized-weight slices always cover whole weight blocks; the CM2 slices
+cover whole 256-element groups, as llama.cpp rounds its coopmat2 slices. On an RTX 5080 Laptop GPU
+at 512 tokens the three CM2 slices of a 2560-row projection (40 tiles of 60 compute units) run
+8-28% faster than the whole launch, and those of a 1024-row one (16 tiles) about 2.2x. The slice
+partials are then summed in fp32 by `LLM_SplitK_Reduce`. For the MMA, MMQ, CM and dense F16 CM2
+kernels the results differ from the unsplit kernel only by fp32 addition order: the MMQ slices read
+the same staged 8-bit codes as the unsplit kernel, the CM slices the same fp32 activations, and the
+F16 CM2 slices accumulate in fp32. The quantized CM2 kernels accumulate in fp16, saturating at
+±65504, within each slice, so a split launch rounds every output differently from the whole one:
+each fp16 sum runs over one slice of the reduction, and a sum that would saturate in one whole-K
+fp16 chain can come out unclipped. On Qwen3-Embedding-4B (RTX 5080 Laptop, 2040 wikitext-2
+positions at 512-token context) the three-slice split of the 2560-row projections moved the
+next-token distribution from the whole launch's by a mean KL divergence of 0.025 in Q8_0 and 0.020
+in Q4_K_M, less than either launch's distance from the CPU engine (Q8_0: 0.052 whole, 0.038 split;
+Q4_K_M: 0.156 whole, 0.162 split); the top token agreed at 97-98% of the positions, and 4 of 8
+greedy 48-token continuations in Q8_0 (5 of 8 in Q4_K_M) stayed identical. The last-token
+embeddings of 24 prompts of 348-457 tokens kept a cosine of at least 0.99989 to the whole launch's,
+while both lie at 0.9994 (Q8_0) and 0.9968 (Q4_K_M) from the CPU engine's.
 
 Split-K needs the device's compute-unit count. A device that does not report one — a Vulkan driver without
 `VK_NV_shader_sm_builtins` or `VK_AMD_shader_core_properties2`, such as Intel integrated GPUs — runs every
@@ -8767,6 +8782,7 @@ GGUF files ignore these; Hugging Face checkpoints read them at open. The meaning
 | `neuralfree.vulkan.pipelineCache` | On-disk Vulkan pipeline cache (`~/.cache/neuralfree/vulkan/`) | true |
 | `neuralfree.vulkan.validation` | Enable `VK_LAYER_KHRONOS_validation` | false |
 | `neuralfree.vulkan.coopmat2` | `off` keeps every device's `VK_NV_cooperative_matrix2` kernels off, as llama.cpp `GGML_VK_DISABLE_COOPMAT2`: the GEMMs take their `VK_KHR_cooperative_matrix` forms (`<T>_MatMul_CM`, `F16_MatMul_MMA`) and the prefill attention its tiled kernel; `auto` uses them where the device supports them | `auto` |
+| `neuralfree.vulkan.coopmat2.decodeVector` | `off` keeps the quantized cooperative-matrix2 GEMMs on their one-element decode callbacks (`<T>_MatMul_CM2`), as llama.cpp `GGML_VK_DISABLE_COOPMAT2_DECODE_VECTOR`; `auto` runs the four-element `<T>_MatMul_CM2V` forms on devices that report `VK_NV_cooperative_matrix_decode_vector`. Both forms store the same outputs | `auto` |
 | `neuralfree.vulkan.blockMb` | Vulkan device-memory block size in MiB | 256 |
 | `neuralfree.hip.shim.path` | Absolute path of `libhipshim.so`, the HIP backend's JNI shim; unset loads `hipshim` from the library path | none |
 | `neuralfree.vulkan.dispatchesPerSubmit` | Dispatches recorded per Vulkan command buffer | 256 |

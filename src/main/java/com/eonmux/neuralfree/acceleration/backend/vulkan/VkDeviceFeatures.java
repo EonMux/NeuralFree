@@ -2,6 +2,7 @@ package com.eonmux.neuralfree.acceleration.backend.vulkan;
 
 import com.eonmux.neuralfree.acceleration.NoBackendAvailableException;
 import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
+import com.eonmux.neuralfree.acceleration.vulkan.VkDecodeVectorFeatures;
 import com.eonmux.neuralfree.acceleration.vulkan.VkDeviceRanking;
 import com.eonmux.neuralfree.acceleration.vulkan.VkPhysicalDeviceInfo;
 import com.eonmux.neuralfree.acceleration.vulkan.VkPhysicalDeviceInfo.Feature;
@@ -64,7 +65,9 @@ import static org.lwjgl.vulkan.VK13.VK_API_VERSION_1_3;
  * ({@link Feature#COOPERATIVE_MATRIX}); {@code VK_NV_cooperative_matrix2} next to it when the device
  * supports flexible workgroup-scope matrix dimensions matching the engine's CM2 tile and the tensor-layout form
  * ({@link Feature#COOPERATIVE_MATRIX_2}), with its {@code cooperativeMatrixConversions} feature when the device also
- * reports the attention tile ({@link Feature#COOPERATIVE_MATRIX_2_ATTENTION}); and
+ * reports the attention tile ({@link Feature#COOPERATIVE_MATRIX_2_ATTENTION}), and
+ * {@code VK_NV_cooperative_matrix_decode_vector} with it when the device reports its four-element decode callbacks
+ * ({@link Feature#COOPERATIVE_MATRIX_2_DECODE_VECTOR}); and
  * {@code VK_KHR_shader_bfloat16} next to it when the device also
  * reports {@link Feature#SHADER_BFLOAT16_COOP_MATRIX} (llama.cpp {@code coopmat_bf16_support}).</p>
  */
@@ -127,6 +130,10 @@ public final class VkDeviceFeatures {
         if (coopMatrix2) {
             extensions.add(VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME);
         }
+        boolean decodeVector = coopMatrix2 && on.contains(Feature.COOPERATIVE_MATRIX_2_DECODE_VECTOR);
+        if (decodeVector) {
+            extensions.add(VkDecodeVectorFeatures.EXTENSION_NAME);
+        }
         boolean bfloat16 = coopMatrix && on.contains(Feature.SHADER_BFLOAT16_COOP_MATRIX);
         if (bfloat16) {
             extensions.add(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
@@ -167,6 +174,10 @@ public final class VkDeviceFeatures {
             if (on.contains(Feature.COOPERATIVE_MATRIX_2_ATTENTION)) {
                 mapped.add(DeviceFeature.COOPERATIVE_MATRIX_2_ATTENTION);
             }
+            // The quantized GEMM's weight tiles decode four elements per callback (<T>_MatMul_CM2V).
+            if (decodeVector) {
+                mapped.add(DeviceFeature.COOPERATIVE_MATRIX_2_DECODE_VECTOR);
+            }
         }
         // The bf16 form (VK_KHR_shader_bfloat16, llama.cpp coopmat_bf16_support) shares the cooperative-
         // matrix and memory-model requirements; it needs no fp16 arithmetic of its own (the accumulator is
@@ -183,7 +194,7 @@ public final class VkDeviceFeatures {
             mapped.add(DeviceFeature.MEMORY_BUDGET);
         }
         return new Enabled(v13, on, extensions, mapped, pushDescriptors, memoryBudget, sizeControlExt,
-                dotProductExt, coopMatrix, coopMatrix2, bfloat16);
+                dotProductExt, coopMatrix, coopMatrix2, decodeVector, bfloat16);
     }
 
     private static void mapIf(Set<DeviceFeature> mapped, Set<Feature> on, Feature feature, DeviceFeature as) {
@@ -205,13 +216,14 @@ public final class VkDeviceFeatures {
         private final boolean integerDotProductExtension;
         private final boolean cooperativeMatrixExtension;
         private final boolean cooperativeMatrix2Extension;
+        private final boolean decodeVectorExtension;
         private final boolean bfloat16Extension;
 
         private Enabled(boolean vulkan13, EnumSet<Feature> features, List<String> extensions,
                         EnumSet<DeviceFeature> deviceFeatures, boolean pushDescriptors, boolean memoryBudget,
                         boolean subgroupSizeControlExtension, boolean integerDotProductExtension,
                         boolean cooperativeMatrixExtension, boolean cooperativeMatrix2Extension,
-                        boolean bfloat16Extension) {
+                        boolean decodeVectorExtension, boolean bfloat16Extension) {
             this.vulkan13 = vulkan13;
             this.features = Collections.unmodifiableSet(EnumSet.copyOf(features));
             this.extensions = Collections.unmodifiableList(new ArrayList<>(extensions));
@@ -222,6 +234,7 @@ public final class VkDeviceFeatures {
             this.integerDotProductExtension = integerDotProductExtension;
             this.cooperativeMatrixExtension = cooperativeMatrixExtension;
             this.cooperativeMatrix2Extension = cooperativeMatrix2Extension;
+            this.decodeVectorExtension = decodeVectorExtension;
             this.bfloat16Extension = bfloat16Extension;
         }
 
@@ -268,6 +281,12 @@ public final class VkDeviceFeatures {
             return cooperativeMatrix2Extension;
         }
 
+        /** True when {@code VK_NV_cooperative_matrix_decode_vector} is enabled next to
+         *  {@code VK_NV_cooperative_matrix2}. */
+        public boolean decodeVectorExtension() {
+            return decodeVectorExtension;
+        }
+
         /** True when {@code VK_KHR_shader_bfloat16} is enabled next to the cooperative-matrix extension. */
         public boolean bfloat16Extension() {
             return bfloat16Extension;
@@ -281,7 +300,9 @@ public final class VkDeviceFeatures {
          * {@code Vulkan13Features} on a 1.3 device, otherwise {@code → SubgroupSizeControlFeatures}
          * and {@code → ShaderIntegerDotProductFeatures} when their extensions are enabled; then
          * {@code → CooperativeMatrixFeaturesKHR} when {@code VK_KHR_cooperative_matrix} is enabled and
-         * {@code → CooperativeMatrix2FeaturesNV} when {@code VK_NV_cooperative_matrix2} is; any
+         * {@code → CooperativeMatrix2FeaturesNV} when {@code VK_NV_cooperative_matrix2} is,
+         * {@code → CooperativeMatrixDecodeVectorFeaturesNV} ({@link VkDecodeVectorFeatures}) when
+         * {@code VK_NV_cooperative_matrix_decode_vector} is; any
          * {@code pNext} chain already on {@code createInfo} follows the last feature struct.
          * {@code pEnabledFeatures} is cleared, since the core features travel in
          * {@code VkPhysicalDeviceFeatures2}. The structs live as long as {@code stack}'s frame.</p>
@@ -346,6 +367,9 @@ public final class VkDeviceFeatures {
                         .cooperativeMatrixPerElementOperations(true)
                         .cooperativeMatrixReductions(true)
                         .cooperativeMatrixConversions(isEnabled(Feature.COOPERATIVE_MATRIX_2_ATTENTION)));
+            }
+            if (decodeVectorExtension) {
+                chain.add(VkDecodeVectorFeatures.calloc(stack, true));
             }
             if (bfloat16Extension) {
                 chain.add(VkPhysicalDeviceShaderBfloat16FeaturesKHR.calloc(stack).sType$Default()

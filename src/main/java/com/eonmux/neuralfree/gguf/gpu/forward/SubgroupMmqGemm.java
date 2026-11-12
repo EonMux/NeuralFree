@@ -12,12 +12,14 @@ import java.util.Set;
 
 /**
  * Launch plan of the subgroup-row int8 MMQ GEMM ({@code kernels/llm/matmul_mmq_sg.cl}): {@code {T}_MatMulSg_MMQ},
- * the multi-token product of {@link #TYPES} weights (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K) with the staged Q8_1 activation
+ * the multi-token product of {@link #TYPES} weights (Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K) with the staged
+ * Q8_1 activation
  * records of {@code {T}_MatMul_MMQ}, under the same argument list. A work-group of 16-lane subgroups owns
  * {@link #TILE_ROWS} weight rows by {@link #TILE_TOKENS} tokens: each lane keeps one row's token sums in registers,
  * reads its weights with 16-byte loads straight from the GGUF blocks, and takes every token's activation words from
  * one uniform local-memory block read shared by subgroup shuffles, over {@link #STAGE_DEPTH}-deep stages with one
- * barrier each (a Q8_0 or Q4_0 block pair, or a quarter of a K-quant super-block).
+ * barrier each (a block pair of a 32-element type, or a quarter of a K-quant super-block). Q4_1 and Q5_1 take the
+ * Q4_K minimum term over their 32-element blocks and Q5_0 the Q4_0 code offset (-16 instead of -8).
  *
  * <p>The form exists where {@link SubgroupRowForms#served} holds: in OpenCL programs built with
  * {@code NF_SG_ROW_SIZE} ({@link OpenClKernelLibrary#subgroupRowSize}: a device that accepts a required 16-lane
@@ -62,7 +64,7 @@ final class SubgroupMmqGemm {
     /** Weight rows per work-group ({@code NF_SGM_TM}): each work-item owns one. */
     static final int TILE_ROWS = 128;
     /**
-     * Work-items per weight row of the Vulkan Q8_0, Q4_0, Q4_K and Q5_K forms ({@code NF_SGM_SPLIT} of
+     * Work-items per weight row of the Vulkan forms other than Q6_K ({@code NF_SGM_SPLIT} of
      * shaders/llm/matmul_mmq_sg.comp): the GLSL form splits a work-group's tokens between two halves of
      * {@link #TILE_ROWS} work-items, so each keeps 16 token sums instead of 32. Mesa's Intel compiler gives a SIMD16
      * thread 128 registers, in which the 32-sum Q4_K tile spilled 76 of them; split, the Arrow-Lake iGPU's 512-token
@@ -74,7 +76,7 @@ final class SubgroupMmqGemm {
     /** Tokens per work-group ({@code NF_SGM_TN}). */
     static final int TILE_TOKENS = 32;
     /**
-     * Reduction depth of one stage ({@code NF_SGM_TK}): a Q8_0 or Q4_0 block pair, a quarter of a K-quant
+     * Reduction depth of one stage ({@code NF_SGM_TK}): a block pair of a 32-element type, a quarter of a K-quant
      * super-block. The row length must hold whole stages and whole weight blocks ({@link #shapeServes}).
      */
     static final int STAGE_DEPTH = SplitKGemmPlan.SUBGROUP_MMQ_SLICE_DEPTH;
@@ -83,8 +85,8 @@ final class SubgroupMmqGemm {
 
     /** The weight types with a subgroup MMQ form. */
     static final Set<GGMLType> TYPES =
-            Collections.unmodifiableSet(EnumSet.of(GGMLType.Q8_0, GGMLType.Q4_0, GGMLType.Q4_K, GGMLType.Q5_K,
-                    GGMLType.Q6_K));
+            Collections.unmodifiableSet(EnumSet.of(GGMLType.Q8_0, GGMLType.Q4_0, GGMLType.Q4_1, GGMLType.Q5_0,
+                    GGMLType.Q5_1, GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.Q6_K));
 
     private static final String SUFFIX = "_MatMulSg_MMQ";
 
@@ -98,7 +100,7 @@ final class SubgroupMmqGemm {
 
     /**
      * Whether rows of {@code cols} elements of {@code type} meet the kernel's layout: whole stages of whole blocks, a
-     * multiple of 64 for Q8_0 and Q4_0 (their 4-byte-aligned block pairs) and of 256 for the K-quants (their
+     * multiple of 64 for the 32-element types (their 4-byte-aligned block pairs) and of 256 for the K-quants (their
      * super-blocks).
      */
     static boolean shapeServes(GGMLType type, long cols) {

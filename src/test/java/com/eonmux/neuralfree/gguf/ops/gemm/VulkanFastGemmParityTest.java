@@ -17,7 +17,7 @@ import org.junit.Test;
  * {@link DeviceFeature#COOPERATIVE_MATRIX} every fp16-tile CM kernel, the F16 and BF16 MMA rows and
  * the split-K pair of both dense 16-bit types, and on devices with
  * {@link DeviceFeature#COOPERATIVE_MATRIX_2} every workgroup-scope CM2 kernel and its split-K twin, the dense
- * F16 one included.
+ * F16 one included, and the four-element decode forms against the per-element ones.
  * Skips without a Vulkan GPU.
  */
 public class VulkanFastGemmParityTest {
@@ -91,6 +91,13 @@ public class VulkanFastGemmParityTest {
         }
     }
 
+    /** The int8 MMQ GEMM and its split-K twin store the exact integer dot of fp32-exact operands bit for bit:
+     *  partial row and token tiles over 48 stages, so both halves of the double-buffered stage tile are reused. */
+    @Test
+    public void theMmqKernelStoresExactIntegerDotsBitForBit() throws Exception {
+        parity.mmqExactOnIntegerOperands(M, 768, N, 3);
+    }
+
     /** The split-K twins of the int8 MMQ and CM kernels against their plain kernels. */
     @Test
     public void mmqAndCmSplitKTwinsMatchTheirPlainKernels() throws Exception {
@@ -139,6 +146,71 @@ public class VulkanFastGemmParityTest {
             parity.cm2SplitKMatchesPlain(type, M, 768, N, 3);
             parity.cm2SplitKMatchesPlain(type, M3, 768, N3, 3);
             parity.cm2SplitKMatchesPlain(type, M3, 768, N3, 4);
+        }
+    }
+
+    /**
+     * The heuristic split of the reductions of the 4B decoder's attention-output and down projections (K=2560 and
+     * K=9728) at its two-thirds band: two row tiles (one interior, one partial) over a full token tile and a
+     * quarter-width tail make 4 tiles, which a 6-unit device splits into three 256-aligned slices (1024/1024/512 and
+     * 3328/3328/3072 elements), the slice geometry of the 40-tile grids on the 60-unit RTX 5080; in each decode form
+     * the device runs, against the plain kernel.
+     */
+    @Test
+    public void cm2HeuristicSplitsOfTheDecoderReductionsMatchTheirPlainKernels() throws Exception {
+        assumeCooperativeMatrix2();
+        boolean vectors = backend.capabilities().hasFeature(DeviceFeature.COOPERATIVE_MATRIX_2_DECODE_VECTOR);
+        for (GGMLType type : quantizedCm2Types()) {
+            for (int k : new int[]{2560, 9728}) {
+                parity.cm2HeuristicSplitMatchesPlain(type, false, M2, k, N2, 6, 3);
+                if (vectors) {
+                    parity.cm2HeuristicSplitMatchesPlain(type, true, M2, k, N2, 6, 3);
+                }
+            }
+        }
+    }
+
+    /**
+     * The four-element decode form of every quantized CM2 kernel ({@code <T>_MatMul_CM2V}) and its split-K twin
+     * against the per-element form, bit for bit: every element of the weight through an identity activation, and a
+     * full reduction over a partial second row tile. Needs a device reporting
+     * {@link DeviceFeature#COOPERATIVE_MATRIX_2_DECODE_VECTOR}.
+     */
+    @Test
+    public void cm2DecodeVectorKernelsMatchTheScalarDecodeExactly() throws Exception {
+        assumeCooperativeMatrix2();
+        Assume.assumeTrue("no cooperative-matrix2 decode vectors on " + backend.capabilities().getDeviceName(),
+                backend.capabilities().hasFeature(DeviceFeature.COOPERATIVE_MATRIX_2_DECODE_VECTOR));
+        for (GGMLType type : quantizedCm2Types()) {
+            parity.cm2DecodeVectorMatchesScalar(type, M2, 768);
+        }
+    }
+
+    /**
+     * The 128-token CM2 tiles ({@code _N128}) of every CM2 type, dense F16 included, in each decode form the device
+     * runs, against the 256-token tile bit for bit: two row tiles, the second partial, over two whole 128-token tiles
+     * and a quarter-width (32-token) tail (280 tokens), and whole row tiles through the interior path over one
+     * 128-token tile that the 256-token grid runs at half width (100 tokens).
+     */
+    @Test
+    public void cm2MediumTilesMatchTheLargeTileExactly() throws Exception {
+        assumeCooperativeMatrix2();
+        boolean vectors = backend.capabilities().hasFeature(DeviceFeature.COOPERATIVE_MATRIX_2_DECODE_VECTOR);
+        int[][] shapes = {{M2, K, 280}, {M3, 768, N3}};
+        for (GGMLType type : quantizedCm2Types()) {
+            for (int[] s : shapes) {
+                byte[] weight = OpenClMmqGemmParityTest.buildWeight(type, s[0], s[1]);
+                float[] x = OpenClMmqGemmParityTest.buildX(s[2], s[1]);
+                parity.cm2MediumTileMatchesLarge(type, false, weight, x, s[0], s[1], s[2]);
+                if (vectors) {
+                    parity.cm2MediumTileMatchesLarge(type, true, weight, x, s[0], s[1], s[2]);
+                }
+            }
+        }
+        for (int[] s : shapes) {
+            float[] w = FastGemmParity.denseValues(s[0] * s[1], 0x51ED);
+            float[] x = FastGemmParity.denseValues(s[2] * s[1], 0xC0DE);
+            parity.cm2MediumTileMatchesLarge(GGMLType.F16, false, FastGemmParity.f16Bytes(w), x, s[0], s[1], s[2]);
         }
     }
 

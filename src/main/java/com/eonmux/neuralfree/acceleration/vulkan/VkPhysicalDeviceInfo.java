@@ -111,6 +111,21 @@ public final class VkPhysicalDeviceInfo {
      */
     public static final String COOPMAT2_PROPERTY = "neuralfree.vulkan.coopmat2";
 
+    /**
+     * Token width the {@link Feature#COOPERATIVE_MATRIX_2} probe asks the device's flexible dimensions to divide: the
+     * narrowest token matrix of the CM2 GEMM kernels (matmul_mmq_cm2.comp), the quarter-width tail tile of their
+     * 128-token form ({@code NF_CM2_BN=128}, 32 tokens). Every other token matrix of those kernels is a multiple of it.
+     */
+    public static final int COOPMAT2_GEMM_MIN_TOKENS = 32;
+
+    /**
+     * System property that turns the four-element decode callbacks of the cooperative-matrix2 GEMM off: {@code off}
+     * reports no {@link Feature#COOPERATIVE_MATRIX_2_DECODE_VECTOR}, so the quantized CM2 GEMMs decode one element
+     * per callback ({@code <T>_MatMul_CM2}), as llama.cpp's {@code GGML_VK_DISABLE_COOPMAT2_DECODE_VECTOR};
+     * {@code auto}, the default, reports it wherever the device supports it. Read when the devices are enumerated.
+     */
+    public static final String COOPMAT2_DECODE_VECTOR_PROPERTY = "neuralfree.vulkan.coopmat2.decodeVector";
+
     /** Mask that removes the patch number from a packed Vulkan version. */
     private static final int VERSION_NO_PATCH_MASK = 0xFFFFF000;
     private static final int UUID_BYTES = 16;
@@ -145,6 +160,10 @@ public final class VkPhysicalDeviceInfo {
          *  flexible dimensions matching the tensor-core prefill attention's fp16 x fp16 -> fp32 tiles of 128
          *  invocations: 64 query rows, 64 keys, head dims of 16-multiples. */
         COOPERATIVE_MATRIX_2_ATTENTION,
+        /** {@link #COOPERATIVE_MATRIX_2} plus {@code VK_NV_cooperative_matrix_decode_vector}'s
+         *  {@code cooperativeMatrixDecodeVector}: tensor loads with four-element decode callbacks
+         *  ({@link VkDecodeVectorFeatures}). */
+        COOPERATIVE_MATRIX_2_DECODE_VECTOR,
         /** {@code VkPhysicalDeviceShaderBfloat16FeaturesKHR.shaderBFloat16Type} ({@code VK_KHR_shader_bfloat16}). */
         SHADER_BFLOAT16_TYPE,
         /** {@code VK_KHR_shader_bfloat16} with {@code bfloat16CooperativeMatrix} and a bf16 x bf16 -> fp32
@@ -825,6 +844,8 @@ public final class VkPhysicalDeviceInfo {
                 VkPhysicalDeviceCooperativeMatrix2FeaturesNV.calloc(stack).sType$Default();
         VkPhysicalDeviceShaderBfloat16FeaturesKHR bfloat16 =
                 VkPhysicalDeviceShaderBfloat16FeaturesKHR.calloc(stack).sType$Default();
+        boolean decodeVectorExt = coopMat2Ext && s.extensions.contains(VkDecodeVectorFeatures.EXTENSION_NAME);
+        VkBaseOutStructure decodeVector = VkDecodeVectorFeatures.calloc(stack, false);
 
         List<Struct<?>> chain = new ArrayList<>();
         chain.add(features2);
@@ -847,6 +868,9 @@ public final class VkPhysicalDeviceInfo {
         }
         if (bfloat16Ext) {
             chain.add(bfloat16);
+        }
+        if (decodeVectorExt) {
+            chain.add(decodeVector);
         }
         link(chain);
         vkGetPhysicalDeviceFeatures2(device, features2);
@@ -890,8 +914,10 @@ public final class VkPhysicalDeviceInfo {
                 && v12.bufferDeviceAddress()
                 && coopMat2.cooperativeMatrixWorkgroupScope()
                 && coopMat2.cooperativeMatrixFlexibleDimensions()
-                && hasCoopMat2Tile(device, stack, VK_COMPONENT_TYPE_FLOAT16_KHR, 256, 128, 64, 64)
-                && hasCoopMat2Tile(device, stack, VK_COMPONENT_TYPE_FLOAT32_KHR, 256, 128, 64, 64)
+                && hasCoopMat2Tile(device, stack, VK_COMPONENT_TYPE_FLOAT16_KHR, 256, 128,
+                        COOPMAT2_GEMM_MIN_TOKENS, 64)
+                && hasCoopMat2Tile(device, stack, VK_COMPONENT_TYPE_FLOAT32_KHR, 256, 128,
+                        COOPMAT2_GEMM_MIN_TOKENS, 64)
                 && coopMat2.cooperativeMatrixTensorAddressing()
                 && coopMat2.cooperativeMatrixBlockLoads()
                 && coopMat2.cooperativeMatrixPerElementOperations()
@@ -904,6 +930,10 @@ public final class VkPhysicalDeviceInfo {
         put(s, Feature.COOPERATIVE_MATRIX_2_ATTENTION, s.features.contains(Feature.COOPERATIVE_MATRIX_2)
                 && coopMat2.cooperativeMatrixConversions()
                 && hasCoopMat2Tile(device, stack, VK_COMPONENT_TYPE_FLOAT32_KHR, 128, 64, 64, 64));
+        put(s, Feature.COOPERATIVE_MATRIX_2_DECODE_VECTOR, s.features.contains(Feature.COOPERATIVE_MATRIX_2)
+                && decodeVectorExt
+                && VkDecodeVectorFeatures.decodeVector(decodeVector)
+                && decodeVectorAllowed(System.getProperty(COOPMAT2_DECODE_VECTOR_PROPERTY)));
         put(s, Feature.SHADER_BFLOAT16_TYPE, bfloat16Ext && bfloat16.shaderBFloat16Type());
         put(s, Feature.SHADER_BFLOAT16_COOP_MATRIX,
                 bfloat16Ext && bfloat16.shaderBFloat16CooperativeMatrix() && hasCoopMatBf16MulAdd(device, stack));
@@ -961,11 +991,30 @@ public final class VkPhysicalDeviceInfo {
     }
 
     /**
+     * Whether {@value #COOPMAT2_DECODE_VECTOR_PROPERTY} lets a device report
+     * {@link Feature#COOPERATIVE_MATRIX_2_DECODE_VECTOR}: unset, blank or {@code auto} (any case) lets it, {@code off}
+     * does not.
+     *
+     * @throws IllegalArgumentException naming the property and its values for any other value
+     */
+    static boolean decodeVectorAllowed(String value) {
+        if (value == null || value.trim().isEmpty() || value.trim().equalsIgnoreCase("auto")) {
+            return true;
+        }
+        if (value.trim().equalsIgnoreCase("off")) {
+            return false;
+        }
+        throw new IllegalArgumentException(COOPMAT2_DECODE_VECTOR_PROPERTY + " must be auto or off, got '" + value
+                + "'");
+    }
+
+    /**
      * Whether NV flexible dimensions advertise a workgroup tile of {@code invocations} invocations multiplying fp16
      * operands into an {@code accType} accumulator and result, not saturating, whose granularities divide
      * {@code m}, {@code n} and {@code k}: every matrix of the kernel then has a matching tuple, since its dimensions
      * are multiples of those. The CM2 GEMM (matmul_mmq_cm2.comp) asks for fp16 accumulation (quantized weights) and
-     * fp32 accumulation (dense F16 weights) at 256 invocations over 128 rows, 64-token tails and 64-deep stages, as
+     * fp32 accumulation (dense F16 weights) at 256 invocations over 128 rows, the
+     * {@link #COOPMAT2_GEMM_MIN_TOKENS}-token tails of the 128-token tile and 64-deep stages, as
      * llama.cpp's coopmat2 check asks for both accumulators at 256 invocations; the prefill attention
      * (flash_mma_cm2.comp) for fp32 accumulation at 128 invocations over 64 query rows and 64-key tiles. The extension requires a matching property tuple when
      * flexible dimensions are enabled; the KHR subgroup property list does not describe workgroup-scope matrices.

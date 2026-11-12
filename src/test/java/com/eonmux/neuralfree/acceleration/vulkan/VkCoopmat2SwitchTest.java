@@ -10,8 +10,9 @@ import static org.junit.Assert.assertTrue;
 
 /**
  * The {@value VkPhysicalDeviceInfo#COOPMAT2_PROPERTY} switch: its values, and on a device that reports
- * {@code VK_NV_cooperative_matrix2} (skipped elsewhere) the enumeration under {@code off}, which reports neither CM2
- * feature while keeping the KHR cooperative matrices.
+ * {@code VK_NV_cooperative_matrix2} (skipped elsewhere) the enumeration under {@code off}, which reports none of the
+ * CM2 features while keeping the KHR cooperative matrices; and the values of
+ * {@value VkPhysicalDeviceInfo#COOPMAT2_DECODE_VECTOR_PROPERTY}.
  */
 public class VkCoopmat2SwitchTest {
 
@@ -31,6 +32,17 @@ public class VkCoopmat2SwitchTest {
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
                 () -> VkPhysicalDeviceInfo.coopMat2Allowed("on"));
         assertTrue(e.getMessage(), e.getMessage().contains(VkPhysicalDeviceInfo.COOPMAT2_PROPERTY));
+    }
+
+    @Test
+    public void theDecodeVectorSwitchTakesAutoAndOff() {
+        assertTrue(VkPhysicalDeviceInfo.decodeVectorAllowed(null));
+        assertTrue(VkPhysicalDeviceInfo.decodeVectorAllowed(""));
+        assertTrue(VkPhysicalDeviceInfo.decodeVectorAllowed(" Auto "));
+        assertFalse(VkPhysicalDeviceInfo.decodeVectorAllowed("OFF"));
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> VkPhysicalDeviceInfo.decodeVectorAllowed("true"));
+        assertTrue(e.getMessage(), e.getMessage().contains(VkPhysicalDeviceInfo.COOPMAT2_DECODE_VECTOR_PROPERTY));
     }
 
     @Test
@@ -63,6 +75,8 @@ public class VkCoopmat2SwitchTest {
                     found = true;
                     assertFalse(name, info.supports(VkPhysicalDeviceInfo.Feature.COOPERATIVE_MATRIX_2));
                     assertFalse(name, info.supports(VkPhysicalDeviceInfo.Feature.COOPERATIVE_MATRIX_2_ATTENTION));
+                    assertFalse(name,
+                            info.supports(VkPhysicalDeviceInfo.Feature.COOPERATIVE_MATRIX_2_DECODE_VECTOR));
                     assertTrue(name, info.supports(VkPhysicalDeviceInfo.Feature.COOPERATIVE_MATRIX));
                 }
             }

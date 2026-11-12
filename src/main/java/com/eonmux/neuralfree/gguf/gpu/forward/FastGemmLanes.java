@@ -99,7 +99,7 @@ final class FastGemmLanes {
                 return null;
             }
             if (mmqMode.prefersCm() && cm2Form() && GemmKernels.hasCm2(type)) {
-                return GemmKernels.matmulCm2(type);
+                return GemmKernels.matmulCm2(type, cm2DecodeVector(type));
             }
             return mmqMode.prefersCm() && cmForm() && GemmKernels.hasCm(type)
                     ? GemmKernels.matmulCm(type) : GemmKernels.matmulMmq(type);
@@ -267,12 +267,12 @@ final class FastGemmLanes {
      * {@code NF_MMA_TN} for the MMA and CM forms.
      */
     int fastTileTokens(String fastKernel) {
+        if (cm2Fast(fastKernel)) {
+            return cm2MediumFast(fastKernel) ? Cm2GemmPlan.MEDIUM_TILE_TOKENS : Cm2GemmPlan.TILE_TOKENS;
+        }
         int twin = twinTokensOf(fastKernel);
         if (twin > 0) {
             return twin;
-        }
-        if (cm2Fast(fastKernel)) {
-            return Cm2GemmPlan.TILE_TOKENS;
         }
         if (mmaLargeFast(fastKernel)) {
             return MmaGemmPlan.LARGE_TILE_TOKENS;
@@ -284,12 +284,12 @@ final class FastGemmLanes {
      *  ({@link MmqConfig#smallTile}, the 256-item twin) for the twins, the
      *  {@link MmqConfig} row tile, {@code NF_MMAL_TM} for the large-tile MMA form or {@code NF_MMA_TM}. */
     int fastTileRows(String fastKernel) {
+        if (cm2Fast(fastKernel)) {
+            return Cm2GemmPlan.TILE_ROWS;
+        }
         int twin = twinTokensOf(fastKernel);
         if (twin > 0) {
             return MmqConfig.smallTile(mmqConfig, twin).tileRows();
-        }
-        if (cm2Fast(fastKernel)) {
-            return Cm2GemmPlan.TILE_ROWS;
         }
         if (mmaLargeFast(fastKernel)) {
             return MmaGemmPlan.LARGE_TILE_ROWS;
@@ -300,19 +300,39 @@ final class FastGemmLanes {
     /** Work-items per workgroup of a fast GEMM kernel: the small tiles' 256-item group for the
      *  twins, the {@link MmqConfig} work-group size or {@code NF_MMA_WG}. */
     int fastWorkGroup(String fastKernel) {
+        if (cm2Fast(fastKernel)) {
+            return Cm2GemmPlan.WORKGROUP_SIZE;
+        }
         int twin = twinTokensOf(fastKernel);
         if (twin > 0) {
             return MmqConfig.smallTile(mmqConfig, twin).workGroupSize();
         }
-        if (cm2Fast(fastKernel)) {
-            return Cm2GemmPlan.WORKGROUP_SIZE;
-        }
         return stagedFast(fastKernel) ? mmqConfig.workGroupSize() : MmaGemmPlan.WORKGROUP_SIZE;
     }
 
-    /** Whether a fast kernel is a workgroup-scope cooperative-matrix form ({@code <T>_MatMul_CM2}). */
+    /** Whether a fast kernel is a workgroup-scope cooperative-matrix form ({@code <T>_MatMul_CM2}, its
+     *  four-element decode form {@code <T>_MatMul_CM2V}, or the 128-token tile {@code _N128} of either). */
     static boolean cm2Fast(String fastKernel) {
-        return fastKernel.endsWith(GemmKernels.MATMUL_CM2_SUFFIX);
+        String tile = cm2TileBase(fastKernel);
+        return tile.endsWith(GemmKernels.MATMUL_CM2_SUFFIX) || tile.endsWith(GemmKernels.MATMUL_CM2V_SUFFIX);
+    }
+
+    /** Whether a fast kernel is the four-element decode form of the CM2 GEMM ({@code <T>_MatMul_CM2V}, either
+     *  tile). */
+    static boolean cm2DecodeVectorFast(String fastKernel) {
+        return cm2TileBase(fastKernel).endsWith(GemmKernels.MATMUL_CM2V_SUFFIX);
+    }
+
+    /** Whether a fast kernel is the 128-token tile of a CM2 form ({@code <T>_MatMul_CM2[V]_N128}). */
+    static boolean cm2MediumFast(String fastKernel) {
+        return fastKernel.endsWith(GemmKernels.CM2_MEDIUM_TILE_SUFFIX) && cm2Fast(fastKernel);
+    }
+
+    /** The kernel name without the 128-token tile suffix. */
+    private static String cm2TileBase(String fastKernel) {
+        return fastKernel.endsWith(GemmKernels.CM2_MEDIUM_TILE_SUFFIX)
+                ? fastKernel.substring(0, fastKernel.length() - GemmKernels.CM2_MEDIUM_TILE_SUFFIX.length())
+                : fastKernel;
     }
 
     /** Whether a fast kernel reads the staged activation records of the MMQ and W4A8 lanes, the
@@ -361,8 +381,9 @@ final class FastGemmLanes {
     }
 
     /**
-     * The small-token-tile twin of a staged fast lane for a launch of {@code nTokens}, or null when the
-     * launch keeps {@code fastKernel}: only the MMQ and W4A8 lanes of a device whose tile is wider than
+     * The small-token-tile twin of a fast lane for a launch of {@code nTokens}, or null when the launch keeps
+     * {@code fastKernel}: for a CM2 lane its 128-token tile where the grid calls for it ({@link #cm2MediumKernel});
+     * for the staged lanes, only the MMQ and W4A8 lanes of a device whose tile is wider than
      * 16 tokens have twins, and the launch takes the twin of its ladder row
      * ({@link MmqConfig#twinTokens(int, int)}, the tile llama.cpp picks per launch,
      * ggml_cuda_mmq_get_J_best) &mdash;
@@ -376,6 +397,9 @@ final class FastGemmLanes {
      * function, below sm_80, records it unavailable).
      */
     String smallTileKernel(String fastKernel, GpuWeight w, int nTokens) {
+        if (cm2Fast(fastKernel)) {
+            return cm2MediumKernel(fastKernel, w, nTokens);
+        }
         if (!stagedFast(fastKernel) || BatchInvariance.enabled()
                 || mmqConfig.tileTokens() <= MmqConfig.TOKEN_LANES) {
             return null;
@@ -388,6 +412,28 @@ final class FastGemmLanes {
                 ? GemmKernels.matmulW4a8Small(w.type(), tokens)
                 : GemmKernels.matmulMmqSmall(w.type(), tokens);
         return ops.optionalReady(twin, MmqConfig.smallTile(mmqConfig, tokens).workGroupSize(), 1) ? twin : null;
+    }
+
+    /**
+     * The 128-token tile of a CM2 launch ({@code <T>_MatMul_CM2[V]_N128}, {@link Cm2GemmPlan#MEDIUM_TILE_TOKENS}), or
+     * null when it keeps the 256-token tile: where {@link Cm2GemmPlan#tileTokensFor} picks it for the weight's largest
+     * shard, never under {@link BatchInvariance} (the tile is part of the lane a batch-invariant run pins), and only
+     * when the kernel can run its work-group on this device. The launch then never splits K ({@link #splitK}).
+     */
+    private String cm2MediumKernel(String fastKernel, GpuWeight w, int nTokens) {
+        if (BatchInvariance.enabled() || cm2MediumFast(fastKernel)) {
+            return null;
+        }
+        long rows = 0;
+        for (int s = 0; s < w.shardCount(); s++) {
+            rows = Math.max(rows, w.shardRows(s));
+        }
+        if (Cm2GemmPlan.tileTokensFor(kernels.caps().getComputeUnits(), (int) rows, nTokens, (int) w.cols())
+                != Cm2GemmPlan.MEDIUM_TILE_TOKENS) {
+            return null;
+        }
+        String medium = GemmKernels.matmulCm2Medium(w.type(), cm2DecodeVectorFast(fastKernel));
+        return ops.optionalReady(medium, Cm2GemmPlan.WORKGROUP_SIZE, 1) ? medium : null;
     }
 
     /**
@@ -497,6 +543,21 @@ final class FastGemmLanes {
     }
 
     /**
+     * Whether the CM2 lane of {@code type} runs the four-element decode form {@code <T>_MatMul_CM2V}: a quantized
+     * CM2 type on a device whose tensor loads take vector decode callbacks
+     * ({@link DeviceFeature#COOPERATIVE_MATRIX_2_DECODE_VECTOR}, llama.cpp {@code coopmat2_decode_vector}). One
+     * callback then decodes four consecutive elements of a block from one 32-bit code word, where the per-element
+     * form reads a byte and the block's scale for every element. A device whose driver reports the feature but cannot
+     * build the {@code <T>_MatMul_CM2V} pipeline ({@link GpuOps#optionalReady}) keeps the per-element form, which
+     * computes the same values, rather than leaving the cooperative-matrix lane.
+     */
+    private boolean cm2DecodeVector(GGMLType type) {
+        return GemmKernels.hasCm2DecodeVector(type)
+                && kernels.caps().hasFeature(DeviceFeature.COOPERATIVE_MATRIX_2_DECODE_VECTOR)
+                && ops.optionalReady(GemmKernels.matmulCm2(type, true), Cm2GemmPlan.WORKGROUP_SIZE, 1);
+    }
+
+    /**
      * Whether a fast GEMM kernel can run this launch: the work-group size and group counts of its tile
      * ({@code tiledUsable} with the fast tile) and {@link GpuOps#optionalReady}, of the CM2 lane's activation
      * staging as well.
@@ -524,9 +585,12 @@ final class FastGemmLanes {
      * {@link com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities#UNKNOWN_COMPUTE_UNITS}). A launch of
      * fewer tokens than the device tile ({@code smallTile}, the {@code _S} twin's regime) splits by the wave-fill
      * heuristic ({@link SplitKGemmPlan#ofSmallTiles}) instead, whose partial grid gives every compute unit several
-     * blocks. The family follows the lane: {@link SplitKGemmPlan.Family#MMA} for F16/BF16,
+     * blocks; a CM2 launch on its 128-token tile ({@code smallTile}, {@link #cm2MediumKernel}) never splits, since
+     * that tile is the choice for grids the split leaves whole. The family follows the lane:
+     * {@link SplitKGemmPlan.Family#MMA} for F16/BF16,
      * {@link SplitKGemmPlan.Family#MMQ} for the staged int8 GEMM, {@link SplitKGemmPlan.Family#CM2} for the
-     * workgroup-scope cooperative-matrix form and {@link SplitKGemmPlan.Family#CM} for the fp16-tile
+     * workgroup-scope cooperative-matrix form ({@link SplitKGemmPlan.Family#CM2V} for its four-element decode form)
+     * and {@link SplitKGemmPlan.Family#CM} for the fp16-tile
      * cooperative-matrix form.
      *
      * @param xOff    offset of the activation view the launch reads, in floats or, for the staged MMQ lane, in staged
@@ -549,8 +613,11 @@ final class FastGemmLanes {
                     : SplitKGemmPlan.ofW4a8(w.type(), m, cols, nTokens, mmqConfig.rowRecords(cols), xOff,
                             mmqConfig, computeUnits, local);
         } else if (cm2Fast(fastKernel)) {
-            plan = SplitKGemmPlan.of(Cm2GemmPlan.of(w.type(), m, cols, nTokens, cols, xOff, yStride, yOff),
-                    computeUnits, local);
+            if (smallTile || cm2MediumFast(fastKernel)) {
+                return null;
+            }
+            plan = SplitKGemmPlan.of(Cm2GemmPlan.of(w.type(), cm2DecodeVectorFast(fastKernel), m, cols, nTokens, cols,
+                    xOff, yStride, yOff), computeUnits, local);
         } else if (fastKernel.endsWith(GemmKernels.MATMUL_CM_SUFFIX)) {
             plan = SplitKGemmPlan.of(CmGemmPlan.of(w.type(), m, cols, nTokens, cols, xOff, yStride, yOff),
                     computeUnits, local);
@@ -867,7 +934,8 @@ final class FastGemmLanes {
             });
             prewarmFp8Staging();
         } else if (cm2Fast(fast)) {
-            ops.optionalReady(GemmKernels.matmulCm2KSplit(type), workGroup, 1);
+            ops.optionalReady(GemmKernels.matmulCm2KSplit(type, cm2DecodeVectorFast(fast)), workGroup, 1);
+            ops.optionalReady(GemmKernels.matmulCm2Medium(type, cm2DecodeVectorFast(fast)), workGroup, 1);
             ops.optionalReady(Cm2GemmPlan.STAGE_KERNEL, Cm2GemmPlan.STAGE_LOCAL);
             if (GemmKernels.hasMma(type)) {
                 // The MMA pair still serves the dense reductions the CM2 rows cannot align (fastGemm(GpuWeight, int)).

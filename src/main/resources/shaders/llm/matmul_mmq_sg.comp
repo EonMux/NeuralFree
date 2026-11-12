@@ -1,25 +1,27 @@
-/* matmul_mmq_sg.comp - subgroup-row int8 MMQ GEMM of Q8_0, Q4_0, Q4_K, Q5_K and Q6_K weights for 16-lane
- * subgroups: the Vulkan form of kernels/llm/matmul_mmq_sg.cl. Requires: common/nf_common.glsl.
+/* matmul_mmq_sg.comp - subgroup-row int8 MMQ GEMM of Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K and Q6_K weights for
+ * 16-lane subgroups: the Vulkan form of kernels/llm/matmul_mmq_sg.cl. Requires: common/nf_common.glsl.
  *
- * {T}_MatMulSg_MMQ (T = Q8_0, Q4_0, Q4_K, Q5_K, Q6_K) computes what {T}_MatMul_MMQ (matmul_mmq.comp) computes, with
- * their argument list and staged Q8_1 records (quant_mmq.comp, tk = 16: codes at units 0..3, d at 4, code sum at 5,
- * zero point at 6), under the work mapping of the OpenCL source, which that file documents in full:
+ * {T}_MatMulSg_MMQ (T = Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K) computes what {T}_MatMul_MMQ
+ * (matmul_mmq.comp) computes, with their argument list and staged Q8_1 records (quant_mmq.comp, tk = 16: codes at
+ * units 0..3, d at 4, code sum at 5, zero point at 6), under the work mapping of the OpenCL source, which that file
+ * documents in full:
  *
  * - A workgroup owns NF_SGM_TM = 128 weight rows by NF_SGM_TN = 32 tokens in NF_SGM_SPLIT token halves of 128
  *   invocations (subgroups of 16 lanes; the variants row's sg16 flag pins the size and full subgroups): work-item
  *   l = 16 * subgroup + lane owns row m0 + l % 128 and keeps the token sums of its half, 32 / NF_SGM_SPLIT, in
- *   registers. Q8_0, Q4_0, Q4_K and Q5_K split in two: Mesa's Intel compiler gives a SIMD16 thread 128 registers,
+ *   registers. Every form but Q6_K splits in two: Mesa's Intel compiler gives a SIMD16 thread 128 registers,
  *   which the 32 sums of the OpenCL tile overflow; Q6_K keeps one half, its block decode costing more when repeated
  *   (SubgroupMmqGemm.VULKAN_TOKEN_SPLIT has the measurements).
- * - A stage is 64 deep (a Q8_0 or Q4_0 block pair, or a quarter of a K-quant super-block). Each work-item of the
- *   first half copies one 16-deep record of one token into shared memory (double-buffered, the next stage's copy issued
- *   between the two halves of the stage), one barrier per stage.
+ * - A stage is 64 deep (a block pair of a 32-element type, or a quarter of a K-quant super-block). Each work-item of
+ *   the first half copies one 16-deep record of one token into shared memory (double-buffered, the next stage's copy
+ *   issued between the two halves of the stage), one barrier per stage.
  * - Each token's 16-unit record pair is one shared load across the subgroup (lane i reads unit i) and its words
  *   reach every lane through subgroupBroadcast with constant lane ids, which the Intel compiler lowers to scalar
  *   register regions; the codes meet them in dotPacked4x8EXT (dp4a), 8 per 32-deep half and token.
  * - The subgroup operations are basic and ballot ones (subgroupBroadcast) only.
  *
- * Variant rows select NF_SGM_Q8_0, NF_SGM_Q4_0, NF_SGM_Q4_K, NF_SGM_Q5_K or NF_SGM_Q6_K.
+ * Variant rows select NF_SGM_Q8_0, NF_SGM_Q4_0, NF_SGM_Q4_1, NF_SGM_Q5_0, NF_SGM_Q5_1, NF_SGM_Q4_K, NF_SGM_Q5_K or
+ * NF_SGM_Q6_K; the block layouts and offset terms are those of the OpenCL source.
  *
  * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
  *   (i M, i K, i N, i q_stride, i q_off, i y_stride, i y_off, R weight, R uint q8, W float y)
@@ -42,16 +44,16 @@
 #if !defined(USE_SUBGROUPS) || !defined(NF_SG_ROW_SIZE) || NF_SG_ROW_SIZE != 16
 #error "matmul_mmq_sg.comp is built only by an sg16 variants row"
 #endif
-#if defined(NF_SGM_Q8_0) + defined(NF_SGM_Q4_0) + defined(NF_SGM_Q4_K) + defined(NF_SGM_Q5_K) \
-    + defined(NF_SGM_Q6_K) != 1
-#error "matmul_mmq_sg.comp requires exactly one of NF_SGM_Q8_0, NF_SGM_Q4_0, NF_SGM_Q4_K, NF_SGM_Q5_K, NF_SGM_Q6_K"
+#if defined(NF_SGM_Q8_0) + defined(NF_SGM_Q4_0) + defined(NF_SGM_Q4_1) + defined(NF_SGM_Q5_0) + defined(NF_SGM_Q5_1) \
+    + defined(NF_SGM_Q4_K) + defined(NF_SGM_Q5_K) + defined(NF_SGM_Q6_K) != 1
+#error "matmul_mmq_sg.comp requires exactly one NF_SGM_<type> define"
 #endif
 /* The forms whose 16-deep records start their integer dots at a code offset (unit 6) and those with the Q4_K
  * minimum term. */
-#if defined(NF_SGM_Q6_K) || defined(NF_SGM_Q4_0)
+#if defined(NF_SGM_Q6_K) || defined(NF_SGM_Q4_0) || defined(NF_SGM_Q5_0)
 #define NF_SGM_OFFSET_FORM
 #endif
-#if defined(NF_SGM_Q4_K) || defined(NF_SGM_Q5_K)
+#if defined(NF_SGM_Q4_K) || defined(NF_SGM_Q5_K) || defined(NF_SGM_Q4_1) || defined(NF_SGM_Q5_1)
 #define NF_SGM_MIN_FORM
 #endif
 
@@ -194,13 +196,35 @@ vec2 nf_sgm_q4k_scales(uvec4 h, int q, int i) {
         acc[t] = fma(eb, float(i1) * NF_SGM_XF(11), fma(ea, float(i0) * NF_SGM_XF(4), acc[t])); \
     }
 
-/* Unit 6: the code offset of the record's integer dot, -32 * sum for Q6_K and -8 * sum for Q4_0. */
+/* Unit 6: the code offset of the record's integer dot, -32 * sum for Q6_K, -16 * sum for Q5_0 and -8 * sum for
+ * Q4_0. */
 uint nf_sgm_fix(int st, uvec3 g1) {
 #ifdef NF_SGM_Q6_K
     return uint(-32 * int(g1.y));
+#elif defined(NF_SGM_Q5_0)
+    return uint(-16 * int(g1.y));
 #else
     return uint(-8 * int(g1.y));
 #endif
+}
+#endif
+
+#if defined(NF_SGM_Q5_0) || defined(NF_SGM_Q5_1)
+/* qh bits 0..3 of h as bit 4 of the four bytes of a code word. */
+uint nf_sgm_fifth(uint h) {
+    return ((h & 1u) | ((h & 2u) << 7) | ((h & 4u) << 14) | ((h & 8u) << 21)) << 4;
+}
+
+/* The 5-bit codes of a block's records (low nibbles record r, high nibbles r + 1) from code words q and qh word h. */
+void nf_sgm_codes5(uvec4 q, uint h, out uint c[8]) {
+    c[0] = (q.x & 0x0F0F0F0Fu) | nf_sgm_fifth(h);
+    c[1] = (q.y & 0x0F0F0F0Fu) | nf_sgm_fifth(h >> 4);
+    c[2] = (q.z & 0x0F0F0F0Fu) | nf_sgm_fifth(h >> 8);
+    c[3] = (q.w & 0x0F0F0F0Fu) | nf_sgm_fifth(h >> 12);
+    c[4] = ((q.x >> 4) & 0x0F0F0F0Fu) | nf_sgm_fifth(h >> 16);
+    c[5] = ((q.y >> 4) & 0x0F0F0F0Fu) | nf_sgm_fifth(h >> 20);
+    c[6] = ((q.z >> 4) & 0x0F0F0F0Fu) | nf_sgm_fifth(h >> 24);
+    c[7] = ((q.w >> 4) & 0x0F0F0F0Fu) | nf_sgm_fifth(h >> 28);
 }
 #endif
 
@@ -342,6 +366,64 @@ void main() {
                                       (b0 >> 4) & 0x0F0F0F0Fu, (b1 >> 4) & 0x0F0F0F0Fu,
                                       (b2 >> 4) & 0x0F0F0F0Fu, (b3 >> 4) & 0x0F0F0F0Fu);
             const float dw = nf_half(w4 >> 16);
+            NF_SGM_BLOCK_Q6K(xb + 16u, c, dw, dw)
+        }
+        barrier();
+    }
+#elif defined(NF_SGM_Q4_1) || defined(NF_SGM_Q5_1)
+    /* A row is K / 64 block pairs of 10 (Q4_1) or 12 (Q5_1) words, block B's words following block A's: a header
+     * word (d low, m high), Q5_1's qh word, then 4 code words. The minimum form with d * sc = d and -dmin * m = m. */
+#ifdef NF_SGM_Q5_1
+    const uint bw = 6u;
+#else
+    const uint bw = 5u;
+#endif
+    uint p = lrow * uint(stages) * (2u * bw);
+    for (int s = 0; s < stages; s++, p += 2u * bw) {
+        const uint xb = uint(s & 1) * NF_SGM_XBUF;
+        [[unroll]] for (uint hb = 0u; hb < 2u; hb++) {
+            const uint pb = p + hb * bw;
+            const uint hd = w_u32[pb];
+            const uvec4 q = uvec4(w_u32[pb + bw - 4u], w_u32[pb + bw - 3u], w_u32[pb + bw - 2u], w_u32[pb + bw - 1u]);
+            uint c[8];
+#ifdef NF_SGM_Q5_1
+            nf_sgm_codes5(q, w_u32[pb + 1u], c);
+#else
+            c = uint[8](q.x & 0x0F0F0F0Fu, q.y & 0x0F0F0F0Fu, q.z & 0x0F0F0F0Fu, q.w & 0x0F0F0F0Fu,
+                        (q.x >> 4) & 0x0F0F0F0Fu, (q.y >> 4) & 0x0F0F0F0Fu, (q.z >> 4) & 0x0F0F0F0Fu,
+                        (q.w >> 4) & 0x0F0F0F0Fu);
+#endif
+            const float dsc = nf_half(hd), nmm = nf_half(hd >> 16);
+            NF_SGM_BLOCK_Q4K(xb + 16u * hb, c, dsc, nmm)
+            if (hb == 0u && s + 1 < stages) {
+                nf_sgm_gather(uint((s + 1) & 1) * NF_SGM_XBUF, s + 1);
+            }
+        }
+        barrier();
+    }
+#elif defined(NF_SGM_Q5_0)
+    /* A row is K / 64 block pairs of 11 words (44 bytes): block A's d is the low half of word 0, its qh
+     * (w_0 >> 16) | (w_1 << 16) and its code word i (w_{1+i} >> 16) | (w_{2+i} << 16); block B's d is the high half
+     * of word 5, its qh word 6 and its code words words 7..10. W = d * (c - 16), the offset form. */
+    uint p = lrow * uint(stages) * 11u;
+    for (int s = 0; s < stages; s++, p += 11u) {
+        const uint xb = uint(s & 1) * NF_SGM_XBUF;
+        {
+            const uint w0 = w_u32[p], w1 = w_u32[p + 1u], w2 = w_u32[p + 2u], w3 = w_u32[p + 3u];
+            const uint w4 = w_u32[p + 4u], w5 = w_u32[p + 5u];
+            uint c[8];
+            nf_sgm_codes5(uvec4((w1 >> 16) | (w2 << 16), (w2 >> 16) | (w3 << 16), (w3 >> 16) | (w4 << 16),
+                                (w4 >> 16) | (w5 << 16)), (w0 >> 16) | (w1 << 16), c);
+            const float dw = nf_half(w0);
+            NF_SGM_BLOCK_Q6K(xb, c, dw, dw)
+        }
+        if (s + 1 < stages) {
+            nf_sgm_gather(uint((s + 1) & 1) * NF_SGM_XBUF, s + 1);
+        }
+        {
+            uint c[8];
+            nf_sgm_codes5(uvec4(w_u32[p + 7u], w_u32[p + 8u], w_u32[p + 9u], w_u32[p + 10u]), w_u32[p + 6u], c);
+            const float dw = nf_half(w_u32[p + 5u] >> 16);
             NF_SGM_BLOCK_Q6K(xb + 16u, c, dw, dw)
         }
         barrier();

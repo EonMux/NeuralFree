@@ -126,6 +126,14 @@ public final class GemmKernels {
     public static final String MATMUL_CM2_SUFFIX = "_MatMul_CM2";
     /** Name suffix of the split-K twins of the CM2 GEMM kernels, {@code <T>_MatMul_CM2_KSplit}. */
     public static final String MATMUL_CM2_KSPLIT_SUFFIX = "_MatMul_CM2_KSplit";
+    /** Name suffix of the CM2 GEMM kernels whose weight tile decodes four elements per callback
+     *  (VK_NV_cooperative_matrix_decode_vector), {@code <T>_MatMul_CM2V}. */
+    public static final String MATMUL_CM2V_SUFFIX = "_MatMul_CM2V";
+    /** Name suffix of the split-K twins of the CM2V GEMM kernels, {@code <T>_MatMul_CM2V_KSplit}. */
+    public static final String MATMUL_CM2V_KSPLIT_SUFFIX = "_MatMul_CM2V_KSplit";
+    /** Name suffix that marks the 128-token tile of a CM2 or CM2V GEMM kernel, {@code <T>_MatMul_CM2[V]_N128}
+     *  (Cm2GemmPlan.MEDIUM_TILE_TOKENS); the kernels without it run the 256-token tile. */
+    public static final String CM2_MEDIUM_TILE_SUFFIX = "_N128";
     /** Name suffix of the E4M3 GEMM kernels of the 4-bit weight types, {@code <T>_MatMul_W4A8}. */
     public static final String MATMUL_W4A8_SUFFIX = "_MatMul_W4A8";
     /** Name suffix of the split-K twins of the W4A8 GEMM kernels, {@code <T>_MatMul_W4A8_KSplit}. */
@@ -636,6 +644,15 @@ public final class GemmKernels {
         return type != null && CM2_TYPES.contains(type);
     }
 
+    /**
+     * Whether {@code type} has a {@code <T>_MatMul_CM2V} GEMM kernel, the CM2 form whose weight tile decodes four
+     * elements per callback (VK_NV_cooperative_matrix_decode_vector): every quantized {@link #CM2_TYPES} entry. The
+     * dense F16 form loads its halves without a decode callback.
+     */
+    public static boolean hasCm2DecodeVector(GGMLType type) {
+        return hasCm2(type) && type != GGMLType.F16;
+    }
+
     /** Whether {@code type} is an E4M3 weight type of the FP8 lane ({@link #FP8_TYPES}). */
     public static boolean isFp8(GGMLType type) {
         return type != null && FP8_TYPES.contains(type);
@@ -761,12 +778,54 @@ public final class GemmKernels {
         return type.name() + MATMUL_CM2_KSPLIT_SUFFIX;
     }
 
+    /**
+     * Name of the CM2 GEMM kernel of a CM2 weight type in the decode form {@code decodeVector} selects:
+     * {@code <T>_MatMul_CM2V} (four elements per decode callback) or {@code <T>_MatMul_CM2}.
+     *
+     * @throws IllegalArgumentException when the type has no kernel of that form
+     */
+    public static String matmulCm2(GGMLType type, boolean decodeVector) {
+        if (!decodeVector) {
+            return matmulCm2(type);
+        }
+        if (!hasCm2DecodeVector(type)) {
+            throw new IllegalArgumentException("no CM2V GEMM kernel for weight type " + type
+                    + "; supported: the quantized types of " + CM2_TYPES);
+        }
+        return type.name() + MATMUL_CM2V_SUFFIX;
+    }
+
+    /**
+     * Name of the split-K twin of {@link #matmulCm2(GGMLType, boolean)}: {@code <T>_MatMul_CM2V_KSplit} or
+     * {@code <T>_MatMul_CM2_KSplit}.
+     *
+     * @throws IllegalArgumentException when the type has no kernel of that form
+     */
+    public static String matmulCm2KSplit(GGMLType type, boolean decodeVector) {
+        if (!decodeVector) {
+            return matmulCm2KSplit(type);
+        }
+        return matmulCm2(type, true) + "_KSplit";
+    }
+
+    /**
+     * Name of the 128-token tile form of {@link #matmulCm2(GGMLType, boolean)}: {@code <T>_MatMul_CM2_N128} or
+     * {@code <T>_MatMul_CM2V_N128} (Cm2GemmPlan.MEDIUM_TILE_TOKENS). It has no split-K twin: the dispatch takes it
+     * only for a launch it does not split.
+     *
+     * @throws IllegalArgumentException when the type has no kernel of that form
+     */
+    public static String matmulCm2Medium(GGMLType type, boolean decodeVector) {
+        return matmulCm2(type, decodeVector) + CM2_MEDIUM_TILE_SUFFIX;
+    }
+
     /** Every kernel name of this family: tiled, MMQ, MMQ KSplit, MMQ S, MMQ S64, MMQ SKSplit,
-     *  MMQ SKSplit64, CM and CM KSplit GEMM kernels in {@link GGMLType} order, the CM2 pair of the
-     *  non-i-quant types and of F16 (after the MMA pair), the FP8 and W4A8 E4M3 GEMMs with their S, S64, SKSplit and SKSplit64
-     *  twins, then the activation staging kernels, the reduce and the top-k. */
+     *  MMQ SKSplit64, CM and CM KSplit GEMM kernels in {@link GGMLType} order, the CM2 and CM2V pairs of the
+     *  non-i-quant types with their 128-token tiles, the CM2 pair of F16 and its 128-token tile (after the MMA
+     *  pair), the FP8 and W4A8 E4M3 GEMMs with their S, S64,
+     *  SKSplit and SKSplit64 twins, then the activation staging kernels, the reduce and the top-k. */
     public static List<String> kernelNames() {
-        List<String> names = new ArrayList<>(TILED_TYPES.size() + 8 * MMQ_TYPES.size() + 2 * CM2_TYPES.size()
+        List<String> names = new ArrayList<>(TILED_TYPES.size() + 8 * MMQ_TYPES.size() + 6 * CM2_TYPES.size()
                 + 6 * FP8_TYPES.size() + MMA_TYPES.size() + 6 * W4A8_TYPES.size() + 7);
         for (GGMLType type : TILED_TYPES) {
             names.add(matmulTiled(type));
@@ -783,6 +842,10 @@ public final class GemmKernels {
             if (hasCm2(type)) {
                 names.add(matmulCm2(type));
                 names.add(matmulCm2KSplit(type));
+                names.add(matmulCm2(type, true));
+                names.add(matmulCm2KSplit(type, true));
+                names.add(matmulCm2Medium(type, false));
+                names.add(matmulCm2Medium(type, true));
             }
         }
         for (GGMLType type : FP8_TYPES) {
@@ -799,6 +862,7 @@ public final class GemmKernels {
             if (hasCm2(type)) {
                 names.add(matmulCm2(type));
                 names.add(matmulCm2KSplit(type));
+                names.add(matmulCm2Medium(type, false));
             }
         }
         for (GGMLType type : W4A8_TYPES) {

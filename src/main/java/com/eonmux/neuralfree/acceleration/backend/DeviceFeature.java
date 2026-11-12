@@ -59,6 +59,12 @@ public enum DeviceFeature {
      */
     COOPERATIVE_MATRIX_2_ATTENTION,
     /**
+     * {@link #COOPERATIVE_MATRIX_2} tensor loads also take four-element decode callbacks
+     * ({@code VK_NV_cooperative_matrix_decode_vector}, {@code cooperativeMatrixDecodeVector}), which the quantized CM2
+     * GEMM forms {@code <T>_MatMul_CM2V} use (llama.cpp {@code coopmat2_decode_vector}). Vulkan only.
+     */
+    COOPERATIVE_MATRIX_2_DECODE_VECTOR,
+    /**
      * Bfloat16 matrix multiply-accumulate on the tensor cores is usable in kernels: CUDA compute capability 8.0+
      * ({@code mma.sync.f32.bf16.bf16.f32}), or Vulkan {@code VK_KHR_shader_bfloat16} with the
      * {@code bfloat16CooperativeMatrix} feature and a 16-multiple bf16 x bf16 -> fp32 subgroup multiply-add (llama.cpp

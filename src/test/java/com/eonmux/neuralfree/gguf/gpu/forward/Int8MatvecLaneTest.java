@@ -564,7 +564,7 @@ public class Int8MatvecLaneTest {
 
     /**
      * A multi-token projection of a {@link SubgroupMmqGemm#TYPES} type on a program built with the subgroup forms
-     * runs that type's subgroup-row MMQ GEMM over the same staged records; a type without a subgroup GEMM (Q5_0),
+     * runs that type's subgroup-row MMQ GEMM over the same staged records; a type without a subgroup GEMM (Q3_K),
      * and a device whose program does not build the forms, keep the portable MMQ kernel.
      */
     @Test
@@ -574,18 +574,18 @@ public class Int8MatvecLaneTest {
                 subgroupRowCapabilities(8, 32));
         GpuBuffer in = backend.allocateBuffer((long) COLS * tokens * 4);
         GpuBuffer out = backend.allocateBuffer((long) ROWS * tokens * 4);
-        assertEquals(EnumSet.of(GGMLType.Q8_0, GGMLType.Q4_0, GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.Q6_K),
-                SubgroupMmqGemm.TYPES);
+        assertEquals(EnumSet.of(GGMLType.Q8_0, GGMLType.Q4_0, GGMLType.Q4_1, GGMLType.Q5_0, GGMLType.Q5_1,
+                GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.Q6_K), SubgroupMmqGemm.TYPES);
         for (GGMLType type : SubgroupMmqGemm.TYPES) {
             GpuWeight w = weight(type);
             List<String> sg = run(() -> ops.matmul(w, in, 0, out, 0, tokens));
             assertTrue(type + " " + sg, sg.contains(type.name() + "_MatMulSg_MMQ"));
             assertFalse(type + " " + sg, sg.contains(type.name() + "_MatMul_MMQ"));
         }
-        GpuWeight q50 = weight(GGMLType.Q5_0);
-        List<String> family = run(() -> ops.matmul(q50, in, 0, out, 0, tokens));
-        assertTrue(family.toString(), family.contains("Q5_0_MatMul_MMQ"));
-        assertFalse(family.toString(), family.contains("Q5_0_MatMulSg_MMQ"));
+        GpuWeight q3k = weight(GGMLType.Q3_K);
+        List<String> family = run(() -> ops.matmul(q3k, in, 0, out, 0, tokens));
+        assertTrue(family.toString(), family.contains("Q3_K_MatMul_MMQ"));
+        assertFalse(family.toString(), family.contains("Q3_K_MatMulSg_MMQ"));
 
         open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.OPENCL,
                 subgroupRowCapabilities(32, 64));
@@ -644,8 +644,13 @@ public class Int8MatvecLaneTest {
             assertFalse(type.name(), SubgroupMmqGemm.shapeServes(type, 192));
             assertFalse(type.name(), SubgroupMmqGemm.shapeServes(type, 0));
         }
-        assertNull(SubgroupMmqGemm.kernel(GGMLType.Q5_0));
-        assertFalse(SubgroupMmqGemm.shapeServes(GGMLType.Q5_0, 256));
+        for (GGMLType type : new GGMLType[]{GGMLType.Q4_1, GGMLType.Q5_0, GGMLType.Q5_1}) {
+            assertEquals(type.name() + "_MatMulSg_MMQ", SubgroupMmqGemm.kernel(type));
+            assertTrue(type.name(), SubgroupMmqGemm.shapeServes(type, 64));
+            assertFalse(type.name(), SubgroupMmqGemm.shapeServes(type, 96));
+        }
+        assertNull(SubgroupMmqGemm.kernel(GGMLType.Q3_K));
+        assertFalse(SubgroupMmqGemm.shapeServes(GGMLType.Q3_K, 256));
     }
 
     /** The Arrow-Lake OpenCL kind with subgroups whose required sizes span {@code min..max}. */

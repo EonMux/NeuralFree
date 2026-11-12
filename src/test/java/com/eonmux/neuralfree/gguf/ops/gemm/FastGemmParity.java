@@ -11,6 +11,7 @@ import com.eonmux.neuralfree.gguf.quant.CpuBlockDecoders;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -86,6 +87,56 @@ final class FastGemmParity {
             assertTrue(shifted.kernelName() + " qOff " + qOff + " token " + i / m + " row " + i % m + ": " + got[i]
                     + " at qOff 0: " + want[i], Float.floatToRawIntBits(got[i]) == Float.floatToRawIntBits(want[i]));
         }
+    }
+
+    /**
+     * The int8 MMQ GEMM over operands whose every step is exact in fp32: Q8_0 blocks of scale 1 holding random codes,
+     * and integer activations in [-127, 127] whose every 16-element chunk reaches 127 in magnitude, so the staging
+     * scale is 1 and the staged codes are the activations themselves. Each output is then an integer below 2^24 that
+     * any correct evaluation stores exactly, whatever its integer-dot instruction, staging order or float
+     * contraction: the plain kernel and its split-K twin must equal the CPU's integer sum bit for bit.
+     */
+    void mmqExactOnIntegerOperands(int m, int k, int n, int splits) throws InterruptedException {
+        GGMLType type = GGMLType.Q8_0;
+        java.util.Random rnd = new java.util.Random(0x1A7E5L + 31L * m + k + n);
+        byte[] weight = new byte[m * (k / 32) * 34];
+        int[] codes = new int[m * k];
+        for (int r = 0; r < m; r++) {
+            for (int b = 0; b < k / 32; b++) {
+                int base = (r * (k / 32) + b) * 34;
+                weight[base] = 0x00;
+                weight[base + 1] = 0x3C;
+                for (int e = 0; e < 32; e++) {
+                    int c = rnd.nextInt(255) - 127;
+                    codes[r * k + b * 32 + e] = c;
+                    weight[base + 2 + e] = (byte) c;
+                }
+            }
+        }
+        float[] x = new float[n * k];
+        for (int t = 0; t < n; t++) {
+            for (int i = 0; i < k; i++) {
+                x[t * k + i] = i % 16 == rnd.nextInt(16) || i % 16 == 15 ? (rnd.nextBoolean() ? 127 : -127)
+                        : rnd.nextInt(255) - 127;
+            }
+        }
+        float[] want = new float[n * m];
+        for (int t = 0; t < n; t++) {
+            for (int r = 0; r < m; r++) {
+                long dot = 0;
+                for (int i = 0; i < k; i++) {
+                    dot += (long) codes[r * k + i] * (long) x[t * k + i];
+                }
+                want[t * m + r] = dot;
+            }
+        }
+        MmqGemmPlan base = MmqGemmPlan.contiguous(mmqConfig, type, m, k, n);
+        assertIdentical(base.kernelName() + " exact", java.util.Arrays.copyOf(launchMmq(base, weight, x), n * m),
+                want);
+        SplitKGemmPlan split = SplitKGemmPlan.ofMmq(type, m, k, n, base.qStride(), 0, splits,
+                SplitKGemmPlan.sliceLength(k, splits, type.getBlockSize()), mmqConfig, false, 256);
+        assertIdentical(split.kernelName() + " exact", java.util.Arrays.copyOf(launchMmqSplit(split, weight, x),
+                n * m), want);
     }
 
     /**
@@ -170,6 +221,128 @@ final class FastGemmParity {
         float[] plain = launchCm2(base, null, weight, x);
         float[] splitOut = launchCm2(base, split, weight, x);
         assertWithinRelative(split.kernelName(), splitOut, plain, w, x, m, k, n, 2.5e-3);
+    }
+
+    /**
+     * The split-K launch the dispatch's heuristic makes of a CM2 launch ({@link SplitKGemmPlan#of(Cm2GemmPlan, int,
+     * int)}) on a device of {@code computeUnits}, against the plain kernel of the same form: the plan must take
+     * {@code splits} slices of whole {@link Cm2GemmPlan#SPLIT_SLICE_ALIGN}-element groups, so slices past the first
+     * start at a non-zero 256-multiple and, for the 32-element types, run the unrolled interior groups from there. A
+     * one-hot activation at each slice's first and last element and at the reduction's last one selects one decoded
+     * weight per output, which both launches store exactly; a full reduction agrees within the fp16-accumulation
+     * bound ({@link #cm2SplitKMatchesPlain}). The full reduction's activations are scaled by a power of two so that no
+     * output's sum of absolute products reaches 2^14: every running fp16 sum then stays in range and the comparison
+     * covers the slice geometry alone. Unscaled, the fixture's 9728-deep sums reach past 65504 in the whole launch's
+     * single fp16 chain, which saturates there while the slices' shorter chains do not.
+     */
+    void cm2HeuristicSplitMatchesPlain(GGMLType type, boolean decodeVector, int m, int k, int n, int computeUnits,
+                                       int splits) throws InterruptedException {
+        Cm2GemmPlan base = Cm2GemmPlan.of(type, decodeVector, m, k, n, k, 0, m, 0);
+        SplitKGemmPlan split = SplitKGemmPlan.of(base, computeUnits, 256);
+        String what = (split == null ? base.kernelName() : split.kernelName()) + " M=" + m + " K=" + k + " N=" + n;
+        assertTrue(what + " splits on " + computeUnits + " units", split != null);
+        assertEquals(what + " slices", splits, split.splits());
+        assertEquals(what + " slice alignment", 0, split.kSlice() % Cm2GemmPlan.SPLIT_SLICE_ALIGN);
+        byte[] weight = OpenClMmqGemmParityTest.buildWeight(type, m, k);
+        for (int s = 0; s < splits; s++) {
+            int start = s * split.kSlice();
+            int end = Math.min(k, start + split.kSlice());
+            for (int selectedK : new int[]{start, end - 1}) {
+                float[] oneHot = new float[n * k];
+                for (int t = 0; t < n; t++) {
+                    oneHot[t * k + selectedK] = 1.0f;
+                }
+                assertEqualValues(what + " one-hot K=" + selectedK, launchCm2(base, split, weight, oneHot),
+                        launchCm2(base, null, weight, oneHot));
+            }
+        }
+        float[] x = OpenClMmqGemmParityTest.buildX(n, k);
+        float[] w = CpuBlockDecoders.dequantize(weight, type, (long) m * k);
+        double maxTerms = 0.0;
+        for (int t = 0; t < n; t++) {
+            for (int r = 0; r < m; r++) {
+                double terms = 0.0;
+                for (int i = 0; i < k; i++) {
+                    terms += Math.abs((double) w[r * k + i] * x[t * k + i]);
+                }
+                maxTerms = Math.max(maxTerms, terms);
+            }
+        }
+        float scale = 1.0f;
+        while (maxTerms * scale >= 16384.0) {
+            scale *= 0.5f;
+        }
+        for (int i = 0; i < x.length; i++) {
+            x[i] *= scale;
+        }
+        assertWithinRelative(what, launchCm2(base, split, weight, x), launchCm2(base, null, weight, x), w, x, m, k, n,
+                2.5e-3);
+    }
+
+    /** Equal values element for element ({@code -0.0} equals {@code 0.0}: a slice sum turns a negative zero
+     *  positive). */
+    private static void assertEqualValues(String what, float[] actual, float[] expected) {
+        assertEquals(what + " length", expected.length, actual.length);
+        for (int i = 0; i < expected.length; i++) {
+            if (actual[i] != expected[i]) {
+                throw new AssertionError(what + " element " + i + ": " + actual[i] + " expected " + expected[i]);
+            }
+        }
+    }
+
+    /**
+     * The four-element decode form {@code <T>_MatMul_CM2V} against {@code <T>_MatMul_CM2}: an identity activation over
+     * every reduction position (token t selects column t, so each output is one decoded weight) must agree bit for
+     * bit, since each vector component takes the scalar callback's formula; over a full reduction both feed the same
+     * fp16 tiles to the same products and must agree exactly as well, plain and split-K. Rows {@code m} past a whole
+     * tile take the clamped layouts.
+     */
+    void cm2DecodeVectorMatchesScalar(GGMLType type, int m, int k) throws InterruptedException {
+        Cm2GemmPlan scalar = Cm2GemmPlan.contiguous(type, m, k, k);
+        Cm2GemmPlan vector = Cm2GemmPlan.of(type, true, m, k, k, k, 0, m, 0);
+        byte[] weight = OpenClMmqGemmParityTest.buildWeight(type, m, k);
+        float[] identity = new float[k * k];
+        for (int t = 0; t < k; t++) {
+            identity[t * k + t] = 1.0f;
+        }
+        assertIdentical(vector.kernelName() + " identity", launchCm2(vector, null, weight, identity),
+                launchCm2(scalar, null, weight, identity));
+        int n = 40;
+        float[] x = OpenClMmqGemmParityTest.buildX(n, k);
+        Cm2GemmPlan scalarN = Cm2GemmPlan.contiguous(type, m, k, n);
+        Cm2GemmPlan vectorN = Cm2GemmPlan.of(type, true, m, k, n, k, 0, m, 0);
+        assertIdentical(vectorN.kernelName(), launchCm2(vectorN, null, weight, x),
+                launchCm2(scalarN, null, weight, x));
+        int splits = 3;
+        int kSlice = SplitKGemmPlan.sliceLength(k, splits, Cm2GemmPlan.TILE_DEPTH);
+        SplitKGemmPlan scalarSplit = SplitKGemmPlan.of(SplitKGemmPlan.Family.CM2, type, m, k, n, k, 0, splits, kSlice,
+                Cm2GemmPlan.TILE_TOKENS, 256);
+        SplitKGemmPlan vectorSplit = SplitKGemmPlan.of(SplitKGemmPlan.Family.CM2V, type, m, k, n, k, 0, splits, kSlice,
+                Cm2GemmPlan.TILE_TOKENS, 256);
+        assertIdentical(vectorSplit.kernelName(), launchCm2(vectorN, vectorSplit, weight, x),
+                launchCm2(scalarN, scalarSplit, weight, x));
+    }
+
+    /**
+     * The 128-token tile ({@code <T>_MatMul_CM2[V]_N128}) against the 256-token tile of the same form over the same
+     * launch, bit for bit: both accumulate every output element over the same reduction stages, and differ only in the
+     * grid and the token width of the narrower tail tiles.
+     */
+    void cm2MediumTileMatchesLarge(GGMLType type, boolean decodeVector, byte[] weight, float[] x, int m, int k, int n)
+            throws InterruptedException {
+        Cm2GemmPlan large = Cm2GemmPlan.of(type, decodeVector, m, k, n, k, 0, m, 0);
+        Cm2GemmPlan medium = Cm2GemmPlan.of(type, decodeVector, Cm2GemmPlan.MEDIUM_TILE_TOKENS, m, k, n, k, 0, m, 0);
+        assertIdentical(medium.kernelName() + " M=" + m + " K=" + k + " N=" + n, launchCm2(medium, null, weight, x),
+                launchCm2(large, null, weight, x));
+    }
+
+    private static void assertIdentical(String what, float[] actual, float[] expected) {
+        assertEquals(what + " length", expected.length, actual.length);
+        for (int i = 0; i < expected.length; i++) {
+            if (Float.floatToRawIntBits(actual[i]) != Float.floatToRawIntBits(expected[i])) {
+                throw new AssertionError(what + " element " + i + ": " + actual[i] + " expected " + expected[i]);
+            }
+        }
     }
 
     /**

@@ -222,4 +222,120 @@ float16_t mmq_ref_decode(const in NfMmqRef b, const in uint bc[2], const in uint
 }
 #endif
 
+#ifdef NF_CM2_DECODE_VECTOR
+/* Four-element decode callbacks (mmq_ref_decode4, GL_NV_cooperative_matrix_decode_vector): the tensor load asks
+ * for elements e .. e+3 of a block, e a multiple of four, so one callback reads one 32-bit word of codes (two
+ * aligned 16-bit loads) where mmq_ref_decode reads a byte per element; llama.cpp's dequantFunc*_v. The four
+ * elements always share their sub-block, so the scale and offset load once. Each component takes the scalar
+ * callback's formula in the same operation order, so both forms decode every element to the same fp16 value. */
+
+/* The 32-bit word at even byte offset o. */
+uint mmq_ref_u32(const in NfMmqRef b, const in uint o) { return mmq_ref_w(b, o) | (mmq_ref_w(b, o + 2u) << 16u); }
+/* The four bytes of word v, unsigned. */
+uvec4 mmq_ref_bytes(const uint v) { return uvec4(v, v >> 8u, v >> 16u, v >> 24u) & 0xFFu; }
+/* The four bytes of word v as signed int8 values. */
+ivec4 mmq_ref_sbytes(const uint v) {
+    return ivec4(bitfieldExtract(int(v), 0, 8), bitfieldExtract(int(v), 8, 8), bitfieldExtract(int(v), 16, 8),
+                 bitfieldExtract(int(v), 24, 8));
+}
+
+#if QTYPE == QT_Q4_0
+f16vec4 mmq_ref_decode4(const in NfMmqRef b, const in uint bc[2], const in uint e2[2]) {
+    const uint e = e2[1];
+    const uvec4 code = mmq_ref_bytes((mmq_ref_u32(b, 2u + (e & 15u)) >> ((e & 16u) >> 2u)) & 0x0F0F0F0Fu);
+    return f16vec4((vec4(code) - 8.0) * mmq_ref_f16(b, 0u));
+}
+#elif QTYPE == QT_Q4_1
+f16vec4 mmq_ref_decode4(const in NfMmqRef b, const in uint bc[2], const in uint e2[2]) {
+    const uint e = e2[1];
+    const uvec4 code = mmq_ref_bytes((mmq_ref_u32(b, 4u + (e & 15u)) >> ((e & 16u) >> 2u)) & 0x0F0F0F0Fu);
+    return f16vec4(mmq_ref_f16(b, 0u) * vec4(code) + mmq_ref_f16(b, 2u));
+}
+#elif QTYPE == QT_Q5_0
+f16vec4 mmq_ref_decode4(const in NfMmqRef b, const in uint bc[2], const in uint e2[2]) {
+    const uint e = e2[1];
+    const uint qh = mmq_ref_u32(b, 2u) >> e;
+    const uvec4 code = mmq_ref_bytes((mmq_ref_u32(b, 6u + (e & 15u)) >> ((e & 16u) >> 2u)) & 0x0F0F0F0Fu)
+            | ((uvec4(qh, qh >> 1u, qh >> 2u, qh >> 3u) & 1u) << 4u);
+    return f16vec4((vec4(code) - 16.0) * mmq_ref_f16(b, 0u));
+}
+#elif QTYPE == QT_Q5_1
+f16vec4 mmq_ref_decode4(const in NfMmqRef b, const in uint bc[2], const in uint e2[2]) {
+    const uint e = e2[1];
+    const uint qh = mmq_ref_u32(b, 4u) >> e;
+    const uvec4 code = mmq_ref_bytes((mmq_ref_u32(b, 8u + (e & 15u)) >> ((e & 16u) >> 2u)) & 0x0F0F0F0Fu)
+            | ((uvec4(qh, qh >> 1u, qh >> 2u, qh >> 3u) & 1u) << 4u);
+    return f16vec4(mmq_ref_f16(b, 0u) * vec4(code) + mmq_ref_f16(b, 2u));
+}
+#elif QTYPE == QT_Q8_0
+f16vec4 mmq_ref_decode4(const in NfMmqRef b, const in uint bc[2], const in uint e2[2]) {
+    return f16vec4(vec4(mmq_ref_sbytes(mmq_ref_u32(b, 2u + e2[1]))) * mmq_ref_f16(b, 0u));
+}
+#elif QTYPE == QT_Q2_K
+f16vec4 mmq_ref_decode4(const in NfMmqRef b, const in uint bc[2], const in uint e2[2]) {
+    const uint e = e2[1];
+    const uint q = mmq_ref_u32(b, 16u + ((e >> 7u) << 5u) + (e & 31u));
+    const uvec4 code = mmq_ref_bytes((q >> (((e >> 5u) & 3u) << 1u)) & 0x03030303u);
+    const uint sc = mmq_ref_u8(b, e >> 4u);
+    return f16vec4(mmq_ref_f16(b, 80u) * float(sc & 0xFu) * vec4(code) - mmq_ref_f16(b, 82u) * float(sc >> 4u));
+}
+#elif QTYPE == QT_Q3_K
+f16vec4 mmq_ref_decode4(const in NfMmqRef b, const in uint bc[2], const in uint e2[2]) {
+    const uint e = e2[1];
+    const uint hf = e >> 7u, j = (e >> 5u) & 3u, l = e & 31u;
+    const ivec4 low = ivec4(mmq_ref_bytes((mmq_ref_u32(b, 32u + (hf << 5u) + l) >> (j << 1u)) & 0x03030303u));
+    const uvec4 high = mmq_ref_bytes((mmq_ref_u32(b, l) >> ((hf << 2u) + j)) & 0x01010101u);
+    const ivec4 code = low - ivec4(4) * ivec4(uvec4(1u) - high);
+    const uint si = e >> 4u;
+    const uint lo = (mmq_ref_u8(b, 96u + (si & 7u)) >> ((si >> 3u) * 4u)) & 0xFu;
+    const uint hi = (mmq_ref_u8(b, 104u + (si & 3u)) >> ((si >> 2u) * 2u)) & 3u;
+    return f16vec4(mmq_ref_f16(b, 108u) * float(int(lo | (hi << 4u)) - 32) * vec4(code));
+}
+#elif QTYPE == QT_Q4_K
+f16vec4 mmq_ref_decode4(const in NfMmqRef b, const in uint bc[2], const in uint e2[2]) {
+    const uint e = e2[1];
+    const uint si = e >> 5u;
+    const vec4 code = vec4(mmq_ref_bytes((mmq_ref_u32(b, 16u + ((si >> 1u) << 5u) + (e & 31u)) >> ((si & 1u) << 2u))
+            & 0x0F0F0F0Fu));
+#ifdef MMQ_REF_STAGED
+    const vec2 s = mmq_ref_stage[si * MMQ_REF_STAGE_STRIDE + bc[0] % MMQ_REF_SCALE_ROWS];
+    return f16vec4(s.x * code - s.y);
+#else
+    const vec2 sm = mmq_ref_k4_scale_min(b, si);
+    return f16vec4(mmq_ref_f16(b, 0u) * sm.x * code - mmq_ref_f16(b, 2u) * sm.y);
+#endif
+}
+#elif QTYPE == QT_Q5_K
+f16vec4 mmq_ref_decode4(const in NfMmqRef b, const in uint bc[2], const in uint e2[2]) {
+    const uint e = e2[1];
+    const uint si = e >> 5u, l = e & 31u;
+    const uint lo = (mmq_ref_u32(b, 48u + ((si >> 1u) << 5u) + l) >> ((si & 1u) << 2u)) & 0x0F0F0F0Fu;
+    const uint hi = ((mmq_ref_u32(b, 16u + l) >> si) & 0x01010101u) << 4u;
+    const vec4 code = vec4(mmq_ref_bytes(lo | hi));
+#ifdef MMQ_REF_STAGED
+    const vec2 s = mmq_ref_stage[si * MMQ_REF_STAGE_STRIDE + bc[0] % MMQ_REF_SCALE_ROWS];
+    return f16vec4(s.x * code - s.y);
+#else
+    const vec2 sm = mmq_ref_k4_scale_min(b, si);
+    return f16vec4(mmq_ref_f16(b, 0u) * sm.x * code - mmq_ref_f16(b, 2u) * sm.y);
+#endif
+}
+#elif QTYPE == QT_Q6_K
+f16vec4 mmq_ref_decode4(const in NfMmqRef b, const in uint bc[2], const in uint e2[2]) {
+    const uint e = e2[1];
+    const uint hf = e >> 7u, t = (e >> 5u) & 3u, l = e & 31u;
+    const uint lo = (mmq_ref_u32(b, (hf << 6u) + ((t & 1u) << 5u) + l) >> ((t >> 1u) << 2u)) & 0x0F0F0F0Fu;
+    const uint hi = ((mmq_ref_u32(b, 128u + (hf << 5u) + l) >> (t << 1u)) & 0x03030303u) << 4u;
+    const ivec4 code = ivec4(mmq_ref_bytes(lo | hi)) - 32;
+    const int sc = bitfieldExtract(int(mmq_ref_u8(b, 192u + (e >> 4u))), 0, 8);
+    return f16vec4(mmq_ref_f16(b, 208u) * float(sc) * vec4(code));
+}
+#elif QTYPE == QT_I8_B128
+f16vec4 mmq_ref_decode4(const in NfMmqRef b, const in uint bc[2], const in uint e2[2]) {
+    const float d = uintBitsToFloat(mmq_ref_u32(b, 0u));
+    return f16vec4(vec4(mmq_ref_sbytes(mmq_ref_u32(b, 4u + e2[1]))) * d);
+}
+#endif
+#endif /* NF_CM2_DECODE_VECTOR */
+
 #endif /* NF_QUANT_MMQ_REF_GLSL */

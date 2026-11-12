@@ -74,6 +74,9 @@ public class MmqGemmPlanTest {
         assertTrue(names.contains("Q4_K_MatMul_CM_KSplit"));
         assertTrue(names.contains("Q4_K_MatMul_CM2"));
         assertTrue(names.contains("Q4_K_MatMul_CM2_KSplit"));
+        assertTrue(names.contains("Q4_K_MatMul_CM2V"));
+        assertTrue(names.contains("Q4_K_MatMul_CM2V_KSplit"));
+        assertFalse(names.contains("F16_MatMul_CM2V"));
         assertTrue(names.contains("F16_MatMul_MMA_KSplit"));
         assertTrue(names.contains("BF16_MatMul_MMA_KSplit"));
         assertTrue(names.contains("LLM_Quant_MMQ_Q8_1"));
@@ -84,7 +87,8 @@ public class MmqGemmPlanTest {
         assertTrue(names.contains(GemmKernels.LOGITS_PREFILTER));
         assertEquals(GemmKernels.TILED_TYPES.size() + GemmKernels.MMQ_TYPES.size() * 8
                         + GemmKernels.FP8_TYPES.size() * 6 + GemmKernels.W4A8_TYPES.size() * 6
-                        + GemmKernels.MMA_TYPES.size() * 2 + GemmKernels.CM2_TYPES.size() * 2 + 14,
+                        + GemmKernels.MMA_TYPES.size() * 2 + GemmKernels.CM2_TYPES.size() * 2
+                        + (GemmKernels.CM2_TYPES.size() - 1) * 4 + 1 + 14,
                 names.size());
     }
 
