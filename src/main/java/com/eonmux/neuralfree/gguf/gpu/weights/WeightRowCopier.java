@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.gpu.weights;
 
+import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
@@ -26,22 +27,65 @@ import java.util.Objects;
 final class WeightRowCopier {
     /** Staging chunks a queue may hold in pending writes before the copier finishes it. */
     static final int IN_FLIGHT_CHUNKS = 8;
+    /** Bytes of one slot of the page-locked upload ring. */
+    static final int RING_SLOT_BYTES = 32 << 20;
+    /**
+     * Least raw bytes an upload call moves for it to open the page-locked upload ring. Opening and closing the ring
+     * (its page-locked slots and fill threads) costs about 20 ms on CUDA and the ring saves about 0.03 ms per MiB of
+     * mapped bytes over the queue's writes, so it pays from about 640 MiB on; below this bound the ring costs at most
+     * a few milliseconds more than it saves.
+     */
+    static final long RING_MIN_BYTES = 512L << 20;
 
     private final WeightStore store;
     private final int stagingBytes;
     private final W12F16Mode w12F16;
     private final long inFlightLimit;
     private final Map<ComputeQueue, long[]> pending = new IdentityHashMap<>();
+    /** The backend of the page-locked upload ring, or null to write every chunk through the queue. */
+    private final ComputeBackend ringBackend;
+    /** The queue of {@link #ringBackend} whose uploads may take the ring; other queues write their chunks. */
+    private final ComputeQueue ringQueue;
+    private PinnedUploadRing ring;
+    private boolean ringOpened;
+    /** Whether the uploads until the next {@link #release()} move enough raw bytes to use the ring. */
+    private boolean ringWanted;
     private ByteBuffer staging;
     private float[] floats;
     private float[] verify;
     private ByteBuffer w12;
 
     WeightRowCopier(WeightStore store, int stagingBytes, W12F16Mode w12F16) {
+        this(store, stagingBytes, w12F16, null, null);
+    }
+
+    /**
+     * A copier whose raw chunks of mapped tensor data enqueued on {@code ringQueue} may go through a
+     * {@link PinnedUploadRing} on {@code ringBackend}, the backend that owns {@code ringQueue} (see
+     * {@link #planRing}); a null {@code ringBackend} writes every chunk through its queue.
+     *
+     * @throws NullPointerException when {@code ringBackend} is given without its queue
+     */
+    WeightRowCopier(WeightStore store, int stagingBytes, W12F16Mode w12F16, ComputeBackend ringBackend,
+                    ComputeQueue ringQueue) {
+        if (ringBackend != null) {
+            Objects.requireNonNull(ringQueue, "ringQueue");
+        }
+        this.ringBackend = ringBackend;
+        this.ringQueue = ringQueue;
         this.store = store;
         this.stagingBytes = stagingBytes;
         this.w12F16 = Objects.requireNonNull(w12F16, "w12F16");
         this.inFlightLimit = (long) IN_FLIGHT_CHUNKS * stagingBytes;
+    }
+
+    /**
+     * Declares the raw bytes the upload calls until the next {@link #release()} move: at least
+     * {@link #RING_MIN_BYTES} lets their mapped chunks on the ring queue take the upload ring, which opens with the
+     * first such chunk; fewer bytes write every chunk through its queue.
+     */
+    void planRing(long rawBytes) {
+        ringWanted = ringBackend != null && rawBytes >= RING_MIN_BYTES;
     }
 
     /** Declares that {@code q} has been finished: none of its writes are pending any more. */
@@ -75,17 +119,66 @@ final class WeightRowCopier {
         }
     }
 
+    /**
+     * Uploads stored bytes as they are, in chunks of the staging size. A store that maps its data hands each chunk's
+     * mapped pages over directly ({@link WeightStore#mappedSlice}); a chunk ends early at a mapping boundary. While
+     * the upload ring is planned ({@link #planRing}) and {@code q} is the ring's queue, such a chunk is copied into
+     * the page-locked ring by several threads and reaches the device as one device copy ({@link PinnedUploadRing});
+     * otherwise the queue's write takes it. A queue of another backend never takes the ring: its device cannot read
+     * the ring backend's slots. Without a mapping each chunk is read into the host staging first.
+     */
     private void copyRaw(TensorPlan p, long srcOffset, long bytes, GpuBuffer dst, long dstOffset,
                          ComputeQueue q) {
-        ByteBuffer buf = staging(stagingBytes);
+        PinnedUploadRing pinned = ring(q);
+        long chunk = pinned != null ? Math.min(stagingBytes, pinned.slotBytes()) : stagingBytes;
         long done = 0;
         while (done < bytes) {
-            int n = (int) Math.min(bytes - done, buf.capacity());
-            buf.clear();
-            read(p, srcOffset + done, n, buf);
-            closeEvent(q.enqueueWriteBuffer(dst, dstOffset + done, n, buf));
+            long want = Math.min(bytes - done, chunk);
+            ByteBuffer src = mapped(p, srcOffset + done, want);
+            int n;
+            if (src != null && pinned != null) {
+                n = src.capacity();
+                pinned.upload(src, dst, dstOffset + done, q);
+                done += n;
+                continue;
+            }
+            if (src != null) {
+                n = src.capacity();
+            } else {
+                src = staging(stagingBytes);
+                n = (int) want;
+                src.clear();
+                read(p, srcOffset + done, n, src);
+            }
+            closeEvent(q.enqueueWriteBuffer(dst, dstOffset + done, n, src));
             enqueued(q, n);
             done += n;
+        }
+    }
+
+    /**
+     * Bytes {@code [byteOffset, byteOffset + n)} of the plan's stored tensor as a buffer whose index 0 is the first
+     * byte: the store's mapped view when it holds the whole range, else the host staging filled by a read.
+     */
+    private ByteBuffer chunk(TensorPlan p, long byteOffset, int n) {
+        ByteBuffer src = mapped(p, byteOffset, n);
+        if (src != null && src.capacity() == n) {
+            return src;
+        }
+        ByteBuffer buf = staging((int) Math.max(stagingBytes, n));
+        buf.clear();
+        read(p, byteOffset, n, buf);
+        buf.flip();
+        return buf;
+    }
+
+    /** The store's mapped view of the tensor's bytes from {@code byteOffset}, at most {@code maxBytes}; or null. */
+    private ByteBuffer mapped(TensorPlan p, long byteOffset, long maxBytes) {
+        try {
+            return store.mappedSlice(p.info().offset() + byteOffset, maxBytes);
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot map " + maxBytes + " bytes of tensor " + p.name() + " at byte "
+                    + byteOffset, e);
         }
     }
 
@@ -99,16 +192,13 @@ final class WeightRowCopier {
             throw new IllegalStateException("tensor " + p.name() + ": one row of " + cols
                     + " elements exceeds the host staging");
         }
-        ByteBuffer buf = staging((int) Math.max(stagingBytes, rowsPerChunk * srcRow));
         float[] out = floats((int) chunkFloats);
         long done = 0;
         while (done < nRows) {
             long r = Math.min(rowsPerChunk, nRows - done);
             int n = (int) (r * srcRow);
-            buf.clear();
-            read(p, (firstRow + done) * srcRow, n, buf);
-            buf.flip();
-            CpuBlockDecoders.decodeElements(p.sourceType(), buf, 0L, out, 0,
+            ByteBuffer src = chunk(p, (firstRow + done) * srcRow, n);
+            CpuBlockDecoders.decodeElements(p.sourceType(), src, 0L, out, 0,
                     r * cols);
             closeEvent(q.enqueueWriteBuffer(dst, dstOffset + done * cols * 4L, r * cols * 4L, out));
             enqueued(q, r * cols * 4L);
@@ -157,11 +247,8 @@ final class WeightRowCopier {
         int n = (int) (r * p.cols());
         boolean onGrid = p.sourceType() == GGMLType.BF16 && (update == null || decode);
         if (update == null) {
-            ByteBuffer buf = staging((int) Math.max(stagingBytes, r * p.sourceRowBytes()));
-            buf.clear();
-            read(p, (firstRow + done) * p.sourceRowBytes(), (int) (r * p.sourceRowBytes()), buf);
-            buf.flip();
-            CpuBlockDecoders.decodeElements(p.sourceType(), buf, 0L, out, 0, n);
+            ByteBuffer src = chunk(p, (firstRow + done) * p.sourceRowBytes(), (int) (r * p.sourceRowBytes()));
+            CpuBlockDecoders.decodeElements(p.sourceType(), src, 0L, out, 0, n);
         } else if (decode) {
             CpuBlockDecoders.decodeElements(p.sourceType(), update,
                     (firstRow + done) * p.sourceRowBytes(), out, 0, n);
@@ -402,8 +489,33 @@ final class WeightRowCopier {
         return w12;
     }
 
-    /** Drops the host staging and the pending-write accounting (writes copy their host data at enqueue). */
+    /**
+     * The upload ring for chunks enqueued on {@code q}, opened on first use: null when {@code q} is not the ring's
+     * queue, the ring is not planned, or the backend has no ring ({@link PinnedUploadRing#open}).
+     */
+    private PinnedUploadRing ring(ComputeQueue q) {
+        if (q != ringQueue || !ringWanted) {
+            return null;
+        }
+        if (!ringOpened) {
+            ringOpened = true;
+            ring = PinnedUploadRing.open(ringBackend, RING_SLOT_BYTES);
+        }
+        return ring;
+    }
+
+    /**
+     * Drops the host staging and the pending-write accounting (writes copy their host data at enqueue), and closes
+     * the upload ring once the copies reading it completed; a later upload opens it again when planned.
+     */
     void release() {
+        PinnedUploadRing open = ring;
+        ring = null;
+        ringOpened = false;
+        ringWanted = false;
+        if (open != null) {
+            open.close();
+        }
         staging = null;
         floats = null;
         verify = null;

@@ -55,6 +55,7 @@ public final class WeightDataProvider implements AutoCloseable {
     private final int layerCount;
     private final long maxCacheBytes;
     private final long perLayerBytes;
+    private final long modelBytes;
     private volatile int vramDepth;
 
     private final byte[][][] ramCache;
@@ -122,6 +123,7 @@ public final class WeightDataProvider implements AutoCloseable {
         }
         this.layerCount = streamedByLayer.size();
         this.maxCacheBytes = maxCacheBytes;
+        this.modelBytes = modelBytes(tensors);
         this.vramDepth = Math.max(0, vramDepth);
 
         Map<String, GGUFTensorInfo> infos = new HashMap<>(tensors.size() * 4 / 3 + 1);
@@ -358,6 +360,11 @@ public final class WeightDataProvider implements AutoCloseable {
         for (int i = 0; i < ramWindow && i + vramDepth < layerCount; i++) {
             loadLayerIntoCache((vramDepth + i) % layerCount);
         }
+    }
+
+    /** Storage bytes of every tensor of the model file. */
+    public long modelBytes() {
+        return modelBytes;
     }
 
     /** Returns current RAM cache usage in bytes. */

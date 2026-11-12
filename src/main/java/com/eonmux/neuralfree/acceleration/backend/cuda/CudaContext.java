@@ -36,15 +36,20 @@ public final class CudaContext {
     }
 
     /**
-     * Retains the primary context of {@code device} ({@code cuDevicePrimaryCtxRetain}).
-     * The driver must already be initialised ({@code cuInit}).
+     * Retains the primary context of {@code device} ({@code cuDevicePrimaryCtxRetain}), first setting the host
+     * scheduling {@value CudaScheduling#PROPERTY} names while the context is not active yet
+     * ({@link CudaScheduling}). The driver must already be initialised ({@code cuInit}).
      *
-     * @throws IllegalArgumentException when {@code device} is null
+     * @throws IllegalArgumentException when {@code device} is null or the scheduling property names no scheduling
      * @throws RuntimeException         the translated driver failure
      */
     public static CudaContext retainPrimary(CUdevice device) {
         if (device == null) {
             throw new IllegalArgumentException("CUDA device must not be null");
+        }
+        CudaScheduling scheduling = CudaScheduling.configured();
+        if (scheduling != null) {
+            scheduling.applyTo(device);
         }
         CUcontext ctx = new CUcontext();
         CudaErrors.check("cuDevicePrimaryCtxRetain", () -> cuDevicePrimaryCtxRetain(ctx, device));

@@ -2,6 +2,7 @@ package com.eonmux.neuralfree.acceleration.backend.cuda;
 
 import com.eonmux.neuralfree.acceleration.backend.KernelHandle;
 import com.eonmux.neuralfree.acceleration.backend.KernelSignature;
+import com.eonmux.neuralfree.acceleration.backend.LaunchGeometry;
 import jcuda.driver.CUfunction;
 import jcuda.driver.CUfunction_attribute;
 
@@ -38,6 +39,8 @@ public final class CudaKernelHandle implements KernelHandle {
     private final KernelSignature signature;
     private final CudaArgState args;
     private final DynamicSharedReservation dynamicShared;
+    /** The geometry of the last dispatch, reused while dispatches repeat their sizes. */
+    private volatile LaunchGeometry lastGeometry;
     private volatile boolean closed;
 
     /**
@@ -118,6 +121,16 @@ public final class CudaKernelHandle implements KernelHandle {
     /** The sticky launch arguments of this handle. */
     public CudaArgState args() {
         return args;
+    }
+
+    /** The geometry of this handle's last dispatch, or null before the first. */
+    LaunchGeometry lastGeometry() {
+        return lastGeometry;
+    }
+
+    /** Keeps {@code geometry} as the last dispatch's. */
+    void lastGeometry(LaunchGeometry geometry) {
+        lastGeometry = geometry;
     }
 
     /** {@code CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK}: the largest block this function can launch with. */

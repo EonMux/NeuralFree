@@ -16,6 +16,7 @@ import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.List;
 
 import static org.jocl.CL.*;
@@ -331,10 +332,16 @@ public final class OclComputeQueue implements ComputeQueue {
         if (withEvent) {
             cl_event event = new cl_event();
             enqueueClDispatch(handle, globalWorkSize, localWorkSize, waitOnEvents, event);
-            trackTiming(timingKey(handle.kernelName(), globalWorkSize, localWorkSize), event, false);
+            if (timing != null) {
+                trackTiming(timingKey(handle.kernelName(), globalWorkSize, localWorkSize), event, false);
+            }
             return new OclGpuEvent(event, null, profiled, owner);
         }
-        cl_event event = timing != null ? new cl_event() : null;
+        if (timing == null) {
+            enqueueClDispatch(handle, globalWorkSize, localWorkSize, waitOnEvents, null);
+            return null;
+        }
+        cl_event event = new cl_event();
         enqueueClDispatch(handle, globalWorkSize, localWorkSize, waitOnEvents, event);
         trackTiming(timingKey(handle.kernelName(), globalWorkSize, localWorkSize), event, true);
         return null;
@@ -573,7 +580,11 @@ public final class OclComputeQueue implements ComputeQueue {
                     + (handle.numArgs() == OclKernelHandle.UNKNOWN ? "" : handle.numArgs() + " ")
                     + "arguments of OpenCL kernel " + handle.kernelName());
         }
-        setSingleKernelArg(handle, argIndex, arg);
+        if (arg instanceof GpuBuffer) {
+            extractClMem((GpuBuffer) arg);
+        }
+        handle.args().set(argIndex, arg);
+        applyChangedArgs(handle);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -1226,24 +1237,44 @@ public final class OclComputeQueue implements ComputeQueue {
     }
 
     /**
-     * Sets every argument when {@code args} is non-empty; null or empty keeps the stored arguments.
+     * Sets every argument when {@code args} is non-empty; null or empty keeps the stored arguments. Only the
+     * arguments whose values differ from the ones the kernel object holds reach {@code clSetKernelArg}
+     * ({@link #applyChangedArgs}); a buffer argument is checked to be open either way.
      *
      * @throws IllegalArgumentException when the count differs from the kernel's argument count, or an
      *                                  argument is null or unsupported
+     * @throws IllegalStateException    when a buffer argument is closed
      */
     private void setKernelArgs(OclKernelHandle handle, Object[] args) {
         if (args == null || args.length == 0) {
             return;
         }
         handle.checkArgCount(args.length);
+        for (int i = 0; i < args.length; i++) {
+            if (args[i] instanceof GpuBuffer) {
+                extractClMem((GpuBuffer) args[i]);
+            }
+        }
         // The sticky store validates the whole list before any argument reaches the driver.
         handle.args().setAll(args);
-        for (int i = 0; i < args.length; i++) {
-            setSingleKernelArg(handle, i, args[i]);
+        applyChangedArgs(handle);
+    }
+
+    /**
+     * Passes every argument stored since the kernel object last received it to {@code clSetKernelArg}. The kernel
+     * object keeps an argument until it is set again, so an argument whose value did not change is not sent; one
+     * the driver refused stays pending and is sent again by the next call.
+     */
+    private void applyChangedArgs(OclKernelHandle handle) {
+        StickyArgs args = handle.args();
+        BitSet changed = args.dirty();
+        for (int i = changed.nextSetBit(0); i >= 0; i = changed.nextSetBit(i + 1)) {
+            setClKernelArg(handle, i, args.get(i));
+            args.clearDirty(i);
         }
     }
 
-    private void setSingleKernelArg(OclKernelHandle handle, int index, Object arg) {
+    private void setClKernelArg(OclKernelHandle handle, int index, Object arg) {
         long size;
         Pointer value;
         if (arg instanceof GpuBuffer) {
@@ -1309,7 +1340,6 @@ public final class OclComputeQueue implements ComputeQueue {
         if (status != CL_SUCCESS) {
             throw OclErrors.translate(status, "clSetKernelArg", handle.kernelName() + " arg " + index, -1, thrown);
         }
-        handle.args().set(index, arg);
     }
 
     /**

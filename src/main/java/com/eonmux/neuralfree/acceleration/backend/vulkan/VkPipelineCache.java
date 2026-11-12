@@ -36,7 +36,11 @@ import static org.lwjgl.vulkan.VK10.nvkGetPipelineCacheData;
  *
  * <p>The persistent form loads
  * {@code ${user.home}/.cache/neuralfree/vulkan/<vendorId>-<deviceId>-<driverVersion>-<pipelineCacheUUID>.bin}
- * at creation and writes it back on {@link #save()} and {@link #close()}. Loaded data is used only
+ * at creation and writes it back on {@link #save()} and {@link #close()} once a pipeline was created through it
+ * since it was loaded or last saved ({@link #pipelineCreated()}) and the size of the driver's cache data differs from
+ * what the file holds: pipelines the loaded data already held leave the size unchanged, so a warm run does not rewrite
+ * the file.
+ * Loaded data is used only
  * when its Vulkan header (version one) names the same vendor, device and pipeline-cache UUID.
  * Persistence is best-effort: IO failures and rejected data are logged at DEBUG and the cache
  * starts empty. {@code -Dneuralfree.vulkan.pipelineCache=false} disables persistence.</p>
@@ -63,6 +67,10 @@ public final class VkPipelineCache implements AutoCloseable {
     private final int vendorId;
     private final int deviceId;
     private final byte[] uuid;
+    /** Whether a pipeline was created through the cache since it was loaded or last saved. */
+    private volatile boolean dirty;
+    /** Bytes of cache data the file holds: what was loaded, then what the last save wrote. */
+    private long persistedBytes;
     private boolean closed;
 
     /** An in-memory cache that is never persisted. */
@@ -81,7 +89,8 @@ public final class VkPipelineCache implements AutoCloseable {
         this(device, info, persistenceEnabled() && info != null ? cacheFile(info) : null);
     }
 
-    private VkPipelineCache(VkDevice device, VkPhysicalDeviceInfo info, Path file) {
+    /** A cache for {@code info}'s device persisted to {@code file}, or never persisted when it is null. */
+    VkPipelineCache(VkDevice device, VkPhysicalDeviceInfo info, Path file) {
         if (device == null) {
             throw new IllegalArgumentException("VkDevice must not be null");
         }
@@ -93,6 +102,7 @@ public final class VkPipelineCache implements AutoCloseable {
         byte[] initial = file != null ? load(file) : null;
         long created = initial != null ? create(initial) : VK_NULL_HANDLE;
         this.handle = created != VK_NULL_HANDLE ? created : create(null);
+        this.persistedBytes = created != VK_NULL_HANDLE ? initial.length : 0L;
     }
 
     /** The {@code VkPipelineCache} handle. */
@@ -126,20 +136,40 @@ public final class VkPipelineCache implements AutoCloseable {
         return readData();
     }
 
+    /** Records that a pipeline was created through this cache, so the next {@link #save()} writes it out. */
+    public void pipelineCreated() {
+        dirty = true;
+    }
+
+    /** Whether a pipeline was created through this cache since it was loaded or last saved. */
+    public boolean isDirty() {
+        return dirty;
+    }
+
     /**
-     * Writes the cache contents to the cache file; does nothing when not persisted. Best-effort. The contents go to
+     * Writes the cache contents to the cache file when a pipeline was created since the cache was loaded or last
+     * saved and the size of the contents differs from what the file holds; does nothing when not persisted.
+     * Best-effort: a failed save keeps the cache marked, so a later save tries again. The contents go to
      * a temporary file of their own in the cache directory, which then replaces the cache file in one rename, so
      * concurrent savers of the same device's cache (other processes, other backends on the device) each publish a
      * complete image and a failed save leaves no temporary file behind.
      */
     public synchronized void save() {
-        if (closed || file == null) {
+        if (closed || file == null || !dirty) {
             return;
         }
+        // cleared before the read: a pipeline created during the save marks the cache again for the next one
+        dirty = false;
         Path tmp = null;
+        boolean saved = false;
         try {
+            if (dataSize() == persistedBytes) {
+                saved = true;
+                return;
+            }
             byte[] data = readData();
             if (data.length < HEADER_BYTES) {
+                saved = true;
                 return;
             }
             Path directory = file.getParent();
@@ -152,12 +182,17 @@ public final class VkPipelineCache implements AutoCloseable {
                 Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING);
             }
             tmp = null;
+            saved = true;
+            persistedBytes = data.length;
             LOGGER.debug("Vulkan pipeline cache saved: {} bytes to {}", data.length, file);
         } catch (IOException | RuntimeException e) {
             LOGGER.debug("Vulkan pipeline cache not saved to {}: {}", file, e.toString());
         } finally {
             if (tmp != null) {
                 deleteTemporary(tmp);
+            }
+            if (!saved) {
+                dirty = true;
             }
         }
     }
@@ -216,6 +251,16 @@ public final class VkPipelineCache implements AutoCloseable {
             if (data != null) {
                 MemoryUtil.memFree(data);
             }
+        }
+    }
+
+    /** The size {@code vkGetPipelineCacheData} reports for the cache contents, without reading them. */
+    private long dataSize() {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            PointerBuffer pSize = stack.mallocPointer(1);
+            VkErrors.check(nvkGetPipelineCacheData(device, handle, MemoryUtil.memAddress(pSize), MemoryUtil.NULL),
+                    "vkGetPipelineCacheData (size)");
+            return pSize.get(0);
         }
     }
 

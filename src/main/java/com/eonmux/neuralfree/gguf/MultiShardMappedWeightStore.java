@@ -95,6 +95,18 @@ public final class MultiShardMappedWeightStore implements WeightStore {
         storeOf(shard, globalOffset, size).readTensorDirect(localOffset, size, dst);
     }
 
+    /** The mapped view of the shard holding {@code globalOffset}, ending at the shard's end at the latest. */
+    @Override
+    public ByteBuffer mappedSlice(long globalOffset, long maxSize) throws IOException {
+        if (maxSize < 1) {
+            throw new IllegalArgumentException("a mapped slice holds at least one byte, asked for " + maxSize);
+        }
+        int shard = findShard(globalOffset);
+        MappedWeightStore store = storeOf(shard, globalOffset, 1);
+        long inShard = Math.min(maxSize, segments[shard].virtualEnd() - globalOffset);
+        return store.mappedSlice(globalOffset - shardBaseOffsets[shard], inShard);
+    }
+
     /** The store of {@code shard}, which must hold {@code [globalOffset, globalOffset + size)}. */
     private MappedWeightStore storeOf(int shard, long globalOffset, int size) throws IOException {
         if (!segments[shard].contains(globalOffset, size) || shards[shard] == null) {

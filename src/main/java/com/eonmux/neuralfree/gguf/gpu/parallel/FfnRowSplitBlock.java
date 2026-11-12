@@ -1,6 +1,5 @@
 package com.eonmux.neuralfree.gguf.gpu.parallel;
 
-import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuFfnBlock;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuAllReduce;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuForwardContext;
@@ -15,9 +14,10 @@ import java.util.Objects;
 
 /**
  * The feed-forward block of one split layer: every rank's {@link GpuDenseFfn} over the rank's shard weights, driven
- * from the model's step. Rank 0 computes its partial straight into the output slot of the model device; every peer
- * rank receives a replay of the normalized FFN input in its own buffer, computes its partial there and an
- * all-reduce ({@link GpuAllReduce#sum}) adds the partials into the output slot, which then holds the whole
+ * from the model's step. Every peer rank first receives one replay of the normalized FFN input in its own buffer and
+ * its partial is enqueued there; rank 0 then computes its partial straight into the output slot of the model device
+ * while the peers run, and a reduction ({@link GpuAllReduce#reduceToRoot}) adds the partials into the output slot,
+ * which then holds the whole
  * {@code down(act(gate x, up x))} of the layer as the whole-device block would have written it.
  *
  * <p>Lifecycle and per-step rules as {@link GpuFfnBlock}. A block binds once, over the per-rank contexts of its
@@ -58,32 +58,21 @@ final class FfnRowSplitBlock implements GpuFfnBlock {
         if (!bound) {
             throw new IllegalStateException("layer " + describe() + " is not bound");
         }
-        parts.get(0).forward(nTokens, in, out);
+        RankExchange.replayToPeers(group, parts.size(), ctx.queue(), in, (long) nTokens * split.nIn(),
+                (long) nTokens * split.nOut());
         for (int rank = 1; rank < parts.size(); rank++) {
-            ScratchSlot peerIn = group.inputSlot(rank);
-            ScratchSlot peerOut = group.partialSlot(rank);
-            peerIn.require((long) nTokens * split.nIn());
-            peerOut.require((long) nTokens * split.nOut());
-            replayInput(nTokens, in, peerIn, group.rankQueue(rank));
-            parts.get(rank).forward(nTokens, peerIn, peerOut);
+            parts.get(rank).forward(nTokens, group.inputSlot(rank), group.partialSlot(rank));
         }
+        parts.get(0).forward(nTokens, in, out);
         List<GpuAllReduce.Participant> participants = new ArrayList<>(parts.size());
         participants.add(new GpuAllReduce.Participant(ctx.queue(), out.buffer(), out.offset()));
         for (int rank = 1; rank < parts.size(); rank++) {
             ScratchSlot peerOut = group.partialSlot(rank);
             participants.add(new GpuAllReduce.Participant(group.rankQueue(rank), peerOut.buffer(), peerOut.offset()));
         }
-        GpuAllReduce.sum(ctx.ops(), group.allReduceTemporary(), participants, nTokens * split.nOut());
+        GpuAllReduce.reduceToRoot(ctx.ops(), group.allReduceTemporary(), participants, nTokens * split.nOut());
     }
 
-    /**
-     * Replays the normalized FFN input to a peer rank, device to device when the queues support it and through
-     * host memory otherwise, and waits for the copy so the rank's projection reads the whole input.
-     */
-    private void replayInput(int nTokens, ScratchSlot in, ScratchSlot peerIn, ComputeQueue dst) {
-        RankExchange.replay(ctx.queue(), in.buffer(), in.offset(), dst, peerIn.buffer(),
-                (long) nTokens * split.nIn());
-    }
 
     /** The layer's spec with a shard-local {@code n_ff}, so the dense FFN binds over the shard shapes. */
     static com.eonmux.neuralfree.gguf.spec.FfnSpec shardFfn(LayerSpec layer, int shard) {

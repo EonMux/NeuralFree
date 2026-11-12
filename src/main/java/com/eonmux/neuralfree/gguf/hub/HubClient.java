@@ -413,7 +413,9 @@ public final class HubClient {
      * gives the current ETag, a cached file with an unchanged ETag is kept, a changed cache entry is
      * redownloaded from the top, an in-progress partial is resumed over {@code Range}, and an LFS
      * file's bytes must digest to their sha256 pointer before the blob is linked into the snapshot
-     * tree. RepoFile URLs with other file names ({@link #expectFile}) are never accepted.
+     * tree. The digest is taken while the bytes arrive, after the bytes a resumed partial already
+     * held, so a download reads its file once. RepoFile URLs with other file names
+     * ({@link #expectFile}) are never accepted.
      */
     public Path download(HubRef ref, String commit, RepoFile file)
             throws IOException, InterruptedException {
@@ -473,13 +475,14 @@ public final class HubClient {
                 Files.deleteIfExists(partial);
             }
             long offset = head.ranges && Files.isRegularFile(partial) ? Files.size(partial) : 0;
+            MessageDigest digest = file.isLfs() ? digestOf(partial, offset) : null;
             try {
-                pull(url, partial, offset);
+                pull(url, partial, offset, digest);
             } catch (IOException e) {
                 failure = e;
                 continue;
             }
-            if (file.isLfs() && !sha256(partial).toLowerCase(Locale.ROOT).equals(file.oid())) {
+            if (digest != null && !hex(digest).equals(file.oid())) {
                 Files.deleteIfExists(partial);
                 Files.deleteIfExists(Paths.get(partial + ".etag"));
                 throw new IOException("the downloaded bytes of '" + file.path()
@@ -757,8 +760,12 @@ public final class HubClient {
         }
     }
 
-    /** One GET over the resolve endpoint, appended to the partial body from {@code offset}. */
-    private void pull(String url, Path partial, long offset) throws IOException, InterruptedException {
+    /**
+     * One GET over the resolve endpoint, appended to the partial body from {@code offset}; every byte
+     * written also goes to {@code digest} unless it is null.
+     */
+    private void pull(String url, Path partial, long offset, MessageDigest digest)
+            throws IOException, InterruptedException {
         HttpRequest.Builder b = requestBuilder(url).GET();
         if (offset > 0) {
             b.header("Range", "bytes=" + offset + "-");
@@ -783,6 +790,9 @@ public final class HubClient {
             int n;
             while ((n = in.read(buf)) >= 0) {
                 out.write(buf, 0, n);
+                if (digest != null) {
+                    digest.update(buf, 0, n);
+                }
             }
         }
     }
@@ -915,19 +925,43 @@ public final class HubClient {
 
     /** The SHA-256 digest of {@code file}'s bytes in lowercase hex, the LFS pointer's form. */
     static String sha256(Path file) throws IOException {
+        return hex(digestOf(file, Files.size(file)));
+    }
+
+    /**
+     * A SHA-256 digest that has taken the first {@code bytes} bytes of {@code file}, the bytes a
+     * resumed download keeps; nothing is read when {@code bytes} is 0.
+     *
+     * @throws IOException when the file holds fewer bytes
+     */
+    static MessageDigest digestOf(Path file, long bytes) throws IOException {
         MessageDigest digest;
         try {
             digest = MessageDigest.getInstance("SHA-256");
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 is not available on this JVM", e);
         }
+        if (bytes <= 0) {
+            return digest;
+        }
         try (InputStream in = Files.newInputStream(file)) {
             byte[] buf = new byte[128 * 1024];
-            int n;
-            while ((n = in.read(buf)) >= 0) {
+            long left = bytes;
+            while (left > 0) {
+                int n = in.read(buf, 0, (int) Math.min(buf.length, left));
+                if (n < 0) {
+                    throw new IOException("'" + file.getFileName() + "' holds fewer than the " + bytes
+                            + " bytes to digest");
+                }
                 digest.update(buf, 0, n);
+                left -= n;
             }
         }
+        return digest;
+    }
+
+    /** The finished digest in lowercase hex. */
+    private static String hex(MessageDigest digest) {
         StringBuilder hex = new StringBuilder(digest.getDigestLength() * 2);
         for (byte b : digest.digest()) {
             hex.append(Character.forDigit((b >> 4) & 0xF, 16));

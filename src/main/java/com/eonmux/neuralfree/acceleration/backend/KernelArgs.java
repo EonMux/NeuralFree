@@ -226,7 +226,7 @@ public final class KernelArgs {
             throw new IndexOutOfBoundsException("argument of " + size + " bytes at offset " + offset
                     + " does not fit in a buffer of " + dst.capacity() + " bytes");
         }
-        ByteBuffer le = dst.duplicate().order(ByteOrder.LITTLE_ENDIAN);
+        ByteBuffer le = dst.order() == ByteOrder.LITTLE_ENDIAN ? dst : dst.duplicate().order(ByteOrder.LITTLE_ENDIAN);
         if (snapshot instanceof Integer) {
             le.putInt(offset, (Integer) snapshot);
         } else if (snapshot instanceof Boolean) {

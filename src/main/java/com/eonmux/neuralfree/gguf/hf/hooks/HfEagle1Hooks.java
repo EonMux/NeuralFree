@@ -269,12 +269,15 @@ public final class HfEagle1Hooks {
             Path path = ctx.targetPath().get().toAbsolutePath().normalize();
             String arch = ctx.config().architecture();
             if (ModelSources.detect(path) == ModelFormat.GGUF) {
-                Map<String, Object> tokenizerKeys = ggufTokenizerKeys(ctx, path);
-                // the target GGUF carries its own architecture; the keys are prefixed with it
-                String targetArch = String.valueOf(ModelSources.open(path.toString())
-                        .getMetadata().getOrDefault(GgufKeys.GENERAL_ARCHITECTURE, arch));
-                return new Target(path, null, tokenizerKeys, ggufInt(ctx, path, targetArch,
-                        GgufKeys.EMBEDDING_LENGTH), ggufInt(ctx, path, targetArch, GgufKeys.BLOCK_COUNT));
+                try (ModelSource target = ModelSources.open(path.toString())) {
+                    Map<String, Object> metadata = target.getMetadata();
+                    Map<String, Object> tokenizerKeys = ggufTokenizerKeys(ctx, path, metadata);
+                    // the target GGUF carries its own architecture; the keys are prefixed with it
+                    String targetArch = String.valueOf(metadata.getOrDefault(GgufKeys.GENERAL_ARCHITECTURE, arch));
+                    return new Target(path, null, tokenizerKeys,
+                            ggufInt(path, metadata, targetArch, GgufKeys.EMBEDDING_LENGTH),
+                            ggufInt(path, metadata, targetArch, GgufKeys.BLOCK_COUNT));
+                }
             }
             Path dir = Files.isDirectory(path) ? path : path.getParent();
             HfConfig cfg = HfConfigLoader.load(dir.toAbsolutePath().normalize(),
@@ -284,9 +287,10 @@ public final class HfEagle1Hooks {
         }
 
         /** A GGUF target's {@code tokenizer.*} metadata, as the draft's vocabulary inherits it. */
-        private static Map<String, Object> ggufTokenizerKeys(HfLoadContext ctx, Path path) throws IOException {
+        private static Map<String, Object> ggufTokenizerKeys(HfLoadContext ctx, Path path,
+                                                             Map<String, Object> metadata) throws IOException {
             Map<String, Object> keys = new LinkedHashMap<>();
-            for (Map.Entry<String, Object> e : ModelSources.open(path.toString()).getMetadata().entrySet()) {
+            for (Map.Entry<String, Object> e : metadata.entrySet()) {
                 if (e.getKey().startsWith(GgufKeys.TOKENIZER_PREFIX)) {
                     keys.put(e.getKey(), e.getValue());
                 }
@@ -299,19 +303,18 @@ public final class HfEagle1Hooks {
         }
 
         /** A GGUF target's {@code <arch>.<key>} hparam as an exact int32. */
-        private static int ggufInt(HfLoadContext ctx, Path path, String arch, String keyFmt) throws IOException {
-            try (ModelSource p = ModelSources.open(path.toString())) {
-                Object v = p.getMetadata().get(String.format(Locale.ROOT, keyFmt, arch));
-                if (!(v instanceof Number)) {
-                    throw new GgufFormatException("EAGLE-1 target '" + path + "' holds no " + keyFmt.replace("%s", arch));
-                }
-                double d = ((Number) v).doubleValue();
-                if (d != Math.rint(d) || d < 1 || d > HfConfig.MAX_LAYERS) {
-                    throw new GgufFormatException("EAGLE-1 target '" + path + "' " + keyFmt.replace("%s", arch)
-                            + " value " + d + " is not a positive layer or width count");
-                }
-                return (int) d;
+        private static int ggufInt(Path path, Map<String, Object> metadata, String arch, String keyFmt)
+                throws IOException {
+            Object v = metadata.get(String.format(Locale.ROOT, keyFmt, arch));
+            if (!(v instanceof Number)) {
+                throw new GgufFormatException("EAGLE-1 target '" + path + "' holds no " + keyFmt.replace("%s", arch));
             }
+            double d = ((Number) v).doubleValue();
+            if (d != Math.rint(d) || d < 1 || d > HfConfig.MAX_LAYERS) {
+                throw new GgufFormatException("EAGLE-1 target '" + path + "' " + keyFmt.replace("%s", arch)
+                        + " value " + d + " is not a positive layer or width count");
+            }
+            return (int) d;
         }
     }
 }

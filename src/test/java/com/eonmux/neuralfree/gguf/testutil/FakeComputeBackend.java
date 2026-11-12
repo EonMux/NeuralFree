@@ -85,6 +85,7 @@ public final class FakeComputeBackend implements ComputeBackend {
     final boolean strictLlmArgs;
     final boolean graphCapture;
     final boolean graphArgUpdates;
+    private final boolean parallelUploadStaging;
     private final Set<String> unavailableKernels;
     final Map<String, KernelEmulator> emulators;
     private final FakeQueue computeQueue;
@@ -113,6 +114,7 @@ public final class FakeComputeBackend implements ComputeBackend {
         this.strictLlmArgs = b.strictLlmArgs;
         this.graphCapture = b.graphCapture;
         this.graphArgUpdates = b.graphArgUpdates;
+        this.parallelUploadStaging = b.parallelUploadStaging;
         this.unavailableKernels = Collections.unmodifiableSet(new HashSet<>(b.unavailable));
         this.emulators = Collections.unmodifiableMap(new HashMap<>(b.emulators));
         this.computeQueue = new FakeQueue(this, COMPUTE_QUEUE, ComputeQueue.QueueType.COMPUTE, true);
@@ -208,6 +210,11 @@ public final class FakeComputeBackend implements ComputeBackend {
     @Override
     public boolean supportsHostMappedBuffers() {
         return true;
+    }
+
+    @Override
+    public boolean prefersParallelUploadStaging() {
+        return parallelUploadStaging;
     }
 
     @Override
@@ -1155,6 +1162,7 @@ public final class FakeComputeBackend implements ComputeBackend {
         private boolean strictLlmArgs;
         private boolean graphCapture;
         private boolean graphArgUpdates;
+        private boolean parallelUploadStaging = true;
         private final Set<String> unavailable = new LinkedHashSet<>();
         private final Map<String, KernelEmulator> emulators = new LinkedHashMap<>();
 
@@ -1189,6 +1197,15 @@ public final class FakeComputeBackend implements ComputeBackend {
          */
         public Builder graphArgUpdates(boolean supported) {
             this.graphArgUpdates = supported;
+            return this;
+        }
+
+        /**
+         * Whether the backend prefers uploads staged through page-locked memory filled by several threads
+         * ({@link ComputeBackend#prefersParallelUploadStaging}); true by default, like CUDA.
+         */
+        public Builder parallelUploadStaging(boolean prefers) {
+            this.parallelUploadStaging = prefers;
             return this;
         }
 

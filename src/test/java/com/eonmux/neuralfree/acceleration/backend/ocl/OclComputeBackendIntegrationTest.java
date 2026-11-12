@@ -270,6 +270,97 @@ public class OclComputeBackendIntegrationTest {
     }
 
     @Test
+    public void unchangedArgumentsStayOnTheKernelObjectAndChangedOnesReachIt() throws InterruptedException {
+        ComputeQueue compute = backend.computeQueue();
+        ComputeQueue transfer = backend.transferQueue();
+        int size = 64;
+        float[] ones = new float[size];
+        java.util.Arrays.fill(ones, 1f);
+        KernelHandle kernel = backend.compileKernel("scale", SCALE_KERNEL, null);
+        GpuBuffer a = backend.allocateBuffer(size * Float.BYTES);
+        GpuBuffer b = backend.allocateBuffer(size * Float.BYTES);
+        track(compute.enqueueWriteBuffer(a, 0, size * Float.BYTES, ones));
+        track(compute.enqueueWriteBuffer(b, 0, size * Float.BYTES, ones));
+        long[] global = {size};
+        long[] local = {32};
+        // a: x2, x2 (same arguments again), x3 (one scalar changed); b: x5 through the other queue, then a
+        // pre-bound dispatch keeps b and x5, and a set argument switches it back to a
+        compute.enqueueKernelNoEvent(kernel, global, local, new Object[]{a, 2f, size});
+        compute.enqueueKernelNoEvent(kernel, global, local, new Object[]{a, 2f, size});
+        compute.enqueueKernelNoEvent(kernel, global, local, new Object[]{a, 3f, size});
+        compute.finish();
+        transfer.enqueueKernelNoEvent(kernel, global, local, new Object[]{b, 5f, size});
+        transfer.enqueueKernelPreBound(kernel, global, local);
+        transfer.finish();
+        transfer.setKernelArg(kernel, 0, a);
+        transfer.enqueueKernelPreBound(kernel, global, local);
+        transfer.finish();
+        float[] ra = new float[size];
+        float[] rb = new float[size];
+        track(compute.enqueueReadBuffer(a, 0, size * Float.BYTES, ra)).awaitCompletion();
+        track(compute.enqueueReadBuffer(b, 0, size * Float.BYTES, rb)).awaitCompletion();
+        for (int i = 0; i < size; i++) {
+            assertEquals("a[" + i + "]", 2f * 2f * 3f * 5f, ra[i], 0f);
+            assertEquals("b[" + i + "]", 5f * 5f, rb[i], 0f);
+        }
+        compute.enqueueKernelNoEvent(kernel, global, local, new Object[]{b, 1f, size});
+        compute.finish();
+        b.close();
+        try {
+            compute.enqueueKernelNoEvent(kernel, global, local, new Object[]{b, 1f, size});
+            fail("a closed buffer argument must be refused even when it is the bound one");
+        } catch (IllegalStateException expected) {
+            assertTrue(expected.getMessage(), expected.getMessage().contains("closed"));
+        }
+        a.close();
+        kernel.close();
+    }
+
+    @Test
+    public void anUnchangedArgumentIsNotSentToTheKernelObjectAgain() throws InterruptedException {
+        ComputeQueue compute = backend.computeQueue();
+        int size = 64;
+        float[] ones = new float[size];
+        java.util.Arrays.fill(ones, 1f);
+        KernelHandle kernel = backend.compileKernel("scale", SCALE_KERNEL, null);
+        GpuBuffer a = backend.allocateBuffer(size * Float.BYTES);
+        GpuBuffer b = backend.allocateBuffer(size * Float.BYTES);
+        track(compute.enqueueWriteBuffer(a, 0, size * Float.BYTES, ones));
+        track(compute.enqueueWriteBuffer(b, 0, size * Float.BYTES, ones));
+        long[] global = {size};
+        long[] local = {32};
+        compute.enqueueKernelNoEvent(kernel, global, local, new Object[]{a, 2f, size});
+        compute.finish();
+        // behind the queue's back, the kernel object now holds b and 7 in the arguments the queue set to a and 2
+        org.jocl.cl_kernel clKernel = ((OclKernelHandle) kernel).getCLKernel();
+        org.jocl.CL.clSetKernelArg(clKernel, 0, org.jocl.Sizeof.cl_mem,
+                org.jocl.Pointer.to(((OclGpuBuffer) b).getCLMem()));
+        org.jocl.CL.clSetKernelArg(clKernel, 1, org.jocl.Sizeof.cl_float, org.jocl.Pointer.to(new float[]{7f}));
+        compute.enqueueKernelNoEvent(kernel, global, local, new Object[]{a, 2f, size});
+        compute.finish();
+        assertScaled(compute, a, b, size, 2f, 7f);
+        compute.enqueueKernelNoEvent(kernel, global, local, new Object[]{a, 3f, size});
+        compute.finish();
+        assertScaled(compute, a, b, size, 2f, 21f);
+        a.close();
+        b.close();
+        kernel.close();
+    }
+
+    /** Asserts every element of {@code a} and {@code b}, both filled with ones before the scalings. */
+    private void assertScaled(ComputeQueue queue, GpuBuffer a, GpuBuffer b, int size, float expectA, float expectB)
+            throws InterruptedException {
+        float[] ra = new float[size];
+        float[] rb = new float[size];
+        track(queue.enqueueReadBuffer(a, 0, size * Float.BYTES, ra)).awaitCompletion();
+        track(queue.enqueueReadBuffer(b, 0, size * Float.BYTES, rb)).awaitCompletion();
+        for (int i = 0; i < size; i++) {
+            assertEquals("a[" + i + "]", expectA, ra[i], 0f);
+            assertEquals("b[" + i + "]", expectB, rb[i], 0f);
+        }
+    }
+
+    @Test
     public void testTransferQueueWorksIndependently() throws InterruptedException {
         ComputeQueue transferQueue = backend.transferQueue();
         assertEquals("Transfer queue type should be TRANSFER", ComputeQueue.QueueType.TRANSFER, transferQueue.getQueueType());

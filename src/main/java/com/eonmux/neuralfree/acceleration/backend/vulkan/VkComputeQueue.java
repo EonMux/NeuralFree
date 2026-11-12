@@ -514,7 +514,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         if (args != null && args.length > 0) {
             state.setAll(args);
         }
-        replayGraph.dispatch(handle, global, local3, groups, VkGraph.copyArgs(state));
+        replayGraph.dispatch(handle, global, local3, groups, state.sticky());
     }
 
     /** The group counts of a dispatch of {@code handle} over {@code global} at {@code local3}, folded as launched. */

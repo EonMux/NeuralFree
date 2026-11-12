@@ -2,6 +2,7 @@ package com.eonmux.neuralfree.acceleration.backend.hip;
 
 import com.eonmux.neuralfree.acceleration.backend.KernelHandle;
 import com.eonmux.neuralfree.acceleration.backend.KernelSignature;
+import com.eonmux.neuralfree.acceleration.backend.LaunchGeometry;
 import com.eonmux.neuralfree.acceleration.hip.HipNative;
 
 /**
@@ -29,6 +30,8 @@ public final class HipKernelHandle implements KernelHandle {
     private final int staticSharedMemoryBytes;
     private final KernelSignature signature;
     private final HipArgState args;
+    /** The geometry of the last dispatch, reused while dispatches repeat their sizes. */
+    private volatile LaunchGeometry lastGeometry;
     private volatile boolean closed;
 
     /**
@@ -105,6 +108,16 @@ public final class HipKernelHandle implements KernelHandle {
     /** The sticky launch arguments of this handle. */
     public HipArgState args() {
         return args;
+    }
+
+    /** The geometry of this handle's last dispatch, or null before the first. */
+    LaunchGeometry lastGeometry() {
+        return lastGeometry;
+    }
+
+    /** Keeps {@code geometry} as the last dispatch's. */
+    void lastGeometry(LaunchGeometry geometry) {
+        lastGeometry = geometry;
     }
 
     /** The largest block this function can launch with. */

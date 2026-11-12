@@ -14,8 +14,9 @@ import java.util.Objects;
 /**
  * The expert block of one split layer: every rank's {@link GpuMoeFfn} over the rank's intermediate-width shard of
  * every expert and of the shared expert, or, under expert parallel, over the rank's own whole experts with the
- * routed pairs of the other ranks' experts zeroed. Rank 0 computes its partial into the output slot; every peer
- * receives a replay of the normalized FFN input, computes its partial there, and an all-reduce sums them. The router
+ * routed pairs of the other ranks' experts zeroed. Every peer first receives one replay of the normalized FFN input
+ * and its partial is enqueued there; rank 0 then computes its partial into the output slot while the peers run, and
+ * a reduction into rank 0 ({@link GpuAllReduce#reduceToRoot}) sums them. The router
  * weights and the routing stay whole on every rank, so each rank selects the same experts, and the sum of the
  * partials is the whole block's output.
  */
@@ -56,23 +57,19 @@ final class TpMoeBlock implements GpuFfnBlock {
             throw new IllegalStateException("layer " + describe() + " is not bound");
         }
         int width = layer.residual().streamWidth();
-        parts.get(0).forward(nTokens, in, out);
+        long floats = (long) nTokens * width;
+        RankExchange.replayToPeers(group, parts.size(), ctx.queue(), in, floats, floats);
         for (int rank = 1; rank < parts.size(); rank++) {
-            ScratchSlot peerIn = group.inputSlot(rank);
-            ScratchSlot peerOut = group.partialSlot(rank);
-            peerIn.require((long) nTokens * width);
-            peerOut.require((long) nTokens * width);
-            RankExchange.replay(ctx.queue(), in.buffer(), in.offset(), group.rankQueue(rank), peerIn.buffer(),
-                    (long) nTokens * width);
-            parts.get(rank).forward(nTokens, peerIn, peerOut);
+            parts.get(rank).forward(nTokens, group.inputSlot(rank), group.partialSlot(rank));
         }
+        parts.get(0).forward(nTokens, in, out);
         List<GpuAllReduce.Participant> participants = new ArrayList<>(parts.size());
         participants.add(new GpuAllReduce.Participant(ctx.queue(), out.buffer(), out.offset()));
         for (int rank = 1; rank < parts.size(); rank++) {
             ScratchSlot peerOut = group.partialSlot(rank);
             participants.add(new GpuAllReduce.Participant(group.rankQueue(rank), peerOut.buffer(), peerOut.offset()));
         }
-        GpuAllReduce.sum(ctx.ops(), group.allReduceTemporary(), participants, nTokens * width);
+        GpuAllReduce.reduceToRoot(ctx.ops(), group.allReduceTemporary(), participants, nTokens * width);
     }
 
     private String describe() {

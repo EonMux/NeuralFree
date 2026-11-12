@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.acceleration.backend.vulkan;
 
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
+import com.eonmux.neuralfree.acceleration.backend.DeviceClass;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.HostMappedBuffer;
 import com.eonmux.neuralfree.acceleration.backend.KernelHandle;
@@ -16,10 +17,13 @@ import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
+import static org.lwjgl.vulkan.VK10.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
 /**
  * Vulkan host-visible weight memory ({@link VkGpuBuffer#hostView(long, int)}): the device reads a persistently
  * mapped host-visible allocation through a copy and through a kernel argument, and the buffer reports its mapping.
+ * Host staging memory ({@link VkComputeBackend#allocateHostStagingBuffer}) stays out of a discrete device's
+ * device-local memory, even where a resizable BAR offers host-visible device memory.
  */
 public class VkHostMappedBufferTest {
 
@@ -119,6 +123,39 @@ public class VkHostMappedBufferTest {
         } finally {
             device.close();
             mapped.close();
+        }
+    }
+
+    @Test
+    public void aStagingBufferIsSystemMemoryTheDeviceCopiesFrom() {
+        int bytes = 256 * Float.BYTES;
+        HostMappedBuffer staging = backend.allocateHostStagingBuffer(bytes);
+        GpuBuffer device = backend.allocateBuffer(bytes);
+        try {
+            VkGpuBuffer vk = (VkGpuBuffer) staging;
+            assertTrue(vk.isHostVisible());
+            assertTrue(vk.isHostCoherent());
+            if (backend.capabilities().getDeviceClass() == DeviceClass.DISCRETE) {
+                int flags = backend.info().memoryTypePropertyFlags()[vk.memoryTypeIndex()];
+                assertEquals("staging memory type " + vk.memoryTypeIndex() + " is device-local", 0,
+                        flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            }
+            float[] src = new float[256];
+            for (int i = 0; i < src.length; i++) {
+                src[i] = i - 100.5f;
+            }
+            staging.hostView(0, bytes).asFloatBuffer().put(src);
+            staging.flush();
+
+            queue.enqueueCopyBuffer(staging, 0, device, 0, bytes);
+            float[] dst = new float[256];
+            queue.enqueueReadBuffer(device, 0, bytes, dst);
+            queue.finish();
+
+            assertArrayEquals(src, dst, 0.0f);
+        } finally {
+            device.close();
+            staging.close();
         }
     }
 }

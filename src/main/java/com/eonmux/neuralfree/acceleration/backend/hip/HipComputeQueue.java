@@ -8,6 +8,7 @@ import com.eonmux.neuralfree.acceleration.backend.GpuGraph;
 import com.eonmux.neuralfree.acceleration.backend.GpuGraphMismatchException;
 import com.eonmux.neuralfree.acceleration.backend.GpuUncapturableCommandException;
 import com.eonmux.neuralfree.acceleration.backend.KernelHandle;
+import com.eonmux.neuralfree.acceleration.backend.LaunchGeometry;
 import com.eonmux.neuralfree.acceleration.backend.WorkSizes;
 import com.eonmux.neuralfree.utils.Closeables;
 import com.eonmux.neuralfree.utils.LoggingUtil;
@@ -784,18 +785,9 @@ public final class HipComputeQueue implements ComputeQueue {
         HipKernelHandle handle = ownHandle(kernel);
         long function = handle.function();
         String name = handle.kernelName();
-        long[] rawBlock = local == null ? WorkSizes.defaultLocal(global, handle.maxThreadsPerBlock()) : local;
-        WorkSizes.validateLocal(rawBlock, handle.maxThreadsPerBlock(), name);
-        long[] grid = WorkSizes.groupCounts(global, rawBlock);
-        for (int d = 0; d < grid.length; d++) {
-            if (grid[d] > maxGrid[d]) {
-                throw new IllegalArgumentException(name + ": " + grid[d] + " blocks in dimension " + d
-                        + " (global " + global[d] + ", local " + rawBlock[d] + ") exceed the device limit of "
-                        + maxGrid[d]);
-            }
-        }
-        long[] block = WorkSizes.pad3(rawBlock, 1);
-        long[] paddedGrid = WorkSizes.pad3(grid, 1);
+        LaunchGeometry geometry = geometryOf(handle, global, local);
+        long[] block = geometry.block();
+        long[] paddedGrid = geometry.grid();
         validateWaits(waits);
         if (args != null && args.length > 0) {
             handle.args().setAll(args);
@@ -834,6 +826,34 @@ public final class HipComputeQueue implements ComputeQueue {
         applyWaits(waits);
         backend.driver().launchKernel(function, gx, gy, gz, bx, by, bz, 0, stream, params);
         return withEvent ? record() : null;
+    }
+
+    /**
+     * The grid and block of a dispatch of {@code handle}: a null local size becomes
+     * {@link WorkSizes#defaultLocal(long[], long)}, the block is checked against the function's thread limit and the
+     * grid against the device limits, both padded to three dimensions with 1. A dispatch that repeats the sizes of
+     * the handle's last one reuses its geometry, which was validated when it was derived.
+     */
+    private LaunchGeometry geometryOf(HipKernelHandle handle, long[] global, long[] local) {
+        LaunchGeometry last = handle.lastGeometry();
+        if (last != null && last.matches(global, local)) {
+            return last;
+        }
+        String name = handle.kernelName();
+        long[] rawBlock = local == null ? WorkSizes.defaultLocal(global, handle.maxThreadsPerBlock()) : local;
+        WorkSizes.validateLocal(rawBlock, handle.maxThreadsPerBlock(), name);
+        long[] grid = WorkSizes.groupCounts(global, rawBlock);
+        for (int d = 0; d < grid.length; d++) {
+            if (grid[d] > maxGrid[d]) {
+                throw new IllegalArgumentException(name + ": " + grid[d] + " blocks in dimension " + d
+                        + " (global " + global[d] + ", local " + rawBlock[d] + ") exceed the device limit of "
+                        + maxGrid[d]);
+            }
+        }
+        LaunchGeometry geometry = new LaunchGeometry(global, local, WorkSizes.pad3(grid, 1),
+                WorkSizes.pad3(rawBlock, 1));
+        handle.lastGeometry(geometry);
+        return geometry;
     }
 
     private GpuEvent write(GpuBuffer dst, long dstOffset, long size, HostSource source, GpuEvent[] waits) {

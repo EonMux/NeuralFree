@@ -6,15 +6,12 @@ import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.HostMappedBuffer;
 import com.eonmux.neuralfree.gguf.WeightDataProvider;
 import com.eonmux.neuralfree.gguf.gpu.weights.LayerWeightSet.Entry;
-import com.eonmux.neuralfree.gguf.quant.CpuBlockDecoders;
 import com.eonmux.neuralfree.utils.Closeables;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -196,14 +193,13 @@ public final class HostMappedWeightSource implements LayerWeightSource {
         private final ComputeBackend backend;
         private final WeightDataProvider data;
         private final List<GpuBuffer> owned;
-        private final ByteBuffer staging;
-        private float[] decoded;
+        private final ShardFiller filler;
 
         Loader(ComputeBackend backend, WeightDataProvider data, List<GpuBuffer> owned) {
             this.backend = backend;
             this.data = data;
             this.owned = owned;
-            this.staging = ByteBuffer.allocateDirect(LayerSlots.CHUNK_BYTES).order(ByteOrder.LITTLE_ENDIAN);
+            this.filler = new ShardFiller(data);
         }
 
         GpuWeight upload(Entry e) {
@@ -212,7 +208,7 @@ public final class HostMappedWeightSource implements LayerWeightSource {
                 HostMappedBuffer buffer = backend.allocateHostMappedBuffer(e.shardBytes(k));
                 owned.add(buffer);
                 shards.add(buffer);
-                fill(e, k, buffer);
+                filler.fill(e, k, buffer, 0L, "host-mapped tensor");
                 buffer.flush();
             }
             GpuWeight w = GpuWeight.sharded(e.name(), e.uploadType(), e.ne(), shards, e.shardRowCounts());
@@ -225,38 +221,6 @@ public final class HostMappedWeightSource implements LayerWeightSource {
                 w = w.withScale(LayerSlots.readScale(data, e));
             }
             return w;
-        }
-
-        /** Copies rows of shard {@code k} into {@code buffer}, decoding to F32 when the entry says so. */
-        private void fill(Entry e, int k, HostMappedBuffer buffer) {
-            long storedRow = e.storedRowBytes();
-            long deviceRow = e.uploadRowBytes();
-            long rowStart = rowStart(e, k);
-            long rows = e.shardRows(k);
-            int chunk = chunkRows(e);
-            for (long done = 0; done < rows; ) {
-                int n = (int) Math.min(chunk, rows - done);
-                long srcOff = (rowStart + done) * storedRow;
-                int srcBytes = (int) (n * storedRow);
-                long dstOff = done * deviceRow;
-                try {
-                    if (e.dequantize()) {
-                        staging.clear();
-                        data.readRange(e.name(), srcOff, srcBytes, staging);
-                        int elems = (int) (n * e.cols());
-                        float[] out = floats(elems);
-                        CpuBlockDecoders.decodeElements(e.source().type(), staging, 0, out, 0, elems);
-                        ByteBuffer view = buffer.hostView(dstOff, elems * Float.BYTES);
-                        view.asFloatBuffer().put(out, 0, elems);
-                    } else {
-                        data.readRange(e.name(), srcOff, srcBytes, buffer.hostView(dstOff, srcBytes));
-                    }
-                } catch (IOException ex) {
-                    throw new UncheckedIOException("host-mapped tensor '" + e.name() + "' failed: " + ex.getMessage(),
-                            ex);
-                }
-                done += n;
-            }
         }
 
         /** The host-mapped int buffer of the entry's {@code <base>.input_perm} tensor, or null. */
@@ -311,34 +275,6 @@ public final class HostMappedWeightSource implements LayerWeightSource {
             }
             buffer.flush();
             return buffer;
-        }
-
-        /** The reusable decode buffer, grown to at least {@code elems} floats. */
-        private float[] floats(int elems) {
-            if (decoded == null || decoded.length < elems) {
-                decoded = new float[elems];
-            }
-            return decoded;
-        }
-
-        /** Row {@code 0} of shard {@code k}: shards are contiguous from the tensor's first row. */
-        private static long rowStart(Entry e, int k) {
-            long start = 0;
-            for (int i = 0; i < k; i++) {
-                start += e.shardRows(i);
-            }
-            return start;
-        }
-
-        /** Rows per host chunk of one tensor: at most {@link LayerSlots#CHUNK_BYTES}, at least one row. */
-        private static int chunkRows(Entry e) {
-            long rowBytes = Math.max(e.storedRowBytes(), e.uploadRowBytes());
-            long rows = Math.max(1, LayerSlots.CHUNK_BYTES / rowBytes);
-            long maxShard = 0;
-            for (int k = 0; k < e.shardCount(); k++) {
-                maxShard = Math.max(maxShard, e.shardRows(k));
-            }
-            return (int) Math.min(rows, maxShard);
         }
     }
 

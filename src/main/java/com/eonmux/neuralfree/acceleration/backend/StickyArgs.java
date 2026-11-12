@@ -7,7 +7,7 @@ import java.util.BitSet;
 
 /**
  * Per-kernel-handle argument storage with OpenCL {@code clSetKernelArg} semantics,
- * used by the CUDA and Vulkan handles.
+ * used by the kernel handles of every backend.
  *
  * <p>Each argument is snapshotted when it is set ({@link KernelArgs#snapshot}).
  * The arguments stay set across dispatches until they are overwritten, so a
@@ -184,6 +184,11 @@ public final class StickyArgs {
 
     public void clearDirty() {
         dirty.clear();
+    }
+
+    /** Marks index {@code i} as no longer changed, once its backend applied it. */
+    public void clearDirty(int i) {
+        dirty.clear(i);
     }
 
     private void requireSet(int i) {

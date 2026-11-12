@@ -229,6 +229,16 @@ public final class CudaComputeBackend implements ComputeBackend {
         return true;
     }
 
+    /**
+     * True: a queue write stages each slice through the queue's pinned ring on the calling thread, one event per
+     * slice, and moves about 10 GB/s on a PCIe 5 device, where slots filled by several threads and read by the copy
+     * engine move about 16 GB/s.
+     */
+    @Override
+    public boolean prefersParallelUploadStaging() {
+        return true;
+    }
+
     @Override
     public HostMappedBuffer allocateHostMappedBuffer(long sizeInBytes) {
         enter();

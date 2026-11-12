@@ -14,14 +14,18 @@ import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
 import com.eonmux.neuralfree.gguf.testutil.GgufTestWriter;
 import com.eonmux.neuralfree.gguf.tokenizer.hf.HfPreTokenizerResolver;
 import org.junit.After;
+import org.junit.Assume;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -115,6 +119,17 @@ public class HfEagle1HooksTest {
     }
 
     @Test
+    public void aGgufTargetIsReadThroughOneSourceThatIsClosedAfterwards() throws Exception {
+        Path fds = Paths.get("/proc/self/fd");
+        Assume.assumeTrue("needs /proc/self/fd", Files.isDirectory(fds));
+        Path target = target().toRealPath();
+        assertEquals(0, openDescriptors(fds, target));
+        HfMetadata md = meta(draft(""));
+        assertEquals(8, md.get("eagle.target_hidden_size"));
+        assertEquals(0, openDescriptors(fds, target));
+    }
+
+    @Test
     public void anAliasCheckpointNormalizesToOneDrafterLayer() {
         HfConfig fixed = HfEagle1Hooks.fixup(config("{'architectures': ['LlamaEagleForCausalLM'],"
                 + " 'hidden_size': 8}"));
@@ -200,6 +215,23 @@ public class HfEagle1HooksTest {
         ctx.entry().meta().apply(ctx, kv, null);
         return kv.build();
     }
+    /** The process's open file descriptors that resolve to {@code file}. */
+    private static long openDescriptors(Path fds, Path file) throws IOException {
+        long n = 0;
+        try (DirectoryStream<Path> entries = Files.newDirectoryStream(fds)) {
+            for (Path fd : entries) {
+                try {
+                    if (file.equals(Files.readSymbolicLink(fd))) {
+                        n++;
+                    }
+                } catch (NoSuchFileException e) {
+                    // the descriptor closed while the directory was listed: it holds nothing open
+                }
+            }
+        }
+        return n;
+    }
+
     /** A structurally valid safetensors file with an empty header and no tensors. */
     private static void writeEmptySafetensors(Path dir) throws IOException {
         byte[] header = "{}".getBytes(StandardCharsets.UTF_8);

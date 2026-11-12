@@ -69,7 +69,10 @@ import java.util.regex.Pattern;
  * {@link GpuWeight#withInverseHadamard}.</p>
  *
  * <p>Uploads run on the given queue in order and copy their host data at enqueue; every upload call ends with the
- * queue finished. Not thread-safe. The uploader owns every buffer it allocates; {@link #close()} releases them.</p>
+ * queue finished. An {@link #uploadResident} or {@link #upload} call whose stored-form tensors come to at least
+ * {@link WeightRowCopier#RING_MIN_BYTES} moves their mapped bytes through a page-locked upload ring on a discrete
+ * device ({@link PinnedUploadRing}), opened for that call and closed at its end. Not thread-safe. The uploader owns
+ * every buffer it allocates; {@link #close()} releases them.</p>
  */
 public final class GpuWeightUploader implements GpuWeights, AutoCloseable {
 
@@ -118,7 +121,7 @@ public final class GpuWeightUploader implements GpuWeights, AutoCloseable {
         this.maxBufferBytes = config.maxBufferBytes > 0 ? Math.min(config.maxBufferBytes, deviceMax) : deviceMax;
         this.plans = planAll(tensors);
         this.w12Rounding = config.w12 && config.w12F16 == W12F16Mode.ROUND ? new W12Rounding() : null;
-        this.copier = new WeightRowCopier(store, config.stagingBytes, config.w12F16);
+        this.copier = new WeightRowCopier(store, config.stagingBytes, config.w12F16, backend, queue);
     }
 
     /** A configuration builder with the given type policy. */
@@ -242,7 +245,9 @@ public final class GpuWeightUploader implements GpuWeights, AutoCloseable {
 
     /**
      * Enqueues the upload of rows {@code [firstRow, firstRow + nRows)} of a tensor to {@code dst} at byte offset
-     * {@code dstOffset}, staging through the uploader's host buffers as {@link #uploadResident} does. The caller
+     * {@code dstOffset}, staging through the uploader's host buffers as {@link #uploadResident} does. The rows reach
+     * the device through {@code q}'s own writes, never through this uploader's page-locked upload ring, so {@code q}
+     * and {@code dst} may belong to another backend (a tensor-parallel rank's). The caller
      * finishes {@code q} and calls {@link #syncCopier(ComputeQueue)} when its writes are done. A W12 tensor's rows
      * refuse an off-grid F16 weight under {@code w12F16 = refuse}, and feed the load's rounding report otherwise.
      *
@@ -315,10 +320,16 @@ public final class GpuWeightUploader implements GpuWeights, AutoCloseable {
         int dequantized = 0;
         int sharded = 0;
         long bytes = 0;
+        List<TensorPlan> pending = new ArrayList<>();
+        long rawBytes = 0;
         for (TensorPlan p : plans.values()) {
-            if (resident.containsKey(p.name()) || deferred.test(p.info())) {
-                continue;
+            if (!resident.containsKey(p.name()) && !deferred.test(p.info())) {
+                pending.add(p);
+                rawBytes += rawBytes(p);
             }
+        }
+        copier.planRing(rawBytes);
+        for (TensorPlan p : pending) {
             GpuWeight w = uploadPlan(p);
             count++;
             bytes += p.deviceBytes();
@@ -361,6 +372,7 @@ public final class GpuWeightUploader implements GpuWeights, AutoCloseable {
         TensorPlan p = requirePlan(name);
         GpuWeight w = resident.get(name);
         if (w == null) {
+            copier.planRing(rawBytes(p));
             uploadPlan(p);
             finishQueue();
             attachScales();
@@ -584,6 +596,11 @@ public final class GpuWeightUploader implements GpuWeights, AutoCloseable {
      */
     private static boolean wholeCodeRuns(GGMLType type, GGUFTensorInfo t) {
         return type != GGMLType.F8_E4M3FN || t.dim(0) % GGMLType.F8_E4M3.getBlockSize() == 0;
+    }
+
+    /** Bytes of a tensor that upload as stored, unconverted: the bytes its upload may move through the ring. */
+    private static long rawBytes(TensorPlan p) {
+        return p.deviceType() == GGMLType.W12 || p.needsDecode() ? 0L : p.rows() * p.sourceRowBytes();
     }
 
     private TensorPlan requirePlan(String name) {

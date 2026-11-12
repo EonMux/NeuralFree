@@ -76,9 +76,9 @@ public final class OclComputeBackend implements ComputeBackend {
     private final OclCommandBufferApi commandBuffers;
     private final KernelCache kernelCache;
     // Compiled cl_program cache. Keys are "source:<sha256>|<options>" for compileKernel and
-    // "program:<programKey>" for loadKernel. All kernels of one program share ONE compiled program;
-    // programs are owned by the backend and released in close().
-    private final java.util.Map<String, cl_program> programCache = new java.util.HashMap<>();
+    // "program:<programKey>" for loadKernel. All kernels of one program share ONE compiled program, built outside
+    // this backend's monitor; programs are owned by the backend and released in close().
+    private final OclProgramCache programCache = new OclProgramCache();
     // Build options seen per artifact program key; one program key must always carry the same options.
     private final java.util.Map<String, String> artifactOptions = new java.util.HashMap<>();
     private final OclProgramBinaryCache binaryCache;
@@ -168,6 +168,25 @@ public final class OclComputeBackend implements ComputeBackend {
      *  Ensures buffers start at aligned boundaries for optimal memory access patterns. */
     private static final long GPU_BUFFER_ALIGNMENT = 256L;
 
+    /** A new {@code cl_mem} of {@code alignedSize} bytes; {@code requestedBytes} is reported on out-of-memory. */
+    private cl_mem createMem(long flags, long alignedSize, long requestedBytes) {
+        int[] error = new int[1];
+        cl_mem mem;
+        try {
+            mem = clCreateBuffer(clDevice.getDeviceContext(), flags, alignedSize, null, error);
+        } catch (CLException e) {
+            throw OclErrors.translate(e.getStatus(), "clCreateBuffer", alignedSize + " bytes", requestedBytes, e);
+        }
+        if (error[0] != CL_SUCCESS) {
+            throw OclErrors.translate(error[0], "clCreateBuffer", alignedSize + " bytes", requestedBytes, null);
+        }
+        if (mem == null) {
+            throw new GpuBackendException(OclErrors.BACKEND, CL_SUCCESS, "clCreateBuffer (" + alignedSize
+                    + " bytes) reported success but returned no buffer");
+        }
+        return mem;
+    }
+
     @Override
     public GpuBuffer allocateBuffer(long sizeInBytes, boolean readOnly) {
         ensureOpen();
@@ -180,20 +199,7 @@ public final class OclComputeBackend implements ComputeBackend {
                 / GPU_BUFFER_ALIGNMENT) * GPU_BUFFER_ALIGNMENT;
 
         long flags = readOnly ? CL_MEM_READ_ONLY : CL_MEM_READ_WRITE;
-        int[] error = new int[1];
-        cl_mem mem;
-        try {
-            mem = clCreateBuffer(clDevice.getDeviceContext(), flags, alignedSize, null, error);
-        } catch (CLException e) {
-            throw OclErrors.translate(e.getStatus(), "clCreateBuffer", alignedSize + " bytes", sizeInBytes, e);
-        }
-        if (error[0] != CL_SUCCESS) {
-            throw OclErrors.translate(error[0], "clCreateBuffer", alignedSize + " bytes", sizeInBytes, null);
-        }
-        if (mem == null) {
-            throw new GpuBackendException(OclErrors.BACKEND, CL_SUCCESS, "clCreateBuffer (" + alignedSize
-                    + " bytes) reported success but returned no buffer");
-        }
+        cl_mem mem = createMem(flags, alignedSize, sizeInBytes);
 
         allocatedBytes.addAndGet(alignedSize);
         LOGGER.trace("Allocated OpenCL buffer: {} bytes (aligned to {}), readOnly={}", alignedSize, GPU_BUFFER_ALIGNMENT, readOnly);
@@ -201,6 +207,46 @@ public final class OclComputeBackend implements ComputeBackend {
         synchronized (this) {
             openBuffers.add(buffer);
         }
+        return buffer;
+    }
+
+    /**
+     * True on a device that shares the host's memory ({@link DeviceClass#INTEGRATED},
+     * {@code CL_DEVICE_HOST_UNIFIED_MEMORY}): {@link #allocateHostMappedBuffer} then allocates memory the device
+     * reads in place.
+     */
+    @Override
+    public boolean supportsHostMappedBuffers() {
+        return capabilities.getDeviceClass() == DeviceClass.INTEGRATED;
+    }
+
+    /**
+     * A {@code CL_MEM_ALLOC_HOST_PTR} buffer the host fills through a mapping and the device reads in place
+     * ({@link OclHostMappedBuffer}); it counts against no device allocation.
+     *
+     * @throws UnsupportedOperationException when the device does not share the host's memory
+     * @throws IllegalArgumentException      when the size is not positive
+     */
+    @Override
+    public HostMappedBuffer allocateHostMappedBuffer(long sizeInBytes) {
+        ensureOpen();
+        if (!supportsHostMappedBuffers()) {
+            throw new UnsupportedOperationException("OpenCL device " + capabilities.getDeviceName()
+                    + " does not share the host's memory (CL_DEVICE_HOST_UNIFIED_MEMORY), so it has no host-mapped"
+                    + " weight memory; use the streamed tier instead");
+        }
+        if (sizeInBytes <= 0) {
+            throw new IllegalArgumentException("sizeInBytes must be positive");
+        }
+        long alignedSize = ((sizeInBytes + GPU_BUFFER_ALIGNMENT - 1)
+                / GPU_BUFFER_ALIGNMENT) * GPU_BUFFER_ALIGNMENT;
+        cl_mem mem = createMem(CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, alignedSize, sizeInBytes);
+        OclHostMappedBuffer buffer = new OclHostMappedBuffer(mem, alignedSize, transferQueue::getCLQueue,
+                this::onBufferClosed);
+        synchronized (this) {
+            openBuffers.add(buffer);
+        }
+        LOGGER.trace("Allocated OpenCL host-mapped buffer: {} bytes", alignedSize);
         return buffer;
     }
 
@@ -419,11 +465,8 @@ public final class OclComputeBackend implements ComputeBackend {
             }
         }
         kernelCache.clear();
+        programCache.releaseAll(OclComputeBackend::releaseProgram);
         synchronized (this) {
-            for (cl_program p : programCache.values()) {
-                releaseProgram(p);
-            }
-            programCache.clear();
             artifactOptions.clear();
         }
         releaseOpenBuffers();
@@ -683,14 +726,17 @@ public final class OclComputeBackend implements ComputeBackend {
     /**
      * Returns the cached program for {@code cacheMapKey}, or builds it: first from a verified
      * binary in the {@link OclProgramBinaryCache}, else from source, storing the fresh binary.
-     * The source supplier is evaluated only here, on a miss.
+     * The source supplier is evaluated only here, on a miss. The build runs on the calling thread
+     * without holding this backend's monitor; callers of the same key wait for it
+     * ({@link OclProgramCache}).
      */
-    private synchronized cl_program getOrBuildProgram(String cacheMapKey, Supplier<String> source, String options,
-                                                      String label) {
-        cl_program cached = programCache.get(cacheMapKey);
-        if (cached != null) {
-            return cached;
-        }
+    private cl_program getOrBuildProgram(String cacheMapKey, Supplier<String> source, String options,
+                                         String label) {
+        return programCache.getOrBuild(cacheMapKey, () -> compileProgram(source, options, label));
+    }
+
+    /** Builds a program from the binary cache or from source, storing a fresh binary. */
+    private cl_program compileProgram(Supplier<String> source, String options, String label) {
         String kernelSource = source.get();
         String binaryKey = binaryCache.isEnabled() ? binaryCache.keyFor(kernelSource, options) : null;
         cl_program program = binaryKey == null ? null : buildFromCachedBinary(binaryKey, options, label);
@@ -705,7 +751,6 @@ public final class OclComputeBackend implements ComputeBackend {
                 }
             }
         }
-        programCache.put(cacheMapKey, program);
         return program;
     }
 

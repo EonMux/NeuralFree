@@ -73,7 +73,8 @@ public final class StreamingLayerWeightSource implements LayerWeightSource {
     /**
      * Opens a streaming source configured by an {@link EngineConfig}: the depth comes from
      * {@link #resolveDepth} ({@code neuralfree.vram.depth}, else the budget), the host tier caches
-     * {@link WeightDataProvider#ramCacheBytes} ({@code neuralfree.ram.cache.mb}) and prefetches beyond that depth.
+     * {@link WeightDataProvider#ramCacheBytes} ({@code neuralfree.ram.cache.mb}) and prefetches beyond that depth,
+     * unless the layers stage from page-locked copies ({@code neuralfree.stream.pinned.mb}, {@link LayerSlots}).
      *
      * @param store                tensor data of the model file (not owned)
      * @param tensors              all tensor infos of the file
@@ -276,13 +277,16 @@ public final class StreamingLayerWeightSource implements LayerWeightSource {
     }
 
     /**
-     * Stages the first {@code depth} streamed layers of the sequence and loads the host RAM window, so the next
-     * forward pass finds its leading layers in flight. The slot of the layer last awaited is left alone: dispatches
+     * Stages the first {@code depth} streamed layers of the sequence and loads the host RAM window (none when the
+     * layers stage from page-locked copies, {@link LayerSlots#pinned()}), so the next forward pass finds its leading
+     * layers in flight. The slot of the layer last awaited is left alone: dispatches
      * reading it may still be pending, and it has no release marker until the next {@link #await}.
      */
     public void warmup() {
         ensureOpen();
-        data.warmup();
+        if (!slots.pinned()) {
+            data.warmup();
+        }
         if (current >= 0 && current < seen.length) {
             seen[current] = true;
         }
@@ -321,6 +325,11 @@ public final class StreamingLayerWeightSource implements LayerWeightSource {
     /** True when uploads overlap compute on a separate transfer queue. */
     public boolean asyncTransfers() {
         return slots.asyncTransfers();
+    }
+
+    /** True when the streamed layers stage from page-locked host copies ({@link LayerSlots#pinned()}). */
+    public boolean pinned() {
+        return slots.pinned();
     }
 
     /** Waits for the queues and releases the slots and the host tier. Idempotent. */
@@ -395,7 +404,7 @@ public final class StreamingLayerWeightSource implements LayerWeightSource {
     }
 
     private void advanceHostTier(int il) {
-        if (il < data.layerCount()) {
+        if (il < data.layerCount() && !slots.pinned()) {
             data.advanceExecution(il);
         }
     }

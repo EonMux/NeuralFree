@@ -207,6 +207,7 @@ final class GpuModelLoad {
                 model.plan.ubatch(), model.moeCacheLayers, model.usableVram(), model.ranking, model.modelName);
         model.moePrefetch = MoeCacheLoader.openPrefetch(model.moeCacheSettings, model.moeCache, model.backend, model.modelName);
         bindForward(model);
+        model.backend.persistCaches();
         model.loras = model.hybridSplit != null
                 ? model.adapters.attachHybridLoras(model.modelName, model.kernels, model.ops, model.ctx.projectionDeltas(),
                         model.cpuContext.projectionDeltas())
@@ -278,7 +279,7 @@ final class GpuModelLoad {
             throw new UnsupportedOperationException(initial.arch().ggufName() + ": "
                     + EngineConfig.PROP_CPU_OFFLOAD_MB + " keeps trunk weights in host-mapped memory, which the "
                     + model.backend.backendType() + " backend does not provide; clear " + EngineConfig.PROP_CPU_OFFLOAD_MB
-                    + ", or use a CUDA or Vulkan backend");
+                    + ", or use a CUDA or Vulkan backend or an integrated OpenCL device");
         }
         LayerWeightSet.Options options = LayerWeightSet.Options.builder(t -> model.uploader.deviceType(t.name()))
                 .maxShardBytes(LayerWeightSet.Options.maxShardBytes(model.backend.capabilities()))

@@ -1141,7 +1141,8 @@ final class SplitAssembly {
 
     /**
      * Sizes every stage's scratch to the plan, allocates its memory and holds the bytes its fit reserved for later
-     * (the NextN draft caches, the drafter) out of its later budgets, uploads its resident weights and opens its
+     * (the NextN draft caches, the drafter) out of its later budgets; uploads the resident weights of every stage at
+     * the same time ({@link ConcurrentStageWork}), each over its own device and store; then opens every stage's
      * streaming source, whose slots take the VRAM the stage has left beside its adapter uploads; then the host
      * layers' scratch, heap memory and context.
      */
@@ -1161,7 +1162,18 @@ final class SplitAssembly {
                 s.allocateMemory(stagePlan, spec.hparams().mropeTextPositions());
                 s.reserve(ContextFitter.reservedBytes(spec, stageMem, stagePlan, companion(i)));
             }
-            s.uploadResident(owned(i));
+        }
+        List<String> names = new ArrayList<>(stages.size());
+        List<Runnable> uploads = new ArrayList<>(stages.size());
+        for (int i = 0; i < stages.size(); i++) {
+            SplitStage s = stages.get(i);
+            Predicate<GGUFTensorInfo> owned = owned(i);
+            names.add(s.name());
+            uploads.add(() -> s.uploadResident(owned));
+        }
+        ConcurrentStageWork.runAll(names, uploads);
+        for (int i = 0; i < stages.size(); i++) {
+            SplitStage s = stages.get(i);
             long share = streamedTotal == 0L ? 0L
                     : (long) (ramCache * ((double) s.streamedBytes() / streamedTotal));
             s.openStreaming(request.source(), forwardSpec, cfg, Math.max(0L, s.usableBytes(pendingBytes[i])), share);

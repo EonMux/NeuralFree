@@ -424,7 +424,7 @@ sources.
 ### Logging
 
 NeuralFree logs through the Log4j 2 API; `log4j-core` is its runtime implementation.
-- **The Gradle run tasks** (`runApp`, `runDemos`, `runLLMDemo`) pass `-Dlog4j2.configurationFile=src/main/config/log4j2.xml`, which logs INFO and above to the console.
+- **The Gradle run tasks** (`runApp`, `runDemos`, `runLLMDemo`, `runNfTool`) pass `-Dlog4j2.configurationFile=src/main/config/log4j2.xml`, which logs INFO and above to standard error. Standard output carries only what a command prints, so `nftool bench -o jsonl > rows.jsonl` and `nftool bench-compare` read the rows without filtering.
 - **The library jar ships no logging configuration.** An application configures Log4j itself; without a configuration, Log4j's default prints errors only. To use the run tasks' configuration with `java`, pass `-Dlog4j2.configurationFile=<checkout>/src/main/config/log4j2.xml`.
 - **The tests** log INFO and above to the console through `src/test/resources/log4j2-test.xml`.
 
@@ -788,6 +788,11 @@ either way. On OpenCL the capture is a `cl_command_buffer_khr`, which
 requires the device's `cl_khr_command_buffer` extension; a device without it reports no capture support and
 decode runs directly there, so both properties have no effect on that device. HIP records the stream with
 `hipStreamBeginCapture`.
+
+A layer split (`neuralfree.split.mode=layer`) captures each device's span on that device's own queue and replays it
+there under the same rules, one submission per device and step; the per-step inputs, the stream hand-offs between
+the devices, the embedding and the head run outside the captures. A tensor-parallel split decodes directly, since
+its blocks synchronize with the peer queues between the main queue's dispatches.
 
 How it behaves:
 - After load, a rollback, a context shift, a hidden-tap change or a batched call (`forwardBatch`,
@@ -1174,7 +1179,7 @@ layer(s) stream from the host (0.3 MiB through 0.2 MiB of slots), the experts of
 device, context 256
 ```
 
-A context set with `neuralfree.ctx` is honored as given: the fit moves weights to the host until it fits, and refuses the load naming `neuralfree.ctx` when even the streamed placement cannot hold it. Streamed weights are read from the model file (mmap) through the streaming slots; `neuralfree.vram.depth` sets how many slots are used and `neuralfree.ram.cache.mb` the host RAM cache. Models evaluated in a single step (encoder-decoder sources, the WavTokenizer decoder) keep every weight resident.
+A context set with `neuralfree.ctx` is honored as given: the fit moves weights to the host until it fits, and refuses the load naming `neuralfree.ctx` when even the streamed placement cannot hold it. Streamed weights are read from the model file (mmap) through the streaming slots; `neuralfree.vram.depth` sets how many slots are used and `neuralfree.ram.cache.mb` the host RAM cache. On a backend with page-locked host memory (CUDA, Vulkan, Metal, an integrated OpenCL device) the streamed layers are copied once at load into page-locked system memory when `neuralfree.stream.pinned.mb` allows (by default half the RAM the model leaves free, and at most half the RAM the host reports available), and every layer then reaches its slot as device copies from it instead of host reads; the copies never take device memory, also where Vulkan offers host-visible VRAM through a resizable BAR. A load whose copies cannot be allocated or filled keeps reading from the host tier. Models evaluated in a single step (encoder-decoder sources, the WavTokenizer decoder) keep every weight resident.
 
 #### Hybrid CPU and GPU execution
 
@@ -1312,9 +1317,11 @@ Example: two GPUs, three layers on the first GPU's span and one on the second, w
 
 `neuralfree.cpu.offload.mb` keeps up to that many MiB of device-resident trunk weights in page-locked host memory
 that the device reads in place, instead of VRAM: CUDA mapped host memory (`cuMemHostAlloc` +
-`cuMemHostGetDevicePointer`) or Vulkan host-visible memory (device-local when the heap offers it). Nothing is
-copied per forward pass; the interconnect carries each read. This is vLLM's UVA offload backend
-(`cpu_offload_gb`) and needs a CUDA or Vulkan device: on another backend, beside a layer split (a
+`cuMemHostGetDevicePointer`), Vulkan host-visible memory (device-local when the heap offers it), or on an OpenCL
+device that shares the host's memory (`CL_DEVICE_HOST_UNIFIED_MEMORY`, an integrated GPU) a `CL_MEM_ALLOC_HOST_PTR`
+buffer the host fills through a mapping. Nothing is copied per forward pass; the interconnect carries each read.
+This is vLLM's UVA offload backend (`cpu_offload_gb`) and needs a CUDA or Vulkan device or an integrated OpenCL
+device: on another backend, beside a layer split (a
 `split.mode=layer` load or an explicit hybrid `-ngl` load) and beside a row/tensor split over two or more devices,
 the setting is refused by name.
 
@@ -1498,7 +1505,8 @@ or with properties:
   `--main-gpu` / `neuralfree.main.gpu`, or the default device); the other GPUs are the peers. Every rank holds its
   rows of `ffn_gate` / `ffn_up` (and both halves of a fused gate-and-up), the matching slice of the hidden-width
   biases and mpt activation scales, and the matching column slice of `ffn_down`. Each rank computes its partial
-  output and a device-to-device all-reduce sums the partials; the output-width down bias is added once, on rank 0.
+  output and a device-to-device reduction sums the partials into rank 0, the only rank that reads the sum; the peers
+  receive their input first and compute beside rank 0. The output-width down bias is added once, on rank 0.
 - Attention, the norms, the embedding, the output head and the NextN/MTP blocks stay whole on the model's device, as
   do trunk layers whose FFN cannot be split (a routed-MoE FFN, `ffn_sub_norm`, gemma3n activation sparsity, a
   hidden width that does not divide evenly, a PRISM/Hadamard transform on the split projections, or a non-trunk
@@ -8774,6 +8782,7 @@ GGUF files ignore these; Hugging Face checkpoints read them at open. The meaning
 | `neuralfree.cpu.repack` | Type selection for CPU weight repacking: `auto` repacks only the types whose repacked kernels measured faster than the plain ones (currently none), `on` every covered type (`Q4_0`, `Q8_0`, `Q4_K`), `off` none; any other value is rejected by name | auto |
 | `neuralfree.cpu.repack.budget` | Byte cap on the repacked copies; unset measures the free-heap headroom automatically | unset |
 | `neuralfree.stream.sync` | Force synchronous transfers for streamed weights | false |
+| `neuralfree.stream.pinned.mb` | MiB of page-locked host copies the streamed layers of the process may stage from (CUDA, Vulkan, Metal, an integrated OpenCL device): a layer then reaches its device slot as one device copy per tensor, with no host copy and no RAM-cache read; `-1` = half the RAM the model file leaves free and at most half the RAM the host reports available (`MemAvailable`; nothing for a model as large as RAM), `0` = stage from the host tier. Layers that each have a slot are never pinned | -1 |
 | `neuralfree.diag` | GPU stage diagnostics | false |
 | `neuralfree.diag.dump` | Append full-precision diagnostic values to the dump file | false |
 | `neuralfree.diag.dumpfile` | Dump file | `<java.io.tmpdir>/neuralfree_diag_dump.txt` |
@@ -8789,6 +8798,7 @@ GGUF files ignore these; Hugging Face checkpoints read them at open. The meaning
 | `neuralfree.opencl.disable` | Skip OpenCL enumeration | false |
 | `neuralfree.opencl.skip.probe` | Skip the subprocess probe for crashing OpenCL platforms | false |
 | `neuralfree.opencl.binaryCache` | OpenCL program binary cache (`~/.cache/neuralfree/opencl`, capped at 1 GiB) | true |
+| `neuralfree.cuda.sched` | How a host thread waits for a CUDA device (`CU_CTX_SCHED_*` of the device's primary context): `auto` (the driver's choice: spin while the process has fewer active contexts than cores, else yield), `spin`, `yield` or `block` (blocking sync, which frees the waiting core at some wake-up latency); any other value is rejected by name. It applies when the process first opens the device; a different value requested once the device's context is active is logged and not applied. Unset leaves the driver's default | unset |
 | `neuralfree.gpu.profile` | Device timing per command name ([`nftool bench --kernels`](#nftool-bench) sets it). `true`: per-command profiling on OpenCL queues, per-launch event pairs on CUDA streams, per-dispatch timestamp queries on Vulkan queues. `step`: the same on OpenCL and CUDA, one timestamp pair per submitted command batch on Vulkan. Both time a CUDA graph or Vulkan command-buffer replay as one `graph[N dispatches]` entry; an OpenCL command-buffer replay is not timed. The value is `true`, `false` (or empty) or `step`, in any case; any other value fails backend selection, in AUTO and in an explicit mode, with an error naming the property | false |
 | `neuralfree.gpu.stepBreakdown` | Record where the host time of each one-token GPU decode step goes and log the summary when the model closes ([`nftool bench --host-breakdown`](#nftool-bench) sets it and prints it per test) | false |
 | `neuralfree.gpu.decodeReplay` | Replay the single-token decode trunk as one CUDA graph / HIP graph / Vulkan or OpenCL command-buffer submission ([decode-step command replay](#decode-step-command-replay)) | true |

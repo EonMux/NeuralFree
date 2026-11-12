@@ -598,4 +598,14 @@ public class GpuSplitForwardBackendTest {
         assertEquals(java.util.Arrays.asList("step+0x1", "EMBEDDING:-1", "LAYER:0", "LAYER:1", "OUTPUT_NORM:-1",
                 "step-0x1"), one.seen);
     }
+
+    @Test
+    public void aNarrowStreamWidensInPlaceWithZeroedColumns() {
+        float[] rows = {1, 2, 3, 4, 5, 6, 9, 9, 9, 9, 9, 9, 9, 9, 9};
+        GpuSplitForwardBackend.widen(rows, 3, 2, 5);
+        float[] expected = {1, 2, 0, 0, 0, 3, 4, 0, 0, 0, 5, 6, 0, 0, 0};
+        org.junit.Assert.assertArrayEquals(expected, rows, 0f);
+        org.junit.Assert.assertThrows(IllegalStateException.class,
+                () -> GpuSplitForwardBackend.widen(new float[8], 2, 4, 3));
+    }
 }

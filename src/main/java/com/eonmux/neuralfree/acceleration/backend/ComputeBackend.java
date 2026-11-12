@@ -138,8 +138,9 @@ public interface ComputeBackend extends AutoCloseable {
 
     /**
      * True when {@link #allocateHostMappedBuffer(long)} works on this backend: CUDA mapped host
-     * memory, Vulkan host-visible memory, or a Metal shared-storage buffer. The default is false;
-     * OpenCL and HIP have no zero-copy weight path in this engine.
+     * memory, Vulkan host-visible memory, a Metal shared-storage buffer, or an OpenCL
+     * {@code CL_MEM_ALLOC_HOST_PTR} buffer on a device that shares the host's memory. The default is
+     * false; HIP and discrete OpenCL devices have no zero-copy weight path in this engine.
      */
     default boolean supportsHostMappedBuffers() {
         return false;
@@ -156,6 +157,31 @@ public interface ComputeBackend extends AutoCloseable {
     default HostMappedBuffer allocateHostMappedBuffer(long sizeInBytes) {
         throw new UnsupportedOperationException(backendType() + " backend cannot allocate host-mapped weight"
                 + " memory; use the streamed tier instead of the UVA offload");
+    }
+
+    /**
+     * Allocates page-locked host memory that serves as the source of device copies
+     * ({@link ComputeQueue#enqueueCopyBuffer}): the staging of an upload or a host copy of a streamed layer. Unlike
+     * {@link #allocateHostMappedBuffer(long)}, which may place its memory where kernels read it fastest (Vulkan's
+     * device-local host-visible memory under a resizable BAR), this memory is always system memory and never takes
+     * device memory. The default is {@link #allocateHostMappedBuffer(long)}, whose memory is system memory on every
+     * backend but Vulkan.
+     *
+     * @throws UnsupportedOperationException when {@link #supportsHostMappedBuffers()} is false
+     * @throws IllegalArgumentException      when the size is not positive
+     */
+    default HostMappedBuffer allocateHostStagingBuffer(long sizeInBytes) {
+        return allocateHostMappedBuffer(sizeInBytes);
+    }
+
+    /**
+     * True when a large upload of host bytes reaches the device faster through page-locked staging that several threads
+     * fill ({@link #allocateHostStagingBuffer}, read by {@link ComputeQueue#enqueueCopyBuffer}) than through
+     * {@link ComputeQueue#enqueueWriteBuffer}, whose host copy runs on the calling thread. The default is false: the
+     * backend's own write path is the faster or the only one.
+     */
+    default boolean prefersParallelUploadStaging() {
+        return false;
     }
 
     /**
@@ -223,6 +249,14 @@ public interface ComputeBackend extends AutoCloseable {
      * creates the pipeline now instead of at the first dispatch. The default does nothing.
      */
     default void prepareKernel(KernelHandle kernel, long[] localWorkSize) {
+    }
+
+    /**
+     * Writes the backend's persistent compilation caches out now, so the kernels prepared so far survive a process
+     * that ends without closing the backend: Vulkan saves its pipeline cache when pipelines it did not hold were
+     * created since the last save. A model load calls it once its kernels are prepared. The default does nothing.
+     */
+    default void persistCaches() {
     }
 
     /**

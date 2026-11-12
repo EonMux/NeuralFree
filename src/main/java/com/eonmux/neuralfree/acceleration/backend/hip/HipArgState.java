@@ -40,6 +40,9 @@ public final class HipArgState {
     private final KernelSignature signature;
     private final StickyArgs sticky;
     private long checkedLayoutVersion = -1;
+    /** The last parameter table and the argument version it was built at. */
+    private Object[] params;
+    private long paramsVersion = -1;
 
     /**
      * @param backend    the backend whose buffers the arguments may reference
@@ -91,7 +94,10 @@ public final class HipArgState {
 
     /**
      * The parameter table for {@code hipModuleLaunchKernel}: one element per argument, buffers as
-     * their device pointer, everything else as its snapshot.
+     * their device pointer, everything else as its snapshot. The table is built when an argument
+     * changed since the last call and shared otherwise, so a launch that repeats its arguments (every
+     * decode step) allocates nothing; the buffers are checked to be open on every call. The shim
+     * copies the values during the launch call, and callers only read the table.
      *
      * @throws IllegalStateException    naming the first unset argument when the list is incomplete,
      *                                  or the first buffer argument closed since it was set
@@ -101,22 +107,30 @@ public final class HipArgState {
     public Object[] launchParams() {
         sticky.requireComplete();
         checkSignature();
+        long version = sticky.version();
+        if (params != null && paramsVersion == version) {
+            for (int i = 0; i < params.length; i++) {
+                requireOpen(sticky.get(i), i);
+            }
+            return params;
+        }
         int count = sticky.count();
-        Object[] params = new Object[count];
+        Object[] built = new Object[count];
         for (int i = 0; i < count; i++) {
             Object value = sticky.get(i);
-            if (value instanceof HipGpuBuffer) {
-                HipGpuBuffer buffer = (HipGpuBuffer) value;
-                if (buffer.isClosed()) {
-                    throw new IllegalStateException("arg " + i + " of " + sticky.kernelName()
-                            + " is a HIP buffer that was closed after it was set");
-                }
-                params[i] = buffer.getDevicePointer();
-            } else {
-                params[i] = value;
-            }
+            requireOpen(value, i);
+            built[i] = value instanceof HipGpuBuffer ? (Object) ((HipGpuBuffer) value).getDevicePointer() : value;
         }
-        return params;
+        params = built;
+        paramsVersion = version;
+        return built;
+    }
+
+    private void requireOpen(Object value, int i) {
+        if (value instanceof HipGpuBuffer && ((HipGpuBuffer) value).isClosed()) {
+            throw new IllegalStateException("arg " + i + " of " + sticky.kernelName()
+                    + " is a HIP buffer that was closed after it was set");
+        }
     }
 
     /** The underlying argument snapshots. */

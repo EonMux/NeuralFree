@@ -132,6 +132,36 @@ public class GpuAllReduceTest {
     }
 
     @Test
+    public void reduceToRootSumsIntoRankZeroInRankOrderAndLeavesThePeersAlone() {
+        ComputeQueue root = backend.computeQueue();
+        int n = GpuAllReduce.CHUNK_FLOATS + 5;
+        try (GpuBuffer a = backend.allocateBuffer((long) n * 4); GpuBuffer b = backend.allocateBuffer((long) n * 4);
+             GpuBuffer c = backend.allocateBuffer((long) n * 4);
+             GpuBuffer temp = backend.allocateBuffer((long) GpuAllReduce.CHUNK_FLOATS * 4)) {
+            float[] x = new float[n];
+            float[] y = new float[n];
+            float[] z = new float[n];
+            float[] expected = new float[n];
+            for (int i = 0; i < n; i++) {
+                x[i] = i % 2 == 0 ? 1e20f : i % 13;
+                y[i] = i % 2 == 0 ? -1e20f : -(i % 7);
+                z[i] = 0.5f * (i % 5);
+                expected[i] = (x[i] + y[i]) + z[i];
+            }
+            writePending(root, a, x);
+            writePending(second, b, y);
+            writePending(root, c, z);
+            GpuAllReduce.reduceToRoot(ops, temp, Arrays.asList(new GpuAllReduce.Participant(root, a, 0),
+                    new GpuAllReduce.Participant(second, b, 0), new GpuAllReduce.Participant(root, c, 0)), n);
+            assertArrayEquals(expected, read(root, a, n), 0f);
+            assertArrayEquals("a peer's view is not overwritten with the sum", y, read(second, b, n), 0f);
+            assertArrayEquals(z, read(root, c, n), 0f);
+            assertThrows(IllegalArgumentException.class, () -> GpuAllReduce.reduceToRoot(ops, temp,
+                    Collections.singletonList(new GpuAllReduce.Participant(second, a, 0)), 1));
+        }
+    }
+
+    @Test
     public void singleRankAndValidation() {
         ComputeQueue root = backend.computeQueue();
         try (GpuBuffer a = backend.allocateBuffer(16); GpuBuffer temp = backend.allocateBuffer(16)) {

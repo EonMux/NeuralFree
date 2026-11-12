@@ -259,12 +259,13 @@ final class VkGraph implements GpuGraph {
     /**
      * One dispatch of the replay body: matches it against the next captured dispatch and adopts changed scalar
      * arguments and group counts. The bound buffers, the argument kinds and the local size must match the capture.
+     * The handle's live arguments are compared in place; only a dispatch that changed copies them.
      *
      * @throws IllegalStateException     when the graph is closed or a bound buffer is closed
      * @throws GpuGraphMismatchException when the body's dispatch sequence, local size, buffers or argument kinds
      *                                   leave the capture
      */
-    void dispatch(VkKernelHandle handle, long[] global, int[] local3, long[] groups, Object[] args) {
+    void dispatch(VkKernelHandle handle, long[] global, int[] local3, long[] groups, StickyArgs args) {
         requireOpen();
         String name = handle.kernelName();
         if (position >= dispatches.size()) {
@@ -282,20 +283,27 @@ final class VkGraph implements GpuGraph {
                     + " local size from " + Arrays.toString(d.local3) + " to " + Arrays.toString(local3)
                     + "; re-capture the step");
         }
-        if (d.args.length != args.length) {
+        int count = args.count();
+        if (d.args.length != count) {
             throw new GpuGraphMismatchException("command replay of " + this + ": " + name + " binds "
-                    + args.length + " arguments, the capture holds " + d.args.length);
+                    + count + " arguments, the capture holds " + d.args.length);
         }
         boolean recorded = !Arrays.equals(d.groups, groups);
-        for (int i = 0; i < args.length; i++) {
+        Object[] changed = null;
+        for (int i = 0; i < count; i++) {
             requireOpenBuffer(name, d.args[i]);
-            if (!KernelArgs.sameValue(d.args[i], args[i])) {
-                requireScalarChange(d, i, args[i]);
+            Object now = args.get(i);
+            if (!KernelArgs.sameValue(d.args[i], now)) {
+                requireScalarChange(d, i, now);
+                if (changed == null) {
+                    changed = d.args.clone();
+                }
+                changed[i] = copyValue(now);
                 recorded = true;
             }
         }
         if (recorded || !Arrays.equals(d.global, global)) {
-            adopt(index, d.with(global.clone(), groups.clone(), args), recorded);
+            adopt(index, d.with(global.clone(), groups.clone(), changed != null ? changed : d.args), recorded);
             replayChanges.set(index);
         }
     }

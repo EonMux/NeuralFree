@@ -140,6 +140,28 @@ public class KernelArgsTest {
     }
 
     @Test
+    public void writeLEIntoLittleEndianBufferMatchesBigEndianBufferBytes() {
+        Object[] values = {0x01020304, -2.5f, Boolean.FALSE, 0x0102030405060708L, 3.25, new int[] {9, -1},
+                new float[] {0.5f}, new long[] {-7L}, new double[] {1e-3}};
+        ByteBuffer little = ByteBuffer.allocateDirect(96).order(ByteOrder.LITTLE_ENDIAN);
+        ByteBuffer big = ByteBuffer.allocateDirect(96).order(ByteOrder.BIG_ENDIAN);
+        little.position(5);
+        int offset = 0;
+        for (Object v : values) {
+            assertEquals(KernelArgs.writeLE(big, offset, v), KernelArgs.writeLE(little, offset, v));
+            offset += KernelArgs.byteSize(v);
+        }
+        assertEquals(5, little.position());
+        assertEquals(ByteOrder.LITTLE_ENDIAN, little.order());
+        assertEquals(ByteOrder.BIG_ENDIAN, big.order());
+        for (int i = 0; i < offset; i++) {
+            assertEquals("byte " + i, big.get(i), little.get(i));
+        }
+        assertEquals(0x04, little.get(0));
+        assertEquals(0x0102030405060708L, little.getLong(12));
+    }
+
+    @Test
     public void describeNamesTypes() {
         assertEquals("Float", KernelArgs.describe(1f));
         assertEquals("int[3]", KernelArgs.describe(new int[3]));

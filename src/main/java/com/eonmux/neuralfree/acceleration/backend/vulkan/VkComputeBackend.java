@@ -45,6 +45,7 @@ import static org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 import static org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 import static org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 import static org.lwjgl.vulkan.VK10.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+import static org.lwjgl.vulkan.VK10.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 import static org.lwjgl.vulkan.VK10.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
 import static org.lwjgl.vulkan.VK10.VK_SUCCESS;
 import static org.lwjgl.vulkan.VK10.vkCreateDevice;
@@ -279,6 +280,20 @@ public final class VkComputeBackend implements ComputeBackend {
     }
 
     /**
+     * Allocates host-visible, host-coherent memory outside the device-local heap (on a discrete GPU a device-local
+     * type loses unless asked for, {@link VkMemoryAllocator}), as the upload staging ring does: the copy engine reads
+     * it over the interconnect and it takes no VRAM, even where a resizable BAR offers host-visible device memory.
+     */
+    @Override
+    public HostMappedBuffer allocateHostStagingBuffer(long sizeInBytes) {
+        VkGpuBuffer buffer = allocator.createBuffer(sizeInBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+        LOGGER.trace("Allocated Vulkan host staging buffer: {} bytes (type {})", sizeInBytes,
+                buffer.memoryTypeIndex());
+        return buffer;
+    }
+
+    /**
      * Loads {@code kernelName} from the classpath SPIR-V module {@code spirvPath}, without
      * specialisation constants or a build-time signature; arguments are validated against the
      * module's reflected bindings and push constants. Build options do not apply and are ignored.
@@ -491,7 +506,13 @@ public final class VkComputeBackend implements ComputeBackend {
         return programs;
     }
 
-    /** The pipeline cache, persisted on {@link #close()}. */
+    /** Saves the pipeline cache when it gained pipelines since it was loaded or last saved. */
+    @Override
+    public void persistCaches() {
+        pipelineCache.save();
+    }
+
+    /** The pipeline cache, persisted on {@link #persistCaches()} and {@link #close()}. */
     public VkPipelineCache getVkPipelineCache() {
         return pipelineCache;
     }

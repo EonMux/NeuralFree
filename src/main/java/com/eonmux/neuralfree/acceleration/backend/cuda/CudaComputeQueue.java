@@ -10,6 +10,7 @@ import com.eonmux.neuralfree.acceleration.backend.GpuUncapturableCommandExceptio
 import com.eonmux.neuralfree.acceleration.backend.KernelHandle;
 import com.eonmux.neuralfree.acceleration.backend.KernelTaskBatch;
 import com.eonmux.neuralfree.acceleration.backend.KernelTiming;
+import com.eonmux.neuralfree.acceleration.backend.LaunchGeometry;
 import com.eonmux.neuralfree.acceleration.backend.WorkSizes;
 import com.eonmux.neuralfree.utils.Closeables;
 import com.eonmux.neuralfree.utils.LoggingUtil;
@@ -811,9 +812,9 @@ public final class CudaComputeQueue implements ComputeQueue {
         CudaKernelHandle handle = ownHandle(kernel);
         String name = handle.kernelName();
         CUfunction function = handle.function();
-        long[][] geometry = gridBlockOf(handle, global, local);
-        long[] grid = geometry[0];
-        long[] block = geometry[1];
+        LaunchGeometry geometry = gridBlockOf(handle, global, local);
+        long[] grid = geometry.grid();
+        long[] block = geometry.block();
         validateWaits(waits);
         if (args != null && args.length > 0) {
             handle.args().setAll(args);
@@ -846,7 +847,8 @@ public final class CudaComputeQueue implements ComputeQueue {
             return null;
         }
         applyWaits(waits);
-        CUevent timedStart = beginTiming(timingKey(name, grid, block));
+        String timedKey = timing == null ? null : timingKey(name, grid, block);
+        CUevent timedStart = beginTiming(timedKey);
         int result;
         try {
             result = cuLaunchKernel(handle.function(), (int) grid[0], (int) grid[1], (int) grid[2],
@@ -860,7 +862,7 @@ public final class CudaComputeQueue implements ComputeQueue {
             cancelTiming(timedStart);
             throw CudaErrors.translate(result, "cuLaunchKernel(" + handle.kernelName() + ")", -1);
         }
-        endTiming(timedStart, timingKey(name, grid, block));
+        endTiming(timedStart, timedKey);
         return withEvent ? record() : null;
     }
 
@@ -998,10 +1000,15 @@ public final class CudaComputeQueue implements ComputeQueue {
      * Validates a dispatch of {@code handle} and converts it to the grid and block
      * {@code cuLaunchKernel} takes: a null local size becomes
      * {@link WorkSizes#defaultLocal(long[], long)}, the block is checked against the function's
-     * thread limit and the device's block z limit, the grid against the device limits. Index 0
-     * of the result is the grid, index 1 the block, each padded to three dimensions with 1.
+     * thread limit and the device's block z limit, the grid against the device limits. The grid and the
+     * block are padded to three dimensions with 1. A dispatch that repeats the sizes of the handle's last one
+     * reuses its geometry, which was validated when it was derived.
      */
-    static long[][] gridBlockOf(CudaKernelHandle handle, long[] global, long[] local) {
+    static LaunchGeometry gridBlockOf(CudaKernelHandle handle, long[] global, long[] local) {
+        LaunchGeometry last = handle.lastGeometry();
+        if (last != null && last.matches(global, local)) {
+            return last;
+        }
         String name = handle.kernelName();
         long[] blockRaw = local == null ? WorkSizes.defaultLocal(global, handle.maxThreadsPerBlock()) : local;
         WorkSizes.validateLocal(blockRaw, handle.maxThreadsPerBlock(), name);
@@ -1019,7 +1026,9 @@ public final class CudaComputeQueue implements ComputeQueue {
                         + maxGrid[d]);
             }
         }
-        return new long[][]{grid, block};
+        LaunchGeometry geometry = new LaunchGeometry(global, local, grid, block);
+        handle.lastGeometry(geometry);
+        return geometry;
     }
 
     /** Rejects waits on events of other queues: a captured graph records only this stream's order. */

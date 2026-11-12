@@ -7,7 +7,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import static org.jocl.CL.*;
 
-public final class OclGpuBuffer implements GpuBuffer {
+public class OclGpuBuffer implements GpuBuffer {
     private cl_mem mem;
     private final long sizeBytes;
     private final AtomicLong allocatedBytesTracker;

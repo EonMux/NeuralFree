@@ -337,6 +337,7 @@ public final class VkProgram implements AutoCloseable {
             LongBuffer pPipeline = stack.mallocLong(1);
             VkErrors.check(vkCreateComputePipelines(device, pipelineCache.handle(), create, null, pPipeline),
                     "vkCreateComputePipelines for " + resourcePath);
+            pipelineCache.pipelineCreated();
             return pPipeline.get(0);
         }
     }

@@ -341,7 +341,7 @@ if (vectorUsable) {
 }
 
 // Every application run forwards neuralfree.* system properties (-D) and project properties (-P) to the JVM, and
-// logs through src/main/config/log4j2.xml (INFO and above to the console).
+// logs through src/main/config/log4j2.xml (INFO and above to standard error).
 tasks.withType(JavaExec).configureEach {
     systemProperty 'log4j2.configurationFile', layout.projectDirectory.file('src/main/config/log4j2.xml').asFile.absolutePath
     systemProperties System.properties.findAll { it.key.startsWith('neuralfree.') }

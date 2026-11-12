@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Logging configuration of the Gradle run tasks (runApp, runDemos, runLLMDemo), which pass it to the JVM as
-     -Dlog4j2.configurationFile. The library jar ships no logging configuration. -->
+<!-- Logging configuration of the Gradle run tasks (runApp, runDemos, runLLMDemo, runNfTool), which pass it to the JVM
+     as -Dlog4j2.configurationFile. The library jar ships no logging configuration. Log lines go to standard error, so
+     the structured standard output of the tools (nftool bench -o jsonl, batched-bench) stays machine-readable. -->
 <Configuration status="WARN">
     <Appenders>
-        <Console name="Console" target="SYSTEM_OUT">
+        <Console name="Console" target="SYSTEM_ERR">
             <PatternLayout pattern="%d{HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n"/>
         </Console>
     </Appenders>

@@ -43,9 +43,12 @@ import java.util.Objects;
  *
  * <p><b>Host side.</b> Tensors are read through the {@link WeightDataProvider} (RAM cache, else the mapped file) in
  * chunks of at most {@value #CHUNK_BYTES} bytes into one reusable staging buffer: writes copy their source at
- * enqueue. Tensors whose device type is F32 but whose stored type is not are decoded on the host per chunk.</p>
+ * enqueue. Tensors whose device type is F32 but whose stored type is not are decoded on the host per chunk. When
+ * the backend allocates host-mapped memory and {@code neuralfree.stream.pinned.mb} allows, every set is instead held
+ * in page-locked host copies made at allocation ({@link PinnedLayerTier}), and a stage is one device copy per shard
+ * from them, with no host copy.</p>
  *
- * <p>Owns its buffers and the provider. Not thread-safe.</p>
+ * <p>Owns its buffers, the page-locked copies and the provider. Not thread-safe.</p>
  */
 final class LayerSlots implements AutoCloseable {
 
@@ -77,6 +80,8 @@ final class LayerSlots implements AutoCloseable {
     private final ByteBuffer staging;
     private final ByteBuffer raw;
     private final float[] decoded;
+    /** Page-locked copies of the sets, or null when the layers stage from the host tier. */
+    private final PinnedLayerTier pinned;
     private long unfinishedWriteBytes;
     private boolean closed;
 
@@ -104,8 +109,9 @@ final class LayerSlots implements AutoCloseable {
     private LayerSlots(ComputeQueue computeQueue, ComputeQueue transferQueue, WeightDataProvider data,
                        List<LayerWeightSet> sets, int[] slotOf,
                        GpuBuffer[][] pools, Plan plan, Map<String, GpuBuffer> perms,
-                       Map<String, GpuBuffer> preScales, List<GpuBuffer> permBuffers) {
+                       Map<String, GpuBuffer> preScales, List<GpuBuffer> permBuffers, PinnedLayerTier pinned) {
         this.computeQueue = computeQueue;
+        this.pinned = pinned;
         this.transferQueue = transferQueue;
         this.sameQueue = transferQueue == computeQueue;
         this.data = data;
@@ -160,9 +166,12 @@ final class LayerSlots implements AutoCloseable {
             ws.add(Collections.unmodifiableMap(map));
         }
         this.weights = Collections.unmodifiableList(ws);
-        this.staging = ByteBuffer.allocateDirect((int) stagingBytes).order(ByteOrder.LITTLE_ENDIAN);
-        this.raw = rawBytes > 0 ? ByteBuffer.allocateDirect((int) rawBytes).order(ByteOrder.LITTLE_ENDIAN) : null;
-        this.decoded = floats > 0 ? new float[(int) floats] : null;
+        boolean hostWrites = pinned == null;
+        this.staging = hostWrites ? ByteBuffer.allocateDirect((int) stagingBytes).order(ByteOrder.LITTLE_ENDIAN)
+                : null;
+        this.raw = hostWrites && rawBytes > 0
+                ? ByteBuffer.allocateDirect((int) rawBytes).order(ByteOrder.LITTLE_ENDIAN) : null;
+        this.decoded = hostWrites && floats > 0 ? new float[(int) floats] : null;
     }
 
     /**
@@ -204,6 +213,7 @@ final class LayerSlots implements AutoCloseable {
         List<GpuBuffer> permBuffers = new ArrayList<>();
         Map<String, GpuBuffer> perms = new HashMap<>();
         Map<String, GpuBuffer> preScales = new HashMap<>();
+        PinnedLayerTier pinned = null;
         try {
             for (int s = 0; s < slotCount; s++) {
                 pools[s] = new GpuBuffer[plan.poolBytes[s].length];
@@ -231,13 +241,18 @@ final class LayerSlots implements AutoCloseable {
                 }
             }
             computeQueue.finish();
+            pinned = PinnedLayerTier.open(backend, data, setList, slotCount);
             LayerSlots slots = new LayerSlots(computeQueue, transfer, data, setList, slotOf, pools, plan, perms,
-                    preScales, permBuffers);
+                    preScales, permBuffers, pinned);
             LOGGER.info(
-                    "Layer weight streaming: {} layers in {} slots, {} MB on the device, async={}",
-                    setList.size(), slotCount, plan.totalBytes() / (1024 * 1024), transfer != computeQueue);
+                    "Layer weight streaming: {} layers in {} slots, {} MB on the device, async={}, staged from {}",
+                    setList.size(), slotCount, plan.totalBytes() / (1024 * 1024), transfer != computeQueue,
+                    pinned != null ? "page-locked copies" : "the host tier");
             return slots;
         } catch (RuntimeException e) {
+            if (pinned != null) {
+                pinned.close();
+            }
             Closeables.closeAll(permBuffers, null);
             for (GpuBuffer[] pool : pools) {
                 if (pool == null) {
@@ -435,6 +450,11 @@ final class LayerSlots implements AutoCloseable {
     public long deviceBytes() { return Math.addExact(deviceBytes, permBytes); }
     /** True when uploads run on their own transfer queue. */
     public boolean asyncTransfers() { return !sameQueue; }
+    /**
+     * True when the sets stage from page-locked host copies ({@link PinnedLayerTier}) and never read the host
+     * tier.
+     */
+    public boolean pinned() { return pinned != null; }
 
     /**
      * Device tensors of set {@code i} by stored name (unmodifiable); valid whenever the set is resident and
@@ -446,9 +466,11 @@ final class LayerSlots implements AutoCloseable {
 
     /**
      * Uploads set {@code i} into its slot, evicting the slot's previous set; a no-op when it is resident. The first
-     * upload waits on the slot's release marker; the uploads are flushed to the device before returning. When more
-     * than {@link #MAX_UNFINISHED_WRITE_BYTES} were written since the transfer queue was last finished, it is
-     * finished first: its pending uploads wait only on compute markers that were flushed when they were enqueued.
+     * upload waits on the slot's release marker; the uploads are flushed to the device before returning. With
+     * page-locked copies ({@link #pinned()}) each shard is one device copy from them; otherwise the shards are
+     * written from the host tier, and when more than {@link #MAX_UNFINISHED_WRITE_BYTES} were written since the
+     * transfer queue was last finished, it is finished first: its pending uploads wait only on compute markers that
+     * were flushed when they were enqueued.
      *
      * @throws UncheckedIOException when a tensor cannot be read (the slot is then empty)
      */
@@ -458,7 +480,7 @@ final class LayerSlots implements AutoCloseable {
         if (occupant[s] == i) {
             return;
         }
-        if (unfinishedWriteBytes >= MAX_UNFINISHED_WRITE_BYTES) {
+        if (pinned == null && unfinishedWriteBytes >= MAX_UNFINISHED_WRITE_BYTES) {
             transferQueue.finish();
             unfinishedWriteBytes = 0;
         }
@@ -477,10 +499,17 @@ final class LayerSlots implements AutoCloseable {
         LayerWeightSet set = sets.get(i);
         Map<String, GpuWeight> dev = weights.get(i);
         try {
+            int flat = 0;
             for (Entry e : set.entries()) {
                 GpuWeight w = dev.get(e.name());
                 for (int k = 0; k < e.shardCount(); k++) {
-                    waits = upload(e, w.shard(k), w.shardRowStart(k), e.shardRows(k), waits);
+                    if (pinned != null) {
+                        pinned.copy(transferQueue, i, flat, e.shardBytes(k), w.shard(k), waits);
+                        waits = NO_EVENTS;
+                    } else {
+                        waits = upload(e, w.shard(k), w.shardRowStart(k), e.shardRows(k), waits);
+                    }
+                    flat++;
                 }
             }
         } catch (IOException ex) {
@@ -624,6 +653,9 @@ final class LayerSlots implements AutoCloseable {
             }
         }
         RuntimeException permFailure = Closeables.closeAll(permBuffers, null);
+        if (pinned != null) {
+            permFailure = Closeables.close(pinned, permFailure);
+        }
         data.close();
         if (failure == null) {
             failure = permFailure;

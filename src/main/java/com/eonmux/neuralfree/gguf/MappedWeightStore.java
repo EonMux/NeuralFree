@@ -5,6 +5,7 @@ import com.eonmux.neuralfree.utils.LoggingUtil;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 
@@ -28,6 +29,8 @@ public class MappedWeightStore implements WeightStore {
     /** Maximum bytes per MappedByteBuffer segment (1 GB). */
     private static final long SEGMENT_SIZE = 1024L * 1024 * 1024;
 
+    /** Bytes per mapped segment: {@link #SEGMENT_SIZE}, smaller only where a test needs segment boundaries. */
+    private final long segmentSize;
     private final long dataOffset;
     private final long dataLength;
     private final RandomAccessFile raf;
@@ -48,6 +51,19 @@ public class MappedWeightStore implements WeightStore {
      * @param dataLength total bytes of tensor data
      */
     public MappedWeightStore(String path, long dataOffset, long dataLength) throws IOException {
+        this(path, dataOffset, dataLength, TensorReadMode.current(), SEGMENT_SIZE);
+    }
+
+    /**
+     * Opens the file as {@link #MappedWeightStore(String, long, long)} does, under {@code mode} and with mapped
+     * segments of {@code segmentSize} bytes.
+     */
+    MappedWeightStore(String path, long dataOffset, long dataLength, TensorReadMode mode, long segmentSize)
+            throws IOException {
+        if (segmentSize < 1 || segmentSize > SEGMENT_SIZE) {
+            throw new IllegalArgumentException("segment size " + segmentSize + " is not in [1, " + SEGMENT_SIZE + "]");
+        }
+        this.segmentSize = segmentSize;
         this.dataOffset = dataOffset;
         this.dataLength = dataLength;
 
@@ -57,7 +73,6 @@ public class MappedWeightStore implements WeightStore {
             raf = new RandomAccessFile(path, "r");
             ch = raf.getChannel();
 
-            TensorReadMode mode = TensorReadMode.current();
             MappedByteBuffer[] maps = null;
             boolean mapped = false;
 
@@ -71,13 +86,13 @@ public class MappedWeightStore implements WeightStore {
                                 + dataOffset + ", fileSize=" + fileSize);
                     }
 
-                    int segmentCount = (int) ((effectiveDataLen + SEGMENT_SIZE - 1) / SEGMENT_SIZE);
+                    int segmentCount = (int) ((effectiveDataLen + segmentSize - 1) / segmentSize);
                     if (segmentCount == 0) segmentCount = 1;
                     maps = new MappedByteBuffer[segmentCount];
 
                     for (int i = 0; i < segmentCount; i++) {
-                        long segStart = dataOffset + (long) i * SEGMENT_SIZE;
-                        long segLen = Math.min(SEGMENT_SIZE, dataOffset + effectiveDataLen - segStart);
+                        long segStart = dataOffset + (long) i * segmentSize;
+                        long segLen = Math.min(segmentSize, dataOffset + effectiveDataLen - segStart);
                         if (segLen <= 0) {
                             maps[i] = null;
                             continue;
@@ -227,6 +242,34 @@ public class MappedWeightStore implements WeightStore {
         }
     }
 
+    /**
+     * A read-only view of the mapped segment holding {@code tensorOffset}, up to {@code maxSize} bytes or the
+     * segment's end; null when tensor reads do not come from the mapping ({@link #isMmapAvailable()}).
+     */
+    @Override
+    public ByteBuffer mappedSlice(long tensorOffset, long maxSize) throws IOException {
+        if (maxSize < 1) {
+            throw new IllegalArgumentException("a mapped slice holds at least one byte, asked for " + maxSize);
+        }
+        if (!mmapAvailable) {
+            return null;
+        }
+        if (tensorOffset < 0) {
+            throw new IOException("negative tensor offset " + tensorOffset);
+        }
+        long segIdx = tensorOffset / segmentSize;
+        int segOff = (int) (tensorOffset % segmentSize);
+        MappedByteBuffer seg = segIdx < mappings.length ? mappings[(int) segIdx] : null;
+        if (seg == null || segOff >= seg.capacity()) {
+            throw new IOException("mapped slice at offset " + (dataOffset + tensorOffset)
+                    + " starts beyond the mapped region");
+        }
+        int length = (int) Math.min(maxSize, seg.capacity() - segOff);
+        ByteBuffer view = seg.asReadOnlyBuffer();
+        view.position(segOff).limit(segOff + length);
+        return view.slice().order(ByteOrder.LITTLE_ENDIAN);
+    }
+
     private void readFromFileDirect(long tensorOffset, int size, ByteBuffer dst) throws IOException {
         byte[] chunk = new byte[Math.min(size, FALLBACK_CHUNK_SIZE)];
         int remaining = size;
@@ -248,8 +291,8 @@ public class MappedWeightStore implements WeightStore {
         int dstPos = dstOffset;
 
         while (remaining > 0) {
-            int segIdx = (int) (pos / SEGMENT_SIZE);
-            int segOff = (int) (pos % SEGMENT_SIZE);
+            int segIdx = (int) (pos / segmentSize);
+            int segOff = (int) (pos % segmentSize);
 
             if (segIdx >= mappings.length || mappings[segIdx] == null) {
                 throw new IOException("Read beyond mapped region: segIdx=" + segIdx
@@ -257,7 +300,7 @@ public class MappedWeightStore implements WeightStore {
             }
 
             MappedByteBuffer seg = mappings[segIdx];
-            // Use actual segment capacity — last segment may be shorter than SEGMENT_SIZE
+            // Use actual segment capacity — last segment may be shorter than segmentSize
             int readable = (int) Math.min(remaining, seg.capacity() - segOff);
             if (readable <= 0) {
                 throw new IOException("Read beyond segment boundary: segOff=" + segOff
@@ -282,8 +325,8 @@ public class MappedWeightStore implements WeightStore {
         int remaining = size;
 
         while (remaining > 0) {
-            int segIdx = (int) (pos / SEGMENT_SIZE);
-            int segOff = (int) (pos % SEGMENT_SIZE);
+            int segIdx = (int) (pos / segmentSize);
+            int segOff = (int) (pos % segmentSize);
 
             if (segIdx >= mappings.length || mappings[segIdx] == null) {
                 throw new IOException("Read beyond mapped region: segIdx=" + segIdx
@@ -291,7 +334,7 @@ public class MappedWeightStore implements WeightStore {
             }
 
             MappedByteBuffer seg = mappings[segIdx];
-            // Use actual segment capacity — last segment may be shorter than SEGMENT_SIZE
+            // Use actual segment capacity — last segment may be shorter than segmentSize
             int readable = (int) Math.min(remaining, seg.capacity() - segOff);
             if (readable <= 0) {
                 throw new IOException("Read beyond segment boundary: segOff=" + segOff

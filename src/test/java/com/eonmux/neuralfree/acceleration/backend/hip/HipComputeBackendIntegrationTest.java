@@ -19,6 +19,9 @@ import java.util.List;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNotSame;
+import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -250,6 +253,69 @@ public class HipComputeBackendIntegrationTest {
         } finally {
             other.close();
         }
+    }
+
+    @Test
+    public void repeatedDispatchSizesReuseTheGeometryAndChangedOnesDeriveIt() throws Exception {
+        ComputeQueue queue = backend.computeQueue();
+        HipGpuBuffer buffer = (HipGpuBuffer) backend.allocateBuffer(1024 * Float.BYTES);
+        KernelHandle kernel = backend.loadKernel(scaleArtifact());
+        long[] global = {128};
+        long[] local = {64};
+        queue.enqueueKernel(kernel, global, local, new Object[]{buffer, 2f, 128});
+        queue.enqueueKernel(kernel, global, local, new Object[]{buffer, 2f, 128});
+        // the caller's arrays change in place: the kept geometry is keyed by their values, not the arrays
+        global[0] = 512;
+        queue.enqueueKernel(kernel, global, local, new Object[]{buffer, 2f, 512});
+        local[0] = 128;
+        queue.enqueueKernel(kernel, global, local, new Object[]{buffer, 2f, 512});
+        queue.enqueueKernel(kernel, global, null, new Object[]{buffer, 2f, 512});
+        queue.finish();
+
+        List<FakeHipDriver.Launch> launches = driver.launches();
+        assertEquals(5, launches.size());
+        int[][] gridBlock = {{2, 64}, {2, 64}, {8, 64}, {4, 128}, {2, 256}};
+        for (int i = 0; i < gridBlock.length; i++) {
+            FakeHipDriver.Launch launch = launches.get(i);
+            assertEquals("launch " + i + " grid", gridBlock[i][0], launch.gridX);
+            assertEquals("launch " + i + " block", gridBlock[i][1], launch.blockX);
+            assertEquals(1, launch.gridY);
+            assertEquals(1, launch.blockZ);
+        }
+        try {
+            queue.enqueueKernel(kernel, new long[]{64, 65536}, new long[]{64, 1},
+                    new Object[]{buffer, 2f, 64});
+            fail("a grid beyond the device's y limit must be refused");
+        } catch (IllegalArgumentException expected) {
+            assertTrue(expected.getMessage(), expected.getMessage().contains("exceed the device limit of 65535"));
+        }
+        assertTrue(driver.launches().isEmpty());
+    }
+
+    @Test
+    public void launchParamsAreBuiltOnceWhileTheArgumentsRepeat() {
+        HipKernelHandle kernel = (HipKernelHandle) backend.loadKernel(scaleArtifact());
+        HipGpuBuffer buffer = (HipGpuBuffer) backend.allocateBuffer(64);
+        HipGpuBuffer other = (HipGpuBuffer) backend.allocateBuffer(64);
+        HipArgState args = kernel.args();
+        args.setAll(new Object[]{buffer, 2f, 16});
+        Object[] first = args.launchParams();
+        args.setAll(new Object[]{buffer, 2f, 16});
+        assertSame("unchanged arguments reuse the table", first, args.launchParams());
+        assertEquals(buffer.getDevicePointer(), first[0]);
+
+        args.set(1, 3f);
+        Object[] changed = args.launchParams();
+        assertNotSame(first, changed);
+        assertEquals(3f, changed[1]);
+        assertEquals("a table handed out is never rewritten", 2f, first[1]);
+
+        args.set(0, other);
+        assertEquals(other.getDevicePointer(), args.launchParams()[0]);
+        other.close();
+        IllegalStateException closed = assertThrows(IllegalStateException.class, args::launchParams);
+        assertTrue(closed.getMessage(), closed.getMessage().contains("closed after it was set"));
+        buffer.close();
     }
 
     @Test

@@ -14,10 +14,11 @@ import java.util.Objects;
 
 /**
  * The attention mixer of one tensor-parallel layer: every rank's {@link GpuAttentionMixer} over the rank's head shard
- * and the rank's own KV cache. Rank 0 computes its heads straight from the main device's normalized input into the
- * branch output slot; every other rank receives a replay of that input in its own buffer, computes its heads there,
- * and an all-reduce ({@link GpuAllReduce#sum}) adds the partial branch outputs into rank 0's slot, so the layer
- * output is the sum of the rank blocks exactly as vLLM's row-parallel attention output projection sums them.
+ * and the rank's own KV cache. Every peer rank first receives one replay of the main device's normalized input in its
+ * own buffer ({@link RankExchange#replayAll}) and its heads are enqueued there; then rank 0 computes its heads from
+ * the input into the branch output slot while the peers run, and a reduction ({@link GpuAllReduce#reduceToRoot}) adds
+ * the partial branch outputs into rank 0's slot in rank order, so the layer output is the sum of the rank blocks
+ * exactly as vLLM's row-parallel attention output projection sums them.
  *
  * <p>Each rank's mixer binds against a copy of the layer spec whose head counts are the rank's, so its projection
  * shapes, scratch rows, RoPE geometry and KV cache rows are shard-local. Every rank's cache is written by that rank's
@@ -68,24 +69,20 @@ final class TpAttentionMixer implements GpuMixer {
     private void forward(int pos0, int nTokens, ScratchSlot in, ScratchSlot out) {
         requireBound();
         group.uploadStepInputs(pos0, nTokens);
-        if (nTokens == 1) {
-            parts.get(0).decode(pos0, in, out);
-        } else {
-            parts.get(0).prefill(pos0, nTokens, in, out);
-        }
-        int width = streamWidth();
+        replayToPeers(in, nTokens, true);
         for (int rank = 1; rank < parts.size(); rank++) {
             ScratchSlot peerIn = group.inputSlot(rank);
             ScratchSlot peerOut = group.partialSlot(rank);
-            peerIn.require((long) nTokens * width);
-            peerOut.require((long) nTokens * width);
-            RankExchange.replay(ctx.queue(), in.buffer(), in.offset(), group.rankQueue(rank), peerIn.buffer(),
-                    (long) nTokens * width);
             if (nTokens == 1) {
                 parts.get(rank).decode(pos0, peerIn, peerOut);
             } else {
                 parts.get(rank).prefill(pos0, nTokens, peerIn, peerOut);
             }
+        }
+        if (nTokens == 1) {
+            parts.get(0).decode(pos0, in, out);
+        } else {
+            parts.get(0).prefill(pos0, nTokens, in, out);
         }
         sumPartials(out, nTokens);
     }
@@ -105,21 +102,21 @@ final class TpAttentionMixer implements GpuMixer {
             return;
         }
         int nTokens = s.nTokens();
-        int width = streamWidth();
-        parts.get(0).batch(s, in, out);
+        replayToPeers(in, nTokens, true);
         for (int rank = 1; rank < parts.size(); rank++) {
-            ScratchSlot peerIn = group.inputSlot(rank);
-            ScratchSlot peerOut = group.partialSlot(rank);
-            peerIn.require((long) nTokens * width);
-            peerOut.require((long) nTokens * width);
-            RankExchange.replay(ctx.queue(), in.buffer(), in.offset(), group.rankQueue(rank), peerIn.buffer(),
-                    (long) nTokens * width);
-            parts.get(rank).batch(s, peerIn, peerOut);
+            parts.get(rank).batch(s, group.inputSlot(rank), group.partialSlot(rank));
         }
+        parts.get(0).batch(s, in, out);
         sumPartials(out, nTokens);
     }
 
-    /** Adds every rank's partial branch output into rank 0's {@code out}. */
+    /** Sends {@code in}'s rows to every peer rank's input slot ({@link RankExchange#replayToPeers}). */
+    private void replayToPeers(ScratchSlot in, int nTokens, boolean partials) {
+        long floats = (long) nTokens * streamWidth();
+        RankExchange.replayToPeers(group, parts.size(), ctx.queue(), in, floats, partials ? floats : 0L);
+    }
+
+    /** Adds every rank's partial branch output into rank 0's {@code out}; the peers' partials are left as they were. */
     private void sumPartials(ScratchSlot out, int nTokens) {
         int width = streamWidth();
         List<GpuAllReduce.Participant> participants = new ArrayList<>(parts.size());
@@ -128,7 +125,7 @@ final class TpAttentionMixer implements GpuMixer {
             ScratchSlot peerOut = group.partialSlot(rank);
             participants.add(new GpuAllReduce.Participant(group.rankQueue(rank), peerOut.buffer(), peerOut.offset()));
         }
-        GpuAllReduce.sum(ctx.ops(), group.allReduceTemporary(), participants, nTokens * width);
+        GpuAllReduce.reduceToRoot(ctx.ops(), group.allReduceTemporary(), participants, nTokens * width);
     }
 
     /** Null when every rank's mixer can step over a paged layout, or the unbound reason. */
@@ -141,15 +138,11 @@ final class TpAttentionMixer implements GpuMixer {
     public void prefillKV(int pos0, int nTokens, ScratchSlot in) {
         requireBound();
         group.uploadStepInputs(pos0, nTokens);
-        parts.get(0).prefillKV(pos0, nTokens, in);
-        int width = streamWidth();
+        replayToPeers(in, nTokens, false);
         for (int rank = 1; rank < parts.size(); rank++) {
-            ScratchSlot peerIn = group.inputSlot(rank);
-            peerIn.require((long) nTokens * width);
-            RankExchange.replay(ctx.queue(), in.buffer(), in.offset(), group.rankQueue(rank), peerIn.buffer(),
-                    (long) nTokens * width);
-            parts.get(rank).prefillKV(pos0, nTokens, peerIn);
+            parts.get(rank).prefillKV(pos0, nTokens, group.inputSlot(rank));
         }
+        parts.get(0).prefillKV(pos0, nTokens, in);
     }
 
     @Override

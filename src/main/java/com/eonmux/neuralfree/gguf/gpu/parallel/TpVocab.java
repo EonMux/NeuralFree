@@ -21,10 +21,10 @@ import java.util.Objects;
  *
  * <p>The lookup runs the rank's own slice of the token table ({@link GpuOps#embed}) with the step's tokens remapped to
  * local row indices, zeroes the rows whose token falls outside the slice, and sums every rank's rows into the model
- * device's embedding rows ({@link GpuAllReduce#sum}). The LM head's product runs on every rank over the same hidden
- * rows; this class replays the hidden rows to the peers, runs their output product and bias, and copies each rank's
- * logits slice into the model device's full row at the rank's column range. Rank 0's own slice is computed by the
- * head before {@link #gather}.</p>
+ * device's embedding rows ({@link GpuAllReduce#reduceToRoot}). The LM head's product runs on every rank over the
+ * same hidden rows; this class replays the hidden rows to the peers, runs their output product and bias, and copies
+ * each rank's logits slice into the model device's full row at the rank's column range. Rank 0's own slice is
+ * computed by the head before {@link #gather}.</p>
  *
  * <p>The peer products use each rank's {@link ScratchSlots#LOGITS} slot and the replayed input slot the group keeps
  * for the attention exchange. Not thread-safe; the forward path drives it from the model's step.</p>
@@ -39,6 +39,9 @@ final class TpVocab implements GpuEmbeddingStage.VocabParallel, GpuLogitsHead.Vo
     private final int ubatch;
     private final ScratchSlot shardLogits;
     private final GpuBuffer shardBuffer;
+    /** Host staging of a peer's logits slice and of one of its rows, reused by {@link #copyStrided}. */
+    private float[] stridedStage;
+    private float[] stridedRow;
 
     /**
      * @param tables  each rank's token-table shard (rank 0's included)
@@ -96,7 +99,8 @@ final class TpVocab implements GpuEmbeddingStage.VocabParallel, GpuLogitsHead.Vo
             ScratchSlot slot = group.inputSlot(rank);
             participants.add(new GpuAllReduce.Participant(group.rankQueue(rank), slot.buffer(), slot.offset()));
         }
-        GpuAllReduce.sum(group.rankOps(0), group.allReduceTemporary(), participants, Math.multiplyExact(n, width));
+        GpuAllReduce.reduceToRoot(group.rankOps(0), group.allReduceTemporary(), participants,
+                Math.multiplyExact(n, width));
     }
 
     /** Looks up the rows that fall in rank {@code rank}'s slice and zeroes the rest. */
@@ -181,19 +185,30 @@ final class TpVocab implements GpuEmbeddingStage.VocabParallel, GpuLogitsHead.Vo
 
     /**
      * Copies rank {@code rank}'s logits slice into the model device's full logits row: the peer writes every row at
-     * its column range, staging the slice through host memory because the copy is strided.
+     * its column range, staging the slice through host memory because the copy is strided. The host arrays are
+     * reused across calls (a write copies its source at enqueue); the first row is written straight from the slice.
      */
     private void copyStrided(int rank, GpuBuffer src, int nRows, int cols, int dstStart, ScratchSlot fullLogits) {
         int full = (int) plan.headRows();
-        float[] staged = new float[Math.multiplyExact(nRows, cols)];
+        int floats = Math.multiplyExact(nRows, cols);
+        if (stridedStage == null || stridedStage.length < floats) {
+            stridedStage = new float[floats];
+        }
+        float[] staged = stridedStage;
         try (com.eonmux.neuralfree.acceleration.backend.GpuEvent event = group.rankQueue(rank)
-                .enqueueReadBuffer(src, 0L, (long) staged.length * Float.BYTES, staged)) {
+                .enqueueReadBuffer(src, 0L, (long) floats * Float.BYTES, staged)) {
             group.rankQueue(rank).finish();
         }
         ComputeQueue root = group.rankQueue(0);
         for (int row = 0; row < nRows; row++) {
-            float[] values = new float[cols];
-            System.arraycopy(staged, row * cols, values, 0, cols);
+            float[] values = staged;
+            if (row > 0) {
+                if (stridedRow == null || stridedRow.length < cols) {
+                    stridedRow = new float[cols];
+                }
+                System.arraycopy(staged, row * cols, stridedRow, 0, cols);
+                values = stridedRow;
+            }
             root.enqueueWriteBuffer(fullLogits.buffer(),
                     (fullLogits.offset() + (long) row * full + dstStart) * Float.BYTES,
                     (long) cols * Float.BYTES, values);

@@ -6,6 +6,7 @@ import com.eonmux.neuralfree.acceleration.backend.GpuGraph;
 import com.eonmux.neuralfree.acceleration.backend.GpuGraphMismatchException;
 import com.eonmux.neuralfree.acceleration.backend.KernelHandle;
 import com.eonmux.neuralfree.acceleration.backend.KernelTaskBatch;
+import com.eonmux.neuralfree.acceleration.backend.LaunchGeometry;
 import com.eonmux.neuralfree.utils.LoggingUtil;
 import jcuda.driver.CUfunction;
 import org.apache.logging.log4j.Logger;
@@ -83,13 +84,13 @@ public final class CudaKernelBatch implements KernelTaskBatch {
         if (handle.isClosed()) {
             throw new IllegalStateException("CUDA kernel " + handle.kernelName() + " was used after it was closed");
         }
-        long[][] geometry = CudaComputeQueue.gridBlockOf(handle, globalWorkSize, localWorkSize);
+        LaunchGeometry geometry = CudaComputeQueue.gridBlockOf(handle, globalWorkSize, localWorkSize);
         Object[] snapshot = copyArgs(args == null ? new Object[0] : args);
         CudaArgState validation = new CudaArgState(backend, handle.kernelName(), handle.signature());
         validation.setAll(snapshot);
         validation.kernelParams();
         tasks.add(new Task(handle, globalWorkSize.clone(), localWorkSize == null ? null : localWorkSize.clone(),
-                geometry[0], geometry[1], snapshot));
+                geometry.grid(), geometry.block(), snapshot));
     }
 
     @Override

@@ -38,6 +38,12 @@ import java.util.Objects;
  * when the requested logits, hidden rows or greedy ids are read back. A shard whose layers stream their weights
  * ({@link GpuForwardContext#weightSource()}) has its first layer prefetched before the embedding runs.</p>
  *
+ * <p>A one-token decode step runs each span through the shard's own {@link GpuDecodeReplay} on the shard's queue, as
+ * the single-device driver runs its trunk: after the warmup the span's dispatches are captured and later steps
+ * replay them as one graph per device, while the per-step inputs, the stream hand-offs, the embedding and the head
+ * stay outside the captures. A prefill step or a memory reset leaves the captures to be verified again; a context
+ * shift, a new hidden tap and a rollback that is not host bookkeeping only drop them.</p>
+ *
  * <p>Every shard's context carries its own {@link ExecutionObserver}: the stages of a span report to the observer of
  * the device that runs them, the embedding and the head to the main device's, and every observer sees the start
  * and the end of each step. Not thread-safe.</p>
@@ -106,6 +112,10 @@ public final class GpuSplitForwardBackend implements ForwardBackend {
     private HiddenTap tap = HiddenTap.NONE;
     private final int ubatch;
     private float[] transferStage;
+    /** The decode replay of every shard's span, in shard order, each on its shard's queue. */
+    private final List<GpuDecodeReplay> replays;
+    /** Whether a rollback keeps the captures ({@link GpuForwardBackend#CHAIN_REPLAY_PROPERTY}), as on one device. */
+    private final boolean chainReplay;
     private boolean closed;
 
     /**
@@ -166,6 +176,13 @@ public final class GpuSplitForwardBackend implements ForwardBackend {
         }
         this.ubatch = host == null ? this.shards.get(0).ubatch()
                 : Math.min(this.shards.get(0).ubatch(), host.ubatch());
+        List<GpuDecodeReplay> shardReplays = new ArrayList<>(this.shards.size());
+        for (Shard shard : this.shards) {
+            shardReplays.add(new GpuDecodeReplay(shard.queue()));
+        }
+        this.replays = Collections.unmodifiableList(shardReplays);
+        this.chainReplay = GpuForwardBackend.chainReplayConfigured(
+                this.shards.get(main).context().backend().backendType());
     }
 
     /** The memory over every shard's memory and the host part's, reporting the main shard's sequence. */
@@ -293,7 +310,25 @@ public final class GpuSplitForwardBackend implements ForwardBackend {
                 throw new IllegalStateException("the call starts at " + pos0 + " but the memory holds " + past
                         + " positions and cannot drop the last " + drop);
             }
-            memory.rollback(drop);
+            rollbackReplays(drop);
+        }
+    }
+
+    /**
+     * Rolls the memory back by {@code drop} positions. The decode captures survive a rollback that is host
+     * bookkeeping only (an uncompressed plan with the speculative round's replay on), their continuity guards
+     * re-armed at the rewound position, as the single-device backend keeps its own; any other rollback drops them.
+     */
+    private void rollbackReplays(int drop) {
+        int nextPos = memory.sequence().nPast() - drop;
+        memory.rollback(drop);
+        boolean keep = chainReplay && !memory.plan().hasCompressed();
+        for (GpuDecodeReplay replay : replays) {
+            if (keep) {
+                replay.rearm(nextPos);
+            } else {
+                replay.invalidate();
+            }
         }
     }
 
@@ -508,9 +543,10 @@ public final class GpuSplitForwardBackend implements ForwardBackend {
                 current = s;
             }
             if (s == last && pruned) {
+                replays.get(s).distrust();
                 shard.executor().run(p, n, mode, shardSink(taps[s], s), read);
             } else {
-                shard.executor().run(p, n, mode, shardSink(taps[s], s));
+                runSpan(s, p, n, mode, taps[s]);
             }
         }
         int stackRows = pruned ? read.length : n;
@@ -529,6 +565,40 @@ public final class GpuSplitForwardBackend implements ForwardBackend {
             done += count;
         }
         observeStep(p, n, false);
+    }
+
+    /**
+     * Runs shard {@code s}'s span: a decode step through the shard's {@link GpuDecodeReplay}, capturable when no tap
+     * point of the span is read and every layer only enqueues kernel dispatches; any other step directly, after
+     * which the shard's capture is verified again before it is trusted.
+     */
+    private void runSpan(int s, int p, int n, GpuLayerExecutor.StepMode mode, GpuTapReads reads) {
+        GpuLayerExecutor executor = shards.get(s).executor();
+        GpuLayerExecutor.TapSink sink = shardSink(reads, s);
+        GpuDecodeReplay replay = replays.get(s);
+        if (mode == GpuLayerExecutor.StepMode.DECODE) {
+            replay.trunk(p, executor.decodeReplayPatchers(),
+                    !reads.wantsAny(executor.layers().size()) && executor.capturableDecode(),
+                    () -> executor.run(p, n, mode, sink));
+        } else {
+            replay.distrust();
+            executor.run(p, n, mode, sink);
+        }
+    }
+
+    /** What every shard's decode replay has done, in shard order, for diagnostics and tests. */
+    List<GpuDecodeReplay.Counters> decodeReplayCounters() {
+        List<GpuDecodeReplay.Counters> out = new ArrayList<>(replays.size());
+        for (GpuDecodeReplay replay : replays) {
+            out.add(replay.counters());
+        }
+        return out;
+    }
+
+    private void invalidateReplays() {
+        for (GpuDecodeReplay replay : replays) {
+            replay.invalidate();
+        }
     }
 
     /** The start or the end of a step, on the observer of every shard that observes. */
@@ -595,17 +665,31 @@ public final class GpuSplitForwardBackend implements ForwardBackend {
         } else {
             src.queue().finish();
         }
-        float[] out = stage;
         if (srcWidth != dstWidth) {
-            out = new float[n * dstWidth];
-            for (int t = 0; t < n; t++) {
-                System.arraycopy(stage, t * srcWidth, out, t * dstWidth, srcWidth);
-            }
+            widen(stage, n, srcWidth, dstWidth);
         }
         GpuEvent write = dst.queue().enqueueWriteBuffer(dst.x().buffer(), (long) dst.x().offset() * Float.BYTES,
-                (long) n * dstWidth * Float.BYTES, out);
+                (long) n * dstWidth * Float.BYTES, stage);
         if (write != null) {
             write.close();
+        }
+    }
+
+    /**
+     * Spreads {@code n} rows of {@code srcWidth} floats at the start of {@code rows} to a row pitch of
+     * {@code dstWidth} in place, zeroing each row's added columns; the last row moves first, so no row is
+     * overwritten before it moved.
+     *
+     * @throws IllegalStateException when the destination rows are narrower than the source rows
+     */
+    static void widen(float[] rows, int n, int srcWidth, int dstWidth) {
+        if (dstWidth < srcWidth) {
+            throw new IllegalStateException("a stream of width " + srcWidth + " cannot enter a span of width "
+                    + dstWidth);
+        }
+        for (int t = n - 1; t >= 0; t--) {
+            System.arraycopy(rows, t * srcWidth, rows, t * dstWidth, srcWidth);
+            Arrays.fill(rows, t * dstWidth + srcWidth, (t + 1) * dstWidth, 0f);
         }
     }
 
@@ -632,6 +716,9 @@ public final class GpuSplitForwardBackend implements ForwardBackend {
         if (memory != null) {
             memory.reset();
         }
+        for (GpuDecodeReplay replay : replays) {
+            replay.distrust();
+        }
     }
 
     @Override
@@ -655,7 +742,7 @@ public final class GpuSplitForwardBackend implements ForwardBackend {
             }
             return;
         }
-        memory.rollback(nTokens);
+        rollbackReplays(nTokens);
     }
 
     /**
@@ -685,6 +772,7 @@ public final class GpuSplitForwardBackend implements ForwardBackend {
                         + ")");
             }
         }
+        invalidateReplays();
         for (Shard shard : shards) {
             shard.memory().shiftPositions(nKeep, nDiscard);
         }
@@ -729,6 +817,7 @@ public final class GpuSplitForwardBackend implements ForwardBackend {
         Objects.requireNonNull(hiddenTap, "tap");
         ensureOpen();
         this.tap = hiddenTap;
+        invalidateReplays();
     }
 
     /**
@@ -779,7 +868,10 @@ public final class GpuSplitForwardBackend implements ForwardBackend {
 
     // ================================================================== lifecycle
 
-    /** Waits for every queue, then closes the span executors and the head. Idempotent. */
+    /**
+     * Waits for every queue, then releases the decode captures and closes the span executors and the head.
+     * Idempotent.
+     */
     @Override
     public void close() {
         if (closed) {
@@ -793,6 +885,9 @@ public final class GpuSplitForwardBackend implements ForwardBackend {
             } catch (RuntimeException e) {
                 first = e;
             }
+        }
+        for (GpuDecodeReplay replay : replays) {
+            first = Closeables.close(replay, first);
         }
         for (Shard shard : shards) {
             first = Closeables.close(shard.executor(), first);
